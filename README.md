@@ -50,7 +50,7 @@ The queen moves normally. The queen also has a 3x3 zone around itself. A jumping
 
 ### King
 
-The king moves normally. The king also has a 3x3 zone around itself. A jumping piece cannot end up in that zone after a jump.
+The king moves normally. The king also has a 3x3 zone around itself. A jumping piece cannot end up in that zone after a jump. Like in normal chess, castling is allowed.
 
 <img src="Images/King.png" alt="King moves" width="570" height="570" />
 <img src="Images/KingSafety.png" alt="King safety zone" width="570" height="570" />
