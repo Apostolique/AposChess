@@ -59,7 +59,6 @@ The king moves normally. The king also has a 3x3 zone around itself. A jumping p
 
 The following is an example attack on the black rook starting from the first move.
 
-<img src="Images/Example01/E01-01a-a-hg3.png" alt="White move 01" width="570" height="570" />
 ![White move 01](Images/Example01/E01-01a-a-hg3.png)
 
 Black has four different defenses:
