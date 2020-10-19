@@ -24,7 +24,7 @@ To play this online, use the Lichess board editor and share the board URL back a
 
 The pawn can move diagonally. It takes forward. On the first move, it can move forward two spaces.
 
-<img src="Images/Pawn.png" alt="Pawn moves" width="570" height="570" />
+![Pawn moves](Images/Pawn.png)
 
 ### Bishop
 
