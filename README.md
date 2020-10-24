@@ -8,6 +8,8 @@ ___
 
 To play this online, use the Lichess board editor and share the board URL back and forth with whomever you're playing with. For example, here is the URL after my first move: https://lichess.org/editor/rnbqkbnr/pppppppp/8/8/8/6P1/PPPPPPP1/RNBQKBNR_w_KQkq_-
 
+Otherwise, you can play on [tabletopia](https://tabletopia.com/playground/chess/play-now).
+
 ## Index
 
 * [Pawn](#pawn)
