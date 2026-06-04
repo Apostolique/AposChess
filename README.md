@@ -6,7 +6,9 @@ ___
 
 [![Discord](https://img.shields.io/discord/257949867551358987.svg)](https://discord.gg/Wwdb9Cs)
 
-To play this online, use the Lichess board editor and share the board URL back and forth with whomever you're playing with. For example, here is the URL after my first move: https://lichess.org/editor/rnbqkbnr/pppppppp/8/8/8/6P1/PPPPPPP1/RNBQKBNR_w_KQkq_-
+**▶ [Play in your browser](https://apostolique.github.io/AposChess/)** — local two-player, vs. a simple AI, or watch AI vs. AI.
+
+To play this online with a friend, use the Lichess board editor and share the board URL back and forth with whomever you're playing with. For example, here is the URL after my first move: https://lichess.org/editor/rnbqkbnr/pppppppp/8/8/8/6P1/PPPPPPP1/RNBQKBNR_w_KQkq_-
 
 Otherwise, you can play on [tabletopia](https://tabletopia.com/playground/chess/play-now).
 
@@ -76,3 +78,9 @@ Black has four different defenses:
 ![Black move 01b](Images/Example01/E01-01b-b-h6.png)
 ![Black move 01c](Images/Example01/E01-01b-c-h5.png)
 ![Black move 01d](Images/Example01/E01-01b-d-Rh6.png)
+
+## License
+
+AposChess is free software licensed under the [GNU General Public License v3.0 or later](LICENSE).
+
+The web app bundles Lichess's [chessground](https://github.com/lichess-org/chessground) board library, which is GPL-3.0-licensed; the project as a whole is therefore distributed under the GPL.

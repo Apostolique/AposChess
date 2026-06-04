@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AposChess</title>
+  <meta name="description" content="Play AposChess, a chess variant, in your browser." />
+</head>
+<body>
+  <main class="app">
+    <h1>AposChess</h1>
+    <p class="tagline">A chess variant that might or might not be fun.</p>
+
+    <section class="controls">
+      <label>
+        Mode
+        <select id="mode">
+          <option value="human-human">Local: two players</option>
+          <option value="human-ai">You vs AI</option>
+          <option value="ai-ai">AI vs AI</option>
+        </select>
+      </label>
+
+      <label id="side-control" hidden>
+        You play
+        <select id="side">
+          <option value="white">White</option>
+          <option value="black">Black</option>
+        </select>
+      </label>
+
+      <label id="depth-control" hidden>
+        AI strength
+        <select id="depth">
+          <option value="1">Easy</option>
+          <option value="2" selected>Normal</option>
+          <option value="3">Slow</option>
+        </select>
+      </label>
+
+      <button id="new-game" type="button">New game</button>
+      <button id="ai-toggle" type="button" hidden>Start</button>
+    </section>
+
+    <div id="tray-top" class="tray"><span class="caps"></span><span class="adv"></span></div>
+    <div id="board" class="cg-wrap"></div>
+    <div id="tray-bottom" class="tray"><span class="caps"></span><span class="adv"></span></div>
+
+    <p id="status" class="status" role="status" aria-live="polite"></p>
+
+    <details class="rules">
+      <summary>How the pieces move</summary>
+      <ul>
+        <li><b>Pawn</b> — moves one square diagonally forward (to an empty square), captures one square straight forward, and may advance two straight forward on its first move.</li>
+        <li><b>Bishop / Rook</b> — slide normally, and may also jump the first piece in a line to land on the very next square (capturing there or landing empty).</li>
+        <li><b>Knight</b> — travels like a rook (clear path, any distance) then steps one square to the side. It can no longer jump.</li>
+        <li><b>Queen / King</b> — move normally; each projects a 3×3 zone that no jumping piece may land in. The king also castles.</li>
+      </ul>
+    </details>
+
+    <footer class="footer">
+      AposChess is free software under the
+      <a href="https://www.gnu.org/licenses/gpl-3.0.html">GPL-3.0-or-later</a>.
+      <a href="https://github.com/Apostolique/AposChess">Source code</a>.
+      Board by <a href="https://github.com/lichess-org/chessground">chessground</a> (GPL-3.0).
+    </footer>
+  </main>
+
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>

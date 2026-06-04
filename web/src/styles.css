@@ -1,0 +1,122 @@
+:root {
+  --bg: #2b2724;
+  --panel: #3a3531;
+  --text: #ece7e1;
+  --muted: #b6aea6;
+  --accent: #6f9b4e;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  display: flex;
+  justify-content: center;
+}
+
+.app {
+  width: 100%;
+  max-width: 560px;
+  padding: 24px 16px 48px;
+}
+
+h1 { margin: 0; font-size: 2rem; letter-spacing: 0.5px; }
+.tagline { margin: 4px 0 20px; color: var(--muted); }
+
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: end;
+  margin-bottom: 16px;
+}
+
+.controls label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+select, button {
+  font: inherit;
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: 1px solid #555049;
+  background: var(--panel);
+  color: var(--text);
+  cursor: pointer;
+}
+
+button { border-color: var(--accent); }
+button:hover { background: #4a443f; }
+
+/* The board is square and scales to the container width. */
+#board {
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+/* Captured-piece trays above and below the board (Lichess-style). */
+.tray {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 28px;
+  margin: 6px 2px;
+}
+.tray .caps {
+  font-size: 22px;
+  line-height: 1;
+  letter-spacing: -2px; /* overlap pieces slightly, as Lichess does */
+}
+.cap-white { color: #f4f1ec; text-shadow: 0 0 1px #000, 0 0 2px #000; }
+.cap-black { color: #14110f; text-shadow: 0 0 1px #8a837b, 0 0 2px #6f9b4e33; }
+.tray .adv {
+  font-size: 0.85rem;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.status {
+  margin: 16px 0 8px;
+  font-size: 1.1rem;
+  min-height: 1.4em;
+  font-weight: 600;
+}
+.status.over { color: var(--accent); }
+
+.footer { margin-top: 24px; color: var(--muted); font-size: 0.8rem; }
+.footer a { color: var(--accent); }
+
+.rules { margin-top: 16px; color: var(--muted); font-size: 0.9rem; }
+.rules summary { cursor: pointer; color: var(--text); }
+.rules ul { margin: 8px 0 0; padding-left: 18px; }
+.rules li { margin-bottom: 6px; }
+
+/* Promotion picker overlay */
+.promo {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10;
+}
+.promo-card {
+  background: var(--panel);
+  padding: 16px;
+  border-radius: 12px;
+  text-align: center;
+}
+.promo-card p { margin: 0 0 12px; }
+.promo-buttons { display: flex; gap: 8px; }
+.promo-buttons button { font-size: 1.6rem; padding: 6px 14px; line-height: 1; }

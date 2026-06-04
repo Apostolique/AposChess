@@ -1,0 +1,19 @@
+{
+  "name": "aposchess",
+  "version": "1.0.0",
+  "description": "A playable web UI for the AposChess variant",
+  "license": "GPL-3.0-or-later",
+  "author": "Jean-David Moisan",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "chessground": "^9.1.1"
+  },
+  "devDependencies": {
+    "vite": "^6.0.0"
+  }
+}
