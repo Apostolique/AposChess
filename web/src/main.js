@@ -19,8 +19,12 @@ const ui = {
   strengthAi: '2',     // opponent strength in 'human-ai'
   strengthWhite: '2',  // per-colour strength in 'ai-ai'
   strengthBlack: '2',
-  customDepth: 8,      // depth used by any slot set to 'custom'
-  customMs: 6000,      // think-time cap (ms) for 'custom' slots
+  // Per-slot custom depth/timeout, used when that slot's strength is 'custom'.
+  custom: {
+    ai: { depth: 8, ms: 6000 },
+    white: { depth: 8, ms: 6000 },
+    black: { depth: 8, ms: 6000 },
+  },
   maxMs: 6000,         // think-time cap (ms) for preset strengths
   delay: 450,          // ms pause before an AI move, so play is watchable
   running: false,      // AI-vs-AI loop active
@@ -301,33 +305,39 @@ function syncToggleLabel() {
   $('ai-toggle').textContent = ui.running ? 'Stop' : 'Start';
 }
 
+const strengthOf = (slot) =>
+  slot === 'ai' ? ui.strengthAi : slot === 'white' ? ui.strengthWhite : ui.strengthBlack;
+
 function applyModeVisibility() {
-  $('side-control').hidden = ui.mode !== 'human-ai';
-  $('ai-toggle').hidden = ui.mode !== 'ai-ai';
-  // human-ai: one colour-agnostic AI strength. ai-ai: separate per-colour ones.
-  $('depth-ai-control').hidden = ui.mode !== 'human-ai';
-  $('depth-white-control').hidden = ui.mode !== 'ai-ai';
-  $('depth-black-control').hidden = ui.mode !== 'ai-ai';
-  // The custom depth/timeout inputs appear when an active strength is "Custom".
-  const activeCustom = ui.mode === 'human-ai' ? ui.strengthAi === 'custom'
-    : ui.mode === 'ai-ai' ? (ui.strengthWhite === 'custom' || ui.strengthBlack === 'custom')
-    : false;
-  $('custom-depth-control').hidden = !activeCustom;
-  $('custom-ms-control').hidden = !activeCustom;
+  const m = ui.mode;
+  $('side-control').hidden = m !== 'human-ai';
+  $('ai-toggle').hidden = m !== 'ai-ai';
+  // human-ai: one colour-agnostic AI row. ai-ai: separate White/Black rows.
+  $('row-ai').hidden = m !== 'human-ai';
+  $('row-white').hidden = m !== 'ai-ai';
+  $('row-black').hidden = m !== 'ai-ai';
+  // A row's custom depth/timeout inputs appear only when its strength is "Custom".
+  toggleCustom('ai', m === 'human-ai' && ui.strengthAi === 'custom');
+  toggleCustom('white', m === 'ai-ai' && ui.strengthWhite === 'custom');
+  toggleCustom('black', m === 'ai-ai' && ui.strengthBlack === 'custom');
+}
+
+function toggleCustom(slot, show) {
+  $(`custom-depth-${slot}`).closest('label').hidden = !show;
+  $(`custom-ms-${slot}`).closest('label').hidden = !show;
 }
 
 // Search params for the AI playing `turn`: a preset depth + the default cap, or
-// the user's custom depth + timeout when that slot is set to "Custom".
+// that slot's custom depth + timeout when its strength is set to "Custom".
 function aiParams(turn) {
-  const v = ui.mode === 'ai-ai'
-    ? (turn === 'white' ? ui.strengthWhite : ui.strengthBlack)
-    : ui.strengthAi;
+  const slot = ui.mode === 'ai-ai' ? turn : 'ai';
+  const v = strengthOf(slot);
   if (v !== 'custom') return { depth: parseInt(v, 10), maxMs: ui.maxMs };
   // 0 means "no limit" for either field. Both unlimited would never return, so
   // fall back to the default time cap in that case.
-  let depth = ui.customDepth, maxMs = ui.customMs;
-  if (depth === 0 && maxMs === 0) maxMs = ui.maxMs;
-  return { depth: depth === 0 ? Infinity : depth, maxMs: maxMs === 0 ? Infinity : maxMs };
+  let { depth, ms } = ui.custom[slot];
+  if (depth === 0 && ms === 0) ms = ui.maxMs;
+  return { depth: depth === 0 ? Infinity : depth, maxMs: ms === 0 ? Infinity : ms };
 }
 
 function clampInt(value, min, max, fallback) {
@@ -344,8 +354,10 @@ function syncControlsFromDom() {
   ui.strengthAi = $('depth-ai').value;
   ui.strengthWhite = $('depth-white').value;
   ui.strengthBlack = $('depth-black').value;
-  ui.customDepth = clampInt($('custom-depth').value, 0, 40, 8);
-  ui.customMs = clampInt($('custom-ms').value, 0, 60000, 6000);
+  for (const slot of ['ai', 'white', 'black']) {
+    ui.custom[slot].depth = clampInt($(`custom-depth-${slot}`).value, 0, 40, 8);
+    ui.custom[slot].ms = clampInt($(`custom-ms-${slot}`).value, 0, 60000, 6000);
+  }
 }
 
 $('mode').addEventListener('change', (e) => {
@@ -369,14 +381,16 @@ $('depth-black').addEventListener('change', (e) => {
   ui.strengthBlack = e.target.value;
   applyModeVisibility();
 });
-$('custom-depth').addEventListener('change', (e) => {
-  ui.customDepth = clampInt(e.target.value, 0, 40, 8);
-  e.target.value = ui.customDepth; // reflect the clamped value
-});
-$('custom-ms').addEventListener('change', (e) => {
-  ui.customMs = clampInt(e.target.value, 0, 60000, 6000);
-  e.target.value = ui.customMs;
-});
+for (const slot of ['ai', 'white', 'black']) {
+  $(`custom-depth-${slot}`).addEventListener('change', (e) => {
+    ui.custom[slot].depth = clampInt(e.target.value, 0, 40, 8);
+    e.target.value = ui.custom[slot].depth; // reflect the clamped value
+  });
+  $(`custom-ms-${slot}`).addEventListener('change', (e) => {
+    ui.custom[slot].ms = clampInt(e.target.value, 0, 60000, 6000);
+    e.target.value = ui.custom[slot].ms;
+  });
+}
 $('new-game').addEventListener('click', newGame);
 
 // Review navigation: buttons, clicking a move, and arrow/Home/End keys.
