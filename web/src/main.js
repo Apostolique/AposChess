@@ -34,13 +34,15 @@ let state = newGameState();
 let status = gameStatus(state);
 let aiTimer = null;
 
-// Move sound: one reusable Audio element, rewound before each play so rapid
-// consecutive moves (e.g. AI vs AI) still click. Public asset, so it resolves
-// against Vite's base URL.
+// Move/capture sounds: one reusable Audio element each, rewound before play so
+// rapid consecutive moves (e.g. AI vs AI) still click. Public assets, so they
+// resolve against Vite's base URL.
 const moveSound = new Audio(import.meta.env.BASE_URL + 'sound/standard/Move.mp3');
-function playMoveSound() {
-  moveSound.currentTime = 0;
-  moveSound.play().catch(() => {}); // ignore autoplay blocks before first interaction
+const captureSound = new Audio(import.meta.env.BASE_URL + 'sound/standard/Capture.mp3');
+function playMoveSound(capture) {
+  const a = capture ? captureSound : moveSound;
+  a.currentTime = 0;
+  a.play().catch(() => {}); // ignore autoplay blocks before first interaction
 }
 // captured[color] = list of opponent pieces that `color` has captured (live game).
 let captured = { white: [], black: [] };
@@ -235,7 +237,7 @@ function commit(move) {
   });
   if (wasLive) viewIndex = history.length - 1; // follow the game unless reviewing
   lastCommitAt = performance.now();
-  playMoveSound();
+  playMoveSound(move.capture);
   render();
   driveAi();
 }
