@@ -8,6 +8,11 @@
 //                            seed move ordering with its best move.
 //   - Quiescence search    — at a leaf, keep resolving captures/jumps/promotions
 //                            so the evaluation is never taken mid-trade.
+//   - Delta pruning        — in quiescence, skip a plain capture that can't get
+//                            within a margin of alpha even if it wins the victim.
+//                            Jumps/promotions are never pruned (variant tactics).
+//   - Aspiration windows   — open each root iteration with a narrow window around
+//                            the last score for more cutoffs; widen on a fail.
 //   - PVS                  — search non-first moves with a zero-width window,
 //                            re-searching only when one beats it.
 //   - Null-move pruning    — if passing the move still fails high, prune (guarded
@@ -29,6 +34,8 @@ const MATE = 1_000_000;
 const MATE_THRESH = MATE - 1000; // scores beyond this magnitude encode a forced mate
 const MAX_PLY = 64;
 const QDEPTH = 6; // quiescence depth cap
+const DELTA_MARGIN = 200; // qsearch: skip a capture if even winning it stays this far below alpha
+const ASP_WINDOW = 50; // root: initial half-width of the aspiration window around the prior score
 const now = () => Date.now();
 
 let killers; // killers[ply] = [moveKey, moveKey]
@@ -197,11 +204,11 @@ function orderMoves(moves, board, ply, pvKey) {
 // Resolve captures/jumps/promotions to a quiet position before evaluating.
 function qsearch(state, alpha, beta, qdepth) {
   const inCheck = kingAttacked(state.board, state.turn);
-  let best;
+  let best, standPat;
   if (inCheck) {
     best = -MATE;
   } else {
-    best = evalStm(state.board, state.turn); // stand pat
+    standPat = best = evalStm(state.board, state.turn); // stand pat
     if (best >= beta) return best;
     if (best > alpha) alpha = best;
   }
@@ -213,6 +220,14 @@ function qsearch(state, alpha, beta, qdepth) {
   orderMoves(moves, state.board, 0, 0);
 
   for (const m of moves) {
+    // Delta pruning: when not in check, a plain capture whose best case (winning
+    // the victim outright) still can't climb within DELTA_MARGIN of alpha is
+    // hopeless — skip it. Jumps and promotions are never pruned: the variant's
+    // tactics live there, and a non-capturing jump has no victim to bound.
+    if (!inCheck && m.capture && !m.promotion && !m.jump) {
+      const victim = state.board[m.to];
+      if (victim && standPat + VALUE[victim.role] + DELTA_MARGIN <= alpha) continue;
+    }
     const score = -qsearch(applyMove(state, m), -beta, -alpha, qdepth - 1);
     if (score > best) best = score;
     if (best > alpha) alpha = best;
@@ -327,30 +342,58 @@ export function chooseMoveDetailed(state, maxDepth = 2, rand = Math.random, maxM
   const deadline = now() + maxMs;
   let bestMove = root[0];
   let completed = 0;
+  let prevScore = 0;
 
-  // Backstop so an unbounded (maxDepth = Infinity) search still terminates even
-  // if the deadline were also infinite; real searches abort on time long before.
-  const depthCap = Math.min(maxDepth, 99);
-  for (let depth = 1; depth <= depthCap; depth++) {
+  // Search the root once with the window [lo, hi]. Fail-soft: the returned score
+  // may land outside the window, which signals the aspiration re-search below.
+  const runRoot = (depth, lo, hi) => {
     orderMoves(root, state.board, 0, keyOf(bestMove));
-    let alpha = -Infinity, bestScore = -Infinity, localBest = root[0], aborted = false, moveCount = 0;
+    let alpha = lo, bestScore = -Infinity, localBest = root[0], moveCount = 0;
     for (const m of root) {
       moveCount++;
       const child = applyMove(state, m);
       const childHash = useTT ? hashAfter(rootHash, state, m) : 0n;
       let score;
       if (moveCount === 1) {
-        score = -search(child, depth - 1, -Infinity, -alpha, 1, true, childHash, deadline);
+        score = -search(child, depth - 1, -hi, -alpha, 1, true, childHash, deadline);
       } else {
         score = -search(child, depth - 1, -alpha - 1, -alpha, 1, true, childHash, deadline);
-        if (score > alpha) score = -search(child, depth - 1, -Infinity, -alpha, 1, true, childHash, deadline);
+        if (score > alpha && score < hi) score = -search(child, depth - 1, -hi, -alpha, 1, true, childHash, deadline);
       }
-      if (now() > deadline) { aborted = true; break; }
+      if (now() > deadline) return { aborted: true };
       if (score > bestScore) { bestScore = score; localBest = m; }
       if (score > alpha) alpha = score;
+      if (alpha >= hi) break; // fail high at the root — widen and re-search
     }
-    if (!aborted) { bestMove = localBest; completed = depth; }
-    if (aborted || bestScore >= MATE_THRESH) break;
+    return { bestScore, localBest, aborted: false };
+  };
+
+  // Backstop so an unbounded (maxDepth = Infinity) search still terminates even
+  // if the deadline were also infinite; real searches abort on time long before.
+  const depthCap = Math.min(maxDepth, 99);
+  for (let depth = 1; depth <= depthCap; depth++) {
+    // Aspiration window: assume this iteration scores near the last one, so a
+    // narrow window around prevScore yields more cutoffs. On a fail (score lands
+    // on/outside the window) widen that side and re-search; mate scores skip
+    // straight to a full window to avoid thrashing.
+    let lo, hi, window = ASP_WINDOW;
+    if (depth === 1 || Math.abs(prevScore) >= MATE_THRESH) { lo = -Infinity; hi = Infinity; }
+    else { lo = prevScore - window; hi = prevScore + window; }
+
+    let res, aborted = false;
+    while (true) {
+      res = runRoot(depth, lo, hi);
+      if (res.aborted) { aborted = true; break; }
+      if (res.bestScore <= lo && lo > -Infinity) {
+        window *= 4;
+        lo = window >= 2000 ? -Infinity : prevScore - window;
+      } else if (res.bestScore >= hi && hi < Infinity) {
+        window *= 4;
+        hi = window >= 2000 ? Infinity : prevScore + window;
+      } else break;
+    }
+    if (!aborted) { bestMove = res.localBest; completed = depth; prevScore = res.bestScore; }
+    if (aborted || (!aborted && res.bestScore >= MATE_THRESH)) break;
   }
 
   // The predicted reply is the best move stored for the position *after* ours.
