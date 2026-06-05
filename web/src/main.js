@@ -46,18 +46,27 @@ function startEntry(s) {
   return { state: s, captured: { white: [], black: [] }, lastMove: null, san: null, check: false };
 }
 
-// The AI search runs in a worker. `aiSeq` tags each request so a result that
-// arrives after the position changed (new game, undo, stop) is discarded.
+// The AI search runs in a worker. `aiSeq` tags each real-move request and
+// `ponderSeq` each ponder request, so a reply that arrives after the position
+// changed (new game, opponent moved, stop) is discarded by sequence mismatch.
 let aiSeq = 0;
+let ponderSeq = 0;
 let aiThinking = false;
+let lastCommitAt = performance.now(); // for pacing AI moves (the watch delay)
+// While the human thinks, the AI ponders the position after its predicted reply
+// (`predictedReply`, from the last search). `ponderState` is that position and
+// `ponderBest` tracks the deepest iteration reached so we stop once it converges.
+let predictedReply = null;
+let ponderState = null;
+let ponderBest = 0;
+const PONDER_STEP_MS = 700; // ponder in short bursts so the worker stays responsive
 let aiWorker = createAiWorker();
 
 function createAiWorker() {
   const w = new Worker(new URL('./aiWorker.js', import.meta.url), { type: 'module' });
   w.onmessage = ({ data }) => {
-    if (data.seq !== aiSeq) return; // stale result for a superseded position
-    aiThinking = false;
-    if (aiToMove() && data.move) commit(data.move);
+    if (data.type === 'ponder') onPonderResult(data);
+    else onSearchResult(data);
   };
   w.onerror = (e) => {
     console.error('AI worker error:', e.message);
@@ -67,12 +76,15 @@ function createAiWorker() {
   return w;
 }
 
-// Cancel any pending/in-flight AI move. Terminating is the only way to stop a
-// deep search mid-think, so we replace the worker outright.
+// Cancel any pending/in-flight AI work. Terminating is the only way to stop a
+// deep search mid-think, so we replace the worker outright; that also discards
+// the persistent transposition table, which is correct for a hard reset.
 function cancelAi() {
   clearTimeout(aiTimer);
   aiSeq++;
+  ponderSeq++;
   aiThinking = false;
+  predictedReply = null;
   aiWorker.terminate();
   aiWorker = createAiWorker();
   updateWakeLock();
@@ -192,7 +204,11 @@ function updateStatusText() {
 }
 
 function commit(move) {
-  aiSeq++; // a new position supersedes any pending AI result
+  // A new position supersedes any pending search or ponder reply.
+  clearTimeout(aiTimer);
+  aiSeq++;
+  ponderSeq++;
+  aiThinking = false;
   if (move.capture) {
     const taken = state.board[move.to]; // occupant of the landing square (incl. jumps)
     if (taken) captured[state.turn].push(taken);
@@ -209,8 +225,9 @@ function commit(move) {
     check: status.check,
   });
   if (wasLive) viewIndex = history.length - 1; // follow the game unless reviewing
+  lastCommitAt = performance.now();
   render();
-  scheduleAiIfNeeded();
+  driveAi();
 }
 
 // Long algebraic notation: always shows the from-square, so it needs no
@@ -279,18 +296,72 @@ function onUserMove(orig, dest) {
   }
 }
 
-function scheduleAiIfNeeded() {
+// After every position change, decide what the worker should be doing: search
+// the real move when it's an AI's turn, or — in you-vs-AI while it's your turn —
+// ponder its predicted reply so the next real search starts warm.
+function driveAi() {
   clearTimeout(aiTimer);
   updateWakeLock();
-  if (!aiToMove()) return;
-  const seq = aiSeq;
+  if (status.over) { aiThinking = false; updateStatusText(); return; }
+  if (aiToMove()) startSearch();
+  else if (canPonder()) startPonder();
+  else { aiThinking = false; updateStatusText(); }
+}
+
+// Think immediately (no pre-delay): the search overlaps the watch pause, so the
+// AI is never idle. The result is held until at least `ui.delay` has elapsed
+// since the last move, keeping AI-vs-AI watchable.
+function startSearch() {
+  const seq = ++aiSeq;
+  ponderSeq++; // a real search ends any ponder chain
+  aiThinking = true;
+  updateStatusText();
+  const { depth, maxMs } = aiParams(state.turn);
+  aiWorker.postMessage({ type: 'search', seq, state, depth, maxMs });
+}
+
+function onSearchResult(data) {
+  if (data.seq !== aiSeq) return; // stale result for a superseded position
+  predictedReply = data.ponder || null;
+  if (!aiToMove() || !data.move) { aiThinking = false; updateStatusText(); return; }
+  const move = data.move;
+  const seq = data.seq;
+  const wait = Math.max(0, lastCommitAt + ui.delay - performance.now());
   aiTimer = setTimeout(() => {
-    if (!aiToMove() || aiSeq !== seq) return;
-    aiThinking = true;
-    updateStatusText();
-    const { depth, maxMs } = aiParams(state.turn);
-    aiWorker.postMessage({ seq, state, depth, maxMs });
-  }, ui.delay);
+    if (aiSeq !== seq || !aiToMove()) return;
+    commit(move);
+  }, wait);
+}
+
+// Ponder = think about the position we'd reach if the human plays the move the
+// AI predicted for them. On a hit, the real search reuses this work; on a miss,
+// the table still holds useful overlap. Done in repeated short bursts so a real
+// move request (the human moving) is picked up within one burst.
+function canPonder() {
+  return ui.mode === 'human-ai' && !status.over
+    && state.turn === ui.humanColor && !!predictedReply;
+}
+
+function startPonder() {
+  const pm = status.legal.find((m) => m.from === predictedReply.from && m.to === predictedReply.to);
+  if (!pm) { aiThinking = false; return; }
+  ponderState = applyMove(state, pm);
+  ponderBest = 0;
+  aiThinking = false; // pondering is background; the status still reads "your move"
+  updateStatusText();
+  const seq = ++ponderSeq;
+  const { depth } = aiParams(state.turn);
+  aiWorker.postMessage({ type: 'ponder', seq, state: ponderState, depth, maxMs: PONDER_STEP_MS });
+}
+
+function onPonderResult(data) {
+  if (data.seq !== ponderSeq || !canPonder()) return;
+  const { depth } = aiParams(state.turn);
+  // Stop once we've searched to full strength or stopped making progress (e.g. a
+  // forced line resolved), so we don't spin firing instant bursts.
+  if (data.reached >= depth || data.reached <= ponderBest) return;
+  ponderBest = data.reached;
+  aiWorker.postMessage({ type: 'ponder', seq: data.seq, state: ponderState, depth, maxMs: PONDER_STEP_MS });
 }
 
 // --- promotion picker ---
@@ -331,8 +402,9 @@ function newGame() {
   captured = { white: [], black: [] };
   history = [startEntry(state)];
   viewIndex = 0;
+  lastCommitAt = performance.now();
   render();
-  scheduleAiIfNeeded();
+  driveAi();
 }
 
 function syncToggleLabel() {
@@ -451,7 +523,8 @@ $('ai-toggle').addEventListener('click', () => {
   ui.running = !ui.running;
   syncToggleLabel();
   if (ui.running) {
-    scheduleAiIfNeeded();
+    lastCommitAt = performance.now();
+    driveAi();
   } else {
     cancelAi(); // stop the loop and abort any in-flight search
     render();
@@ -461,4 +534,4 @@ $('ai-toggle').addEventListener('click', () => {
 syncControlsFromDom();
 applyModeVisibility();
 render();
-scheduleAiIfNeeded(); // if a restored mode has the AI to move first
+driveAi(); // if a restored mode has the AI to move first

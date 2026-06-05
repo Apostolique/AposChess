@@ -110,10 +110,53 @@ function hashAfter(h, state, m) {
 }
 
 // --- Transposition table -----------------------------------------------------
+// Fixed-size bucket table (one slot per index, addressed by the low hash bits)
+// held in typed arrays. Unlike a growing Map it has a hard memory bound, so it
+// can *persist across moves* instead of being cleared each search — a later
+// search starts "warm", reusing the cutoffs and best moves the previous one (or
+// a ponder search on the opponent's turn) already found.
+//
+// Entries never go stale: each is keyed by the full Zobrist hash, so a value
+// computed any number of moves ago is still correct for the same position. The
+// `gen` field drives *replacement only*: an entry from an earlier search is
+// always overwritable; within the same search we keep the deeper result.
 const EXACT = 0, LOWER = 1, UPPER = 2;
-const TT_CAP = 1 << 20; // entry ceiling, to bound memory
-let tt = new Map();
+const TT_BITS = 20;
+const TT_SIZE = 1 << TT_BITS; // ~1M slots
+const TT_MASK = BigInt(TT_SIZE - 1);
+
+const ttKey = new BigInt64Array(TT_SIZE);   // full hash (signed reinterpret)
+const ttScore = new Int32Array(TT_SIZE);
+const ttMove = new Int32Array(TT_SIZE);     // moveKey = from*64+to
+const ttDepth = new Int16Array(TT_SIZE);
+const ttFlag = new Uint8Array(TT_SIZE);
+const ttGen = new Uint16Array(TT_SIZE);     // 0 = empty slot; else search generation
+let ttCurGen = 0;
 let ttEnabled = true;
+
+const ttReset = () => { ttGen.fill(0); ttCurGen = 0; };
+// New generation per search; stays in 1..65535 (0 is reserved for empty slots).
+const ttBumpGen = () => { ttCurGen = (ttCurGen % 65535) + 1; };
+
+function ttProbe(hash) {
+  const idx = Number(hash & TT_MASK);
+  return ttGen[idx] !== 0 && ttKey[idx] === BigInt.asIntN(64, hash) ? idx : -1;
+}
+
+function ttStore(hash, depth, score, flag, move) {
+  const idx = Number(hash & TT_MASK);
+  const k = BigInt.asIntN(64, hash);
+  // Replace if the slot is empty, holds this same position, is left over from an
+  // earlier search, or holds a shallower result from the current one.
+  if (ttGen[idx] === 0 || ttKey[idx] === k || ttGen[idx] !== ttCurGen || depth >= ttDepth[idx]) {
+    ttKey[idx] = k;
+    ttDepth[idx] = depth;
+    ttScore[idx] = score;
+    ttFlag[idx] = flag;
+    ttMove[idx] = move;
+    ttGen[idx] = ttCurGen;
+  }
+}
 
 // Mate scores are stored relative to the node (distance-to-mate from here), so an
 // entry reused at a different ply still reports the correct mate distance.
@@ -189,14 +232,15 @@ function search(state, depth, alpha, beta, ply, canNull, hash, deadline) {
   const alphaOrig = alpha;
   let ttMoveKey = 0;
   if (ttEnabled) {
-    const e = tt.get(hash);
-    if (e) {
-      ttMoveKey = e.move;
-      if (e.depth >= depth) {
-        const s = fromTT(e.score, ply);
-        if (e.flag === EXACT) return s;
-        if (e.flag === LOWER && s >= beta) return s;
-        if (e.flag === UPPER && s <= alpha) return s;
+    const i = ttProbe(hash);
+    if (i >= 0) {
+      ttMoveKey = ttMove[i];
+      if (ttDepth[i] >= depth) {
+        const s = fromTT(ttScore[i], ply);
+        const flag = ttFlag[i];
+        if (flag === EXACT) return s;
+        if (flag === LOWER && s >= beta) return s;
+        if (flag === UPPER && s <= alpha) return s;
       }
     }
   }
@@ -246,9 +290,13 @@ function search(state, depth, alpha, beta, ply, canNull, hash, deadline) {
     if (now() > deadline) break;
   }
 
-  if (ttEnabled && tt.size < TT_CAP) {
+  // Skip storing once the deadline has passed: a node that broke out of its move
+  // loop on time has an incomplete `best`, and with a persistent table a bogus
+  // entry would survive into later searches. Time is monotonic, so once we're
+  // past the deadline every ancestor's store is skipped too.
+  if (ttEnabled && now() <= deadline) {
     const flag = best <= alphaOrig ? UPPER : best >= beta ? LOWER : EXACT;
-    tt.set(hash, { depth, score: toTT(best, ply), flag, move: bestKey });
+    ttStore(hash, depth, toTT(best, ply), flag, bestKey);
   }
   return best;
 }
@@ -256,9 +304,15 @@ function search(state, depth, alpha, beta, ply, canNull, hash, deadline) {
 // Choose a move for the side to move, searching up to `maxDepth` plies but never
 // past `maxMs` of wall-clock. `rand` shuffles equal choices so games vary.
 // `useTT` exists for benchmarking the transposition table on/off.
-export function chooseMove(state, maxDepth = 2, rand = Math.random, maxMs = Infinity, useTT = true) {
+//
+// Returns { move, ponder, depth }: `move` is the chosen move, `ponder` is the
+// predicted opponent reply (its { from, to } — what to think about during their
+// turn) read from the table after the search, and `depth` is the deepest
+// iteration completed (used to stop pondering once the line is fully resolved).
+// The table is NOT cleared here — it persists across calls (see ttReset).
+export function chooseMoveDetailed(state, maxDepth = 2, rand = Math.random, maxMs = Infinity, useTT = true) {
   const root = legalMoves(state);
-  if (root.length === 0) return null;
+  if (root.length === 0) return { move: null, ponder: null, depth: 0 };
 
   for (let i = root.length - 1; i > 0; i--) {
     const j = Math.floor(rand() * (i + 1));
@@ -268,10 +322,11 @@ export function chooseMove(state, maxDepth = 2, rand = Math.random, maxMs = Infi
   killers = [];
   history = new Int32Array(64 * 64);
   ttEnabled = useTT;
-  tt.clear();
+  if (useTT) ttBumpGen();
   const rootHash = useTT ? hashOf(state) : 0n;
   const deadline = now() + maxMs;
   let bestMove = root[0];
+  let completed = 0;
 
   // Backstop so an unbounded (maxDepth = Infinity) search still terminates even
   // if the deadline were also infinite; real searches abort on time long before.
@@ -294,11 +349,23 @@ export function chooseMove(state, maxDepth = 2, rand = Math.random, maxMs = Infi
       if (score > bestScore) { bestScore = score; localBest = m; }
       if (score > alpha) alpha = score;
     }
-    if (!aborted) bestMove = localBest;
+    if (!aborted) { bestMove = localBest; completed = depth; }
     if (aborted || bestScore >= MATE_THRESH) break;
   }
-  return bestMove;
+
+  // The predicted reply is the best move stored for the position *after* ours.
+  let ponder = null;
+  if (useTT && bestMove) {
+    const i = ttProbe(hashAfter(rootHash, state, bestMove));
+    if (i >= 0 && ttMove[i]) ponder = { from: (ttMove[i] / 64) | 0, to: ttMove[i] % 64 };
+  }
+  return { move: bestMove, ponder, depth: completed };
 }
 
-// Exposed for tests only (Zobrist hash equivalence check).
-export const _internal = { hashOf, hashAfter };
+export function chooseMove(state, maxDepth, rand, maxMs, useTT) {
+  return chooseMoveDetailed(state, maxDepth, rand, maxMs, useTT).move;
+}
+
+// Exposed for tests only: Zobrist hash equivalence check + table reset so a
+// benchmark/test can start each game from a cold table despite persistence.
+export const _internal = { hashOf, hashAfter, resetTT: ttReset };

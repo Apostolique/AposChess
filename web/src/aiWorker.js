@@ -2,14 +2,30 @@
 // Copyright (C) 2019-2026 Jean-David Moisan
 //
 // Runs the AI search off the main thread so deeper lookahead never freezes the
-// UI. The page posts { seq, state, depth }; we reply with { seq, move }. The
-// game state is plain data (board array + flags), so it survives structured
+// UI. Two request kinds, both tagged with a `seq` so a reply for a superseded
+// position is discarded by the page:
+//   { type: 'search', seq, state, depth, maxMs } → { type: 'search', seq, move, ponder }
+//       a real move to play; `ponder` is the predicted opponent reply { from, to }.
+//   { type: 'ponder', seq, state, depth, maxMs } → { type: 'ponder', seq, reached }
+//       thinking on the opponent's turn; the move is irrelevant, the point is the
+//       warmed transposition table. `reached` is the deepest completed iteration.
+//
+// The table lives in the search module and is NOT cleared between messages, so a
+// real search reuses what pondering found (and vice versa). Hard resets (new
+// game / stop) recreate the worker, which gives a fresh table for free.
+//
+// Game state is plain data (board array + flags), so it survives structured
 // cloning across the worker boundary unchanged.
 
-import { chooseMove } from './ai.js';
+import { chooseMoveDetailed } from './ai.js';
 
 self.onmessage = ({ data }) => {
-  const { seq, state, depth, maxMs } = data;
-  const move = chooseMove(state, depth, Math.random, maxMs);
-  self.postMessage({ seq, move });
+  const { type, seq, state, depth, maxMs } = data;
+  if (type === 'ponder') {
+    const { depth: reached } = chooseMoveDetailed(state, depth, Math.random, maxMs);
+    self.postMessage({ type: 'ponder', seq, reached });
+    return;
+  }
+  const { move, ponder } = chooseMoveDetailed(state, depth, Math.random, maxMs);
+  self.postMessage({ type: 'search', seq, move, ponder });
 };
