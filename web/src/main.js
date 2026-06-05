@@ -75,7 +75,33 @@ function cancelAi() {
   aiThinking = false;
   aiWorker.terminate();
   aiWorker = createAiWorker();
+  updateWakeLock();
 }
+
+// --- screen wake lock ---
+// During automated AI play (esp. AI vs AI) there's no user input, so phones dim
+// and then sleep. Hold a wake lock whenever it's the AI's turn to play; release
+// it the rest of the time. Wake locks are auto-released when the tab is hidden,
+// so we re-acquire on visibilitychange.
+let wakeLock = null;
+async function acquireWakeLock() {
+  if (wakeLock || !('wakeLock' in navigator)) return;
+  try {
+    wakeLock = await navigator.wakeLock.request('screen');
+    wakeLock.addEventListener('release', () => { wakeLock = null; });
+  } catch { /* may be rejected (e.g. low battery, not visible); ignore */ }
+}
+function releaseWakeLock() {
+  if (!wakeLock) return;
+  wakeLock.release().catch(() => {});
+  wakeLock = null;
+}
+function updateWakeLock() {
+  if (aiToMove()) acquireWakeLock(); else releaseWakeLock();
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') updateWakeLock();
+});
 
 const cg = Chessground(boardEl, {
   fen: toFen(state),
@@ -255,6 +281,7 @@ function onUserMove(orig, dest) {
 
 function scheduleAiIfNeeded() {
   clearTimeout(aiTimer);
+  updateWakeLock();
   if (!aiToMove()) return;
   const seq = aiSeq;
   aiTimer = setTimeout(() => {

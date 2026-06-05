@@ -189,6 +189,10 @@ button:hover { background: #4a443f; }
   .layout { grid-template-columns: var(--board); }
   .controls, .side-col { width: var(--board); height: auto; }
   .moves { max-height: 36vh; }
+  /* Put the move controls above the list so they don't require scrolling the
+     list down and back up. status (order 0) stays on top. */
+  .side-col .nav { order: 1; }
+  .side-col .moves { order: 2; }
 }
 
 .footer { margin-top: 24px; color: var(--muted); font-size: 0.8rem; }
