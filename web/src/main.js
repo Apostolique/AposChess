@@ -221,7 +221,14 @@ function renderMoveList() {
   }
   el.innerHTML = html;
   const cur = el.querySelector('.current');
-  if (cur) cur.scrollIntoView({ block: 'nearest' });
+  // Scroll within the move list only — `scrollIntoView` would also scroll
+  // every ancestor (the page itself on mobile) and yank the viewport around.
+  if (cur) {
+    const top = cur.offsetTop - el.clientTop;
+    const bottom = top + cur.offsetHeight;
+    if (top < el.scrollTop) el.scrollTop = top;
+    else if (bottom > el.scrollTop + el.clientHeight) el.scrollTop = bottom - el.clientHeight;
+  }
 }
 
 function goTo(index) {
