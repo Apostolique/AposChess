@@ -15,7 +15,9 @@ const $ = (id) => document.getElementById(id);
 const ui = {
   mode: 'human-human', // 'human-human' | 'human-ai' | 'ai-ai'
   humanColor: 'white', // which side the human controls in 'human-ai'
-  depth: 2,
+  aiDepth: 2,          // opponent AI depth in 'human-ai' (independent of colour)
+  depthWhite: 2,       // per-colour AI depth in 'ai-ai'
+  depthBlack: 2,
   maxMs: 6000,         // hard cap on AI thinking time (deep settings stay bounded)
   delay: 450,          // ms pause before an AI move, so play is watchable
   running: false,      // AI-vs-AI loop active
@@ -245,7 +247,10 @@ function scheduleAiIfNeeded() {
     if (!aiToMove() || aiSeq !== seq) return;
     aiThinking = true;
     updateStatusText();
-    aiWorker.postMessage({ seq, state, depth: ui.depth, maxMs: ui.maxMs });
+    const depth = ui.mode === 'ai-ai'
+      ? (state.turn === 'white' ? ui.depthWhite : ui.depthBlack)
+      : ui.aiDepth; // single opponent strength in human-ai
+    aiWorker.postMessage({ seq, state, depth, maxMs: ui.maxMs });
   }, ui.delay);
 }
 
@@ -297,8 +302,11 @@ function syncToggleLabel() {
 
 function applyModeVisibility() {
   $('side-control').hidden = ui.mode !== 'human-ai';
-  $('depth-control').hidden = ui.mode === 'human-human';
   $('ai-toggle').hidden = ui.mode !== 'ai-ai';
+  // human-ai: one colour-agnostic AI strength. ai-ai: separate per-colour ones.
+  $('depth-ai-control').hidden = ui.mode !== 'human-ai';
+  $('depth-white-control').hidden = ui.mode !== 'ai-ai';
+  $('depth-black-control').hidden = ui.mode !== 'ai-ai';
 }
 
 // Browsers restore <select> values on reload, so read them into `ui` at startup
@@ -307,7 +315,9 @@ function applyModeVisibility() {
 function syncControlsFromDom() {
   ui.mode = $('mode').value;
   ui.humanColor = $('side').value;
-  ui.depth = parseInt($('depth').value, 10);
+  ui.aiDepth = parseInt($('depth-ai').value, 10);
+  ui.depthWhite = parseInt($('depth-white').value, 10);
+  ui.depthBlack = parseInt($('depth-black').value, 10);
 }
 
 $('mode').addEventListener('change', (e) => {
@@ -319,8 +329,14 @@ $('side').addEventListener('change', (e) => {
   ui.humanColor = e.target.value;
   newGame();
 });
-$('depth').addEventListener('change', (e) => {
-  ui.depth = parseInt(e.target.value, 10);
+$('depth-ai').addEventListener('change', (e) => {
+  ui.aiDepth = parseInt(e.target.value, 10);
+});
+$('depth-white').addEventListener('change', (e) => {
+  ui.depthWhite = parseInt(e.target.value, 10);
+});
+$('depth-black').addEventListener('change', (e) => {
+  ui.depthBlack = parseInt(e.target.value, 10);
 });
 $('new-game').addEventListener('click', newGame);
 

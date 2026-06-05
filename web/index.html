@@ -5,6 +5,16 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>AposChess</title>
   <meta name="description" content="Play AposChess, a chess variant, in your browser." />
+
+  <!-- Google tag (gtag.js) -->
+  <script async src="https://www.googletagmanager.com/gtag/js?id=G-TYM1QSCNLT"></script>
+  <script>
+    window.dataLayer = window.dataLayer || [];
+    function gtag(){dataLayer.push(arguments);}
+    gtag('js', new Date());
+
+    gtag('config', 'G-TYM1QSCNLT');
+  </script>
 </head>
 <body>
   <main class="app">
@@ -28,9 +38,35 @@
           </select>
         </label>
 
-        <label id="depth-control" hidden>
+        <label id="depth-ai-control" hidden>
           AI strength
-          <select id="depth">
+          <select id="depth-ai">
+            <option value="1">Easy — 1 move ahead</option>
+            <option value="2" selected>Normal — 2 moves ahead</option>
+            <option value="3">Hard — 3 moves ahead</option>
+            <option value="4">Expert — 4 moves ahead</option>
+            <option value="5">Master — 5 moves ahead</option>
+            <option value="6">Insane — 6 moves ahead</option>
+            <option value="7">Max — 7 moves ahead (slow)</option>
+          </select>
+        </label>
+
+        <label id="depth-white-control" hidden>
+          White AI
+          <select id="depth-white">
+            <option value="1">Easy — 1 move ahead</option>
+            <option value="2" selected>Normal — 2 moves ahead</option>
+            <option value="3">Hard — 3 moves ahead</option>
+            <option value="4">Expert — 4 moves ahead</option>
+            <option value="5">Master — 5 moves ahead</option>
+            <option value="6">Insane — 6 moves ahead</option>
+            <option value="7">Max — 7 moves ahead (slow)</option>
+          </select>
+        </label>
+
+        <label id="depth-black-control" hidden>
+          Black AI
+          <select id="depth-black">
             <option value="1">Easy — 1 move ahead</option>
             <option value="2" selected>Normal — 2 moves ahead</option>
             <option value="3">Hard — 3 moves ahead</option>
