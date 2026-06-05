@@ -91,6 +91,16 @@ select, button {
 button { border-color: var(--accent); }
 button:hover { background: #4a443f; }
 
+.controls input[type="number"] {
+  font: inherit;
+  width: 92px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid #555049;
+  background: var(--panel);
+  color: var(--text);
+}
+
 /* Square board sized by the --board variable. */
 #board {
   width: var(--board);

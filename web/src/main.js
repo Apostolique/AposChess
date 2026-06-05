@@ -15,10 +15,13 @@ const $ = (id) => document.getElementById(id);
 const ui = {
   mode: 'human-human', // 'human-human' | 'human-ai' | 'ai-ai'
   humanColor: 'white', // which side the human controls in 'human-ai'
-  aiDepth: 2,          // opponent AI depth in 'human-ai' (independent of colour)
-  depthWhite: 2,       // per-colour AI depth in 'ai-ai'
-  depthBlack: 2,
-  maxMs: 6000,         // hard cap on AI thinking time (deep settings stay bounded)
+  // AI strength per slot: a preset depth string '1'..'7', or 'custom'.
+  strengthAi: '2',     // opponent strength in 'human-ai'
+  strengthWhite: '2',  // per-colour strength in 'ai-ai'
+  strengthBlack: '2',
+  customDepth: 8,      // depth used by any slot set to 'custom'
+  customMs: 6000,      // think-time cap (ms) for 'custom' slots
+  maxMs: 6000,         // think-time cap (ms) for preset strengths
   delay: 450,          // ms pause before an AI move, so play is watchable
   running: false,      // AI-vs-AI loop active
 };
@@ -247,10 +250,8 @@ function scheduleAiIfNeeded() {
     if (!aiToMove() || aiSeq !== seq) return;
     aiThinking = true;
     updateStatusText();
-    const depth = ui.mode === 'ai-ai'
-      ? (state.turn === 'white' ? ui.depthWhite : ui.depthBlack)
-      : ui.aiDepth; // single opponent strength in human-ai
-    aiWorker.postMessage({ seq, state, depth, maxMs: ui.maxMs });
+    const { depth, maxMs } = aiParams(state.turn);
+    aiWorker.postMessage({ seq, state, depth, maxMs });
   }, ui.delay);
 }
 
@@ -307,17 +308,44 @@ function applyModeVisibility() {
   $('depth-ai-control').hidden = ui.mode !== 'human-ai';
   $('depth-white-control').hidden = ui.mode !== 'ai-ai';
   $('depth-black-control').hidden = ui.mode !== 'ai-ai';
+  // The custom depth/timeout inputs appear when an active strength is "Custom".
+  const activeCustom = ui.mode === 'human-ai' ? ui.strengthAi === 'custom'
+    : ui.mode === 'ai-ai' ? (ui.strengthWhite === 'custom' || ui.strengthBlack === 'custom')
+    : false;
+  $('custom-depth-control').hidden = !activeCustom;
+  $('custom-ms-control').hidden = !activeCustom;
 }
 
-// Browsers restore <select> values on reload, so read them into `ui` at startup
+// Search params for the AI playing `turn`: a preset depth + the default cap, or
+// the user's custom depth + timeout when that slot is set to "Custom".
+function aiParams(turn) {
+  const v = ui.mode === 'ai-ai'
+    ? (turn === 'white' ? ui.strengthWhite : ui.strengthBlack)
+    : ui.strengthAi;
+  if (v !== 'custom') return { depth: parseInt(v, 10), maxMs: ui.maxMs };
+  // 0 means "no limit" for either field. Both unlimited would never return, so
+  // fall back to the default time cap in that case.
+  let depth = ui.customDepth, maxMs = ui.customMs;
+  if (depth === 0 && maxMs === 0) maxMs = ui.maxMs;
+  return { depth: depth === 0 ? Infinity : depth, maxMs: maxMs === 0 ? Infinity : maxMs };
+}
+
+function clampInt(value, min, max, fallback) {
+  const n = parseInt(value, 10);
+  return Number.isNaN(n) ? fallback : Math.max(min, Math.min(max, n));
+}
+
+// Browsers restore control values on reload, so read them into `ui` at startup
 // instead of assuming the hardcoded defaults — otherwise the shown selection and
 // the actual behaviour disagree until the next change event.
 function syncControlsFromDom() {
   ui.mode = $('mode').value;
   ui.humanColor = $('side').value;
-  ui.aiDepth = parseInt($('depth-ai').value, 10);
-  ui.depthWhite = parseInt($('depth-white').value, 10);
-  ui.depthBlack = parseInt($('depth-black').value, 10);
+  ui.strengthAi = $('depth-ai').value;
+  ui.strengthWhite = $('depth-white').value;
+  ui.strengthBlack = $('depth-black').value;
+  ui.customDepth = clampInt($('custom-depth').value, 0, 40, 8);
+  ui.customMs = clampInt($('custom-ms').value, 0, 60000, 6000);
 }
 
 $('mode').addEventListener('change', (e) => {
@@ -330,13 +358,24 @@ $('side').addEventListener('change', (e) => {
   newGame();
 });
 $('depth-ai').addEventListener('change', (e) => {
-  ui.aiDepth = parseInt(e.target.value, 10);
+  ui.strengthAi = e.target.value;
+  applyModeVisibility(); // reveal/hide custom inputs
 });
 $('depth-white').addEventListener('change', (e) => {
-  ui.depthWhite = parseInt(e.target.value, 10);
+  ui.strengthWhite = e.target.value;
+  applyModeVisibility();
 });
 $('depth-black').addEventListener('change', (e) => {
-  ui.depthBlack = parseInt(e.target.value, 10);
+  ui.strengthBlack = e.target.value;
+  applyModeVisibility();
+});
+$('custom-depth').addEventListener('change', (e) => {
+  ui.customDepth = clampInt(e.target.value, 0, 40, 8);
+  e.target.value = ui.customDepth; // reflect the clamped value
+});
+$('custom-ms').addEventListener('change', (e) => {
+  ui.customMs = clampInt(e.target.value, 0, 60000, 6000);
+  e.target.value = ui.customMs;
 });
 $('new-game').addEventListener('click', newGame);
 

@@ -48,6 +48,7 @@
             <option value="5">Master — 5 moves ahead</option>
             <option value="6">Insane — 6 moves ahead</option>
             <option value="7">Max — 7 moves ahead (slow)</option>
+            <option value="custom">Custom…</option>
           </select>
         </label>
 
@@ -61,6 +62,7 @@
             <option value="5">Master — 5 moves ahead</option>
             <option value="6">Insane — 6 moves ahead</option>
             <option value="7">Max — 7 moves ahead (slow)</option>
+            <option value="custom">Custom…</option>
           </select>
         </label>
 
@@ -74,7 +76,20 @@
             <option value="5">Master — 5 moves ahead</option>
             <option value="6">Insane — 6 moves ahead</option>
             <option value="7">Max — 7 moves ahead (slow)</option>
+            <option value="custom">Custom…</option>
           </select>
+        </label>
+
+        <label id="custom-depth-control" hidden>
+          Max depth (0 = ∞)
+          <input id="custom-depth" type="number" min="0" max="40" step="1" value="8"
+                 title="0 = no depth limit (search until the timeout)" />
+        </label>
+
+        <label id="custom-ms-control" hidden>
+          Timeout (ms, 0 = ∞)
+          <input id="custom-ms" type="number" min="0" max="60000" step="100" value="6000"
+                 title="0 = no limit (search until the max depth is reached)" />
         </label>
 
         <button id="new-game" type="button">New game</button>
