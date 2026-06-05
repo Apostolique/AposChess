@@ -8,7 +8,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "match": "node scripts/selfplay.mjs"
   },
   "dependencies": {
     "chessground": "^9.1.1"

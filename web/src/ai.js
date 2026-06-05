@@ -11,8 +11,6 @@
 //   - Delta pruning        — in quiescence, skip a plain capture that can't get
 //                            within a margin of alpha even if it wins the victim.
 //                            Jumps/promotions are never pruned (variant tactics).
-//   - Aspiration windows   — open each root iteration with a narrow window around
-//                            the last score for more cutoffs; widen on a fail.
 //   - PVS                  — search non-first moves with a zero-width window,
 //                            re-searching only when one beats it.
 //   - Null-move pruning    — if passing the move still fails high, prune (guarded
@@ -35,7 +33,6 @@ const MATE_THRESH = MATE - 1000; // scores beyond this magnitude encode a forced
 const MAX_PLY = 64;
 const QDEPTH = 6; // quiescence depth cap
 const DELTA_MARGIN = 200; // qsearch: skip a capture if even winning it stays this far below alpha
-const ASP_WINDOW = 50; // root: initial half-width of the aspiration window around the prior score
 const now = () => Date.now();
 
 let killers; // killers[ply] = [moveKey, moveKey]
@@ -342,58 +339,30 @@ export function chooseMoveDetailed(state, maxDepth = 2, rand = Math.random, maxM
   const deadline = now() + maxMs;
   let bestMove = root[0];
   let completed = 0;
-  let prevScore = 0;
 
-  // Search the root once with the window [lo, hi]. Fail-soft: the returned score
-  // may land outside the window, which signals the aspiration re-search below.
-  const runRoot = (depth, lo, hi) => {
+  // Backstop so an unbounded (maxDepth = Infinity) search still terminates even
+  // if the deadline were also infinite; real searches abort on time long before.
+  const depthCap = Math.min(maxDepth, 99);
+  for (let depth = 1; depth <= depthCap; depth++) {
     orderMoves(root, state.board, 0, keyOf(bestMove));
-    let alpha = lo, bestScore = -Infinity, localBest = root[0], moveCount = 0;
+    let alpha = -Infinity, bestScore = -Infinity, localBest = root[0], aborted = false, moveCount = 0;
     for (const m of root) {
       moveCount++;
       const child = applyMove(state, m);
       const childHash = useTT ? hashAfter(rootHash, state, m) : 0n;
       let score;
       if (moveCount === 1) {
-        score = -search(child, depth - 1, -hi, -alpha, 1, true, childHash, deadline);
+        score = -search(child, depth - 1, -Infinity, -alpha, 1, true, childHash, deadline);
       } else {
         score = -search(child, depth - 1, -alpha - 1, -alpha, 1, true, childHash, deadline);
-        if (score > alpha && score < hi) score = -search(child, depth - 1, -hi, -alpha, 1, true, childHash, deadline);
+        if (score > alpha) score = -search(child, depth - 1, -Infinity, -alpha, 1, true, childHash, deadline);
       }
-      if (now() > deadline) return { aborted: true };
+      if (now() > deadline) { aborted = true; break; }
       if (score > bestScore) { bestScore = score; localBest = m; }
       if (score > alpha) alpha = score;
-      if (alpha >= hi) break; // fail high at the root — widen and re-search
     }
-    return { bestScore, localBest, aborted: false };
-  };
-
-  // Backstop so an unbounded (maxDepth = Infinity) search still terminates even
-  // if the deadline were also infinite; real searches abort on time long before.
-  const depthCap = Math.min(maxDepth, 99);
-  for (let depth = 1; depth <= depthCap; depth++) {
-    // Aspiration window: assume this iteration scores near the last one, so a
-    // narrow window around prevScore yields more cutoffs. On a fail (score lands
-    // on/outside the window) widen that side and re-search; mate scores skip
-    // straight to a full window to avoid thrashing.
-    let lo, hi, window = ASP_WINDOW;
-    if (depth === 1 || Math.abs(prevScore) >= MATE_THRESH) { lo = -Infinity; hi = Infinity; }
-    else { lo = prevScore - window; hi = prevScore + window; }
-
-    let res, aborted = false;
-    while (true) {
-      res = runRoot(depth, lo, hi);
-      if (res.aborted) { aborted = true; break; }
-      if (res.bestScore <= lo && lo > -Infinity) {
-        window *= 4;
-        lo = window >= 2000 ? -Infinity : prevScore - window;
-      } else if (res.bestScore >= hi && hi < Infinity) {
-        window *= 4;
-        hi = window >= 2000 ? Infinity : prevScore + window;
-      } else break;
-    }
-    if (!aborted) { bestMove = res.localBest; completed = depth; prevScore = res.bestScore; }
-    if (aborted || (!aborted && res.bestScore >= MATE_THRESH)) break;
+    if (!aborted) { bestMove = localBest; completed = depth; }
+    if (aborted || bestScore >= MATE_THRESH) break;
   }
 
   // The predicted reply is the best move stored for the position *after* ours.
