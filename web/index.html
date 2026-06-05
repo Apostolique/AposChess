@@ -8,45 +8,64 @@
 </head>
 <body>
   <main class="app">
-    <h1>AposChess</h1>
-    <p class="tagline">A chess variant that might or might not be fun.</p>
+    <header class="topbar">
+      <h1>AposChess</h1>
+      <section class="controls">
+        <label>
+          Mode
+          <select id="mode">
+            <option value="human-human">Local: two players</option>
+            <option value="human-ai">You vs AI</option>
+            <option value="ai-ai">AI vs AI</option>
+          </select>
+        </label>
 
-    <section class="controls">
-      <label>
-        Mode
-        <select id="mode">
-          <option value="human-human">Local: two players</option>
-          <option value="human-ai">You vs AI</option>
-          <option value="ai-ai">AI vs AI</option>
-        </select>
-      </label>
+        <label id="side-control" hidden>
+          You play
+          <select id="side">
+            <option value="white">White</option>
+            <option value="black">Black</option>
+          </select>
+        </label>
 
-      <label id="side-control" hidden>
-        You play
-        <select id="side">
-          <option value="white">White</option>
-          <option value="black">Black</option>
-        </select>
-      </label>
+        <label id="depth-control" hidden>
+          AI strength
+          <select id="depth">
+            <option value="1">Easy — 1 move ahead</option>
+            <option value="2" selected>Normal — 2 moves ahead</option>
+            <option value="3">Hard — 3 moves ahead</option>
+            <option value="4">Expert — 4 moves ahead</option>
+            <option value="5">Master — 5 moves ahead</option>
+            <option value="6">Insane — 6 moves ahead</option>
+            <option value="7">Max — 7 moves ahead (slow)</option>
+          </select>
+        </label>
 
-      <label id="depth-control" hidden>
-        AI strength
-        <select id="depth">
-          <option value="1">Easy</option>
-          <option value="2" selected>Normal</option>
-          <option value="3">Slow</option>
-        </select>
-      </label>
+        <button id="new-game" type="button">New game</button>
+        <button id="ai-toggle" type="button" hidden>Start</button>
+      </section>
+    </header>
 
-      <button id="new-game" type="button">New game</button>
-      <button id="ai-toggle" type="button" hidden>Start</button>
-    </section>
+    <div class="layout">
+      <div class="spacer" aria-hidden="true"></div>
 
-    <div id="tray-top" class="tray"><span class="caps"></span><span class="adv"></span></div>
-    <div id="board" class="cg-wrap"></div>
-    <div id="tray-bottom" class="tray"><span class="caps"></span><span class="adv"></span></div>
+      <div class="board-col">
+        <div id="tray-top" class="tray"><span class="caps"></span><span class="adv"></span></div>
+        <div id="board" class="cg-wrap"></div>
+        <div id="tray-bottom" class="tray"><span class="caps"></span><span class="adv"></span></div>
+      </div>
 
-    <p id="status" class="status" role="status" aria-live="polite"></p>
+      <aside class="side-col">
+        <p id="status" class="status" role="status" aria-live="polite"></p>
+        <div id="moves" class="moves"></div>
+        <div class="nav">
+          <button id="nav-first" type="button" title="Start (Home)">⏮</button>
+          <button id="nav-prev" type="button" title="Previous (←)">◀</button>
+          <button id="nav-next" type="button" title="Next (→)">▶</button>
+          <button id="nav-last" type="button" title="Latest (End)">⏭</button>
+        </div>
+      </aside>
+    </div>
 
     <details class="rules">
       <summary>How the pieces move</summary>

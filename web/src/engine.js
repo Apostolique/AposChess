@@ -177,6 +177,68 @@ export function isAttacked(board, target, byColor) {
   return false;
 }
 
+// Fast check detection: is `color`'s king attacked? A king always sits in its
+// own safety zone, so no jump can ever land on it — only normal moves can give
+// check. We therefore scan outward from the king for each attack pattern instead
+// of generating every enemy move (the hot path during search). This must stay
+// equivalent to isAttacked(board, kingSquare, opponent); see the cross-check test.
+export function kingAttacked(board, color) {
+  const k = findKing(board, color);
+  if (k < 0) return false;
+  const enemy = color === 'white' ? 'black' : 'white';
+  const kf = fileOf(k), kr = rankOf(k);
+  const isEnemy = (f, r, role) => {
+    if (!onBoard(f, r)) return false;
+    const p = board[sq(f, r)];
+    return p && p.color === enemy && p.role === role;
+  };
+
+  // Pawn: captures straight forward, so an enemy pawn one square "behind" the
+  // king (from the enemy's point of view) attacks it.
+  const ef = enemy === 'white' ? 1 : -1;
+  if (isEnemy(kf, kr - ef, 'p')) return true;
+
+  // Enemy king on an adjacent square.
+  for (const [df, dr] of ALL8) if (isEnemy(kf + df, kr + dr, 'k')) return true;
+
+  // Normal slides: the first piece along each ray, if it is the matching slider.
+  for (const [df, dr] of ORTHO) {
+    let f = kf + df, r = kr + dr;
+    while (onBoard(f, r)) {
+      const p = board[sq(f, r)];
+      if (p) { if (p.color === enemy && (p.role === 'r' || p.role === 'q')) return true; break; }
+      f += df; r += dr;
+    }
+  }
+  for (const [df, dr] of DIAG) {
+    let f = kf + df, r = kr + dr;
+    while (onBoard(f, r)) {
+      const p = board[sq(f, r)];
+      if (p) { if (p.color === enemy && (p.role === 'b' || p.role === 'q')) return true; break; }
+      f += df; r += dr;
+    }
+  }
+
+  // Knight (rook path then one step to the side). Reverse the move: step from the
+  // king opposite the side-step to the "corner" (must be empty, as in the forward
+  // move), then scan straight back — an enemy knight is the first piece if the
+  // travel path is clear.
+  for (const [sf, sr] of ORTHO) {
+    const cf = kf - sf, cr = kr - sr;
+    if (!onBoard(cf, cr) || board[sq(cf, cr)]) continue;
+    const perps = sf === 0 ? [[1, 0], [-1, 0]] : [[0, 1], [0, -1]];
+    for (const [df, dr] of perps) {
+      let f = cf - df, r = cr - dr;
+      while (onBoard(f, r)) {
+        const p = board[sq(f, r)];
+        if (p) { if (p.color === enemy && p.role === 'n') return true; break; }
+        f -= df; r -= dr;
+      }
+    }
+  }
+  return false;
+}
+
 export function applyMove(state, m) {
   const board = state.board.slice();
   const piece = board[m.from];
@@ -243,8 +305,7 @@ export function legalMoves(state) {
   const legal = [];
   for (const m of generatePseudoMoves(state.board, color)) {
     const next = applyMove(state, m);
-    const ksq = findKing(next.board, color);
-    if (ksq >= 0 && !isAttacked(next.board, ksq, opponent(color))) legal.push(m);
+    if (!kingAttacked(next.board, color)) legal.push(m);
   }
   addCastling(state, color, legal);
   return legal;
@@ -253,8 +314,7 @@ export function legalMoves(state) {
 export function gameStatus(state) {
   const color = state.turn;
   const legal = legalMoves(state);
-  const ksq = findKing(state.board, color);
-  const inCheck = ksq >= 0 && isAttacked(state.board, ksq, opponent(color));
+  const inCheck = kingAttacked(state.board, color);
   if (legal.length === 0) {
     return { over: true, check: inCheck, legal, result: inCheck ? 'checkmate' : 'stalemate', winner: inCheck ? opponent(color) : null };
   }
