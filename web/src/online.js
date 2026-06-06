@@ -14,7 +14,7 @@
 // — main.js owns the move/reset/hello protocol.
 import { joinRoom } from 'trystero';
 
-const APP_ID = 'aposchess';
+export const APP_ID = 'aposchess';
 // Unambiguous alphabet for the visible code (no 0/O/1/I/L).
 const ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
 // Length of a generated share code; also what the join field treats as "complete".
@@ -34,7 +34,7 @@ export const CODE_LENGTH = 5;
 // for TURN (use a provider that scopes/expires credentials). Multiple comma-
 // separated URLs sharing one credential are supported.
 const turnUrls = (import.meta.env.VITE_TURN_URLS || '').split(',').map((u) => u.trim()).filter(Boolean);
-const RTC_CONFIG = {
+export const RTC_CONFIG = {
   iceServers: [
     { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
     ...(turnUrls.length
@@ -43,7 +43,7 @@ const RTC_CONFIG = {
   ],
 };
 
-function makeCode(n = CODE_LENGTH) {
+export function makeCode(n = CODE_LENGTH) {
   let s = '';
   for (let i = 0; i < n; i++) s += ALPHABET[Math.floor(Math.random() * ALPHABET.length)];
   return s;
@@ -98,8 +98,9 @@ function start(handlers, code) {
   };
 }
 
-export function hostGame(handlers) {
-  const code = makeCode();
+// Host a game. `code` is normally minted here, but matchmaking passes a code the
+// two peers already agreed on so both join the same private room.
+export function hostGame(handlers, code = makeCode()) {
   const session = start(handlers, code);
   handlers.onCode?.(code); // available immediately — no server round-trip
   return session;

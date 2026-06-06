@@ -9,6 +9,7 @@ import './styles.css';
 import { newGameState, parseFen, toFen, parseSquare, squareName, opponent } from './board.js';
 import { applyMove, gameStatus, destsMap } from './engine.js';
 import { hostGame, joinGame, normalizeCode, CODE_LENGTH } from './online.js';
+import { findMatch } from './queue.js';
 import { exportPgn, importPgn } from './pgn.js';
 
 const boardEl = document.getElementById('board');
@@ -102,6 +103,11 @@ let online = null;
 let onlineColor = null;
 let onlineConnected = false;
 let isHost = false; // only the host assigns colours (and may swap sides)
+let matchSession = null; // active matchmaking queue search (or null)
+// True when the current online game came from matchmaking. Its private code is
+// throwaway, so on a disconnect we go idle instead of keeping the lobby alive (that
+// host-rehost behaviour is only useful for a code you deliberately shared).
+let matchmade = false;
 
 function startEntry(s) {
   return { state: s, captured: { white: [], black: [] }, lastMove: null, san: null, check: false };
@@ -527,6 +533,7 @@ function setOnlinePhase(phase, detail = '') {
   $('mode').disabled = !idle;
   $('online-host').hidden = !idle;
   $('online-join').hidden = !idle;
+  $('online-find').hidden = !idle;
   $('online-code').hidden = !idle;
   $('online-color-label').hidden = !idle;
   $('online-share').hidden = phase !== 'hosting';
@@ -536,6 +543,7 @@ function setOnlinePhase(phase, detail = '') {
   if (phase === 'hosting') $('online-code-out').textContent = detail;
   const msg = {
     idle: detail,
+    searching: 'Searching for an opponent…',
     hosting: 'Waiting for an opponent to join…',
     connecting: detail || 'Connecting…',
     connected: detail,
@@ -571,10 +579,12 @@ const getUrlCode = () => normalizeCode(hashParams().get('code') || '');
 // Tear down the current session (if any) and clear connection state. The caller
 // is responsible for the resulting UI phase.
 function leaveOnline() {
+  if (matchSession) { matchSession.cancel(); matchSession = null; }
   if (online) { online.close(); online = null; }
   onlineConnected = false;
   onlineColor = null;
   isHost = false;
+  matchmade = false;
 }
 
 function startHost() {
@@ -599,6 +609,52 @@ function startJoin() {
   setOnlinePhase('connecting');
   online = joinGame(code, {
     // The host assigns colours, so the joiner just waits for the `hello` message.
+    onConnected: () => { if (!onlineConnected) setOnlinePhase('connecting', 'Connected — waiting for host…'); },
+    onData: onOnlineData,
+    onClosed: onOnlineClosed,
+    onError: onOnlineError,
+  });
+}
+
+// Auto-matchmaking: wait in the shared queue room until paired with someone, then
+// drop straight into a private game with them. The pair agree a code and which side
+// hosts (see queue.js); we just route the result into the normal host/join path.
+function startFindMatch() {
+  leaveOnline();
+  setOnlinePhase('searching');
+  matchSession = findMatch({
+    onMatched: ({ code, isHost: host }) => {
+      matchSession = null; // the queue room is already left inside findMatch
+      if (host) startMatchedHost(code);
+      else startMatchedJoin(code);
+    },
+    onError: (m) => { matchSession = null; setOnlinePhase('idle', m || 'Matchmaking failed.'); },
+  });
+}
+
+// The matched host: like startHost but with the agreed code and a random colour
+// (there's no colour picker in matchmaking). `matchmade` marks the throwaway code.
+function startMatchedHost(code) {
+  leaveOnline();
+  isHost = true;
+  matchmade = true;
+  const color = Math.random() < 0.5 ? 'white' : 'black';
+  setOnlinePhase('connecting');
+  online = hostGame({
+    onCode: (c) => setUrlCode(c), // keep the URL shareable, but skip the "hosting" UI
+    onConnected: () => onHostConnected(color),
+    onData: onOnlineData,
+    onClosed: onOnlineClosed,
+    onError: onOnlineError,
+  }, code);
+}
+
+// The matched joiner: identical to startJoin, but with the agreed code.
+function startMatchedJoin(code) {
+  leaveOnline();
+  matchmade = true;
+  setOnlinePhase('connecting');
+  online = joinGame(code, {
     onConnected: () => { if (!onlineConnected) setOnlinePhase('connecting', 'Connected — waiting for host…'); },
     onData: onOnlineData,
     onClosed: onOnlineClosed,
@@ -631,7 +687,7 @@ function onOnlineClosed() {
   // Host: keep the lobby (room + code) alive so a new opponent can join the same code
   // — no need to mint a fresh one. Drop back to the waiting state; the next peer to
   // join re-fires onConnected → onHostConnected, which reassigns colours and resets.
-  if (isHost && online) {
+  if (isHost && online && !matchmade) {
     onlineConnected = false;
     setOnlinePhase('hosting', online.getCode());
     render(); // lock the board until someone joins
@@ -930,6 +986,7 @@ $('ai-swap').addEventListener('click', () => {
 // Online panel controls.
 $('online-host').addEventListener('click', startHost);
 $('online-join').addEventListener('click', startJoin);
+$('online-find').addEventListener('click', startFindMatch);
 $('online-code').addEventListener('keydown', (e) => { if (e.key === 'Enter') startJoin(); });
 // Auto-join the moment a complete code is entered — typing the last character or
 // pasting a fresh code over a stale one connects without clicking Join. 'input'
