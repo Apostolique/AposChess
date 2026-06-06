@@ -57,7 +57,7 @@ export function findMatch(handlers) {
   function propose(target) {
     const code = makeCode();
     outstanding = { target, code };
-    send({ t: 'propose', code }, target);
+    send({ t: 'propose', code }, { target });
     proposeTimer = setTimeout(() => {     // no reply → assume gone, skip and retry
       if (done || !outstanding) return;
       cooldown(outstanding.target);
@@ -80,11 +80,14 @@ export function findMatch(handlers) {
     handlers.onMatched?.({ code, isHost: selfId < otherId });
   }
 
-  function onMsg(data, peerId) {
+  function onMsg(data, meta) {
     if (done || !data || typeof data !== 'object') return;
+    // Trystero ≥0.25 delivers the sender to onMessage as `{ peerId }` in the second
+    // arg (older versions passed the id string directly) — accept either shape.
+    const fromId = meta && typeof meta === 'object' ? meta.peerId : meta;
     if (data.t === 'propose') {
       // Already committing to someone else → decline so they retry elsewhere.
-      if (outstanding) { send({ t: 'reject' }, peerId); return; }
+      if (outstanding) { send({ t: 'reject' }, { target: fromId }); return; }
       // Commit synchronously (so a second propose arriving in the await window is
       // ignored via the `done` guard above), but only LEAVE the queue once the
       // `accept` has actually flushed to the peer. Leaving first can tear the data
@@ -93,15 +96,15 @@ export function findMatch(handlers) {
       done = true;
       clearTimeout(proposeTimer);
       const code = data.code;
-      Promise.resolve(send({ t: 'accept', code }, peerId)).finally(() => {
+      Promise.resolve(send({ t: 'accept', code }, { target: fromId })).finally(() => {
         try { room?.leave(); } catch { /* ignore */ }
-        handlers.onMatched?.({ code, isHost: selfId < peerId });
+        handlers.onMatched?.({ code, isHost: selfId < fromId });
       });
     } else if (data.t === 'accept') {
-      if (!outstanding || peerId !== outstanding.target) return;
-      matched(peerId, outstanding.code);
+      if (!outstanding || fromId !== outstanding.target) return;
+      matched(fromId, outstanding.code);
     } else if (data.t === 'reject') {
-      if (!outstanding || peerId !== outstanding.target) return;
+      if (!outstanding || fromId !== outstanding.target) return;
       clearTimeout(proposeTimer);
       cooldown(outstanding.target);
       outstanding = null;
