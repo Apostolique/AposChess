@@ -22,7 +22,7 @@ body {
   min-height: 100vh;
   background: var(--bg);
   color: var(--text);
-  font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  font-family: 'Noto Sans', system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
   display: flex;
   justify-content: center;
 }
@@ -158,7 +158,44 @@ button:disabled:hover { background: var(--panel); } /* no hover lift when locked
   width: var(--board);
   height: var(--board);
   border-radius: 4px;
-  overflow: hidden;
+  /* `visible` so the coordinates can sit in the gutters just outside the board
+     (Lichess-style) without being clipped; the chessground layers don't overflow. */
+  overflow: visible;
+  /* Reserve a strip below the board for the file letters. */
+  margin-bottom: 22px;
+}
+
+/* Coordinates (chessground draws them inside .cg-wrap). Defaults place them with
+   fixed px offsets that look shifted on small boards and force UPPERCASE; override
+   to lowercase, just outside the board edges. Same specificity as chessground's
+   rules but loaded later, so these win. */
+.cg-wrap coords {
+  font-family: 'Noto Sans', sans-serif;
+  font-weight: 700;
+  font-size: 12px;
+}
+.cg-wrap coords.files {
+  bottom: -16px;
+  left: 0;
+  width: 100%;
+  text-transform: lowercase;
+  text-align: center;
+}
+.cg-wrap coords.ranks {
+  left: auto;
+  right: -16px;
+  top: 0;
+  height: 100%;
+}
+/* On desktop the coords sit outside the board, so a single light colour reads
+   better than the theme's per-square dark/light alternation (which was meant for
+   coords over squares). Desktop-only so mobile keeps the alternation (its file
+   letters are inside the squares). The theme rules are higher-specificity, hence
+   !important. */
+@media (min-width: 981px) {
+  .cg-wrap coords coord {
+    color: var(--muted) !important;
+  }
 }
 
 /* Captured-piece trays above and below the board (Lichess-style). */
@@ -242,6 +279,19 @@ button:disabled:hover { background: var(--panel); } /* no hover lift when locked
      list down and back up. status (order 0) stays on top. */
   .side-col .nav { order: 1; }
   .side-col .moves { order: 2; }
+
+  /* On mobile (like Lichess), drop the rank numbers and tuck the file letters
+     into the bottom-left corner of the squares, inside the board. */
+  #board { margin-bottom: 0; }
+  .cg-wrap coords.ranks { display: none; }
+  .cg-wrap coords.files {
+    bottom: 0;
+    left: 0;
+    height: 14px;
+    align-items: flex-end;
+    text-align: left;
+  }
+  .cg-wrap coords.files coord { padding-left: 2px; }
 }
 
 .footer { margin-top: 24px; color: var(--muted); font-size: 0.8rem; }
