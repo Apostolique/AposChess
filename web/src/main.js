@@ -43,11 +43,17 @@ let aiTimer = null;
 const moveSound = new Audio(import.meta.env.BASE_URL + 'sound/standard/Move.mp3');
 const captureSound = new Audio(import.meta.env.BASE_URL + 'sound/standard/Capture.mp3');
 const checkSound = new Audio(import.meta.env.BASE_URL + 'sound/standard/Check.mp3');
+// Played once when an online opponent links up (host and joiner both hear it).
+const connectSound = new Audio(import.meta.env.BASE_URL + 'sound/standard/SocialNotify.mp3');
 // Check takes priority over capture (and covers checkmate, which is also a check).
 function playMoveSound(capture, check) {
   const a = check ? checkSound : capture ? captureSound : moveSound;
   a.currentTime = 0;
   a.play().catch(() => {}); // ignore autoplay blocks before first interaction
+}
+function playConnectSound() {
+  connectSound.currentTime = 0;
+  connectSound.play().catch(() => {}); // gesture-unlocked by the Host/Join click
 }
 // captured[color] = list of opponent pieces that `color` has captured (live game).
 let captured = { white: [], black: [] };
@@ -515,6 +521,10 @@ function askPromotion(color) {
 // message, or an error/idle hint.
 function setOnlinePhase(phase, detail = '') {
   const idle = phase === 'idle';
+  // Lock the mode switch while a session is live (hosting, connecting, connected)
+  // so you can't tear it down by accident — you must Cancel/Leave first, which
+  // returns to 'idle' and re-enables it.
+  $('mode').disabled = !idle;
   $('online-host').hidden = !idle;
   $('online-join').hidden = !idle;
   $('online-code').hidden = !idle;
@@ -603,6 +613,7 @@ function onHostConnected(color) {
   onlineConnected = true;
   online.send({ t: 'hello', color: opponent(color) });
   setOnlinePhase('connected', connectedMsg(color));
+  playConnectSound();
   newGame();
 }
 
@@ -637,9 +648,11 @@ function onOnlineData(msg) {
   if (msg.t === 'hello') {
     // The host tells us (the joiner) which colour to play — on connect, and again
     // on a side swap. Either way: take the colour, go live, and reset.
+    const justConnected = !onlineConnected; // first hello = the actual connect (not a swap)
     onlineColor = msg.color === 'black' ? 'black' : 'white';
     onlineConnected = true;
     setOnlinePhase('connected', connectedMsg(onlineColor));
+    if (justConnected) playConnectSound();
     newGame();
   } else if (msg.t === 'move') {
     if (!onlineConnected || status.over) return;
