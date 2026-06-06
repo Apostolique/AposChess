@@ -485,20 +485,28 @@ function setOnlinePhase(phase, detail = '') {
 
 const connectedMsg = (color) => `Connected — you play ${color === 'white' ? 'White' : 'Black'}.`;
 
-// The share code lives in the page URL (`?code=…`) so a host can just copy the
+// The share code lives in the URL hash (`#code=…`) so a host can just copy the
 // address bar and a joiner who opens that link auto-joins (see startup below).
+// A hash (not a `?query`) keeps the code out of what browsers persist/send and
+// out of the path the way some browsers save query strings on the bare URL.
+const hashParams = () => new URLSearchParams((window.location.hash || '').replace(/^#/, ''));
 const shareUrl = (code) => {
   const u = new URL(window.location.href);
-  u.searchParams.set('code', code);
+  const p = hashParams();
+  p.set('code', code);
+  u.hash = p.toString();
   return u.href;
 };
 function setUrlCode(code) {
   const u = new URL(window.location.href);
-  if (code) u.searchParams.set('code', code);
-  else u.searchParams.delete('code');
+  const p = hashParams();
+  if (code) p.set('code', code);
+  else p.delete('code');
+  const s = p.toString();
+  u.hash = s ? s : '';
   window.history.replaceState(null, '', u.href); // window.history — `history` is the local move list
 }
-const getUrlCode = () => normalizeCode(new URL(window.location.href).searchParams.get('code') || '');
+const getUrlCode = () => normalizeCode(hashParams().get('code') || '');
 
 // Tear down the current session (if any) and clear connection state. The caller
 // is responsible for the resulting UI phase.
@@ -781,7 +789,7 @@ if (ui.mode === 'online') setOnlinePhase('idle');
 render();
 driveAi(); // if a restored mode has the AI to move first
 
-// Opened via a shared link (`?code=…`): switch to online mode and auto-join.
+// Opened via a shared link (`#code=…`): switch to online mode and auto-join.
 const launchCode = getUrlCode();
 if (launchCode.length >= 4) {
   $('mode').value = 'online';
