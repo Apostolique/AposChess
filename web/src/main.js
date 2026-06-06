@@ -6,9 +6,10 @@ import 'chessground/assets/chessground.brown.css';
 import 'chessground/assets/chessground.cburnett.css';
 import './styles.css';
 
-import { newGameState, toFen, parseSquare, squareName, opponent } from './board.js';
+import { newGameState, parseFen, toFen, parseSquare, squareName, opponent } from './board.js';
 import { applyMove, gameStatus, destsMap } from './engine.js';
 import { hostGame, joinGame, normalizeCode } from './online.js';
+import { exportPgn, importPgn } from './pgn.js';
 
 const boardEl = document.getElementById('board');
 const $ = (id) => document.getElementById(id);
@@ -56,6 +57,22 @@ let captured = { white: [], black: [] };
 // the live game while the user steps back through earlier moves.
 let history = [startEntry(state)];
 let viewIndex = 0;
+
+// FENs of every position in the live line, kept in lock-step with `history` and
+// sent to the AI worker so its search knows the real game's repetitions — without
+// this the engine has no game history and can shuffle a won position into a draw.
+let repFens = [toFen(state)];
+
+// The repetition positions worth sending to the worker for position `s`: only those
+// since the last irreversible move (the last `halfmove` plies) can recur, so the
+// engine's lookup set stays tiny. Older positions can never match (material/pawns
+// differ), so dropping them changes nothing but speed.
+const repWindow = (s) => repFens.slice(-(s.halfmove + 1));
+
+// Board-editor mode: which side is to move once you leave the editor. The edited
+// position only becomes a real game when you switch to a play mode (see the mode
+// change handler), so during editing we don't maintain `state` from the board.
+let editorTurn = 'white';
 
 // Threefold-repetition tracking: count occurrences of each position over the live
 // game. A position is identified by the first three FEN fields (piece placement,
@@ -185,6 +202,9 @@ function viewColor() {
 }
 
 function render() {
+  // The editor owns the board directly (free placement); don't overwrite its pieces
+  // from game state — just refresh the surrounding chrome. enterEditor() sets it up.
+  if (ui.mode === 'editor') { updateStatusText(); applyAiLock(); return; }
   const entry = history[viewIndex];
   const atLive = viewIndex === history.length - 1;
   const color = atLive ? controllableColor() : undefined;
@@ -195,7 +215,11 @@ function render() {
     lastMove: entry.lastMove ? [squareName(entry.lastMove.from), squareName(entry.lastMove.to)] : undefined,
     check: entry.check ? entry.state.turn : false,
     viewOnly: !atLive, // lock the board while reviewing an earlier position
-    movable: { color, dests: (atLive && color) ? destsMap(status.legal) : new Map() },
+    // Explicitly restore non-editor settings (free placement, delete-on-drop-off,
+    // and the move-destination dots) — cg.set merges, so the editor's overrides
+    // would otherwise persist after leaving it.
+    movable: { free: false, showDests: true, color, dests: (atLive && color) ? destsMap(status.legal) : new Map() },
+    draggable: { deleteOnDropOff: false },
   });
   renderTrays(entry);
   renderMoveList();
@@ -235,6 +259,11 @@ function renderTrays(entry) {
 
 function updateStatusText() {
   const el = $('status');
+  if (ui.mode === 'editor') {
+    el.classList.remove('over');
+    el.textContent = `Editing — ${editorTurn === 'white' ? 'White' : 'Black'} to move. Switch Mode to play.`;
+    return;
+  }
   el.classList.toggle('over', status.over);
   if (status.result === 'checkmate') {
     el.textContent = `Checkmate — ${status.winner === 'white' ? 'White' : 'Black'} wins.`;
@@ -255,12 +284,10 @@ function updateStatusText() {
   }
 }
 
-function commit(move) {
-  // A new position supersedes any pending search or ponder reply.
-  clearTimeout(aiTimer);
-  aiSeq++;
-  ponderSeq++;
-  aiThinking = false;
+// Apply one move to the live game and record it (state, status, captured tray,
+// history snapshot, repetition FEN). Shared by interactive play (`commit`) and bulk
+// replay (`loadGame`); does no rendering, sound, or AI driving of its own.
+function recordMove(move) {
   if (move.capture) {
     const taken = state.board[move.to]; // occupant of the landing square (incl. jumps)
     if (taken) captured[state.turn].push(taken);
@@ -273,7 +300,6 @@ function commit(move) {
   if (!status.over && countPosition(state) >= 3) {
     status = { over: true, check: status.check, legal: status.legal, result: 'repetition', winner: null };
   }
-  const wasLive = viewIndex === history.length - 1;
   history.push({
     state,
     captured: { white: [...captured.white], black: [...captured.black] },
@@ -281,6 +307,17 @@ function commit(move) {
     san: toSan(pre, move, status),
     check: status.check,
   });
+  repFens.push(toFen(state));
+}
+
+function commit(move) {
+  // A new position supersedes any pending search or ponder reply.
+  clearTimeout(aiTimer);
+  aiSeq++;
+  ponderSeq++;
+  aiThinking = false;
+  const wasLive = viewIndex === history.length - 1;
+  recordMove(move);
   if (wasLive) viewIndex = history.length - 1; // follow the game unless reviewing
   lastCommitAt = performance.now();
   playMoveSound(move.capture, status.check);
@@ -342,6 +379,7 @@ function goTo(index) {
 // chessground reports a legal (from, to); resolve it to an engine move,
 // asking for a promotion piece when several moves share that destination.
 function onUserMove(orig, dest) {
+  if (ui.mode === 'editor') return; // free placement: chessground keeps the move, no game logic
   const from = parseSquare(orig), to = parseSquare(dest);
   const matches = status.legal.filter((m) => m.from === from && m.to === to);
   if (matches.length === 0) { render(); return; }
@@ -385,7 +423,7 @@ function startSearch() {
   aiThinking = true;
   updateStatusText();
   const { depth, maxMs } = aiParams(state.turn);
-  aiWorker.postMessage({ type: 'search', seq, state, depth, maxMs });
+  aiWorker.postMessage({ type: 'search', seq, state, depth, maxMs, posHistory: repWindow(state) });
 }
 
 function onSearchResult(data) {
@@ -419,7 +457,7 @@ function startPonder() {
   updateStatusText();
   const seq = ++ponderSeq;
   const { depth } = aiParams(state.turn);
-  aiWorker.postMessage({ type: 'ponder', seq, state: ponderState, depth, maxMs: PONDER_STEP_MS });
+  aiWorker.postMessage({ type: 'ponder', seq, state: ponderState, depth, maxMs: PONDER_STEP_MS, posHistory: repWindow(ponderState) });
 }
 
 function onPonderResult(data) {
@@ -429,7 +467,7 @@ function onPonderResult(data) {
   // forced line resolved), so we don't spin firing instant bursts.
   if (data.reached >= depth || data.reached <= ponderBest) return;
   ponderBest = data.reached;
-  aiWorker.postMessage({ type: 'ponder', seq: data.seq, state: ponderState, depth, maxMs: PONDER_STEP_MS });
+  aiWorker.postMessage({ type: 'ponder', seq: data.seq, state: ponderState, depth, maxMs: PONDER_STEP_MS, posHistory: repWindow(ponderState) });
 }
 
 // --- promotion picker ---
@@ -613,9 +651,33 @@ function newGame() {
   status = gameStatus(state);
   captured = { white: [], black: [] };
   history = [startEntry(state)];
+  repFens = [toFen(state)];
   viewIndex = 0;
   posCounts = new Map();
   countPosition(state);
+  lastCommitAt = performance.now();
+  if (ui.mode === 'editor') { enterEditor(); return; } // reset to an editable start position
+  render();
+  driveAi();
+}
+
+// Replace the live game with an imported one: reset from `start`, replay `moves`,
+// then show the final position. Keeps the current mode (so you can load a line and
+// let the AIs continue from it), but leaves AI-vs-AI paused until you press Start.
+function loadGame(start, moves) {
+  cancelAi();
+  ui.running = false;
+  ui.started = false;
+  syncToggleLabel();
+  state = start;
+  status = gameStatus(state);
+  captured = { white: [], black: [] };
+  history = [startEntry(state)];
+  repFens = [toFen(state)];
+  posCounts = new Map();
+  countPosition(state);
+  for (const mv of moves) recordMove(mv);
+  viewIndex = history.length - 1;
   lastCommitAt = performance.now();
   render();
   driveAi();
@@ -639,6 +701,7 @@ function applyModeVisibility() {
   $('row-ai').hidden = m !== 'human-ai';
   $('row-white').hidden = m !== 'ai-ai';
   $('row-black').hidden = m !== 'ai-ai';
+  $('row-editor').hidden = m !== 'editor';
   // A row's custom depth/timeout inputs appear only when its strength is "Custom".
   toggleCustom('ai', m === 'human-ai' && ui.strengthAi === 'custom');
   toggleCustom('white', m === 'ai-ai' && ui.strengthWhite === 'custom');
@@ -694,17 +757,100 @@ function syncControlsFromDom() {
   }
 }
 
+// --- board editor ---
+const CG_ROLE = { p: 'pawn', n: 'knight', b: 'bishop', r: 'rook', q: 'queen', k: 'king' };
+
+// Set the board up for free editing, starting from the current position. No game
+// bookkeeping happens while editing; the edited board is turned into a real game
+// only when you switch to a play mode (see the mode change handler).
+function enterEditor() {
+  cancelAi();
+  ui.running = false;
+  ui.started = false;
+  syncToggleLabel();
+  editorTurn = state.turn;
+  $('editor-turn').value = editorTurn;
+  cg.set({
+    fen: toFen(state),
+    orientation: 'white',
+    turnColor: 'white',
+    lastMove: undefined,
+    check: false,
+    viewOnly: false,
+    movable: { free: true, color: 'both', showDests: false, dests: new Map() },
+    draggable: { enabled: true, deleteOnDropOff: true },
+  });
+  renderTrays({ state, captured: { white: [], black: [] } });
+  updateStatusText();
+}
+
+// Castling is available for a side when its king and the relevant rook still sit on
+// their home squares (a1/e1/h1, a8/e8/h8) — derived so the editor needs no toggles.
+function deriveCastling(board) {
+  const at = (i, role, color) => board[i] && board[i].role === role && board[i].color === color;
+  return {
+    K: at(4, 'k', 'white') && at(7, 'r', 'white'),
+    Q: at(4, 'k', 'white') && at(0, 'r', 'white'),
+    k: at(60, 'k', 'black') && at(63, 'r', 'black'),
+    q: at(60, 'k', 'black') && at(56, 'r', 'black'),
+  };
+}
+
+// Turn the edited board into a game state, or null if it isn't playable (a side is
+// missing its king). chessground's FEN is placement-only, so we splice in the chosen
+// side to move and derived castling.
+function readEditorState() {
+  const placement = cg.getFen();
+  const st = parseFen(`${placement} ${editorTurn === 'white' ? 'w' : 'b'} - - 0 1`);
+  st.castling = deriveCastling(st.board);
+  let wk = 0, bk = 0;
+  for (const p of st.board) if (p && p.role === 'k') (p.color === 'white' ? wk++ : bk++);
+  return wk && bk ? st : null;
+}
+
+// Re-evaluate who controls the game after a mode/side change, *keeping* the current
+// position so it can be continued — handed between a human and the AI from wherever
+// the game stands — instead of being reset. Aborts any in-flight search and stops
+// autonomous AI-vs-AI play; the new controller (if any) takes over via driveAi().
+function handoffControl() {
+  cancelAi();
+  ui.running = false;
+  ui.started = false;
+  syncToggleLabel();
+  render();
+  driveAi();
+}
+
 $('mode').addEventListener('change', (e) => {
   const prev = ui.mode;
+  // Leaving the editor: the edited board becomes a fresh game. Reject an unplayable
+  // position (a side with no king) and snap back to the editor so edits aren't lost.
+  if (prev === 'editor') {
+    const edited = readEditorState();
+    if (!edited) {
+      alert('Give each side a king before leaving the board editor.');
+      e.target.value = 'editor';
+      return;
+    }
+    ui.mode = e.target.value;
+    if (ui.mode === 'online') { applyModeVisibility(); setOnlinePhase('idle'); newGame(); return; }
+    applyModeVisibility();
+    loadGame(edited, []); // start a new game from the edited position, then continue
+    return;
+  }
+
   ui.mode = e.target.value;
   if (prev === 'online' && ui.mode !== 'online') { leaveOnline(); setUrlCode(''); }
   applyModeVisibility();
-  if (ui.mode === 'online') setOnlinePhase('idle');
-  newGame();
+  if (ui.mode === 'editor') { enterEditor(); return; }
+  // Online needs a clean handshake, so it still starts a fresh game; every other
+  // mode change continues the current position (there's a New game button per mode).
+  if (ui.mode === 'online') { setOnlinePhase('idle'); newGame(); return; }
+  handoffControl();
 });
 $('side').addEventListener('change', (e) => {
   ui.humanColor = e.target.value;
-  newGame();
+  handoffControl(); // swap which side you play without losing the game
 });
 $('depth-ai').addEventListener('change', (e) => {
   ui.strengthAi = e.target.value;
@@ -771,6 +917,72 @@ $('moves').addEventListener('click', (e) => {
   const t = e.target.closest('[data-i]');
   if (t) goTo(parseInt(t.dataset.i, 10));
 });
+
+// PGN import/export — a save/replay format for sharing games and reproducing bugs
+// (load a line, then let the AIs continue from it). See pgn.js for the format.
+function downloadPgn(text) {
+  const blob = new Blob([text], { type: 'application/x-chess-pgn' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `aposchess-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.pgn`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+$('export-pgn').addEventListener('click', async (e) => {
+  const text = exportPgn(history, status);
+  const b = e.currentTarget;
+  try {
+    // Copy to the clipboard — quickest for the debug round-trip (paste it back via
+    // Import). Fall back to a file download if the clipboard is unavailable/blocked.
+    await navigator.clipboard.writeText(text);
+    b.textContent = 'Copied!';
+    setTimeout(() => { b.textContent = 'Export PGN'; }, 1200);
+  } catch {
+    downloadPgn(text);
+  }
+});
+function loadPgnText(text) {
+  try {
+    const { start, moves } = importPgn(text);
+    loadGame(start, moves);
+  } catch (err) {
+    alert('Could not import PGN: ' + err.message);
+  }
+}
+$('import-pgn').addEventListener('click', async () => {
+  // Pair with the clipboard export: read the pasted PGN directly. If the browser
+  // won't grant clipboard read (Firefox blocks it for pages, or it's denied), fall
+  // back to the file picker so import still works.
+  try {
+    const text = await navigator.clipboard.readText();
+    if (text && text.trim()) { loadPgnText(text); return; }
+  } catch { /* fall through to the file picker */ }
+  $('import-pgn-file').click();
+});
+$('import-pgn-file').addEventListener('change', async (e) => {
+  const file = e.target.files && e.target.files[0];
+  e.target.value = ''; // allow re-importing the same file later
+  if (!file) return;
+  loadPgnText(await file.text());
+});
+
+// Board editor: drag a spare piece from the palette onto the board (chessground's
+// dragNewPiece), drag a piece off the board to delete it (deleteOnDropOff). The
+// side-to-move select and the clear/start buttons round out the editor.
+for (const el of document.querySelectorAll('#editor-palette .sparepiece')) {
+  const piece = { color: el.dataset.color, role: CG_ROLE[el.dataset.role] };
+  const startDrag = (e) => {
+    if (ui.mode !== 'editor') return;
+    e.preventDefault(); // don't start a text selection / scroll
+    cg.dragNewPiece(piece, e);
+  };
+  el.addEventListener('mousedown', startDrag);
+  el.addEventListener('touchstart', startDrag, { passive: false });
+}
+$('editor-turn').addEventListener('change', (e) => { editorTurn = e.target.value; updateStatusText(); });
+$('editor-clear').addEventListener('click', () => cg.set({ fen: '8/8/8/8/8/8/8/8' }));
+$('editor-start').addEventListener('click', () => cg.set({ fen: toFen(newGameState()) }));
 document.addEventListener('keydown', (e) => {
   const tag = e.target.tagName;
   if (tag === 'SELECT' || tag === 'INPUT' || tag === 'TEXTAREA') return;
@@ -799,8 +1011,12 @@ $('ai-toggle').addEventListener('click', () => {
 syncControlsFromDom();
 applyModeVisibility();
 if (ui.mode === 'online') setOnlinePhase('idle');
-render();
-driveAi(); // if a restored mode has the AI to move first
+if (ui.mode === 'editor') {
+  enterEditor(); // a restored editor mode needs the editable board set up
+} else {
+  render();
+  driveAi(); // if a restored mode has the AI to move first
+}
 
 // Opened via a shared link (`#code=…`): switch to online mode and auto-join.
 const launchCode = getUrlCode();

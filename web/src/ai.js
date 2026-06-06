@@ -43,6 +43,20 @@ let history; // Int32Array[from*64+to] of cutoff counts
 // so the engine stops treating a shuffle as progress — it avoids repeating when
 // ahead and seeks it when worse. (Hashes require the TT, so this is gated on it.)
 let repPath;
+// Positions that already occurred in the *actual* game (Zobrist hashes), supplied
+// by the caller. A search node whose hash is in here is a genuine repetition the
+// engine should avoid when ahead and seek when behind, even though it never
+// appeared in the current search line — without this the engine has no game
+// history and will happily shuffle a won position into a threefold draw.
+let repSeen;
+// True when the value the most recent search() call returned came through a
+// repetition draw (its own, or its best/cutoff child's). Such a value is
+// path-dependent — valid only for the move order that reached it — so it must NOT
+// be written to the persistent transposition table. A path-agnostic TT would
+// otherwise reuse that draw score down an unrelated path and hide a real win
+// (graph-history interaction). The flag bubbles up via this module-level var,
+// read by each caller immediately after its recursive search() returns.
+let tainted;
 
 const keyOf = (m) => m.from * 64 + m.to;
 
@@ -314,19 +328,23 @@ function qsearch(state, alpha, beta, qdepth) {
 }
 
 function search(state, depth, alpha, beta, ply, canNull, hash, deadline) {
-  if (now() > deadline) return 0; // aborted; the root discards this iteration
+  if (now() > deadline) { tainted = false; return 0; } // aborted; the root discards this iteration
   if (ttEnabled) {
-    // Draw by repetition: a same-position ancestor (every 2 plies back, since the
-    // side to move must match) or the current game position. Score the first repeat
-    // as a draw — enough to steer the engine without tracking full game history.
-    for (let i = ply - 2; i >= 0; i -= 2) if (repPath[i] === hash) return 0;
+    // Draw by repetition. Two sources, both scored as a draw on the first repeat:
+    //   - repSeen: the position already occurred in the real game (so reaching it
+    //     again is a draw the engine must weigh — avoid when ahead, seek when behind).
+    //   - repPath: a same-position ancestor in this search line (every 2 plies back,
+    //     since the side to move must match) or the current root.
+    // Either way mark the value tainted so it can't poison the persistent table.
+    if (repSeen.size !== 0 && repSeen.has(hash)) { tainted = true; return 0; }
+    for (let i = ply - 2; i >= 0; i -= 2) if (repPath[i] === hash) { tainted = true; return 0; }
     repPath[ply] = hash;
   }
-  if (ply >= MAX_PLY) return evalStm(state.board, state.turn);
+  if (ply >= MAX_PLY) { tainted = false; return evalStm(state.board, state.turn); }
 
   const inCheck = kingAttacked(state.board, state.turn);
   if (inCheck) depth++; // check extension
-  if (depth <= 0) return qsearch(state, alpha, beta, QDEPTH);
+  if (depth <= 0) { tainted = false; return qsearch(state, alpha, beta, QDEPTH); }
 
   const alphaOrig = alpha;
   let ttMoveKey = 0;
@@ -337,9 +355,9 @@ function search(state, depth, alpha, beta, ply, canNull, hash, deadline) {
       if (ttDepth[i] >= depth) {
         const s = fromTT(ttScore[i], ply);
         const flag = ttFlag[i];
-        if (flag === EXACT) return s;
-        if (flag === LOWER && s >= beta) return s;
-        if (flag === UPPER && s <= alpha) return s;
+        if (flag === EXACT) { tainted = false; return s; }
+        if (flag === LOWER && s >= beta) { tainted = false; return s; }
+        if (flag === UPPER && s <= alpha) { tainted = false; return s; }
       }
     }
   }
@@ -352,30 +370,34 @@ function search(state, depth, alpha, beta, ply, canNull, hash, deadline) {
     };
     const nh = ttEnabled ? hash ^ SIDE_KEY : 0n;
     const score = -search(nm, depth - 3, -beta, -beta + 1, ply + 1, false, nh, deadline);
+    // A fail-high resting on a repetition draw is itself path-dependent; leave the
+    // child's `tainted` in place (we don't store on this path) and bail out.
     if (score >= beta) return beta;
   }
 
   const legal = legalMoves(state);
-  if (legal.length === 0) return inCheck ? -MATE - depth : 0;
+  if (legal.length === 0) { tainted = false; return inCheck ? -MATE - depth : 0; }
   orderMoves(legal, state.board, ply, ttMoveKey);
 
-  let best = -Infinity, bestKey = 0, moveCount = 0;
+  let best = -Infinity, bestKey = 0, moveCount = 0, bestTainted = false;
   for (const m of legal) {
     moveCount++;
     const child = applyMove(state, m);
     const childHash = ttEnabled ? hashAfter(hash, state, m) : 0n;
     const quiet = !m.capture && !m.promotion && !m.jump;
-    let score;
+    let score, sTainted;
     if (moveCount === 1) {
       score = -search(child, depth - 1, -beta, -alpha, ply + 1, true, childHash, deadline);
+      sTainted = tainted;
     } else {
       // Late move reduction for quiet, late moves (never jumps/captures/promotions).
       const r = (quiet && depth >= 3 && moveCount > 3 && !inCheck) ? 1 : 0;
       score = -search(child, depth - 1 - r, -alpha - 1, -alpha, ply + 1, true, childHash, deadline);
-      if (score > alpha && r > 0) score = -search(child, depth - 1, -alpha - 1, -alpha, ply + 1, true, childHash, deadline);
-      if (score > alpha && score < beta) score = -search(child, depth - 1, -beta, -alpha, ply + 1, true, childHash, deadline);
+      sTainted = tainted;
+      if (score > alpha && r > 0) { score = -search(child, depth - 1, -alpha - 1, -alpha, ply + 1, true, childHash, deadline); sTainted = tainted; }
+      if (score > alpha && score < beta) { score = -search(child, depth - 1, -beta, -alpha, ply + 1, true, childHash, deadline); sTainted = tainted; }
     }
-    if (score > best) { best = score; bestKey = keyOf(m); }
+    if (score > best) { best = score; bestKey = keyOf(m); bestTainted = sTainted; }
     if (best > alpha) alpha = best;
     if (alpha >= beta) {
       if (quiet) {
@@ -389,11 +411,15 @@ function search(state, depth, alpha, beta, ply, canNull, hash, deadline) {
     if (now() > deadline) break;
   }
 
-  // Skip storing once the deadline has passed: a node that broke out of its move
-  // loop on time has an incomplete `best`, and with a persistent table a bogus
-  // entry would survive into later searches. Time is monotonic, so once we're
-  // past the deadline every ancestor's store is skipped too.
-  if (ttEnabled && now() <= deadline) {
+  // The node's value is tainted if the move that fixed it (the best move, or the one
+  // that caused the beta cutoff — both tracked by bestTainted) came back tainted.
+  // Skip the store in that case so a path-dependent draw never lands in the
+  // persistent table. Also skip past the deadline: a node that broke out of its
+  // move loop on time has an incomplete `best`, and with a persistent table a bogus
+  // entry would survive into later searches. Time is monotonic, so once we're past
+  // the deadline every ancestor's store is skipped too.
+  tainted = bestTainted;
+  if (ttEnabled && !bestTainted && now() <= deadline) {
     const flag = best <= alphaOrig ? UPPER : best >= beta ? LOWER : EXACT;
     ttStore(hash, depth, toTT(best, ply), flag, bestKey);
   }
@@ -409,7 +435,14 @@ function search(state, depth, alpha, beta, ply, canNull, hash, deadline) {
 // turn) read from the table after the search, and `depth` is the deepest
 // iteration completed (used to stop pondering once the line is fully resolved).
 // The table is NOT cleared here — it persists across calls (see ttReset).
-export function chooseMoveDetailed(state, maxDepth = 2, rand = Math.random, maxMs = Infinity, useTT = true) {
+//
+// `prevHashes` is the Zobrist hashes of positions that already occurred in the real
+// game (so the search can recognise — and a winning side avoid — a genuine
+// threefold draw it would otherwise be blind to). Pass [] when there's no history.
+// Only positions since the last irreversible move (capture/pawn move — i.e. the last
+// `halfmove` plies) can ever recur, so the caller need only pass that window; doing
+// so keeps the per-node repetition lookup set tiny (usually empty).
+export function chooseMoveDetailed(state, maxDepth = 2, rand = Math.random, maxMs = Infinity, useTT = true, prevHashes = []) {
   const root = legalMoves(state);
   if (root.length === 0) return { move: null, ponder: null, depth: 0 };
 
@@ -424,6 +457,7 @@ export function chooseMoveDetailed(state, maxDepth = 2, rand = Math.random, maxM
   if (useTT) ttBumpGen();
   const rootHash = useTT ? hashOf(state) : 0n;
   repPath = useTT ? [rootHash] : []; // index 0 = the current (root) position
+  repSeen = useTT ? new Set(prevHashes) : new Set(); // positions already seen in the real game
   const deadline = now() + maxMs;
   let bestMove = root[0];
   let completed = 0;
@@ -462,8 +496,8 @@ export function chooseMoveDetailed(state, maxDepth = 2, rand = Math.random, maxM
   return { move: bestMove, ponder, depth: completed };
 }
 
-export function chooseMove(state, maxDepth, rand, maxMs, useTT) {
-  return chooseMoveDetailed(state, maxDepth, rand, maxMs, useTT).move;
+export function chooseMove(state, maxDepth, rand, maxMs, useTT, prevHashes) {
+  return chooseMoveDetailed(state, maxDepth, rand, maxMs, useTT, prevHashes).move;
 }
 
 // Exposed for tests only: Zobrist hash equivalence check + table reset so a

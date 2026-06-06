@@ -17,15 +17,19 @@
 // Game state is plain data (board array + flags), so it survives structured
 // cloning across the worker boundary unchanged.
 
-import { chooseMoveDetailed } from './ai.js';
+import { chooseMoveDetailed, _internal } from './ai.js';
+import { parseFen } from './board.js';
 
 self.onmessage = ({ data }) => {
-  const { type, seq, state, depth, maxMs } = data;
+  const { type, seq, state, depth, maxMs, posHistory } = data;
+  // posHistory is the live game's prior positions as FENs (compact to clone); the
+  // search wants Zobrist hashes, so convert here, on the worker thread.
+  const prevHashes = posHistory ? posHistory.map((f) => _internal.hashOf(parseFen(f))) : [];
   if (type === 'ponder') {
-    const { depth: reached } = chooseMoveDetailed(state, depth, Math.random, maxMs);
+    const { depth: reached } = chooseMoveDetailed(state, depth, Math.random, maxMs, true, prevHashes);
     self.postMessage({ type: 'ponder', seq, reached });
     return;
   }
-  const { move, ponder } = chooseMoveDetailed(state, depth, Math.random, maxMs);
+  const { move, ponder } = chooseMoveDetailed(state, depth, Math.random, maxMs, true, prevHashes);
   self.postMessage({ type: 'search', seq, move, ponder });
 };

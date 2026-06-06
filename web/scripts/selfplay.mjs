@@ -86,8 +86,9 @@ function makeRng(seed) {
 // A player is a configured engine: how to pick a move + its own persistent table.
 function makePlayer(mod, { depth, movetime }) {
   return {
-    move: (state, rng) =>
-      mod.chooseMove(state, depth ?? 99, rng, depth != null ? Infinity : movetime, cfg.useTT),
+    move: (state, rng, prevHashes) =>
+      mod.chooseMove(state, depth ?? 99, rng, depth != null ? Infinity : movetime, cfg.useTT, prevHashes),
+    hashOf: mod._internal.hashOf,
     resetTT: () => mod._internal.resetTT(),
   };
 }
@@ -98,6 +99,7 @@ function playGame(openingState, A, B, whiteIsA, rng) {
   A.resetTT();
   B.resetTT();
   let st = openingState;
+  const seen = []; // positions played this game, so each engine can detect repetition
   for (let ply = 0; ply < cfg.maxmoves; ply++) {
     const status = gameStatus(st);
     if (status.over) {
@@ -106,7 +108,12 @@ function playGame(openingState, A, B, whiteIsA, rng) {
       return winnerIsA ? 1 : 0;
     }
     const aToMove = (st.turn === 'white') === whiteIsA;
-    const mv = (aToMove ? A : B).move(st, rng);
+    const player = aToMove ? A : B;
+    seen.push(st);
+    // Only positions since the last irreversible move (the last `halfmove` plies) can
+    // recur, so that's all the engine needs for repetition detection.
+    const window = seen.slice(-(st.halfmove + 1));
+    const mv = player.move(st, rng, window.map(player.hashOf));
     if (!mv) return 0.5;
     st = applyMove(st, mv);
   }
