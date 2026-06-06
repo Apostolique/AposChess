@@ -45,7 +45,6 @@
 
           <button id="new-game" type="button">New game</button>
           <button id="ai-toggle" type="button" hidden>Start</button>
-          <button id="ai-swap" type="button" hidden title="Swap the White and Black AI settings">⇄ Swap sides</button>
         </div>
 
         <div class="control-row" id="row-ai" hidden>
@@ -120,6 +119,9 @@
             Timeout (ms, 0 = ∞)
             <input id="custom-ms-black" type="number" min="0" max="60000" step="100" value="6000" />
           </label>
+        </div>
+        <div class="control-row" id="row-ai-swap" hidden>
+          <button id="ai-swap" type="button" title="Swap the White and Black AI settings">⇄ Swap</button>
         </div>
         <div class="control-row" id="row-online" hidden>
           <div class="online-panel">

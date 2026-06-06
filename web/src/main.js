@@ -29,6 +29,7 @@ const ui = {
   maxMs: 6000,         // think-time cap (ms) for preset strengths
   delay: 450,          // ms pause before an AI move, so play is watchable
   running: false,      // AI-vs-AI loop active
+  started: false,      // AI-vs-AI game has been started at least once (Pause/Resume vs Start)
 };
 
 let state = newGameState();
@@ -580,6 +581,7 @@ function onOnlineData(msg) {
 function newGame() {
   cancelAi();
   ui.running = false;
+  ui.started = false;
   syncToggleLabel();
   state = newGameState();
   status = gameStatus(state);
@@ -594,7 +596,8 @@ function newGame() {
 }
 
 function syncToggleLabel() {
-  $('ai-toggle').textContent = ui.running ? 'Stop' : 'Start';
+  // Start (fresh game) → Pause (while running) → Resume (paused).
+  $('ai-toggle').textContent = ui.running ? 'Pause' : ui.started ? 'Resume' : 'Start';
 }
 
 const strengthOf = (slot) =>
@@ -604,7 +607,7 @@ function applyModeVisibility() {
   const m = ui.mode;
   $('side-control').hidden = m !== 'human-ai';
   $('ai-toggle').hidden = m !== 'ai-ai';
-  $('ai-swap').hidden = m !== 'ai-ai';
+  $('row-ai-swap').hidden = m !== 'ai-ai';
   $('row-online').hidden = m !== 'online';
   // human-ai: one colour-agnostic AI row. ai-ai: separate White/Black rows.
   $('row-ai').hidden = m !== 'human-ai';
@@ -744,6 +747,7 @@ document.addEventListener('keydown', (e) => {
 
 $('ai-toggle').addEventListener('click', () => {
   ui.running = !ui.running;
+  if (ui.running) ui.started = true;
   syncToggleLabel();
   if (ui.running) {
     lastCommitAt = performance.now();
