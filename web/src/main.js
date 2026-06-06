@@ -496,7 +496,7 @@ function setUrlCode(code) {
   const u = new URL(window.location.href);
   if (code) u.searchParams.set('code', code);
   else u.searchParams.delete('code');
-  history.replaceState(null, '', u.href);
+  window.history.replaceState(null, '', u.href); // window.history — `history` is the local move list
 }
 const getUrlCode = () => normalizeCode(new URL(window.location.href).searchParams.get('code') || '');
 
