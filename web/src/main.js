@@ -683,18 +683,22 @@ function onlineSwap() {
   newGame();
 }
 
+// A matchmade game's opponent left (or its connection errored out) — the private
+// code was throwaway, so go straight back into the queue for a new opponent. A peer
+// leaving can reach us as a clean close OR a connection error depending on the
+// WebRTC offerer/answerer role (that asymmetry is why a host leaving and a joiner
+// leaving don't surface the same way), so BOTH handlers funnel through here.
+function requeueMatchmade() {
+  if (!matchmade) return false;
+  setUrlCode(''); // drop the finished match's code from the URL
+  startFindMatch(); // its leaveOnline() tears down the old session, then re-queues
+  render(); // lock the board while searching again
+  return true;
+}
+
 function onOnlineClosed() {
-  // Host: keep the lobby (room + code) alive so a new opponent can join the same code
-  // — no need to mint a fresh one. Drop back to the waiting state; the next peer to
-  // join re-fires onConnected → onHostConnected, which reassigns colours and resets.
-  // Matchmade game: the opponent dropped, and the private code was throwaway — so
-  // jump straight back into the queue to find a new opponent rather than go idle.
-  if (matchmade) {
-    setUrlCode(''); // drop the finished match's code from the URL
-    startFindMatch(); // its leaveOnline() tears down the old session, then re-queues
-    render(); // lock the board while searching again
-    return;
-  }
+  if (matchSession) return; // already re-queued — ignore a duplicate close/error event
+  if (requeueMatchmade()) return;
   // Host of a deliberately-shared lobby: keep the room (and code) alive so a new
   // opponent can still join the same code.
   if (isHost && online) {
@@ -711,6 +715,8 @@ function onOnlineClosed() {
 }
 
 function onOnlineError(message) {
+  if (matchSession) return; // already re-queued — ignore a trailing error event
+  if (requeueMatchmade()) return;
   leaveOnline();
   setUrlCode('');
   setOnlinePhase('idle', message);
