@@ -28,6 +28,16 @@ jobs:
           cache-dependency-path: web/package-lock.json
       - run: npm ci
       - run: npm run build
+        env:
+          # TURN server for online play across networks. Set these as repository
+          # secrets (Settings → Secrets and variables → Actions → Secrets); without
+          # them the deployed site has STUN only (same-network play works,
+          # cross-network needs the relay). Vite exposes VITE_*-prefixed env vars.
+          # NOTE: these end up in the public client bundle regardless — secrets just
+          # keep them out of CI logs/UI; rotate in Metered if the quota is abused.
+          VITE_TURN_URLS: ${{ secrets.VITE_TURN_URLS }}
+          VITE_TURN_USERNAME: ${{ secrets.VITE_TURN_USERNAME }}
+          VITE_TURN_CREDENTIAL: ${{ secrets.VITE_TURN_CREDENTIAL }}
       - name: Publish to gh-pages
         uses: peaceiris/actions-gh-pages@v4
         with:
