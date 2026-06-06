@@ -183,7 +183,12 @@ export function isAttacked(board, target, byColor) {
 // of generating every enemy move (the hot path during search). This must stay
 // equivalent to isAttacked(board, kingSquare, opponent); see the cross-check test.
 export function kingAttacked(board, color) {
-  const k = findKing(board, color);
+  return kingAttackedAt(board, color, findKing(board, color));
+}
+
+// Same test as kingAttacked, but with the king's square supplied so the legal-move
+// filter can locate the king once instead of rescanning the board for every move.
+function kingAttackedAt(board, color, k) {
   if (k < 0) return false;
   const enemy = color === 'white' ? 'black' : 'white';
   const kf = fileOf(k), kr = rankOf(k);
@@ -303,6 +308,7 @@ function addCastling(state, color, legal) {
 export function legalMoves(state) {
   const color = state.turn;
   const board = state.board;
+  const kingSq = findKing(board, color);
   const legal = [];
   for (const m of generatePseudoMoves(board, color)) {
     // Make/unmake on the live board to test king safety, instead of cloning the
@@ -314,7 +320,8 @@ export function legalMoves(state) {
     const captured = board[m.to];
     board[m.to] = moved;
     board[m.from] = null;
-    const ok = !kingAttacked(board, color);
+    // The king is at kingSq unless the king itself just moved (then at m.to).
+    const ok = !kingAttackedAt(board, color, moved.role === 'k' ? m.to : kingSq);
     board[m.from] = moved;
     board[m.to] = captured;
     if (ok) legal.push(m);

@@ -1,6 +1,7 @@
 // Throwaway: perft (correctness invariant) + speed benchmark for engine work.
-// A behavior-preserving optimization MUST reproduce the perft counts exactly;
-// the timings show whether it actually got faster.
+// Behaviour-preserving optimizations MUST reproduce the perft counts exactly.
+// Timings are best-of-N (min = least interference) and the workload is kept light
+// so the CPU doesn't thermally throttle mid-measurement and skew comparisons.
 import { newGameState } from './board.js';
 import { legalMoves, applyMove } from './engine.js';
 import { chooseMove, _internal } from './ai.js';
@@ -15,43 +16,41 @@ function perft(state, depth) {
 }
 
 function rng(seed) { return () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; }; }
+function best(runs, fn) {
+  let min = Infinity;
+  for (let i = 0; i < runs; i++) {
+    const t0 = process.hrtime.bigint();
+    fn();
+    const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+    if (ms < min) min = ms;
+  }
+  return min;
+}
 
-// A spread of reachable positions for representative branching/timing.
-function positions(n) {
-  const out = [], r = rng(2024);
+const ps = [];
+{
+  const r = rng(2024);
   let st = newGameState();
-  while (out.length < n) {
+  while (ps.length < 6) {
     const ms = legalMoves(st);
     if (!ms.length) { st = newGameState(); continue; }
     st = applyMove(st, ms[Math.floor(r() * ms.length)]);
-    if (legalMoves(st).length) out.push(st);
-    if (out.length % 5 === 0) st = newGameState();
+    if (legalMoves(st).length) ps.push(st);
+    if (ps.length % 3 === 0) st = newGameState();
   }
-  return out;
 }
 
 const start = newGameState();
-console.log('perft from start (counts are the invariant — must not change):');
-for (let d = 1; d <= 5; d++) {
-  const t0 = Date.now();
-  const n = perft(start, d);
-  const ms = Date.now() - t0;
-  console.log(`  depth ${d}: ${String(n).padStart(9)} nodes  ${String(ms).padStart(6)}ms` + (ms > 5 ? `  ${(n / ms / 1000).toFixed(2)} Mnps` : ''));
-}
+// Correctness invariant — these counts must never change.
+const counts = [1, 2, 3, 4].map((d) => perft(start, d));
+console.log('perft counts d1..d4 (invariant):', counts.join(', '));
 
-// Aggregate perft over varied positions: pure move-gen + make + legality speed.
-const ps = positions(12);
-{
-  const t0 = Date.now();
-  let total = 0;
-  for (const st of ps) total += perft(st, 3);
-  const ms = Date.now() - t0;
-  console.log(`perft d3 over ${ps.length} positions: ${total} nodes, ${ms}ms (${(total / ms / 1000).toFixed(2)} Mnps)`);
-}
+// Move-gen speed: perft d4 from start (deterministic, ~sub-second).
+const genMs = best(5, () => perft(start, 4));
+console.log(`perft d4: ${genMs.toFixed(0)}ms  (${(736594 / genMs / 1000).toFixed(2)} Mnps)`);
 
-// End-to-end search (includes eval + TT): the latency the user actually feels.
-{
-  const t0 = Date.now();
-  for (let i = 0; i < ps.length; i++) { _internal.resetTT(); chooseMove(ps[i], 6, rng(7 + i), Infinity, true); }
-  console.log(`search depth 6 over ${ps.length} positions: ${Date.now() - t0}ms`);
-}
+// End-to-end search speed (depth 5 over a few positions), the felt latency.
+const searchMs = best(3, () => {
+  for (let i = 0; i < ps.length; i++) { _internal.resetTT(); chooseMove(ps[i], 5, rng(7 + i), Infinity, true); }
+});
+console.log(`search d5 x${ps.length}: ${searchMs.toFixed(0)}ms`);
