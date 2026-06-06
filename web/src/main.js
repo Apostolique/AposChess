@@ -8,7 +8,7 @@ import './styles.css';
 
 import { newGameState, parseFen, toFen, parseSquare, squareName, opponent } from './board.js';
 import { applyMove, gameStatus, destsMap } from './engine.js';
-import { hostGame, joinGame, normalizeCode } from './online.js';
+import { hostGame, joinGame, normalizeCode, CODE_LENGTH } from './online.js';
 import { exportPgn, importPgn } from './pgn.js';
 
 const boardEl = document.getElementById('board');
@@ -628,6 +628,16 @@ function onlineSwap() {
 }
 
 function onOnlineClosed() {
+  // Host: keep the lobby (room + code) alive so a new opponent can join the same code
+  // — no need to mint a fresh one. Drop back to the waiting state; the next peer to
+  // join re-fires onConnected → onHostConnected, which reassigns colours and resets.
+  if (isHost && online) {
+    onlineConnected = false;
+    setOnlinePhase('hosting', online.getCode());
+    render(); // lock the board until someone joins
+    return;
+  }
+  // Joiner: the host owned the lobby, so there's nothing left to wait on — go idle.
   leaveOnline();
   setUrlCode('');
   setOnlinePhase('idle', 'Opponent disconnected.');
@@ -921,6 +931,13 @@ $('ai-swap').addEventListener('click', () => {
 $('online-host').addEventListener('click', startHost);
 $('online-join').addEventListener('click', startJoin);
 $('online-code').addEventListener('keydown', (e) => { if (e.key === 'Enter') startJoin(); });
+// Auto-join the moment a complete code is entered — typing the last character or
+// pasting a fresh code over a stale one connects without clicking Join. 'input'
+// fires on paste (keydown doesn't); programmatic value sets (the #code= launch /
+// hashchange path) don't fire it, so they can't double-trigger a join here.
+$('online-code').addEventListener('input', () => {
+  if (normalizeCode($('online-code').value).length >= CODE_LENGTH) startJoin();
+});
 $('online-leave').addEventListener('click', () => { leaveOnline(); setUrlCode(''); setOnlinePhase('idle'); newGame(); });
 $('online-swap').addEventListener('click', onlineSwap);
 $('online-copy').addEventListener('click', async () => {
@@ -1042,13 +1059,26 @@ if (ui.mode === 'editor') {
   driveAi(); // if a restored mode has the AI to move first
 }
 
-// Opened via a shared link (`#code=…`): switch to online mode and auto-join.
-const launchCode = getUrlCode();
-if (launchCode.length >= 4) {
+// A `#code=…` in the URL means "join this game". The hash can arrive two ways:
+// at load (a shared link opened cold) or later, when someone pastes a new share
+// URL into the address bar of an already-open tab — that only changes the hash, so
+// the page never reloads. Handle both by switching to online mode and joining the
+// code. Our own hash writes go through history.replaceState (see setUrlCode), which
+// fires no `hashchange`, so this only ever runs for genuine user navigation.
+function joinFromUrlCode() {
+  const code = getUrlCode();
+  if (code.length < CODE_LENGTH) return; // no/partial code in the hash
+  // If we're hosting, never abandon our lobby for an incoming code — tearing it
+  // down would close the room and strand anyone trying to join our code. A host who
+  // genuinely wants to join elsewhere must Leave first. Joiners/idle tabs do switch.
+  if (isHost) return;
+  if (online && normalizeCode(online.getCode()) === code) return; // already on it
   $('mode').value = 'online';
   ui.mode = 'online';
   applyModeVisibility();
   setOnlinePhase('idle');
-  $('online-code').value = launchCode;
+  $('online-code').value = code;
   startJoin();
 }
+window.addEventListener('hashchange', joinFromUrlCode);
+joinFromUrlCode(); // opened via a shared link (cold load)

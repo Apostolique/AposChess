@@ -17,6 +17,8 @@ import { joinRoom } from 'trystero';
 const APP_ID = 'aposchess';
 // Unambiguous alphabet for the visible code (no 0/O/1/I/L).
 const ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+// Length of a generated share code; also what the join field treats as "complete".
+export const CODE_LENGTH = 5;
 
 // WebRTC can't connect on its own once a NAT/firewall is involved (and browsers
 // hide local IPs behind mDNS, so even two tabs often need help). STUN lets each
@@ -41,7 +43,7 @@ const RTC_CONFIG = {
   ],
 };
 
-function makeCode(n = 5) {
+function makeCode(n = CODE_LENGTH) {
   let s = '';
   for (let i = 0; i < n; i++) s += ALPHABET[Math.floor(Math.random() * ALPHABET.length)];
   return s;
@@ -74,6 +76,10 @@ function start(handlers, code) {
     };
     room.onPeerLeave = (peerId) => {
       if (session.closed || peerId !== session.peerId) return;
+      // Free the slot so the room can accept a new peer on the same code. A host keeps
+      // the room open (see onOnlineClosed), and onPeerJoin then fires again for the next
+      // opponent; a joiner closes the session in response to onClosed instead.
+      session.peerId = null;
       handlers.onClosed?.();
     };
   } catch (err) {
