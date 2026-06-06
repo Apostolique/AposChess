@@ -100,6 +100,14 @@ select, button {
 button { border-color: var(--accent); }
 button:hover { background: #4a443f; }
 
+/* Disabled controls (e.g. AI settings locked while an AI-vs-AI match runs):
+   dim them and show the not-allowed cursor so the lock is visible. */
+select:disabled, button:disabled, .controls input[type="number"]:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+button:disabled:hover { background: var(--panel); } /* no hover lift when locked */
+
 .controls input[type="number"] {
   font: inherit;
   width: 92px;

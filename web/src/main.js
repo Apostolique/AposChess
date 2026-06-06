@@ -200,6 +200,7 @@ function render() {
   renderTrays(entry);
   renderMoveList();
   updateStatusText();
+  applyAiLock();
 }
 
 // --- captured pieces / material advantage (Lichess-style) ---
@@ -649,6 +650,17 @@ function toggleCustom(slot, show) {
   $(`custom-ms-${slot}`).closest('label').hidden = !show;
 }
 
+// While an AI-vs-AI match is actively running, lock both engines' settings and
+// the swap button so they can't change mid-match; they unlock when the match is
+// paused/stopped/over. Called from render() (covers game-over) and on toggle.
+function applyAiLock() {
+  const locked = ui.mode === 'ai-ai' && ui.running && !status.over;
+  for (const id of ['depth-white', 'depth-black', 'custom-depth-white',
+    'custom-ms-white', 'custom-depth-black', 'custom-ms-black', 'ai-swap']) {
+    $(id).disabled = locked;
+  }
+}
+
 // Search params for the AI playing `turn`: a preset depth + the default cap, or
 // that slot's custom depth + timeout when its strength is set to "Custom".
 function aiParams(turn) {
@@ -774,6 +786,7 @@ $('ai-toggle').addEventListener('click', () => {
   ui.running = !ui.running;
   if (ui.running) ui.started = true;
   syncToggleLabel();
+  applyAiLock();
   if (ui.running) {
     lastCommitAt = performance.now();
     driveAi();
