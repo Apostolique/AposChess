@@ -77,6 +77,7 @@ countPosition(state); // seed the start position
 let online = null;
 let onlineColor = null;
 let onlineConnected = false;
+let isHost = false; // only the host assigns colours (and may swap sides)
 
 function startEntry(s) {
   return { state: s, captured: { white: [], black: [] }, lastMove: null, san: null, check: false };
@@ -470,6 +471,7 @@ function setOnlinePhase(phase, detail = '') {
   $('online-share').hidden = phase !== 'hosting';
   $('online-leave').hidden = idle;
   $('online-leave').textContent = phase === 'connected' ? 'Leave' : 'Cancel';
+  $('online-swap').hidden = !(phase === 'connected' && isHost); // host-only, while connected
   if (phase === 'hosting') $('online-code-out').textContent = detail;
   const msg = {
     idle: detail,
@@ -488,10 +490,12 @@ function leaveOnline() {
   if (online) { online.close(); online = null; }
   onlineConnected = false;
   onlineColor = null;
+  isHost = false;
 }
 
 function startHost() {
   leaveOnline();
+  isHost = true;
   const choice = $('online-color').value;
   const color = choice === 'random' ? (Math.random() < 0.5 ? 'white' : 'black') : choice;
   setOnlinePhase('connecting');
@@ -528,6 +532,16 @@ function onHostConnected(color) {
   newGame();
 }
 
+// Host-only: swap colours and start a fresh game. Reuses the `hello` message —
+// the joiner reassigns its colour and resets the same way it does on connect.
+function onlineSwap() {
+  if (!onlineConnected || !isHost) return;
+  onlineColor = opponent(onlineColor);
+  online.send({ t: 'hello', color: opponent(onlineColor) });
+  setOnlinePhase('connected', connectedMsg(onlineColor));
+  newGame();
+}
+
 function onOnlineClosed() {
   leaveOnline();
   setOnlinePhase('idle', 'Opponent disconnected.');
@@ -545,8 +559,8 @@ function onOnlineError(message) {
 function onOnlineData(msg) {
   if (!msg || typeof msg !== 'object') return;
   if (msg.t === 'hello') {
-    // The host has told us (the joiner) which colour to play. Go live.
-    if (onlineConnected) return;
+    // The host tells us (the joiner) which colour to play — on connect, and again
+    // on a side swap. Either way: take the colour, go live, and reset.
     onlineColor = msg.color === 'black' ? 'black' : 'white';
     onlineConnected = true;
     setOnlinePhase('connected', connectedMsg(onlineColor));
@@ -683,6 +697,7 @@ $('online-host').addEventListener('click', startHost);
 $('online-join').addEventListener('click', startJoin);
 $('online-code').addEventListener('keydown', (e) => { if (e.key === 'Enter') startJoin(); });
 $('online-leave').addEventListener('click', () => { leaveOnline(); setOnlinePhase('idle'); newGame(); });
+$('online-swap').addEventListener('click', onlineSwap);
 $('online-copy').addEventListener('click', async () => {
   try {
     await navigator.clipboard.writeText($('online-code-out').textContent);
