@@ -604,6 +604,7 @@ function applyModeVisibility() {
   const m = ui.mode;
   $('side-control').hidden = m !== 'human-ai';
   $('ai-toggle').hidden = m !== 'ai-ai';
+  $('ai-swap').hidden = m !== 'ai-ai';
   $('row-online').hidden = m !== 'online';
   // human-ai: one colour-agnostic AI row. ai-ai: separate White/Black rows.
   $('row-ai').hidden = m !== 'human-ai';
@@ -690,6 +691,20 @@ for (const slot of ['ai', 'white', 'black']) {
 $('new-game').addEventListener('click', () => {
   if (ui.mode === 'online' && onlineConnected) online.send({ t: 'reset' });
   newGame();
+});
+// AI-vs-AI: swap White's and Black's settings (preset strength + custom
+// depth/timeout) so the stronger engine plays the other colour. Takes effect on
+// the next move; the position is left as-is so you can swap mid-game.
+$('ai-swap').addEventListener('click', () => {
+  [ui.strengthWhite, ui.strengthBlack] = [ui.strengthBlack, ui.strengthWhite];
+  [ui.custom.white, ui.custom.black] = [ui.custom.black, ui.custom.white];
+  $('depth-white').value = ui.strengthWhite;
+  $('depth-black').value = ui.strengthBlack;
+  $('custom-depth-white').value = ui.custom.white.depth;
+  $('custom-ms-white').value = ui.custom.white.ms;
+  $('custom-depth-black').value = ui.custom.black.depth;
+  $('custom-ms-black').value = ui.custom.black.ms;
+  applyModeVisibility(); // reveal/hide each row's custom inputs to match
 });
 
 // Online panel controls.
