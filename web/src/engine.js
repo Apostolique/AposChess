@@ -335,12 +335,26 @@ export function legalMoves(state) {
   return legal;
 }
 
+// Draw by insufficient material. Only the unambiguous case is claimed: bare
+// king vs bare king (no other pieces of any kind). The variant's pieces move
+// differently enough that minor-piece mating potential isn't obvious, so we
+// don't extend this to K+minor vs K.
+export function insufficientMaterial(board) {
+  for (const p of board) {
+    if (p && p.role !== 'k') return false;
+  }
+  return true;
+}
+
 export function gameStatus(state) {
   const color = state.turn;
   const legal = legalMoves(state);
   const inCheck = kingAttacked(state.board, color);
   if (legal.length === 0) {
     return { over: true, check: inCheck, legal, result: inCheck ? 'checkmate' : 'stalemate', winner: inCheck ? opponent(color) : null };
+  }
+  if (insufficientMaterial(state.board)) {
+    return { over: true, check: inCheck, legal, result: 'insufficient-material', winner: null };
   }
   if (state.halfmove >= 100) {
     return { over: true, check: inCheck, legal, result: 'fifty-move', winner: null };

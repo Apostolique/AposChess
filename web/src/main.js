@@ -269,6 +269,8 @@ function updateStatusText() {
     el.textContent = `Checkmate — ${status.winner === 'white' ? 'White' : 'Black'} wins.`;
   } else if (status.result === 'stalemate') {
     el.textContent = 'Stalemate — draw.';
+  } else if (status.result === 'insufficient-material') {
+    el.textContent = 'Draw — insufficient material.';
   } else if (status.result === 'fifty-move') {
     el.textContent = 'Draw — fifty-move rule.';
   } else if (status.result === 'repetition') {
@@ -296,7 +298,7 @@ function recordMove(move) {
   state = applyMove(pre, move);
   status = gameStatus(state);
   // Threefold repetition is a draw. Override only if the game isn't already over
-  // (checkmate/stalemate/fifty-move take precedence and may share the position).
+  // (checkmate/stalemate/insufficient-material/fifty-move take precedence and may share the position).
   if (!status.over && countPosition(state) >= 3) {
     status = { over: true, check: status.check, legal: status.legal, result: 'repetition', winner: null };
   }
