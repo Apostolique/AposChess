@@ -47,17 +47,25 @@ function wrap(text) {
 }
 
 // Build a .pgn string from main.js's `history` (per-ply snapshots, each with
-// `.state` and `.lastMove`) and the final game `status`.
-export function exportPgn(history, status) {
+// `.state` and `.lastMove`) and the final game `status`. `players` carries the
+// White/Black names (e.g. "Human" or "AI (depth 7, 6000ms)"); unknown sides fall
+// back to PGN's "?".
+export function exportPgn(history, status, players = {}) {
   const start = history[0].state;
   const result = resultToken(status);
 
+  // The Seven Tag Roster (STR), in PGN's required order, comes first; supplemental
+  // tags (Variant, SetUp/FEN) follow. Round is "-" — these are single casual games,
+  // not tournament rounds.
   const tags = [
     ['Event', 'AposChess'],
     ['Site', 'AposChess'],
     ['Date', new Date().toISOString().slice(0, 10).replace(/-/g, '.')],
-    ['Variant', 'AposChess'],
+    ['Round', '-'],
+    ['White', players.white || '?'],
+    ['Black', players.black || '?'],
     ['Result', result],
+    ['Variant', 'AposChess'],
   ];
   if (toFen(start) !== START_FEN) { tags.push(['SetUp', '1'], ['FEN', toFen(start)]); }
 
