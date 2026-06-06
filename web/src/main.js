@@ -485,6 +485,21 @@ function setOnlinePhase(phase, detail = '') {
 
 const connectedMsg = (color) => `Connected — you play ${color === 'white' ? 'White' : 'Black'}.`;
 
+// The share code lives in the page URL (`?code=…`) so a host can just copy the
+// address bar and a joiner who opens that link auto-joins (see startup below).
+const shareUrl = (code) => {
+  const u = new URL(window.location.href);
+  u.searchParams.set('code', code);
+  return u.href;
+};
+function setUrlCode(code) {
+  const u = new URL(window.location.href);
+  if (code) u.searchParams.set('code', code);
+  else u.searchParams.delete('code');
+  history.replaceState(null, '', u.href);
+}
+const getUrlCode = () => normalizeCode(new URL(window.location.href).searchParams.get('code') || '');
+
 // Tear down the current session (if any) and clear connection state. The caller
 // is responsible for the resulting UI phase.
 function leaveOnline() {
@@ -501,7 +516,7 @@ function startHost() {
   const color = choice === 'random' ? (Math.random() < 0.5 ? 'white' : 'black') : choice;
   setOnlinePhase('connecting');
   online = hostGame({
-    onCode: (code) => setOnlinePhase('hosting', code),
+    onCode: (code) => { setUrlCode(code); setOnlinePhase('hosting', code); },
     onConnected: () => onHostConnected(color),
     onData: onOnlineData,
     onClosed: onOnlineClosed,
@@ -545,12 +560,14 @@ function onlineSwap() {
 
 function onOnlineClosed() {
   leaveOnline();
+  setUrlCode('');
   setOnlinePhase('idle', 'Opponent disconnected.');
   render(); // lock the board
 }
 
 function onOnlineError(message) {
   leaveOnline();
+  setUrlCode('');
   setOnlinePhase('idle', message);
   render();
 }
@@ -660,7 +677,7 @@ function syncControlsFromDom() {
 $('mode').addEventListener('change', (e) => {
   const prev = ui.mode;
   ui.mode = e.target.value;
-  if (prev === 'online' && ui.mode !== 'online') leaveOnline();
+  if (prev === 'online' && ui.mode !== 'online') { leaveOnline(); setUrlCode(''); }
   applyModeVisibility();
   if (ui.mode === 'online') setOnlinePhase('idle');
   newGame();
@@ -714,14 +731,14 @@ $('ai-swap').addEventListener('click', () => {
 $('online-host').addEventListener('click', startHost);
 $('online-join').addEventListener('click', startJoin);
 $('online-code').addEventListener('keydown', (e) => { if (e.key === 'Enter') startJoin(); });
-$('online-leave').addEventListener('click', () => { leaveOnline(); setOnlinePhase('idle'); newGame(); });
+$('online-leave').addEventListener('click', () => { leaveOnline(); setUrlCode(''); setOnlinePhase('idle'); newGame(); });
 $('online-swap').addEventListener('click', onlineSwap);
 $('online-copy').addEventListener('click', async () => {
   try {
-    await navigator.clipboard.writeText($('online-code-out').textContent);
+    await navigator.clipboard.writeText(shareUrl($('online-code-out').textContent));
     const b = $('online-copy');
     b.textContent = 'Copied';
-    setTimeout(() => { b.textContent = 'Copy'; }, 1200);
+    setTimeout(() => { b.textContent = 'Copy link'; }, 1200);
   } catch { /* clipboard may be blocked; the code is shown for manual copy */ }
 });
 
@@ -763,3 +780,14 @@ applyModeVisibility();
 if (ui.mode === 'online') setOnlinePhase('idle');
 render();
 driveAi(); // if a restored mode has the AI to move first
+
+// Opened via a shared link (`?code=…`): switch to online mode and auto-join.
+const launchCode = getUrlCode();
+if (launchCode.length >= 4) {
+  $('mode').value = 'online';
+  ui.mode = 'online';
+  applyModeVisibility();
+  setOnlinePhase('idle');
+  $('online-code').value = launchCode;
+  startJoin();
+}
