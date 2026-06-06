@@ -687,7 +687,17 @@ function onOnlineClosed() {
   // Host: keep the lobby (room + code) alive so a new opponent can join the same code
   // — no need to mint a fresh one. Drop back to the waiting state; the next peer to
   // join re-fires onConnected → onHostConnected, which reassigns colours and resets.
-  if (isHost && online && !matchmade) {
+  // Matchmade game: the opponent dropped, and the private code was throwaway — so
+  // jump straight back into the queue to find a new opponent rather than go idle.
+  if (matchmade) {
+    setUrlCode(''); // drop the finished match's code from the URL
+    startFindMatch(); // its leaveOnline() tears down the old session, then re-queues
+    render(); // lock the board while searching again
+    return;
+  }
+  // Host of a deliberately-shared lobby: keep the room (and code) alive so a new
+  // opponent can still join the same code.
+  if (isHost && online) {
     onlineConnected = false;
     setOnlinePhase('hosting', online.getCode());
     render(); // lock the board until someone joins
