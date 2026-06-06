@@ -320,7 +320,10 @@ function commit(move) {
   recordMove(move);
   if (wasLive) viewIndex = history.length - 1; // follow the game unless reviewing
   lastCommitAt = performance.now();
-  playMoveSound(move.capture, status.check);
+  // Only sound the new move if we're following the live game; while reviewing an
+  // earlier position (e.g. rewound during an AI-vs-AI game) the move isn't shown,
+  // so it shouldn't click.
+  if (wasLive) playMoveSound(move.capture, status.check);
   render();
   driveAi();
 }
@@ -372,6 +375,12 @@ function renderMoveList() {
 function goTo(index) {
   const clamped = Math.max(0, Math.min(history.length - 1, index));
   if (clamped === viewIndex) return;
+  // Stepping/jumping forward replays moves: sound the one we land on (its capture
+  // and check flags). Stepping back is silent.
+  if (clamped > viewIndex) {
+    const entry = history[clamped];
+    playMoveSound(entry.lastMove && entry.lastMove.capture, entry.check);
+  }
   viewIndex = clamped;
   render();
 }
