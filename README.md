@@ -6,11 +6,9 @@ ___
 
 [![Discord](https://img.shields.io/discord/257949867551358987.svg)](https://discord.gg/Wwdb9Cs)
 
-**▶ [Play in your browser](https://apostolique.github.io/AposChess/)** — local two-player, vs. a simple AI, or watch AI vs. AI.
+**▶ [Play in your browser](https://apostolique.github.io/AposChess/)** — local two-player, vs. an AI, watch AI vs. AI, or play a friend online.
 
-To play this online with a friend, use the Lichess board editor and share the board URL back and forth with whomever you're playing with. For example, here is the URL after my first move: https://lichess.org/editor/rnbqkbnr/pppppppp/8/8/8/6P1/PPPPPPP1/RNBQKBNR_w_KQkq_-
-
-Otherwise, you can play on [tabletopia](https://tabletopia.com/playground/chess/play-now).
+To play online with a friend, pick **Online: play a friend**, host a game, and share the generated code. Your friend enters that code to join, and you're connected directly to each other (peer-to-peer) — no account or server sign-up required.
 
 ## Index
 
