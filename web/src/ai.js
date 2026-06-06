@@ -37,6 +37,12 @@ const now = () => Date.now();
 
 let killers; // killers[ply] = [moveKey, moveKey]
 let history; // Int32Array[from*64+to] of cutoff counts
+// Repetition detection: repPath[ply] is the Zobrist hash at each ply of the current
+// search line, with index 0 seeded to the game's current position. A node whose hash
+// matches a same-side-to-move ancestor (or the current position) is scored a draw,
+// so the engine stops treating a shuffle as progress — it avoids repeating when
+// ahead and seeks it when worse. (Hashes require the TT, so this is gated on it.)
+let repPath;
 
 const keyOf = (m) => m.from * 64 + m.to;
 
@@ -309,6 +315,13 @@ function qsearch(state, alpha, beta, qdepth) {
 
 function search(state, depth, alpha, beta, ply, canNull, hash, deadline) {
   if (now() > deadline) return 0; // aborted; the root discards this iteration
+  if (ttEnabled) {
+    // Draw by repetition: a same-position ancestor (every 2 plies back, since the
+    // side to move must match) or the current game position. Score the first repeat
+    // as a draw — enough to steer the engine without tracking full game history.
+    for (let i = ply - 2; i >= 0; i -= 2) if (repPath[i] === hash) return 0;
+    repPath[ply] = hash;
+  }
   if (ply >= MAX_PLY) return evalStm(state.board, state.turn);
 
   const inCheck = kingAttacked(state.board, state.turn);
@@ -410,6 +423,7 @@ export function chooseMoveDetailed(state, maxDepth = 2, rand = Math.random, maxM
   ttEnabled = useTT;
   if (useTT) ttBumpGen();
   const rootHash = useTT ? hashOf(state) : 0n;
+  repPath = useTT ? [rootHash] : []; // index 0 = the current (root) position
   const deadline = now() + maxMs;
   let bestMove = root[0];
   let completed = 0;

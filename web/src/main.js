@@ -56,6 +56,21 @@ let captured = { white: [], black: [] };
 let history = [startEntry(state)];
 let viewIndex = 0;
 
+// Threefold-repetition tracking: count occurrences of each position over the live
+// game. A position is identified by the first three FEN fields (piece placement,
+// side to move, castling rights) — the same identity used for repetition in chess.
+// The game is append-only (review changes viewIndex, not the live line), so a
+// forward-only count is sufficient.
+let posCounts = new Map();
+const positionKey = (s) => toFen(s).split(' ', 3).join(' ');
+function countPosition(s) {
+  const k = positionKey(s);
+  const n = (posCounts.get(k) || 0) + 1;
+  posCounts.set(k, n);
+  return n;
+}
+countPosition(state); // seed the start position
+
 // Online (peer-to-peer) play. `online` is the active session (or null); `onlineColor`
 // is the colour this client controls (host = White, joiner = Black); `onlineConnected`
 // is true only once both peers are linked and the game is live.
@@ -224,6 +239,8 @@ function updateStatusText() {
     el.textContent = 'Stalemate — draw.';
   } else if (status.result === 'fifty-move') {
     el.textContent = 'Draw — fifty-move rule.';
+  } else if (status.result === 'repetition') {
+    el.textContent = 'Draw — threefold repetition.';
   } else if (ui.mode === 'online' && !onlineConnected) {
     el.textContent = 'Not connected — host or join a game.';
   } else if (aiThinking) {
@@ -248,6 +265,11 @@ function commit(move) {
   const pre = state;
   state = applyMove(pre, move);
   status = gameStatus(state);
+  // Threefold repetition is a draw. Override only if the game isn't already over
+  // (checkmate/stalemate/fifty-move take precedence and may share the position).
+  if (!status.over && countPosition(state) >= 3) {
+    status = { over: true, check: status.check, legal: status.legal, result: 'repetition', winner: null };
+  }
   const wasLive = viewIndex === history.length - 1;
   history.push({
     state,
@@ -550,6 +572,8 @@ function newGame() {
   captured = { white: [], black: [] };
   history = [startEntry(state)];
   viewIndex = 0;
+  posCounts = new Map();
+  countPosition(state);
   lastCommitAt = performance.now();
   render();
   driveAi();
