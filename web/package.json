@@ -12,7 +12,8 @@
     "match": "node scripts/selfplay.mjs"
   },
   "dependencies": {
-    "chessground": "^9.1.1"
+    "chessground": "^9.1.1",
+    "trystero": "^0.25.1"
   },
   "devDependencies": {
     "vite": "^6.0.0"

@@ -24,7 +24,7 @@
 // Legality is guaranteed regardless: every move comes from legalMoves(), so
 // pruning only changes which legal move is chosen, never whether it is legal.
 
-import { legalMoves, applyMove, kingAttacked, generatePseudoMoves } from './engine.js';
+import { legalMoves, applyMove, kingAttacked } from './engine.js';
 import { opponent } from './board.js';
 
 const VALUE = { p: 100, n: 300, b: 330, r: 500, q: 900, k: 0 };
@@ -231,8 +231,6 @@ const PST_Q = [
 const PST_K = new Array(64).fill(0);
 const PST = { p: PST_P, n: PST_N, b: PST_B, r: PST_R, q: PST_Q, k: PST_K };
 
-const MOB = 3; // centipawns per extra pseudo-legal move (mobility differential)
-
 function evalStm(board, turn) {
   let s = 0;
   for (let i = 0; i < 64; i++) {
@@ -241,10 +239,6 @@ function evalStm(board, turn) {
     const v = VALUE[p.role] + PST[p.role][p.color === 'white' ? i : i ^ 56];
     s += p.color === 'white' ? v : -v;
   }
-  // Mobility: reward having more moves than the opponent. This is the variant's
-  // lifeblood (boxed knights, jump availability), but it costs a move generation
-  // per side at every leaf. Pseudo-moves (no check filtering) are enough here.
-  s += MOB * (generatePseudoMoves(board, 'white').length - generatePseudoMoves(board, 'black').length);
   return turn === 'white' ? s : -s;
 }
 

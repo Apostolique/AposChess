@@ -31,6 +31,7 @@
               <option value="human-human">Local: two players</option>
               <option value="human-ai">You vs AI</option>
               <option value="ai-ai">AI vs AI</option>
+              <option value="online">Online: play a friend</option>
             </select>
           </label>
 
@@ -119,6 +120,32 @@
             <input id="custom-ms-black" type="number" min="0" max="60000" step="100" value="6000" />
           </label>
         </div>
+        <div class="control-row" id="row-online" hidden>
+          <div class="online-panel">
+            <div class="online-actions">
+              <label id="online-color-label">
+                Host as
+                <select id="online-color">
+                  <option value="white">White</option>
+                  <option value="black">Black</option>
+                  <option value="random">Random</option>
+                </select>
+              </label>
+              <button id="online-host" type="button">Host game</button>
+              <input id="online-code" type="text" maxlength="5" placeholder="Code"
+                     autocomplete="off" autocapitalize="characters" autocorrect="off"
+                     spellcheck="false" aria-label="Game code to join" />
+              <button id="online-join" type="button">Join</button>
+              <button id="online-leave" type="button" hidden>Leave</button>
+            </div>
+            <div id="online-share" class="online-share" hidden>
+              Share this code: <code id="online-code-out"></code>
+              <button id="online-copy" type="button">Copy</button>
+            </div>
+            <p id="online-status" class="online-status" role="status" aria-live="polite"></p>
+          </div>
+        </div>
+
         <details class="rules" open>
           <summary>How the pieces move</summary>
           <ul>

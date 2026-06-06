@@ -35,18 +35,18 @@ export function findKing(board, color) {
 // Squares that no jumping piece may land on: every square within king-distance 1
 // of any king or queen (either colour), including the piece's own square.
 export function safetyZones(board) {
-  const set = new Set();
+  const zones = new Uint8Array(64); // flag per square; far cheaper than a Set in the hot path
   for (let i = 0; i < 64; i++) {
     const p = board[i];
     if (!p || (p.role !== 'q' && p.role !== 'k')) continue;
     const f = fileOf(i), r = rankOf(i);
     for (let df = -1; df <= 1; df++) {
       for (let dr = -1; dr <= 1; dr++) {
-        if (onBoard(f + df, r + dr)) set.add(sq(f + df, r + dr));
+        if (onBoard(f + df, r + dr)) zones[sq(f + df, r + dr)] = 1;
       }
     }
   }
-  return set;
+  return zones;
 }
 
 // --- per-piece pseudo-move generators (do not consider leaving own king in check) ---
@@ -129,7 +129,7 @@ function jumpMoves(board, i, color, dirs, zones, moves) {
     const lf = nf + df, lr = nr + dr;
     if (!onBoard(lf, lr)) continue; // jumped piece sits on the edge
     const li = sq(lf, lr);
-    if (zones.has(li)) continue;
+    if (zones[li]) continue;
     const t = board[li];
     if (t && t.color === color) continue;
     moves.push(mv(i, li, t ? { capture: true, jump: true } : { jump: true }));
@@ -302,10 +302,22 @@ function addCastling(state, color, legal) {
 
 export function legalMoves(state) {
   const color = state.turn;
+  const board = state.board;
   const legal = [];
-  for (const m of generatePseudoMoves(state.board, color)) {
-    const next = applyMove(state, m);
-    if (!kingAttacked(next.board, color)) legal.push(m);
+  for (const m of generatePseudoMoves(board, color)) {
+    // Make/unmake on the live board to test king safety, instead of cloning the
+    // whole board (via applyMove) for every pseudo-move. The promoted role is
+    // irrelevant here — only the moved piece's presence at `to` and absence at
+    // `from` affect whether OUR king is left in check — so we slide the original
+    // piece across and restore it. Pseudo-moves never castle, so no rook to move.
+    const moved = board[m.from];
+    const captured = board[m.to];
+    board[m.to] = moved;
+    board[m.from] = null;
+    const ok = !kingAttacked(board, color);
+    board[m.from] = moved;
+    board[m.to] = captured;
+    if (ok) legal.push(m);
   }
   addCastling(state, color, legal);
   return legal;

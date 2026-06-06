@@ -8,12 +8,13 @@ import './styles.css';
 
 import { newGameState, toFen, parseSquare, squareName, opponent } from './board.js';
 import { applyMove, gameStatus, destsMap } from './engine.js';
+import { hostGame, joinGame, normalizeCode } from './online.js';
 
 const boardEl = document.getElementById('board');
 const $ = (id) => document.getElementById(id);
 
 const ui = {
-  mode: 'human-human', // 'human-human' | 'human-ai' | 'ai-ai'
+  mode: 'human-human', // 'human-human' | 'human-ai' | 'ai-ai' | 'online'
   humanColor: 'white', // which side the human controls in 'human-ai'
   // AI strength per slot: a preset depth string '1'..'7', or 'custom'.
   strengthAi: '2',     // opponent strength in 'human-ai'
@@ -54,6 +55,13 @@ let captured = { white: [], black: [] };
 // the live game while the user steps back through earlier moves.
 let history = [startEntry(state)];
 let viewIndex = 0;
+
+// Online (peer-to-peer) play. `online` is the active session (or null); `onlineColor`
+// is the colour this client controls (host = White, joiner = Black); `onlineConnected`
+// is true only once both peers are linked and the game is live.
+let online = null;
+let onlineColor = null;
+let onlineConnected = false;
 
 function startEntry(s) {
   return { state: s, captured: { white: [], black: [] }, lastMove: null, san: null, check: false };
@@ -140,6 +148,7 @@ function controllableColor() {
   if (status.over) return undefined;
   if (ui.mode === 'human-human') return state.turn;
   if (ui.mode === 'human-ai' && state.turn === ui.humanColor) return state.turn;
+  if (ui.mode === 'online' && onlineConnected && state.turn === onlineColor) return state.turn;
   return undefined;
 }
 
@@ -150,6 +159,14 @@ function aiToMove() {
   return false;
 }
 
+// The colour shown at the bottom of the board (board orientation + bottom tray):
+// the human's side in you-vs-AI, this client's side online, else White.
+function viewColor() {
+  if (ui.mode === 'human-ai') return ui.humanColor;
+  if (ui.mode === 'online') return onlineColor || 'white';
+  return 'white';
+}
+
 function render() {
   const entry = history[viewIndex];
   const atLive = viewIndex === history.length - 1;
@@ -157,7 +174,7 @@ function render() {
   cg.set({
     fen: toFen(entry.state),
     turnColor: entry.state.turn,
-    orientation: ui.mode === 'human-ai' ? ui.humanColor : 'white',
+    orientation: viewColor(),
     lastMove: entry.lastMove ? [squareName(entry.lastMove.from), squareName(entry.lastMove.to)] : undefined,
     check: entry.check ? entry.state.turn : false,
     viewOnly: !atLive, // lock the board while reviewing an earlier position
@@ -193,7 +210,7 @@ function renderTray(el, color, board, caps) {
 
 function renderTrays(entry) {
   // Bottom player matches board orientation; top player is the opponent.
-  const bottom = ui.mode === 'human-ai' ? ui.humanColor : 'white';
+  const bottom = viewColor();
   renderTray($('tray-bottom'), bottom, entry.state.board, entry.captured);
   renderTray($('tray-top'), opponent(bottom), entry.state.board, entry.captured);
 }
@@ -207,6 +224,8 @@ function updateStatusText() {
     el.textContent = 'Stalemate — draw.';
   } else if (status.result === 'fifty-move') {
     el.textContent = 'Draw — fifty-move rule.';
+  } else if (ui.mode === 'online' && !onlineConnected) {
+    el.textContent = 'Not connected — host or join a game.';
   } else if (aiThinking) {
     const side = state.turn === 'white' ? 'White' : 'Black';
     el.textContent = `${side} is thinking…`;
@@ -303,10 +322,20 @@ function onUserMove(orig, dest) {
   if (matches.length === 0) { render(); return; }
   if (matches.length > 1 && matches[0].promotion) {
     askPromotion(state.turn).then((role) => {
-      commit(matches.find((m) => m.promotion === role) || matches[0]);
+      playLocalMove(matches.find((m) => m.promotion === role) || matches[0]);
     });
   } else {
-    commit(matches[0]);
+    playLocalMove(matches[0]);
+  }
+}
+
+// A move the local human made: commit it, and in online play relay it to the peer
+// as a minimal {from,to,promotion} so the other client reconstructs the identical
+// engine move from its own legalMoves (no chance of the two games diverging).
+function playLocalMove(move) {
+  commit(move);
+  if (ui.mode === 'online' && online && onlineConnected) {
+    online.send({ t: 'move', from: move.from, to: move.to, promotion: move.promotion || null });
   }
 }
 
@@ -406,6 +435,111 @@ function askPromotion(color) {
   });
 }
 
+// --- online play ---
+// Drive the host/join panel through its phases by toggling element visibility and
+// the status line. `detail` carries the share code (hosting), the connected-colour
+// message, or an error/idle hint.
+function setOnlinePhase(phase, detail = '') {
+  const idle = phase === 'idle';
+  $('online-host').hidden = !idle;
+  $('online-join').hidden = !idle;
+  $('online-code').hidden = !idle;
+  $('online-color-label').hidden = !idle;
+  $('online-share').hidden = phase !== 'hosting';
+  $('online-leave').hidden = idle;
+  $('online-leave').textContent = phase === 'connected' ? 'Leave' : 'Cancel';
+  if (phase === 'hosting') $('online-code-out').textContent = detail;
+  const msg = {
+    idle: detail,
+    hosting: 'Waiting for an opponent to join…',
+    connecting: detail || 'Connecting…',
+    connected: detail,
+  }[phase];
+  $('online-status').textContent = msg ?? detail;
+}
+
+const connectedMsg = (color) => `Connected — you play ${color === 'white' ? 'White' : 'Black'}.`;
+
+// Tear down the current session (if any) and clear connection state. The caller
+// is responsible for the resulting UI phase.
+function leaveOnline() {
+  if (online) { online.close(); online = null; }
+  onlineConnected = false;
+  onlineColor = null;
+}
+
+function startHost() {
+  leaveOnline();
+  const choice = $('online-color').value;
+  const color = choice === 'random' ? (Math.random() < 0.5 ? 'white' : 'black') : choice;
+  setOnlinePhase('connecting');
+  online = hostGame({
+    onCode: (code) => setOnlinePhase('hosting', code),
+    onConnected: () => onHostConnected(color),
+    onData: onOnlineData,
+    onClosed: onOnlineClosed,
+    onError: onOnlineError,
+  });
+}
+
+function startJoin() {
+  const code = normalizeCode($('online-code').value);
+  if (code.length < 4) { setOnlinePhase('idle', 'Enter the code your opponent shared.'); return; }
+  leaveOnline();
+  setOnlinePhase('connecting');
+  online = joinGame(code, {
+    // The host assigns colours, so the joiner just waits for the `hello` message.
+    onConnected: () => { if (!onlineConnected) setOnlinePhase('connecting', 'Connected — waiting for host…'); },
+    onData: onOnlineData,
+    onClosed: onOnlineClosed,
+    onError: onOnlineError,
+  });
+}
+
+// The host's chosen colour is decided locally; on connect it tells the joiner the
+// opposite colour via `hello`, then both sides start from the same clean position.
+function onHostConnected(color) {
+  onlineColor = color;
+  onlineConnected = true;
+  online.send({ t: 'hello', color: opponent(color) });
+  setOnlinePhase('connected', connectedMsg(color));
+  newGame();
+}
+
+function onOnlineClosed() {
+  leaveOnline();
+  setOnlinePhase('idle', 'Opponent disconnected.');
+  render(); // lock the board
+}
+
+function onOnlineError(message) {
+  leaveOnline();
+  setOnlinePhase('idle', message);
+  render();
+}
+
+// A message from the peer. Moves are re-derived from our own legalMoves so both
+// clients apply the identical engine move; a reset restarts the local game.
+function onOnlineData(msg) {
+  if (!msg || typeof msg !== 'object') return;
+  if (msg.t === 'hello') {
+    // The host has told us (the joiner) which colour to play. Go live.
+    if (onlineConnected) return;
+    onlineColor = msg.color === 'black' ? 'black' : 'white';
+    onlineConnected = true;
+    setOnlinePhase('connected', connectedMsg(onlineColor));
+    newGame();
+  } else if (msg.t === 'move') {
+    if (!onlineConnected || status.over) return;
+    if (state.turn === onlineColor) return; // not the opponent's turn — ignore strays
+    const m = status.legal.find((x) => x.from === msg.from && x.to === msg.to
+      && (msg.promotion ? x.promotion === msg.promotion : !x.promotion));
+    if (m) commit(m); // remote move: commit but do NOT echo it back
+  } else if (msg.t === 'reset') {
+    newGame();
+  }
+}
+
 // --- controls ---
 function newGame() {
   cancelAi();
@@ -432,6 +566,7 @@ function applyModeVisibility() {
   const m = ui.mode;
   $('side-control').hidden = m !== 'human-ai';
   $('ai-toggle').hidden = m !== 'ai-ai';
+  $('row-online').hidden = m !== 'online';
   // human-ai: one colour-agnostic AI row. ai-ai: separate White/Black rows.
   $('row-ai').hidden = m !== 'human-ai';
   $('row-white').hidden = m !== 'ai-ai';
@@ -481,8 +616,11 @@ function syncControlsFromDom() {
 }
 
 $('mode').addEventListener('change', (e) => {
+  const prev = ui.mode;
   ui.mode = e.target.value;
+  if (prev === 'online' && ui.mode !== 'online') leaveOnline();
   applyModeVisibility();
+  if (ui.mode === 'online') setOnlinePhase('idle');
   newGame();
 });
 $('side').addEventListener('change', (e) => {
@@ -511,7 +649,24 @@ for (const slot of ['ai', 'white', 'black']) {
     e.target.value = ui.custom[slot].ms;
   });
 }
-$('new-game').addEventListener('click', newGame);
+$('new-game').addEventListener('click', () => {
+  if (ui.mode === 'online' && onlineConnected) online.send({ t: 'reset' });
+  newGame();
+});
+
+// Online panel controls.
+$('online-host').addEventListener('click', startHost);
+$('online-join').addEventListener('click', startJoin);
+$('online-code').addEventListener('keydown', (e) => { if (e.key === 'Enter') startJoin(); });
+$('online-leave').addEventListener('click', () => { leaveOnline(); setOnlinePhase('idle'); newGame(); });
+$('online-copy').addEventListener('click', async () => {
+  try {
+    await navigator.clipboard.writeText($('online-code-out').textContent);
+    const b = $('online-copy');
+    b.textContent = 'Copied';
+    setTimeout(() => { b.textContent = 'Copy'; }, 1200);
+  } catch { /* clipboard may be blocked; the code is shown for manual copy */ }
+});
 
 // Review navigation: buttons, clicking a move, and arrow/Home/End keys.
 $('nav-first').addEventListener('click', () => goTo(0));
@@ -547,5 +702,6 @@ $('ai-toggle').addEventListener('click', () => {
 
 syncControlsFromDom();
 applyModeVisibility();
+if (ui.mode === 'online') setOnlinePhase('idle');
 render();
 driveAi(); // if a restored mode has the AI to move first

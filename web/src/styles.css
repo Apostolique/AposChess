@@ -119,6 +119,32 @@ button:hover { background: #4a443f; }
   margin: 0;
 }
 
+/* Online (peer-to-peer) panel. */
+.online-panel { display: flex; flex-direction: column; gap: 10px; width: 100%; }
+.online-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+#online-code {
+  font: inherit;
+  width: 6.5em;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid #555049;
+  background: var(--panel);
+  color: var(--text);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+}
+.online-share { font-size: 0.85rem; color: var(--muted); display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.online-share code {
+  font-size: 1.05rem;
+  letter-spacing: 0.18em;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  padding: 4px 10px;
+}
+.online-status { font-size: 0.85rem; color: var(--muted); margin: 0; min-height: 1.1em; }
+
 /* Square board sized by the --board variable. */
 #board {
   width: var(--board);
