@@ -10,9 +10,10 @@
 //     line, landing on the very next square (capturing there or landing empty).
 //   - Knights no longer jump: they travel like a rook (clear path, any distance)
 //     then step one square to the side.
-//   - Queens and Kings each project a 3x3 "safety zone"; a jumping piece may not
-//     land on any square in a zone. (A king's own zone means it can never be
-//     captured or checked by a jump.)
+//   - Queens and Kings each project a 3x3 "safety zone"; an *enemy* jumping piece
+//     may not land on any square in that zone (your own jumps pass through freely).
+//     (A king's zone repels enemy jumps, so a king can never be captured or
+//     checked by a jump.)
 //
 // Standard rules are kept for normal sliding, castling, and check/checkmate.
 
@@ -32,13 +33,15 @@ export function findKing(board, color) {
   return -1;
 }
 
-// Squares that no jumping piece may land on: every square within king-distance 1
-// of any king or queen (either colour), including the piece's own square.
-export function safetyZones(board) {
+// Squares an enemy jumping piece may not land on: every square within
+// king-distance 1 of one of `color`'s kings or queens (including the piece's own
+// square). A king/queen's zone only repels the *opponent's* jumps — your own
+// pieces may freely jump into the zones your kings and queens project.
+export function safetyZones(board, color) {
   const zones = new Uint8Array(64); // flag per square; far cheaper than a Set in the hot path
   for (let i = 0; i < 64; i++) {
     const p = board[i];
-    if (!p || (p.role !== 'q' && p.role !== 'k')) continue;
+    if (!p || p.color !== color || (p.role !== 'q' && p.role !== 'k')) continue;
     const f = fileOf(i), r = rankOf(i);
     for (let df = -1; df <= 1; df++) {
       for (let dr = -1; dr <= 1; dr++) {
@@ -119,7 +122,7 @@ function sliderMoves(board, i, color, dirs, moves) {
 }
 
 // Jump over the first piece in each direction and land on the next square,
-// unless that square is friendly-occupied or inside a safety zone.
+// unless that square is friendly-occupied or inside an enemy safety zone.
 function jumpMoves(board, i, color, dirs, zones, moves) {
   const f = fileOf(i), r = rankOf(i);
   for (const [df, dr] of dirs) {
@@ -150,7 +153,8 @@ function kingMoves(board, i, color, moves) {
 // All pseudo-legal moves for `color` (excluding castling, which needs check info).
 export function generatePseudoMoves(board, color) {
   const moves = [];
-  const zones = safetyZones(board);
+  // A jumping piece is repelled only by the enemy's king/queen zones.
+  const zones = safetyZones(board, opponent(color));
   for (let i = 0; i < 64; i++) {
     const p = board[i];
     if (!p || p.color !== color) continue;
@@ -169,8 +173,9 @@ export function generatePseudoMoves(board, color) {
 }
 
 // Is `target` reachable by any pseudo-legal move of `byColor`? Since the target
-// in practice is the king square (which always lies in its own safety zone),
-// jumps can never reach it — so this correctly captures "is the king in check".
+// in practice is the king square (which always lies in its own safety zone, and
+// that zone repels the enemy's jumps), `byColor`'s jumps can never reach it — so
+// this correctly captures "is the king in check".
 export function isAttacked(board, target, byColor) {
   const moves = generatePseudoMoves(board, byColor);
   for (const m of moves) if (m.to === target) return true;

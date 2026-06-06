@@ -52,14 +52,14 @@ The rook moves normally. Additionally, it can jump over a piece without taking i
 
 ### Queen
 
-The queen moves normally. The queen also has a 3x3 zone around itself. A jumping piece cannot end up in that zone after a jump.
+The queen moves normally. The queen also has a 3x3 zone around itself. An enemy jumping piece cannot end up in that zone after a jump; your own pieces may freely jump into your queen's zone.
 
 ![Queen moves](Images/Queen.png)
 ![Queen safety zone](Images/QueenSafety.png)
 
 ### King
 
-The king moves normally. The king also has a 3x3 zone around itself. A jumping piece cannot end up in that zone after a jump. Like in normal chess, castling is allowed.
+The king moves normally. The king also has a 3x3 zone around itself. An enemy jumping piece cannot end up in that zone after a jump; your own pieces may freely jump into your king's zone. Like in normal chess, castling is allowed.
 
 ![King moves](Images/King.png)
 ![King safety zone](Images/KingSafety.png)
