@@ -85,8 +85,18 @@ export function findMatch(handlers) {
     if (data.t === 'propose') {
       // Already committing to someone else → decline so they retry elsewhere.
       if (outstanding) { send({ t: 'reject' }, peerId); return; }
-      send({ t: 'accept', code: data.code }, peerId);
-      matched(peerId, data.code);
+      // Commit synchronously (so a second propose arriving in the await window is
+      // ignored via the `done` guard above), but only LEAVE the queue once the
+      // `accept` has actually flushed to the peer. Leaving first can tear the data
+      // channel down before the accept is delivered, stranding the proposer — it
+      // keeps "Searching" while we've already moved on to "Connecting".
+      done = true;
+      clearTimeout(proposeTimer);
+      const code = data.code;
+      Promise.resolve(send({ t: 'accept', code }, peerId)).finally(() => {
+        try { room?.leave(); } catch { /* ignore */ }
+        handlers.onMatched?.({ code, isHost: selfId < peerId });
+      });
     } else if (data.t === 'accept') {
       if (!outstanding || peerId !== outstanding.target) return;
       matched(peerId, outstanding.code);
