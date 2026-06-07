@@ -140,6 +140,12 @@ function makeOpening(rng) {
 const eloFromScore = (p) => (p <= 0 ? -800 : p >= 1 ? 800 : -400 * Math.log10(1 / p - 1));
 const scoreFromElo = (e) => 1 / (1 + Math.pow(10, -e / 400));
 
+// Format a duration in seconds as "Mm SSs" (or "SSs" under a minute).
+function fmt(secs) {
+  secs = Math.round(secs);
+  return secs < 60 ? `${secs}s` : `${Math.floor(secs / 60)}m ${String(secs % 60).padStart(2, '0')}s`;
+}
+
 // Generalized SPRT (normal approximation): log-likelihood ratio that the true mean
 // score corresponds to elo1 rather than elo0, using the observed score variance.
 function llr(scores, elo0, elo1) {
@@ -207,10 +213,35 @@ const sprtUpper = Math.log((1 - cfg.beta) / cfg.alpha);
 const t0 = Date.now();
 let decided = null;
 
+// A single in-place status line (carriage-return) refreshed after every game, so a
+// long match never looks frozen between the milestone reports. Lightweight on
+// purpose (no Elo/CI — that's the milestone report's job); just live progress.
+let liveLen = 0;
+function live() {
+  const n = scores.length;
+  const S = scores.reduce((a, b) => a + b, 0);
+  const wins = scores.filter((s) => s === 1).length;
+  const draws = scores.filter((s) => s === 0.5).length;
+  const losses = scores.filter((s) => s === 0).length;
+  const elapsed = (Date.now() - t0) / 1000;
+  let s = `  game ${n}/${cfg.games} | A +${wins} =${draws} -${losses} | `
+    + `${(100 * S / n).toFixed(1)}% | ${fmt(elapsed)} elapsed`;
+  // ETA assumes the full game budget; with SPRT the match may stop sooner, so it's
+  // an upper bound. Drop it once we're done / decided.
+  if (!decided && n < cfg.games) s += ` | ETA ${fmt((elapsed / n) * (cfg.games - n))}`;
+  if (cfg.sprt) s += ` | LLR ${llr(scores, cfg.elo0, cfg.elo1).toFixed(2)} `
+    + `[${sprtLower.toFixed(2)}, ${sprtUpper.toFixed(2)}]`;
+  process.stdout.write('\r' + s.padEnd(liveLen));
+  liveLen = s.length;
+}
+const clearLive = () => process.stdout.write('\r' + ' '.repeat(liveLen) + '\r');
+
 for (let pair = 0; pair < cfg.games / 2 && !decided; pair++) {
   const opening = makeOpening(rng);
   scores.push(playGame(opening, A, B, true, rng));  // A as White
+  live();
   scores.push(playGame(opening, A, B, false, rng)); // A as Black, same opening
+  live();
 
   // Only let SPRT stop after a short warmup; before that the variance estimate is
   // too unstable to trust (a couple of identical results would end the match early).
@@ -219,9 +250,16 @@ for (let pair = 0; pair < cfg.games / 2 && !decided; pair++) {
     if (L >= sprtUpper) decided = 'H1';      // change is an improvement
     else if (L <= sprtLower) decided = 'H0'; // change is not an improvement
   }
-  if ((pair + 1) % 5 === 0 || decided) console.log('  ' + report(scores, false));
+  // Commit a permanent milestone snapshot (full Elo/CI) without losing the live
+  // line: overwrite it, then the next live() redraws on the fresh line below.
+  if ((pair + 1) % 5 === 0 || decided) {
+    clearLive();
+    console.log('  ' + report(scores, false));
+    liveLen = 0;
+  }
 }
 
+clearLive();
 console.log(report(scores, true));
 console.log(`elapsed ${((Date.now() - t0) / 1000).toFixed(1)}s`);
 if (cfg.sprt) {

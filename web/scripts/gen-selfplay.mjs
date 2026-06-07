@@ -4,7 +4,13 @@
 // Self-play data generator for the neural-net evaluation. Plays games with the
 // existing engine (the "teacher") from randomized openings, and writes one JSONL
 // line per position: the active input feature indices (from nn.js, so the feature
-// definition is single-sourced) and the game's final result from White's view.
+// definition is single-sourced), the game's final result from White's view, and a
+// game id ("g") so the trainer can split train/val by GAME — every position in a
+// game shares one label and is highly correlated, so a position-level split would
+// leak a game across both sides and make the val loss (and early stopping)
+// optimistic. The id is "<seed>-<index>" so it's unique per run; merging runs (or
+// appending) never collides as long as seeds differ (a collision would only group
+// two games together, which is harmless — it never straddles the split).
 //
 // The trainer (training/train.py) reads these vectors directly — it needs no chess
 // logic. Targets are pure game outcomes (+1 White win / 0 draw / -1 Black win) so
@@ -135,9 +141,10 @@ for (let g = 0; g < cfg.games; g++) {
   );
 
   const { positions, result } = playGame();
+  const gid = `${cfg.seed.toString(36)}-${g}`; // unique per run; groups one game
   let buf = '';
   for (const { board, turn } of positions) {
-    buf += JSON.stringify({ f: featureIndices(board, turn), r: result }) + '\n';
+    buf += JSON.stringify({ f: featureIndices(board, turn), r: result, g: gid }) + '\n';
   }
   appendFileSync(cfg.out, buf);
   totalPositions += positions.length;

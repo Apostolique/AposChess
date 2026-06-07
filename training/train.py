@@ -4,8 +4,14 @@
 #
 # Trainer for the AposChess neural-net evaluation. Reads the self-play data
 # produced by web/scripts/gen-selfplay.mjs (JSONL: {"f":[feature indices],"r":
-# result}) and fits a small MLP, then writes the weights to web/src/nn-weights.json
-# in the exact layout web/src/nn.js expects.
+# result,"g":game id}) and fits a small MLP, then writes the weights to
+# web/src/nn-weights.json in the exact layout web/src/nn.js expects.
+#
+# The train/val split is by GAME ("g"), not by position: every position in a game
+# shares one label and consecutive positions are nearly identical, so a
+# position-level split would put the same game on both sides and make the val loss
+# (hence early stopping) optimistic. Records without "g" (pre-migration data) each
+# count as their own game, which is conservative — it never leaks across the split.
 #
 # Network: EmbeddingBag(sum) over the active feature indices implements the sparse
 # input->hidden layer (summing a feature's row == our JS forward pass), then a
@@ -53,7 +59,7 @@ def load_data(path):
     if not os.path.exists(path):
         sys.exit(f"No training data at {path}. Generate it first:\n"
                  f"  cd web && npm run train:gen")
-    samples, targets = [], []
+    samples, targets, games = [], [], []
     with open(path, "r") as f:
         for line in f:
             line = line.strip()
@@ -62,9 +68,12 @@ def load_data(path):
             rec = json.loads(line)
             samples.append(rec["f"])
             targets.append(float(rec["r"]))
+            # No "g" (pre-migration data) -> give the row its own unique id so it
+            # stays a singleton "game"; this can never leak across the split.
+            games.append(rec.get("g", f"_nog_{len(games)}"))
     if not targets:
         sys.exit(f"{path} has no samples.")
-    return samples, targets
+    return samples, targets, games
 
 
 def main():
@@ -76,14 +85,30 @@ def main():
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    samples, targets = load_data(args.data)
+    samples, targets, games = load_data(args.data)
     n = len(targets)
-    print(f"Loaded {n} positions from {args.data}")
 
     targets_t = torch.tensor(targets, dtype=torch.float32)
-    perm = torch.randperm(n)
-    n_val = max(1, int(n * args.val))
-    val_idx, train_idx = perm[:n_val], perm[n_val:]
+
+    # Split by GAME, not by position (see header): group rows by game id, shuffle
+    # the games, then send whole games to val/train so no game straddles the split.
+    from collections import defaultdict
+    by_game = defaultdict(list)
+    for i, gid in enumerate(games):
+        by_game[gid].append(i)
+    game_ids = list(by_game.keys())
+    order = torch.randperm(len(game_ids)).tolist()
+    game_ids = [game_ids[i] for i in order]
+    n_val_games = max(1, int(len(game_ids) * args.val))
+    val_set = set(game_ids[:n_val_games])
+    val_idx = torch.tensor(
+        [i for gid in game_ids if gid in val_set for i in by_game[gid]], dtype=torch.long)
+    train_idx = torch.tensor(
+        [i for gid in game_ids if gid not in val_set for i in by_game[gid]], dtype=torch.long)
+    n_val = len(val_idx)
+    print(f"Loaded {n} positions in {len(game_ids)} games from {args.data}")
+    print(f"Split by game: {len(game_ids) - n_val_games} train / {n_val_games} val games "
+          f"({len(train_idx)} / {n_val} positions)")
 
     class Net(nn.Module):
         def __init__(self, h):
