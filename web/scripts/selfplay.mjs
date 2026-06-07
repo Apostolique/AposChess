@@ -140,6 +140,10 @@ function makeOpening(rng) {
 const eloFromScore = (p) => (p <= 0 ? -800 : p >= 1 ? 800 : -400 * Math.log10(1 / p - 1));
 const scoreFromElo = (e) => 1 / (1 + Math.pow(10, -e / 400));
 
+// Confidence interval for the reported Elo: z-multiplier and its matching label,
+// kept together so the bracket and the "N% CI" text can't drift apart.
+const CI = { z: 1.96, label: '95%' };
+
 // Format a duration in seconds as "Mm SSs" (or "SSs" under a minute).
 function fmt(secs) {
   secs = Math.round(secs);
@@ -175,11 +179,13 @@ function report(scores, done) {
   for (const s of scores) varSum += (s - mean) * (s - mean);
   const se = Math.sqrt(varSum / n / n); // standard error of the mean score
   const elo = eloFromScore(p);
-  const eloLo = eloFromScore(p - 1.96 * se);
-  const eloHi = eloFromScore(p + 1.96 * se);
+  const eloLo = eloFromScore(p - CI.z * se);
+  const eloHi = eloFromScore(p + CI.z * se);
+  const margin = (eloHi - eloLo) / 2; // half-width of the CI: the ± error bar
   const pct = (100 * p).toFixed(1);
   let line = `${done ? 'FINAL' : 'after'} ${n} games  A: +${wins} =${draws} -${losses}  ` +
-    `score ${pct}%  Elo ${elo >= 0 ? '+' : ''}${elo.toFixed(0)} [${eloLo.toFixed(0)}, ${eloHi.toFixed(0)}]`;
+    `score ${pct}%  Elo ${elo >= 0 ? '+' : ''}${elo.toFixed(0)} ± ${margin.toFixed(0)}  ` +
+    `${CI.label} CI [${eloLo.toFixed(0)}, ${eloHi.toFixed(0)}]`;
   if (cfg.sprt) {
     const L = llr(scores, cfg.elo0, cfg.elo1);
     const lower = Math.log(cfg.beta / (1 - cfg.alpha));
