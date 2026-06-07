@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2019-2026 Jean-David Moisan
-import { Chessground } from 'chessground';
-import 'chessground/assets/chessground.base.css';
-import 'chessground/assets/chessground.brown.css';
-import 'chessground/assets/chessground.cburnett.css';
+import { Chessground } from '@lichess-org/chessground';
+import '@lichess-org/chessground/assets/chessground.base.css';
+import '@lichess-org/chessground/assets/chessground.brown.css';
+import '@lichess-org/chessground/assets/chessground.cburnett.css';
 import './styles.css';
 
 import { newGameState, parseFen, toFen, parseSquare, squareName, opponent } from './board.js';

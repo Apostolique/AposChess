@@ -16,7 +16,7 @@
     "train:merge": "node scripts/merge-data.mjs"
   },
   "dependencies": {
-    "chessground": "^9.1.1",
+    "@lichess-org/chessground": "^10.1.1",
     "trystero": "^0.25.1"
   },
   "devDependencies": {
