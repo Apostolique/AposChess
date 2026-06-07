@@ -72,6 +72,22 @@ That's the whole routine. The individual stages (`npm run train:gen`,
 `python training/train.py`, `npm run match`) still exist if you want to run one at
 a time, but `npm run train` is the normal path.
 
+## Pooling data from several machines or runs
+
+Self-play scales out: generate on multiple computers, then combine. The records
+are independent and order-agnostic, so merging is just concatenation.
+
+1. On each machine, run the same code version (same commit) with a **distinct
+   `--seed`** (same seed = identical games = wasted effort), and the **same teacher**
+   (both handcrafted, or both the same `nn-weights.json` for `--eval=nn`).
+2. Copy every machine's `training/data/*.jsonl` into one `training/data/` folder
+   (any filenames).
+3. Fold them into one dataset and delete the leftovers:
+   ```
+   npm run train:merge
+   ```
+4. Train as usual — it reads the merged `selfplay.jsonl`.
+
 ## How it fits together
 
 - **Feature definition is single-sourced** in `web/src/nn.js` (`featureIndices`):

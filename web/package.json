@@ -11,7 +11,8 @@
     "preview": "vite preview",
     "match": "node scripts/selfplay.mjs",
     "train": "node scripts/train-pipeline.mjs",
-    "train:gen": "node scripts/gen-selfplay.mjs"
+    "train:gen": "node scripts/gen-selfplay.mjs",
+    "train:merge": "node scripts/merge-data.mjs"
   },
   "dependencies": {
     "chessground": "^9.1.1",
