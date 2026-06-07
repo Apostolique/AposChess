@@ -12,6 +12,7 @@
     "match": "node scripts/selfplay.mjs",
     "train": "node scripts/train-pipeline.mjs",
     "train:gen": "node scripts/gen-selfplay.mjs",
+    "train:fit": "node scripts/train-fit.mjs",
     "train:merge": "node scripts/merge-data.mjs"
   },
   "dependencies": {
