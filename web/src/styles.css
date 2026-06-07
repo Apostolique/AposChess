@@ -106,6 +106,10 @@ fieldset.ai-group legend {
 
 /* Engine picker: a compact segmented toggle (Handcrafted | Neural net) that reads
    as secondary to the strength dropdown instead of a full-width second select. */
+/* The Custom strength inputs (Max depth + Timeout) stay side by side on one row;
+   the labels above each input wrap if the column is narrow rather than stacking. */
+.custom-fields { display: flex; gap: 12px; align-items: end; flex-basis: 100%; }
+.custom-fields .hint { white-space: nowrap; } /* keep "(0 = ∞)" on one line */
 .engine-field { display: flex; flex-direction: column; gap: 4px; }
 .seg-label { font-size: 0.8rem; color: var(--muted); }
 .seg {

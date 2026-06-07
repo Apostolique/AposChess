@@ -834,8 +834,7 @@ function applyModeVisibility() {
 }
 
 function toggleCustom(slot, show) {
-  $(`custom-depth-${slot}`).closest('label').hidden = !show;
-  $(`custom-ms-${slot}`).closest('label').hidden = !show;
+  $(`custom-depth-${slot}`).closest('.custom-fields').hidden = !show;
 }
 
 // While an AI-vs-AI match is actively running, lock both engines' settings and

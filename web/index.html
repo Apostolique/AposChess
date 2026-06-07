@@ -79,16 +79,18 @@
                 <label for="engine-ai-nn" title="Neural net — still weak, experimental">Neural net</label>
               </div>
             </div>
-            <label class="custom-field" hidden>
-              Max depth (0 = ∞)
-              <input id="custom-depth-ai" type="number" min="0" max="40" step="1" value="8"
-                     title="0 = no depth limit (search until the timeout)" />
-            </label>
-            <label class="custom-field" hidden>
-              Timeout (ms, 0 = ∞)
-              <input id="custom-ms-ai" type="number" min="0" max="60000" step="100" value="6000"
-                     title="0 = no limit (search until the max depth is reached)" />
-            </label>
+            <div class="custom-fields" hidden>
+              <label>
+                Max depth <span class="hint">(0 = ∞)</span>
+                <input id="custom-depth-ai" type="number" min="0" max="40" step="1" value="8"
+                       title="0 = no depth limit (search until the timeout)" />
+              </label>
+              <label>
+                Timeout <span class="hint">(ms, 0 = ∞)</span>
+                <input id="custom-ms-ai" type="number" min="0" max="60000" step="100" value="6000"
+                       title="0 = no limit (search until the max depth is reached)" />
+              </label>
+            </div>
           </div>
         </fieldset>
 
@@ -117,14 +119,16 @@
                 <label for="engine-white-nn" title="Neural net — still weak, experimental">Neural net</label>
               </div>
             </div>
-            <label class="custom-field" hidden>
-              Max depth (0 = ∞)
-              <input id="custom-depth-white" type="number" min="0" max="40" step="1" value="8" />
-            </label>
-            <label class="custom-field" hidden>
-              Timeout (ms, 0 = ∞)
-              <input id="custom-ms-white" type="number" min="0" max="60000" step="100" value="6000" />
-            </label>
+            <div class="custom-fields" hidden>
+              <label>
+                Max depth <span class="hint">(0 = ∞)</span>
+                <input id="custom-depth-white" type="number" min="0" max="40" step="1" value="8" />
+              </label>
+              <label>
+                Timeout <span class="hint">(ms, 0 = ∞)</span>
+                <input id="custom-ms-white" type="number" min="0" max="60000" step="100" value="6000" />
+              </label>
+            </div>
           </div>
         </fieldset>
 
@@ -153,14 +157,16 @@
                 <label for="engine-black-nn" title="Neural net — still weak, experimental">Neural net</label>
               </div>
             </div>
-            <label class="custom-field" hidden>
-              Max depth (0 = ∞)
-              <input id="custom-depth-black" type="number" min="0" max="40" step="1" value="8" />
-            </label>
-            <label class="custom-field" hidden>
-              Timeout (ms, 0 = ∞)
-              <input id="custom-ms-black" type="number" min="0" max="60000" step="100" value="6000" />
-            </label>
+            <div class="custom-fields" hidden>
+              <label>
+                Max depth <span class="hint">(0 = ∞)</span>
+                <input id="custom-depth-black" type="number" min="0" max="40" step="1" value="8" />
+              </label>
+              <label>
+                Timeout <span class="hint">(ms, 0 = ∞)</span>
+                <input id="custom-ms-black" type="number" min="0" max="60000" step="100" value="6000" />
+              </label>
+            </div>
           </div>
         </fieldset>
         <div class="control-row" id="row-ai-swap" hidden>
