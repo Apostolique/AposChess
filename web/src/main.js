@@ -804,6 +804,18 @@ const strengthOf = (slot) =>
 const engineOf = (slot) =>
   slot === 'ai' ? ui.engineAi : slot === 'white' ? ui.engineWhite : ui.engineBlack;
 
+// The engine picker is a segmented radio toggle (`engine-<slot>-hc|-nn`), not a
+// <select>; these read/write the checked option by slot.
+const ENGINE_UI_KEY = { ai: 'engineAi', white: 'engineWhite', black: 'engineBlack' };
+function engineValue(slot) {
+  const checked = document.querySelector(`input[name="engine-${slot}"]:checked`);
+  return checked ? checked.value : 'handcrafted';
+}
+function setEngineValue(slot, v) {
+  const el = $(`engine-${slot}-${v === 'nn' ? 'nn' : 'hc'}`);
+  if (el) el.checked = true;
+}
+
 function applyModeVisibility() {
   const m = ui.mode;
   $('side-control').hidden = m !== 'human-ai';
@@ -831,9 +843,12 @@ function toggleCustom(slot, show) {
 // paused/stopped/over. Called from render() (covers game-over) and on toggle.
 function applyAiLock() {
   const locked = ui.mode === 'ai-ai' && ui.running && !status.over;
-  for (const id of ['depth-white', 'depth-black', 'engine-white', 'engine-black',
+  for (const id of ['depth-white', 'depth-black',
     'custom-depth-white', 'custom-ms-white', 'custom-depth-black', 'custom-ms-black', 'ai-swap']) {
     $(id).disabled = locked;
+  }
+  for (const slot of ['white', 'black']) {
+    for (const r of document.querySelectorAll(`input[name="engine-${slot}"]`)) r.disabled = locked;
   }
 }
 
@@ -877,9 +892,9 @@ function syncControlsFromDom() {
   ui.strengthAi = $('depth-ai').value;
   ui.strengthWhite = $('depth-white').value;
   ui.strengthBlack = $('depth-black').value;
-  ui.engineAi = $('engine-ai').value;
-  ui.engineWhite = $('engine-white').value;
-  ui.engineBlack = $('engine-black').value;
+  ui.engineAi = engineValue('ai');
+  ui.engineWhite = engineValue('white');
+  ui.engineBlack = engineValue('black');
   for (const slot of ['ai', 'white', 'black']) {
     ui.custom[slot].depth = clampInt($(`custom-depth-${slot}`).value, 0, 40, 8);
     ui.custom[slot].ms = clampInt($(`custom-ms-${slot}`).value, 0, 60000, 6000);
@@ -993,9 +1008,11 @@ $('depth-black').addEventListener('change', (e) => {
   ui.strengthBlack = e.target.value;
   applyModeVisibility();
 });
-$('engine-ai').addEventListener('change', (e) => { ui.engineAi = e.target.value; });
-$('engine-white').addEventListener('change', (e) => { ui.engineWhite = e.target.value; });
-$('engine-black').addEventListener('change', (e) => { ui.engineBlack = e.target.value; });
+for (const slot of ['ai', 'white', 'black']) {
+  for (const r of document.querySelectorAll(`input[name="engine-${slot}"]`)) {
+    r.addEventListener('change', () => { ui[ENGINE_UI_KEY[slot]] = engineValue(slot); });
+  }
+}
 for (const slot of ['ai', 'white', 'black']) {
   $(`custom-depth-${slot}`).addEventListener('change', (e) => {
     ui.custom[slot].depth = clampInt(e.target.value, 0, 40, 8);
@@ -1019,8 +1036,8 @@ $('ai-swap').addEventListener('click', () => {
   [ui.custom.white, ui.custom.black] = [ui.custom.black, ui.custom.white];
   $('depth-white').value = ui.strengthWhite;
   $('depth-black').value = ui.strengthBlack;
-  $('engine-white').value = ui.engineWhite;
-  $('engine-black').value = ui.engineBlack;
+  setEngineValue('white', ui.engineWhite);
+  setEngineValue('black', ui.engineBlack);
   $('custom-depth-white').value = ui.custom.white.depth;
   $('custom-ms-white').value = ui.custom.white.ms;
   $('custom-depth-black').value = ui.custom.black.depth;

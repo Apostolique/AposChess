@@ -54,100 +54,115 @@
           <button id="ai-toggle" type="button" hidden>Start</button>
         </div>
 
-        <div class="control-row" id="row-ai" hidden>
-          <label>
-            AI strength
-            <select id="depth-ai">
-              <option value="1">Easy — 1 move ahead</option>
-              <option value="2" selected>Normal — 2 moves ahead</option>
-              <option value="3">Hard — 3 moves ahead</option>
-              <option value="4">Expert — 4 moves ahead</option>
-              <option value="5">Master — 5 moves ahead</option>
-              <option value="6">Insane — 6 moves ahead</option>
-              <option value="7">Max — 7 moves ahead</option>
-              <option value="custom">Custom…</option>
-            </select>
-          </label>
-          <label>
-            Engine
-            <select id="engine-ai">
-              <option value="handcrafted" selected>Handcrafted</option>
-              <option value="nn">Neural net (weak)</option>
-            </select>
-          </label>
-          <label class="custom-field" hidden>
-            Max depth (0 = ∞)
-            <input id="custom-depth-ai" type="number" min="0" max="40" step="1" value="8"
-                   title="0 = no depth limit (search until the timeout)" />
-          </label>
-          <label class="custom-field" hidden>
-            Timeout (ms, 0 = ∞)
-            <input id="custom-ms-ai" type="number" min="0" max="60000" step="100" value="6000"
-                   title="0 = no limit (search until the max depth is reached)" />
-          </label>
-        </div>
+        <fieldset class="ai-group" id="row-ai" hidden>
+          <legend>Opponent</legend>
+          <div class="control-row">
+            <label>
+              Strength
+              <select id="depth-ai">
+                <option value="1">Easy — 1 move ahead</option>
+                <option value="2" selected>Normal — 2 moves ahead</option>
+                <option value="3">Hard — 3 moves ahead</option>
+                <option value="4">Expert — 4 moves ahead</option>
+                <option value="5">Master — 5 moves ahead</option>
+                <option value="6">Insane — 6 moves ahead</option>
+                <option value="7">Max — 7 moves ahead</option>
+                <option value="custom">Custom…</option>
+              </select>
+            </label>
+            <div class="engine-field">
+              <span class="seg-label">Engine</span>
+              <div class="seg" role="radiogroup" aria-label="Opponent engine">
+                <input type="radio" name="engine-ai" id="engine-ai-hc" value="handcrafted" checked />
+                <label for="engine-ai-hc" title="Handcrafted evaluation">Handcrafted</label>
+                <input type="radio" name="engine-ai" id="engine-ai-nn" value="nn" />
+                <label for="engine-ai-nn" title="Neural net — still weak, experimental">Neural net</label>
+              </div>
+            </div>
+            <label class="custom-field" hidden>
+              Max depth (0 = ∞)
+              <input id="custom-depth-ai" type="number" min="0" max="40" step="1" value="8"
+                     title="0 = no depth limit (search until the timeout)" />
+            </label>
+            <label class="custom-field" hidden>
+              Timeout (ms, 0 = ∞)
+              <input id="custom-ms-ai" type="number" min="0" max="60000" step="100" value="6000"
+                     title="0 = no limit (search until the max depth is reached)" />
+            </label>
+          </div>
+        </fieldset>
 
-        <div class="control-row" id="row-white" hidden>
-          <label>
-            White AI
-            <select id="depth-white">
-              <option value="1">Easy — 1 move ahead</option>
-              <option value="2" selected>Normal — 2 moves ahead</option>
-              <option value="3">Hard — 3 moves ahead</option>
-              <option value="4">Expert — 4 moves ahead</option>
-              <option value="5">Master — 5 moves ahead</option>
-              <option value="6">Insane — 6 moves ahead</option>
-              <option value="7">Max — 7 moves ahead</option>
-              <option value="custom">Custom…</option>
-            </select>
-          </label>
-          <label>
-            Engine
-            <select id="engine-white">
-              <option value="handcrafted" selected>Handcrafted</option>
-              <option value="nn">Neural net (weak)</option>
-            </select>
-          </label>
-          <label class="custom-field" hidden>
-            Max depth (0 = ∞)
-            <input id="custom-depth-white" type="number" min="0" max="40" step="1" value="8" />
-          </label>
-          <label class="custom-field" hidden>
-            Timeout (ms, 0 = ∞)
-            <input id="custom-ms-white" type="number" min="0" max="60000" step="100" value="6000" />
-          </label>
-        </div>
+        <fieldset class="ai-group" id="row-white" hidden>
+          <legend>White</legend>
+          <div class="control-row">
+            <label>
+              Strength
+              <select id="depth-white">
+                <option value="1">Easy — 1 move ahead</option>
+                <option value="2" selected>Normal — 2 moves ahead</option>
+                <option value="3">Hard — 3 moves ahead</option>
+                <option value="4">Expert — 4 moves ahead</option>
+                <option value="5">Master — 5 moves ahead</option>
+                <option value="6">Insane — 6 moves ahead</option>
+                <option value="7">Max — 7 moves ahead</option>
+                <option value="custom">Custom…</option>
+              </select>
+            </label>
+            <div class="engine-field">
+              <span class="seg-label">Engine</span>
+              <div class="seg" role="radiogroup" aria-label="White engine">
+                <input type="radio" name="engine-white" id="engine-white-hc" value="handcrafted" checked />
+                <label for="engine-white-hc" title="Handcrafted evaluation">Handcrafted</label>
+                <input type="radio" name="engine-white" id="engine-white-nn" value="nn" />
+                <label for="engine-white-nn" title="Neural net — still weak, experimental">Neural net</label>
+              </div>
+            </div>
+            <label class="custom-field" hidden>
+              Max depth (0 = ∞)
+              <input id="custom-depth-white" type="number" min="0" max="40" step="1" value="8" />
+            </label>
+            <label class="custom-field" hidden>
+              Timeout (ms, 0 = ∞)
+              <input id="custom-ms-white" type="number" min="0" max="60000" step="100" value="6000" />
+            </label>
+          </div>
+        </fieldset>
 
-        <div class="control-row" id="row-black" hidden>
-          <label>
-            Black AI
-            <select id="depth-black">
-              <option value="1">Easy — 1 move ahead</option>
-              <option value="2" selected>Normal — 2 moves ahead</option>
-              <option value="3">Hard — 3 moves ahead</option>
-              <option value="4">Expert — 4 moves ahead</option>
-              <option value="5">Master — 5 moves ahead</option>
-              <option value="6">Insane — 6 moves ahead</option>
-              <option value="7">Max — 7 moves ahead</option>
-              <option value="custom">Custom…</option>
-            </select>
-          </label>
-          <label>
-            Engine
-            <select id="engine-black">
-              <option value="handcrafted" selected>Handcrafted</option>
-              <option value="nn">Neural net (weak)</option>
-            </select>
-          </label>
-          <label class="custom-field" hidden>
-            Max depth (0 = ∞)
-            <input id="custom-depth-black" type="number" min="0" max="40" step="1" value="8" />
-          </label>
-          <label class="custom-field" hidden>
-            Timeout (ms, 0 = ∞)
-            <input id="custom-ms-black" type="number" min="0" max="60000" step="100" value="6000" />
-          </label>
-        </div>
+        <fieldset class="ai-group" id="row-black" hidden>
+          <legend>Black</legend>
+          <div class="control-row">
+            <label>
+              Strength
+              <select id="depth-black">
+                <option value="1">Easy — 1 move ahead</option>
+                <option value="2" selected>Normal — 2 moves ahead</option>
+                <option value="3">Hard — 3 moves ahead</option>
+                <option value="4">Expert — 4 moves ahead</option>
+                <option value="5">Master — 5 moves ahead</option>
+                <option value="6">Insane — 6 moves ahead</option>
+                <option value="7">Max — 7 moves ahead</option>
+                <option value="custom">Custom…</option>
+              </select>
+            </label>
+            <div class="engine-field">
+              <span class="seg-label">Engine</span>
+              <div class="seg" role="radiogroup" aria-label="Black engine">
+                <input type="radio" name="engine-black" id="engine-black-hc" value="handcrafted" checked />
+                <label for="engine-black-hc" title="Handcrafted evaluation">Handcrafted</label>
+                <input type="radio" name="engine-black" id="engine-black-nn" value="nn" />
+                <label for="engine-black-nn" title="Neural net — still weak, experimental">Neural net</label>
+              </div>
+            </div>
+            <label class="custom-field" hidden>
+              Max depth (0 = ∞)
+              <input id="custom-depth-black" type="number" min="0" max="40" step="1" value="8" />
+            </label>
+            <label class="custom-field" hidden>
+              Timeout (ms, 0 = ∞)
+              <input id="custom-ms-black" type="number" min="0" max="60000" step="100" value="6000" />
+            </label>
+          </div>
+        </fieldset>
         <div class="control-row" id="row-ai-swap" hidden>
           <button id="ai-swap" type="button" title="Swap the White and Black AI settings">⇄ Swap</button>
         </div>

@@ -87,6 +87,49 @@ h1 { margin: 0; font-size: 1.7rem; letter-spacing: 0.5px; }
 }
 .controls select { max-width: 100%; } /* don't overflow the controls column */
 
+/* Each AI slot (opponent / White / Black) is boxed and labelled so it's obvious
+   which strength + engine belong together. The .control-row inside keeps the
+   existing flex-wrap layout; the fieldset itself is a plain block. */
+fieldset.ai-group {
+  border: 1px solid #555049;
+  border-radius: 10px;
+  margin: 0;
+  padding: 4px 12px 12px;
+}
+fieldset.ai-group legend {
+  padding: 0 6px;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+/* Engine picker: a compact segmented toggle (Handcrafted | Neural net) that reads
+   as secondary to the strength dropdown instead of a full-width second select. */
+.engine-field { display: flex; flex-direction: column; gap: 4px; }
+.seg-label { font-size: 0.8rem; color: var(--muted); }
+.seg {
+  display: inline-flex;
+  border: 1px solid #555049;
+  border-radius: 8px;
+  overflow: hidden;
+  width: fit-content;
+}
+.seg input { position: absolute; opacity: 0; pointer-events: none; }
+.seg label { /* override .controls label (column flex, muted) — these are buttons */
+  margin: 0;
+  padding: 8px 12px;
+  font-size: 0.8rem;
+  color: var(--text);
+  background: var(--panel);
+  cursor: pointer;
+  user-select: none;
+}
+.seg label:not(:first-of-type) { border-left: 1px solid #555049; }
+.seg input:checked + label { background: var(--accent); color: #fff; }
+.seg input:focus-visible + label { outline: 2px solid var(--accent); outline-offset: -2px; }
+.seg input:disabled + label { opacity: 0.45; cursor: not-allowed; }
+
 select, button {
   font: inherit;
   padding: 8px 12px;
