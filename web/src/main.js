@@ -22,6 +22,11 @@ const ui = {
   strengthAi: '2',     // opponent strength in 'human-ai'
   strengthWhite: '2',  // per-colour strength in 'ai-ai'
   strengthBlack: '2',
+  // Which evaluation drives each AI slot: 'handcrafted' or 'nn' (neural net).
+  // Orthogonal to strength — the chosen engine still searches to the depth/time above.
+  engineAi: 'handcrafted',
+  engineWhite: 'handcrafted',
+  engineBlack: 'handcrafted',
   // Per-slot custom depth/timeout, used when that slot's strength is 'custom'.
   custom: {
     ai: { depth: 8, ms: 6000 },
@@ -445,8 +450,8 @@ function startSearch() {
   ponderSeq++; // a real search ends any ponder chain
   aiThinking = true;
   updateStatusText();
-  const { depth, maxMs } = aiParams(state.turn);
-  aiWorker.postMessage({ type: 'search', seq, state, depth, maxMs, posHistory: repWindow(state) });
+  const { depth, maxMs, engine } = aiParams(state.turn);
+  aiWorker.postMessage({ type: 'search', seq, state, depth, maxMs, engine, posHistory: repWindow(state) });
 }
 
 function onSearchResult(data) {
@@ -479,18 +484,18 @@ function startPonder() {
   aiThinking = false; // pondering is background; the status still reads "your move"
   updateStatusText();
   const seq = ++ponderSeq;
-  const { depth } = aiParams(state.turn);
-  aiWorker.postMessage({ type: 'ponder', seq, state: ponderState, depth, maxMs: PONDER_STEP_MS, posHistory: repWindow(ponderState) });
+  const { depth, engine } = aiParams(state.turn);
+  aiWorker.postMessage({ type: 'ponder', seq, state: ponderState, depth, maxMs: PONDER_STEP_MS, engine, posHistory: repWindow(ponderState) });
 }
 
 function onPonderResult(data) {
   if (data.seq !== ponderSeq || !canPonder()) return;
-  const { depth } = aiParams(state.turn);
+  const { depth, engine } = aiParams(state.turn);
   // Stop once we've searched to full strength or stopped making progress (e.g. a
   // forced line resolved), so we don't spin firing instant bursts.
   if (data.reached >= depth || data.reached <= ponderBest) return;
   ponderBest = data.reached;
-  aiWorker.postMessage({ type: 'ponder', seq: data.seq, state: ponderState, depth, maxMs: PONDER_STEP_MS, posHistory: repWindow(ponderState) });
+  aiWorker.postMessage({ type: 'ponder', seq: data.seq, state: ponderState, depth, maxMs: PONDER_STEP_MS, engine, posHistory: repWindow(ponderState) });
 }
 
 // --- promotion picker ---
@@ -796,6 +801,8 @@ function syncToggleLabel() {
 
 const strengthOf = (slot) =>
   slot === 'ai' ? ui.strengthAi : slot === 'white' ? ui.strengthWhite : ui.strengthBlack;
+const engineOf = (slot) =>
+  slot === 'ai' ? ui.engineAi : slot === 'white' ? ui.engineWhite : ui.engineBlack;
 
 function applyModeVisibility() {
   const m = ui.mode;
@@ -824,8 +831,8 @@ function toggleCustom(slot, show) {
 // paused/stopped/over. Called from render() (covers game-over) and on toggle.
 function applyAiLock() {
   const locked = ui.mode === 'ai-ai' && ui.running && !status.over;
-  for (const id of ['depth-white', 'depth-black', 'custom-depth-white',
-    'custom-ms-white', 'custom-depth-black', 'custom-ms-black', 'ai-swap']) {
+  for (const id of ['depth-white', 'depth-black', 'engine-white', 'engine-black',
+    'custom-depth-white', 'custom-ms-white', 'custom-depth-black', 'custom-ms-black', 'ai-swap']) {
     $(id).disabled = locked;
   }
 }
@@ -834,13 +841,14 @@ function applyAiLock() {
 // that slot's custom depth + timeout when its strength is set to "Custom".
 function aiParams(turn) {
   const slot = ui.mode === 'ai-ai' ? turn : 'ai';
+  const engine = engineOf(slot);
   const v = strengthOf(slot);
-  if (v !== 'custom') return { depth: parseInt(v, 10), maxMs: ui.maxMs };
+  if (v !== 'custom') return { depth: parseInt(v, 10), maxMs: ui.maxMs, engine };
   // 0 means "no limit" for either field. Both unlimited would never return, so
   // fall back to the default time cap in that case.
   let { depth, ms } = ui.custom[slot];
   if (depth === 0 && ms === 0) ms = ui.maxMs;
-  return { depth: depth === 0 ? Infinity : depth, maxMs: ms === 0 ? Infinity : ms };
+  return { depth: depth === 0 ? Infinity : depth, maxMs: ms === 0 ? Infinity : ms, engine };
 }
 
 // A PGN player name for one side: "Human" for a human-controlled slot, or a
@@ -869,6 +877,9 @@ function syncControlsFromDom() {
   ui.strengthAi = $('depth-ai').value;
   ui.strengthWhite = $('depth-white').value;
   ui.strengthBlack = $('depth-black').value;
+  ui.engineAi = $('engine-ai').value;
+  ui.engineWhite = $('engine-white').value;
+  ui.engineBlack = $('engine-black').value;
   for (const slot of ['ai', 'white', 'black']) {
     ui.custom[slot].depth = clampInt($(`custom-depth-${slot}`).value, 0, 40, 8);
     ui.custom[slot].ms = clampInt($(`custom-ms-${slot}`).value, 0, 60000, 6000);
@@ -982,6 +993,9 @@ $('depth-black').addEventListener('change', (e) => {
   ui.strengthBlack = e.target.value;
   applyModeVisibility();
 });
+$('engine-ai').addEventListener('change', (e) => { ui.engineAi = e.target.value; });
+$('engine-white').addEventListener('change', (e) => { ui.engineWhite = e.target.value; });
+$('engine-black').addEventListener('change', (e) => { ui.engineBlack = e.target.value; });
 for (const slot of ['ai', 'white', 'black']) {
   $(`custom-depth-${slot}`).addEventListener('change', (e) => {
     ui.custom[slot].depth = clampInt(e.target.value, 0, 40, 8);
@@ -1001,9 +1015,12 @@ $('new-game').addEventListener('click', () => {
 // the next move; the position is left as-is so you can swap mid-game.
 $('ai-swap').addEventListener('click', () => {
   [ui.strengthWhite, ui.strengthBlack] = [ui.strengthBlack, ui.strengthWhite];
+  [ui.engineWhite, ui.engineBlack] = [ui.engineBlack, ui.engineWhite];
   [ui.custom.white, ui.custom.black] = [ui.custom.black, ui.custom.white];
   $('depth-white').value = ui.strengthWhite;
   $('depth-black').value = ui.strengthBlack;
+  $('engine-white').value = ui.engineWhite;
+  $('engine-black').value = ui.engineBlack;
   $('custom-depth-white').value = ui.custom.white.depth;
   $('custom-ms-white').value = ui.custom.white.ms;
   $('custom-depth-black').value = ui.custom.black.depth;

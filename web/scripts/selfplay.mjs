@@ -24,6 +24,9 @@
 //                       git show HEAD:web/src/ai.js > web/src/ai.baseline.js
 //                       node scripts/selfplay.mjs --baseline=ai.baseline.js
 //                       (delete web/src/ai.baseline.js afterwards)
+//   --eval-a=NAME     evaluation for engine A: 'handcrafted' (default) or 'nn'
+//   --eval-b=NAME     evaluation for engine B (default 'handcrafted'). Lets you pit
+//                     the neural-net eval against the handcrafted one in one file.
 //   --no-tt           disable the transposition table for both engines
 //   --openings=K      random legal plies played to diversify each opening (default 6)
 //   --maxmoves=N      adjudicate as a draw after N plies (default 200)
@@ -60,6 +63,8 @@ const cfg = {
   depthB: args['depth-b'] !== undefined ? Number(args['depth-b']) : (args.depth !== undefined ? Number(args.depth) : null),
   engineA: typeof args.a === 'string' ? args.a : './ai.js',
   baseline: typeof args.baseline === 'string' ? args.baseline : './ai.js',
+  evalA: typeof args['eval-a'] === 'string' ? args['eval-a'] : 'handcrafted',
+  evalB: typeof args['eval-b'] === 'string' ? args['eval-b'] : 'handcrafted',
   useTT: !args['no-tt'],
   openings: num(args.openings, 6),
   maxmoves: num(args.maxmoves, 200),
@@ -84,10 +89,10 @@ function makeRng(seed) {
 }
 
 // A player is a configured engine: how to pick a move + its own persistent table.
-function makePlayer(mod, { depth, movetime }) {
+function makePlayer(mod, { depth, movetime, evalName }) {
   return {
     move: (state, rng, prevHashes) =>
-      mod.chooseMove(state, depth ?? 99, rng, depth != null ? Infinity : movetime, cfg.useTT, prevHashes),
+      mod.chooseMove(state, depth ?? 99, rng, depth != null ? Infinity : movetime, cfg.useTT, prevHashes, evalName),
     hashOf: mod._internal.hashOf,
     resetTT: () => mod._internal.resetTT(),
   };
@@ -184,10 +189,11 @@ const baselineRel = cfg.baseline.replace(/^\.\//, '');
 const modA = await import(new URL(`../src/${engineARel}?a`, import.meta.url));
 const modB = await import(new URL(`../src/${baselineRel}?b`, import.meta.url));
 
-const A = makePlayer(modA, { depth: cfg.depth, movetime: cfg.movetime });
-const B = makePlayer(modB, { depth: cfg.depthB, movetime: cfg.movetimeB });
+const A = makePlayer(modA, { depth: cfg.depth, movetime: cfg.movetime, evalName: cfg.evalA });
+const B = makePlayer(modB, { depth: cfg.depthB, movetime: cfg.movetimeB, evalName: cfg.evalB });
 
-console.log(`A = ${cfg.engineA}  vs  B = ${cfg.baseline}`);
+const tag = (file, ev) => (ev === 'handcrafted' ? file : `${file} [${ev}]`);
+console.log(`A = ${tag(cfg.engineA, cfg.evalA)}  vs  B = ${tag(cfg.baseline, cfg.evalB)}`);
 console.log(
   `${cfg.depth != null ? `depth ${cfg.depth}` : `${cfg.movetime}ms/move`} | ` +
   `openings ${cfg.openings} plies | TT ${cfg.useTT ? 'on' : 'off'} | ` +

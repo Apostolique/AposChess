@@ -26,6 +26,7 @@
 
 import { legalMoves, applyMove, kingAttacked, generatePseudoMoves } from './engine.js';
 import { opponent } from './board.js';
+import { evaluate as nnEvaluate } from './nn.js';
 
 const VALUE = { p: 100, n: 300, b: 330, r: 500, q: 900, k: 0 };
 const MATE = 1_000_000;
@@ -268,6 +269,25 @@ function evalStm(board, turn) {
   return turn === 'white' ? s : -s;
 }
 
+// --- pluggable evaluation ----------------------------------------------------
+// The search funnels every leaf and stand-pat score through `activeEval`, which
+// chooseMoveDetailed selects per search from its `engine` argument. This lets the
+// menu offer the handcrafted engine and a neural-network engine side by side
+// without the search itself changing — the only thing that varies is this one
+// function. Both evals share the same contract as evalStm: a centipawn score from
+// the side-to-move's perspective.
+//
+// The neural-net evaluation lives in nn.js (feature extraction + forward pass).
+// Until weights are trained it falls back to a material-only score, so the engine
+// still plays. Loading weights is the caller's job: the worker fetches them, the
+// self-play tools read them from disk — see nn.js. For true NNUE speed an
+// accumulator would later be threaded through applyMove (it is currently
+// pure-functional); recomputing from scratch is fine to start.
+const evalNN = nnEvaluate;
+
+const EVALS = { handcrafted: evalStm, nn: evalNN };
+let activeEval = evalStm;
+
 function hasNonPawn(board, color) {
   for (const p of board) if (p && p.color === color && p.role !== 'p' && p.role !== 'k') return true;
   return false;
@@ -299,7 +319,7 @@ function qsearch(state, alpha, beta, qdepth) {
   if (inCheck) {
     best = -MATE;
   } else {
-    standPat = best = evalStm(state.board, state.turn); // stand pat
+    standPat = best = activeEval(state.board, state.turn); // stand pat
     if (best >= beta) return best;
     if (best > alpha) alpha = best;
   }
@@ -340,7 +360,7 @@ function search(state, depth, alpha, beta, ply, canNull, hash, deadline) {
     for (let i = ply - 2; i >= 0; i -= 2) if (repPath[i] === hash) { tainted = true; return 0; }
     repPath[ply] = hash;
   }
-  if (ply >= MAX_PLY) { tainted = false; return evalStm(state.board, state.turn); }
+  if (ply >= MAX_PLY) { tainted = false; return activeEval(state.board, state.turn); }
 
   const inCheck = kingAttacked(state.board, state.turn);
   if (inCheck) depth++; // check extension
@@ -442,7 +462,8 @@ function search(state, depth, alpha, beta, ply, canNull, hash, deadline) {
 // Only positions since the last irreversible move (capture/pawn move — i.e. the last
 // `halfmove` plies) can ever recur, so the caller need only pass that window; doing
 // so keeps the per-node repetition lookup set tiny (usually empty).
-export function chooseMoveDetailed(state, maxDepth = 2, rand = Math.random, maxMs = Infinity, useTT = true, prevHashes = []) {
+export function chooseMoveDetailed(state, maxDepth = 2, rand = Math.random, maxMs = Infinity, useTT = true, prevHashes = [], engine = 'handcrafted') {
+  activeEval = EVALS[engine] || evalStm;
   const root = legalMoves(state);
   if (root.length === 0) return { move: null, ponder: null, depth: 0 };
 
@@ -496,8 +517,8 @@ export function chooseMoveDetailed(state, maxDepth = 2, rand = Math.random, maxM
   return { move: bestMove, ponder, depth: completed };
 }
 
-export function chooseMove(state, maxDepth, rand, maxMs, useTT, prevHashes) {
-  return chooseMoveDetailed(state, maxDepth, rand, maxMs, useTT, prevHashes).move;
+export function chooseMove(state, maxDepth, rand, maxMs, useTT, prevHashes, engine) {
+  return chooseMoveDetailed(state, maxDepth, rand, maxMs, useTT, prevHashes, engine).move;
 }
 
 // Exposed for tests only: Zobrist hash equivalence check + table reset so a

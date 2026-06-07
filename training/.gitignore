@@ -1,0 +1,5 @@
+# Generated self-play datasets — large and reproducible; don't commit.
+data/
+# Python caches
+__pycache__/
+*.pyc

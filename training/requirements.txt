@@ -1,0 +1,4 @@
+# Trainer dependencies for the AposChess neural-net evaluation.
+# Install with:  pip install -r training/requirements.txt
+torch>=2.0
+numpy>=1.21

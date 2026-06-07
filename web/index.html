@@ -68,6 +68,13 @@
               <option value="custom">Custom…</option>
             </select>
           </label>
+          <label>
+            Engine
+            <select id="engine-ai">
+              <option value="handcrafted" selected>Handcrafted</option>
+              <option value="nn">Neural net</option>
+            </select>
+          </label>
           <label class="custom-field" hidden>
             Max depth (0 = ∞)
             <input id="custom-depth-ai" type="number" min="0" max="40" step="1" value="8"
@@ -94,6 +101,13 @@
               <option value="custom">Custom…</option>
             </select>
           </label>
+          <label>
+            Engine
+            <select id="engine-white">
+              <option value="handcrafted" selected>Handcrafted</option>
+              <option value="nn">Neural net</option>
+            </select>
+          </label>
           <label class="custom-field" hidden>
             Max depth (0 = ∞)
             <input id="custom-depth-white" type="number" min="0" max="40" step="1" value="8" />
@@ -116,6 +130,13 @@
               <option value="6">Insane — 6 moves ahead</option>
               <option value="7">Max — 7 moves ahead</option>
               <option value="custom">Custom…</option>
+            </select>
+          </label>
+          <label>
+            Engine
+            <select id="engine-black">
+              <option value="handcrafted" selected>Handcrafted</option>
+              <option value="nn">Neural net</option>
             </select>
           </label>
           <label class="custom-field" hidden>
