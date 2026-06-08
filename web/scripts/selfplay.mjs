@@ -43,8 +43,11 @@
 // instances (distinct query strings) so each keeps its own transposition table,
 // exactly as two real engines would.
 
+import { readFileSync } from 'node:fs';
+
 import { newGameState, opponent } from '../src/board.js';
 import { legalMoves, applyMove, gameStatus } from '../src/engine.js';
+import { loadWeights } from '../src/nn.js';
 
 // --- args --------------------------------------------------------------------
 const args = Object.fromEntries(
@@ -75,6 +78,18 @@ const cfg = {
   alpha: num(args.alpha, 0.05),
   beta: num(args.beta, 0.05),
 };
+
+// If either engine uses the neural-net eval, load its weights — without this the
+// nn eval silently falls back to material-only (nn.js), so the match would never
+// actually test the trained net. Both ai.js instances import the same nn.js module
+// (the './nn.js' specifier has no cache-busting query), so one load covers A and B.
+if (cfg.evalA === 'nn' || cfg.evalB === 'nn') {
+  try {
+    const w = JSON.parse(readFileSync(new URL('../src/nn-weights.json', import.meta.url), 'utf8'));
+    loadWeights(w);
+    if (!w.arch) console.warn('nn-weights.json is a placeholder; the nn engine will use its material fallback.');
+  } catch { console.warn('Could not read nn-weights.json; the nn engine will use its material fallback.'); }
+}
 
 // --- helpers -----------------------------------------------------------------
 // Mulberry32: small deterministic PRNG so a given --seed reproduces the match.
