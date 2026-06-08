@@ -4,7 +4,9 @@
 // Self-play data generator for the neural-net evaluation. Plays games with the
 // existing engine (the "teacher") from randomized openings, and writes one JSONL
 // line per position: the active input feature indices (from nn.js, so the feature
-// definition is single-sourced), the game's final result from White's view, and a
+// definition is single-sourced), the game's final result from the SIDE-TO-MOVE's
+// view (matching the canonical, side-to-move feature orientation; the White-view
+// outcome is sign-flipped for Black-to-move positions), and a
 // game id ("g") so the trainer can split train/val by GAME — every position in a
 // game shares one label and is highly correlated, so a position-level split would
 // leak a game across both sides and make the val loss (and early stopping)
@@ -13,9 +15,10 @@
 // two games together, which is harmless — it never straddles the split).
 //
 // The trainer (training/train.py) reads these vectors directly — it needs no chess
-// logic. Targets are pure game outcomes (+1 White win / 0 draw / -1 Black win) so
-// the net learns from who actually won rather than mimicking (and inheriting the
-// blind spots of) the handcrafted evaluation. To iterate, regenerate with
+// logic. Targets are pure game outcomes from the mover's view (+1 the side to move
+// went on to win / 0 draw / -1 it lost) so the net learns from who actually won
+// rather than mimicking (and inheriting the blind spots of) the handcrafted
+// evaluation. To iterate, regenerate with
 // --eval=nn once you have weights, so fresh data comes from the improving net.
 //
 // Usage (run from web/):
@@ -144,7 +147,10 @@ for (let g = 0; g < cfg.games; g++) {
   const gid = `${cfg.seed.toString(36)}-${g}`; // unique per run; groups one game
   let buf = '';
   for (const { board, turn } of positions) {
-    buf += JSON.stringify({ f: featureIndices(board, turn), r: result, g: gid }) + '\n';
+    // Canonical features are side-to-move-relative, so the label must be too:
+    // flip the White-view game result for Black-to-move positions.
+    const r = turn === 'white' ? result : -result;
+    buf += JSON.stringify({ f: featureIndices(board, turn), r, g: gid }) + '\n';
   }
   appendFileSync(cfg.out, buf);
   totalPositions += positions.length;

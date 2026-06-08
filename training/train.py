@@ -16,8 +16,9 @@
 # Network: EmbeddingBag(sum) over the active feature indices implements the sparse
 # input->hidden layer (summing a feature's row == our JS forward pass), then a
 # manual bias + ReLU + a linear scalar head. The target is the game result from
-# White's view in {-1, 0, +1}; we squash the raw output with tanh and fit MSE, so
-# the net learns a win-probability-like signal grounded in who actually won.
+# the SIDE-TO-MOVE's view in {-1, 0, +1} (matching nn.js's canonical, side-to-move
+# feature orientation); we squash the raw output with tanh and fit MSE, so the net
+# learns a win-probability-like signal grounded in who actually won.
 #
 # Usage (run from the repo root or anywhere):
 #   pip install -r training/requirements.txt
@@ -33,7 +34,7 @@ REPO = os.path.dirname(THIS_DIR)
 DEFAULT_DATA = os.path.join(THIS_DIR, "data", "selfplay.jsonl")
 DEFAULT_OUT = os.path.join(REPO, "web", "src", "nn-weights.json")
 
-NUM_FEATURES = 12 * 64 + 1  # must match nn.js (769)
+NUM_FEATURES = 12 * 64  # must match nn.js (768; canonical side-to-move layout)
 
 
 def parse_args():

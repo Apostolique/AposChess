@@ -13,27 +13,32 @@
 // Network (v1): a sparse input layer (only a board's worth of features are ever
 // active, so the first layer is a handful of column adds — cheap even recomputed
 // from scratch at every leaf), one ReLU hidden layer, and a scalar output. The
-// raw output is squashed with tanh and scaled to centipawns. The value is
-// WHITE-relative; evaluate() flips it to the side-to-move convention the search
-// expects (matching evalStm). Side-to-move is itself an input feature, so the net
-// can express tempo.
+// raw output is squashed with tanh and scaled to centipawns, already from the
+// SIDE-TO-MOVE's perspective (the search convention, matching evalStm) — no final
+// flip needed.
 
-// Feature layout: 12 piece kinds (6 roles x 2 colours) x 64 squares, plus one
-// trailing side-to-move bit. Index = (role*2 + colourOffset)*64 + square; the
-// last index (768) is set when White is to move.
+// Feature layout (canonical / side-to-move orientation): the board is presented
+// from the mover's point of view, so a position and its colour-mirror collapse to
+// the SAME input and the net never has to learn the colour symmetry separately.
+// 12 piece kinds (6 roles x 2 SIDES) x 64 squares; index = (role*2 + side)*64 +
+// square, where side 0 = the side to move ("us"), side 1 = the opponent ("them").
+// When Black is to move the square is vertically flipped (i ^ 56, the same rank
+// mirror the PSTs use) so the mover's back rank is always rank 0. Side-to-move is
+// encoded by the orientation itself, so there is no separate STM bit.
 const PIECE_INDEX = { p: 0, n: 1, b: 2, r: 3, q: 4, k: 5 };
-export const NUM_FEATURES = 12 * 64 + 1; // 769
-const STM_FEATURE = 12 * 64; // 768
+export const NUM_FEATURES = 12 * 64; // 768
 
-// Active (set-to-1) input indices for a position. Sparse — typically ~17-33 of 769.
+// Active (set-to-1) input indices for a position. Sparse — typically ~17-32 of 768.
 export function featureIndices(board, turn) {
   const idx = [];
+  const flip = turn === 'black';
   for (let i = 0; i < 64; i++) {
     const p = board[i];
     if (!p) continue;
-    idx.push((PIECE_INDEX[p.role] * 2 + (p.color === 'white' ? 0 : 1)) * 64 + i);
+    const side = p.color === turn ? 0 : 1; // 0 = us (side to move), 1 = them
+    const sq = flip ? i ^ 56 : i;
+    idx.push((PIECE_INDEX[p.role] * 2 + side) * 64 + sq);
   }
-  if (turn === 'white') idx.push(STM_FEATURE);
   return idx;
 }
 
@@ -83,6 +88,6 @@ export function evaluate(board, turn) {
     const a = acc[h] > 0 ? acc[h] : 0; // ReLU
     out += a * W.w1[h];
   }
-  const cp = Math.round(Math.tanh(out) * W.scale); // white-relative centipawns
-  return turn === 'white' ? cp : -cp;
+  // Canonical features make the output already side-to-move-relative — no flip.
+  return Math.round(Math.tanh(out) * W.scale);
 }
