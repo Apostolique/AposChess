@@ -7,12 +7,21 @@
 // a many-game match with error bars (or SPRT) settles it. See the blog post that
 // motivated this tool: changes must be *measured*, not assumed.
 //
+// Games run in parallel across worker threads (scripts/matchWorker.mjs) — self-play
+// is embarrassingly parallel, so throughput scales ~linearly with cores. This main
+// thread only dispatches pair indices and aggregates results; all game-playing (and
+// the engine instances) live in the workers. Each pair is seeded purely from --seed
+// and its index, so the aggregate result is reproducible from --seed regardless of
+// --jobs. (With --sprt the exact stopping point can vary slightly run-to-run, since
+// it depends on the order parallel results arrive; the LLR itself is order-free.)
+//
 // Usage (run from web/):
 //   node scripts/selfplay.mjs [options]
 //   npm run match -- [options]
 //
 // Options:
 //   --games=N         total games to play (rounded to an even number; default 100)
+//   --jobs=N          parallel worker threads (default: CPU core count)
 //   --movetime=MS     ms per move for both engines (default 50)
 //   --movetime-b=MS   override think time for engine B only
 //   --depth=D         fixed-depth search instead of movetime (overrides --movetime)
@@ -43,11 +52,8 @@
 // instances (distinct query strings) so each keeps its own transposition table,
 // exactly as two real engines would.
 
-import { readFileSync } from 'node:fs';
-
-import { newGameState, opponent } from '../src/board.js';
-import { legalMoves, applyMove, gameStatus } from '../src/engine.js';
-import { loadWeights } from '../src/nn.js';
+import { Worker } from 'node:worker_threads';
+import { cpus } from 'node:os';
 
 // --- args --------------------------------------------------------------------
 const args = Object.fromEntries(
@@ -79,79 +85,10 @@ const cfg = {
   beta: num(args.beta, 0.05),
 };
 
-// If either engine uses the neural-net eval, load its weights — without this the
-// nn eval silently falls back to material-only (nn.js), so the match would never
-// actually test the trained net. Both ai.js instances import the same nn.js module
-// (the './nn.js' specifier has no cache-busting query), so one load covers A and B.
-if (cfg.evalA === 'nn' || cfg.evalB === 'nn') {
-  try {
-    const w = JSON.parse(readFileSync(new URL('../src/nn-weights.json', import.meta.url), 'utf8'));
-    loadWeights(w);
-    if (!w.arch) console.warn('nn-weights.json is a placeholder; the nn engine will use its material fallback.');
-  } catch { console.warn('Could not read nn-weights.json; the nn engine will use its material fallback.'); }
-}
+const totalPairs = cfg.games / 2;
+const jobs = Math.max(1, Math.min(num(args.jobs, cpus().length), totalPairs));
 
-// --- helpers -----------------------------------------------------------------
-// Mulberry32: small deterministic PRNG so a given --seed reproduces the match.
-function makeRng(seed) {
-  let a = seed >>> 0;
-  return () => {
-    a = (a + 0x6d2b79f5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-// A player is a configured engine: how to pick a move + its own persistent table.
-function makePlayer(mod, { depth, movetime, evalName }) {
-  return {
-    move: (state, rng, prevHashes) =>
-      mod.chooseMove(state, depth ?? 99, rng, depth != null ? Infinity : movetime, cfg.useTT, prevHashes, evalName),
-    hashOf: mod._internal.hashOf,
-    resetTT: () => mod._internal.resetTT(),
-  };
-}
-
-// Play one game; `whiteIsA` decides which engine has White. Returns A's score:
-// 1 win, 0.5 draw, 0 loss.
-function playGame(openingState, A, B, whiteIsA, rng) {
-  A.resetTT();
-  B.resetTT();
-  let st = openingState;
-  const seen = []; // positions played this game, so each engine can detect repetition
-  for (let ply = 0; ply < cfg.maxmoves; ply++) {
-    const status = gameStatus(st);
-    if (status.over) {
-      if (status.result !== 'checkmate') return 0.5; // stalemate / fifty-move
-      const winnerIsA = (status.winner === 'white') === whiteIsA;
-      return winnerIsA ? 1 : 0;
-    }
-    const aToMove = (st.turn === 'white') === whiteIsA;
-    const player = aToMove ? A : B;
-    seen.push(st);
-    // Only positions since the last irreversible move (the last `halfmove` plies) can
-    // recur, so that's all the engine needs for repetition detection.
-    const window = seen.slice(-(st.halfmove + 1));
-    const mv = player.move(st, rng, window.map(player.hashOf));
-    if (!mv) return 0.5;
-    st = applyMove(st, mv);
-  }
-  return 0.5; // adjudicated draw at the move cap
-}
-
-// Random but legal opening so games are diverse; both colors play it once.
-function makeOpening(rng) {
-  let st = newGameState();
-  for (let i = 0; i < cfg.openings; i++) {
-    const moves = legalMoves(st);
-    if (!moves.length) break;
-    st = applyMove(st, moves[Math.floor(rng() * moves.length)]);
-    if (gameStatus(st).over) return newGameState(); // ran into a terminal opening; restart
-  }
-  return st;
-}
-
+// --- reporting helpers -------------------------------------------------------
 const eloFromScore = (p) => (p <= 0 ? -800 : p >= 1 ? 800 : -400 * Math.log10(1 / p - 1));
 const scoreFromElo = (e) => 1 / (1 + Math.pow(10, -e / 400));
 
@@ -167,6 +104,8 @@ function fmt(secs) {
 
 // Generalized SPRT (normal approximation): log-likelihood ratio that the true mean
 // score corresponds to elo1 rather than elo0, using the observed score variance.
+// Order-free (a function of the score multiset), so it's valid even though parallel
+// results arrive out of order.
 function llr(scores, elo0, elo1) {
   const n = scores.length;
   if (n < 2) return 0;
@@ -211,23 +150,14 @@ function report(scores, done) {
 }
 
 // --- run ---------------------------------------------------------------------
-const engineARel = cfg.engineA.replace(/^\.\//, '');
-const baselineRel = cfg.baseline.replace(/^\.\//, '');
-const modA = await import(new URL(`../src/${engineARel}?a`, import.meta.url));
-const modB = await import(new URL(`../src/${baselineRel}?b`, import.meta.url));
-
-const A = makePlayer(modA, { depth: cfg.depth, movetime: cfg.movetime, evalName: cfg.evalA });
-const B = makePlayer(modB, { depth: cfg.depthB, movetime: cfg.movetimeB, evalName: cfg.evalB });
-
 const tag = (file, ev) => (ev === 'handcrafted' ? file : `${file} [${ev}]`);
 console.log(`A = ${tag(cfg.engineA, cfg.evalA)}  vs  B = ${tag(cfg.baseline, cfg.evalB)}`);
 console.log(
   `${cfg.depth != null ? `depth ${cfg.depth}` : `${cfg.movetime}ms/move`} | ` +
-  `openings ${cfg.openings} plies | TT ${cfg.useTT ? 'on' : 'off'} | ` +
+  `openings ${cfg.openings} plies | TT ${cfg.useTT ? 'on' : 'off'} | jobs ${jobs} | ` +
   `${cfg.sprt ? `SPRT[${cfg.elo0},${cfg.elo1}] α=${cfg.alpha} β=${cfg.beta}` : `${cfg.games} games`}`,
 );
 
-const rng = makeRng(cfg.seed);
 const scores = [];
 const sprtLower = Math.log(cfg.beta / (1 - cfg.alpha));
 const sprtUpper = Math.log((1 - cfg.beta) / cfg.alpha);
@@ -257,28 +187,54 @@ function live() {
 }
 const clearLive = () => process.stdout.write('\r' + ' '.repeat(liveLen) + '\r');
 
-for (let pair = 0; pair < cfg.games / 2 && !decided; pair++) {
-  const opening = makeOpening(rng);
-  scores.push(playGame(opening, A, B, true, rng));  // A as White
+// Record a finished pair's two scores and refresh the display / SPRT verdict.
+function record(pairScores) {
+  scores.push(pairScores[0], pairScores[1]);
   live();
-  scores.push(playGame(opening, A, B, false, rng)); // A as Black, same opening
-  live();
-
   // Only let SPRT stop after a short warmup; before that the variance estimate is
   // too unstable to trust (a couple of identical results would end the match early).
-  if (cfg.sprt && scores.length >= 16) {
+  if (cfg.sprt && !decided && scores.length >= 16) {
     const L = llr(scores, cfg.elo0, cfg.elo1);
     if (L >= sprtUpper) decided = 'H1';      // change is an improvement
     else if (L <= sprtLower) decided = 'H0'; // change is not an improvement
   }
   // Commit a permanent milestone snapshot (full Elo/CI) without losing the live
   // line: overwrite it, then the next live() redraws on the fresh line below.
-  if ((pair + 1) % 5 === 0 || decided) {
+  if ((scores.length / 2) % 5 === 0 || decided) {
     clearLive();
     console.log('  ' + report(scores, false));
     liveLen = 0;
   }
 }
+
+// Worker pool: pull-model dispatch (hand each idle worker the next pair index) so
+// load stays balanced regardless of per-game time, and SPRT can stop promptly.
+let nextPair = 0;
+await new Promise((resolve) => {
+  const pool = [];
+  let live_ = jobs;
+  const retire = () => { if (--live_ === 0) resolve(); };
+
+  const dispatch = (w) => {
+    if (decided || nextPair >= totalPairs) { w.terminate(); return; } // exit -> retire
+    w.postMessage({ type: 'play', pair: nextPair++ });
+  };
+
+  for (let i = 0; i < jobs; i++) {
+    const w = new Worker(new URL('./matchWorker.mjs', import.meta.url), { workerData: { cfg } });
+    pool.push(w);
+    w.on('message', (msg) => {
+      if (msg.type === 'ready') { dispatch(w); return; }
+      if (msg.type === 'result') {
+        record(msg.scores);
+        if (decided) pool.forEach((p) => p.terminate()); // stop everyone at once
+        else dispatch(w);
+      }
+    });
+    w.on('error', (err) => { console.error('\nworker error:', err); w.terminate(); });
+    w.on('exit', retire);
+  }
+});
 
 clearLive();
 console.log(report(scores, true));

@@ -21,10 +21,17 @@
 // evaluation. To iterate, regenerate with
 // --eval=nn once you have weights, so fresh data comes from the improving net.
 //
+// Games run in parallel across worker threads (scripts/genWorker.mjs); this main
+// thread is the single writer to the output file, so parallel games never interleave
+// mid-line. Each game is seeded from --seed and its index, so the dataset is
+// reproducible from --seed regardless of --jobs (arrival order in the file may vary,
+// but order doesn't matter to the trainer — the "g" id groups each game).
+//
 // Usage (run from web/):
 //   npm run train:gen -- [options]
 // Options:
 //   --games=N       games to play (default 200)
+//   --jobs=N        parallel worker threads (default: CPU core count)
 //   --depth=D       fixed-depth search per move (default 4)
 //   --movetime=MS   use a time budget per move instead of fixed depth
 //   --openings=K    random plies to start each game, for variety (default 8)
@@ -33,15 +40,11 @@
 //   --out=FILE      output path (default ../training/data/selfplay.jsonl); appends
 //   --seed=S        RNG seed (default Date.now())
 
-import { mkdirSync, appendFileSync, existsSync } from 'node:fs';
+import { mkdirSync, appendFileSync, existsSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { readFileSync } from 'node:fs';
-
-import { newGameState } from '../src/board.js';
-import { legalMoves, applyMove, gameStatus } from '../src/engine.js';
-import { chooseMove, _internal } from '../src/ai.js';
-import { featureIndices, loadWeights } from '../src/nn.js';
+import { Worker } from 'node:worker_threads';
+import { cpus } from 'node:os';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const args = Object.fromEntries(
@@ -66,64 +69,21 @@ const cfg = {
     : resolve(here, '../../training/data/selfplay.jsonl'),
   seed: num(args.seed, Date.now()),
 };
+const jobs = Math.max(1, Math.min(num(args.jobs, cpus().length), cfg.games));
 
-// If playing with the net, load its weights so the teacher is the improving net.
+// Warn once up front (the workers load weights silently) if the net was requested
+// but its weights are missing/placeholder, so the teacher quality is no surprise.
 if (cfg.evalName === 'nn') {
   try {
     const w = JSON.parse(readFileSync(resolve(here, '../src/nn-weights.json'), 'utf8'));
-    loadWeights(w);
     if (!w.arch) console.warn('nn-weights.json is a placeholder; the net will use its material fallback.');
   } catch { console.warn('Could not read nn-weights.json; the net will use its material fallback.'); }
-}
-
-function makeRng(seed) {
-  let a = seed >>> 0;
-  return () => {
-    a = (a + 0x6d2b79f5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-const rng = makeRng(cfg.seed);
-const pick = (arr) => arr[Math.floor(rng() * arr.length)];
-
-// Play one game; return { positions: [{board,turn}], result } with result from
-// White's perspective (+1 / 0 / -1). The opening plies are random for variety.
-function playGame() {
-  let state = newGameState();
-  const positions = [];
-  const seen = [];
-  let result = 0;
-
-  for (let ply = 0; ply < cfg.maxmoves; ply++) {
-    const status = gameStatus(state);
-    if (status.over) {
-      result = status.result === 'checkmate' ? (status.winner === 'white' ? 1 : -1) : 0;
-      break;
-    }
-    // Record real (post-opening) positions only; random opening moves aren't the
-    // engine's choices, but the positions themselves are still fine training data.
-    positions.push({ board: state.board, turn: state.turn });
-
-    let move;
-    if (ply < cfg.openings) {
-      move = pick(status.legal);
-    } else {
-      const prev = seen.map((s) => _internal.hashOf(s));
-      move = chooseMove(state, cfg.depth ?? 99, rng,
-        cfg.depth != null ? Infinity : cfg.movetime, true, prev, cfg.evalName);
-    }
-    seen.push(state);
-    state = applyMove(state, move);
-  }
-  return { positions, result };
 }
 
 mkdirSync(dirname(cfg.out), { recursive: true });
 const fresh = !existsSync(cfg.out);
 console.log(`Generating ${cfg.games} games -> ${cfg.out}${fresh ? '' : ' (appending)'}`);
-console.log(`  ${cfg.depth != null ? `depth ${cfg.depth}` : `${cfg.movetime}ms/move`} | eval ${cfg.evalName} | openings ${cfg.openings} | seed ${cfg.seed}`);
+console.log(`  ${cfg.depth != null ? `depth ${cfg.depth}` : `${cfg.movetime}ms/move`} | eval ${cfg.evalName} | openings ${cfg.openings} | jobs ${jobs} | seed ${cfg.seed}`);
 
 // Format a duration in seconds as "Mm SSs" (or "SSs" under a minute).
 function fmt(secs) {
@@ -133,26 +93,39 @@ function fmt(secs) {
 
 const t0 = Date.now();
 let totalPositions = 0;
-for (let g = 0; g < cfg.games; g++) {
-  // Live status before each game: which game is running, how many are left, and —
-  // once a game or two has finished — elapsed time and an ETA from the running pace.
-  const elapsed = (Date.now() - t0) / 1000;
-  const eta = g > 0 ? ` | ETA ${fmt((elapsed / g) * (cfg.games - g))}` : '';
-  process.stdout.write(
-    `\r  game ${g + 1}/${cfg.games} | ${cfg.games - g - 1} left | `
-    + `${totalPositions} positions | ${fmt(elapsed)} elapsed${eta}      `,
-  );
+let doneGames = 0;
+let nextGame = 0;
 
-  const { positions, result } = playGame();
-  const gid = `${cfg.seed.toString(36)}-${g}`; // unique per run; groups one game
-  let buf = '';
-  for (const { board, turn } of positions) {
-    // Canonical features are side-to-move-relative, so the label must be too:
-    // flip the White-view game result for Black-to-move positions.
-    const r = turn === 'white' ? result : -result;
-    buf += JSON.stringify({ f: featureIndices(board, turn), r, g: gid }) + '\n';
+await new Promise((resolve_) => {
+  const pool = [];
+  let live = jobs;
+  const retire = () => { if (--live === 0) resolve_(); };
+
+  const dispatch = (w) => {
+    if (nextGame >= cfg.games) { w.terminate(); return; } // exit -> retire
+    w.postMessage({ type: 'play', g: nextGame++ });
+  };
+
+  for (let i = 0; i < jobs; i++) {
+    const w = new Worker(new URL('./genWorker.mjs', import.meta.url), { workerData: { cfg } });
+    pool.push(w);
+    w.on('message', (msg) => {
+      if (msg.type === 'ready') { dispatch(w); return; }
+      if (msg.type === 'result') {
+        if (msg.lines) appendFileSync(cfg.out, msg.lines); // single writer: no interleave
+        totalPositions += msg.nPositions;
+        doneGames++;
+        const elapsed = (Date.now() - t0) / 1000;
+        const eta = doneGames < cfg.games ? ` | ETA ${fmt((elapsed / doneGames) * (cfg.games - doneGames))}` : '';
+        process.stdout.write(
+          `\r  ${doneGames}/${cfg.games} games | ${cfg.games - doneGames} left | `
+          + `${totalPositions} positions | ${fmt(elapsed)} elapsed${eta}      `,
+        );
+        dispatch(w);
+      }
+    });
+    w.on('error', (err) => { console.error('\nworker error:', err); w.terminate(); });
+    w.on('exit', retire);
   }
-  appendFileSync(cfg.out, buf);
-  totalPositions += positions.length;
-}
+});
 console.log(`\nDone: ${totalPositions} positions written in ${fmt((Date.now() - t0) / 1000)}.`);

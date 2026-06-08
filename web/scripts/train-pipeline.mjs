@@ -15,6 +15,7 @@
 //   npm run train -- [options]
 // Options:
 //   --games=N         self-play games per generation (default 300)
+//   --jobs=N          parallel worker threads for gen + match (default: all cores)
 //   --depth=D         search depth per move while generating (default 4)
 //   --generations=N   gen+train cycles; gen 2+ use the trained net (default 1)
 //   --eval=NAME       engine for the FIRST generation's data: 'handcrafted'
@@ -50,6 +51,7 @@ const args = Object.fromEntries(
 const num = (v, d) => (v === undefined ? d : Number(v));
 const cfg = {
   games: num(args.games, 300),
+  jobs: args.jobs, // forwarded as-is to gen/match; undefined -> their default (all cores)
   depth: num(args.depth, 4),
   generations: num(args.generations, 1),
   evalFirst: typeof args.eval === 'string' ? args.eval : 'handcrafted',
@@ -116,8 +118,9 @@ for (let g = 0; g < cfg.generations; g++) {
 
   // 1. Generate data (appends to the dataset). The generator reads/writes the
   //    weights file in src/ directly, so no build is needed between generations.
-  runNode('Generate self-play data', genScript,
-    [`--games=${cfg.games}`, `--depth=${cfg.depth}`, `--eval=${evalName}`]);
+  const genArgs = [`--games=${cfg.games}`, `--depth=${cfg.depth}`, `--eval=${evalName}`];
+  if (cfg.jobs !== undefined) genArgs.push(`--jobs=${cfg.jobs}`);
+  runNode('Generate self-play data', genScript, genArgs);
 
   // 2. Train (early stopping picks the epoch count; exports src/nn-weights.json).
   let trainCmd = `${python} "${trainPy}"`;
@@ -128,8 +131,9 @@ for (let g = 0; g < cfg.generations; g++) {
 
 // 3. Optional strength check against the handcrafted eval.
 if (cfg.match > 0) {
-  runNode('Measure vs handcrafted', matchScript,
-    [`--games=${cfg.match}`, `--depth=${cfg.depth}`, '--eval-a=nn']);
+  const matchArgs = [`--games=${cfg.match}`, `--depth=${cfg.depth}`, '--eval-a=nn'];
+  if (cfg.jobs !== undefined) matchArgs.push(`--jobs=${cfg.jobs}`);
+  runNode('Measure vs handcrafted', matchScript, matchArgs);
 }
 
 // 4. Bundle the new weights into the deployable app.
