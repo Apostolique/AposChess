@@ -866,15 +866,17 @@ function aiParams(turn) {
 }
 
 // A PGN player name for one side: "Human" for a human-controlled slot, or a
-// description of the engine settings driving that colour ("AI (depth 7, 6000ms)").
-// human-human / online / editor are all people on both sides.
+// description of the engine driving that colour, incl. which eval it used
+// ("AI (Neural net, depth 7, 6000ms)"). human-human / online / editor are all
+// people on both sides.
 function playerName(color) {
   const isAi = ui.mode === 'ai-ai' || (ui.mode === 'human-ai' && color !== ui.humanColor);
   if (!isAi) return 'Human';
-  const { depth, maxMs } = aiParams(color);
+  const { depth, maxMs, engine } = aiParams(color);
+  const e = engine === 'nn' ? 'Neural net' : 'Handcrafted';
   const d = depth === Infinity ? 'unlimited' : depth;
   const t = maxMs === Infinity ? 'no time limit' : `${maxMs}ms`;
-  return `AI (depth ${d}, ${t})`;
+  return `AI (${e}, depth ${d}, ${t})`;
 }
 
 function clampInt(value, min, max, fallback) {
