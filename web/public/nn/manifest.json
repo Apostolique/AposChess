@@ -4,13 +4,33 @@
     {
       "name": "balanced-64",
       "file": "balanced-64.json",
-      "arch": [768, 64, 1],
+      "arch": [
+        768,
+        64,
+        1
+      ],
       "note": "Baseline 64-wide net (~parity with the handcrafted eval)."
+    },
+    {
+      "name": "deep3",
+      "file": "deep3.json",
+      "arch": [
+        768,
+        256,
+        64,
+        16,
+        1
+      ],
+      "note": ""
     },
     {
       "name": "random-noise",
       "file": "random-noise.json",
-      "arch": [768, 16, 1],
+      "arch": [
+        768,
+        16,
+        1
+      ],
       "note": "Random untrained weights, plays badly (UI test net)"
     }
   ]

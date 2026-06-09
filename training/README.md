@@ -3,8 +3,10 @@
 The "Neural net" engine option uses a small evaluation network in place of the
 handcrafted eval. The search (alpha-beta, TT, quiescence, …) is unchanged — only
 the leaf evaluation differs. This folder is the **offline pipeline** that produces
-its weights. Run it whenever you want to improve the net; the browser only ever
-*consumes* the resulting `web/src/nn-weights.json`.
+net weights. Trained nets live in the catalog `web/public/nn/` (a `manifest.json`
+plus one JSON per net); the web app fetches the one you pick from there at runtime.
+(`web/src/nn-weights.json` is just the default net for the Node tools — `train:gen`
+and `npm run match` — not what the browser loads.)
 
 ## One-time setup
 
@@ -72,6 +74,83 @@ That's the whole routine. The individual stages (`npm run train:gen`,
 `npm run train:featurize`, `python training/train.py`, `npm run match`) still exist
 if you want to run one at a time, but `npm run train` is the normal path.
 
+## Trying new ideas (recipes)
+
+Every idea follows the same shape: **train a candidate, then compare it head-to-head
+against the current best with an SPRT**. A net vs *itself* scores ~50% — that's the
+built-in sanity check, and the comparison is far more sensitive than each-vs-handcrafted.
+
+The current best ships as `web/public/nn/balanced-64.json`; use it as the opponent.
+
+### A. Try a different network shape (width/depth)
+
+Architecture only — features are unchanged, so no re-featurize:
+
+```
+npm run train:fit -- --hidden=256,64,16 --name=cand      # each comma value = one hidden layer
+npm run match -- --eval-a=nn --eval-b=nn \
+  --weights-a=public/nn/cand.json --weights-b=public/nn/balanced-64.json --sprt
+```
+
+### B. Add a new input feature
+
+Features are defined in **one place**: `featureIndices(board, turn)` in
+`web/src/nn.js`. Two edits there:
+
+1. **Emit the new index** in `featureIndices`. Example — an "in check" flag:
+   ```js
+   import { kingAttacked } from './engine.js';
+   // …after the piece-square loop:
+   if (kingAttacked(board, turn)) idx.push(PIECE_SQUARE_FEATURES); // index 768
+   ```
+   For a count (e.g. mobility), push the same index N times — the input layer sums,
+   so N pushes = the value N.
+2. **Grow `NUM_FEATURES`** to cover the new range (express it with shared constants
+   so it can't drift, e.g. `PIECE_SQUARE_FEATURES + 1`).
+
+Then re-derive features (no self-play regen — that's the point of position-primary
+data) and train + compare:
+
+```
+npm run train:featurize
+npm run train:fit -- --name=cand
+npm run match -- --eval-a=nn --eval-b=nn \
+  --weights-a=public/nn/cand.json --weights-b=public/nn/balanced-64.json --sprt
+```
+
+Notes: only `board` + `turn` are available to `featureIndices` (a castling- or
+clock-dependent feature needs the signature widened and threaded through `evaluate`);
+and it runs at **every search leaf**, so keep it cheap (a flag/bucket is free,
+generating moves for a true mobility count costs node speed — check a `--movetime`
+match too). The trainer auto-picks up the new input size from the meta sidecar; you
+never touch `train.py`.
+
+### C. Compare any two existing nets
+
+```
+npm run match -- --eval-a=nn --eval-b=nn \
+  --weights-a=public/nn/<A>.json --weights-b=public/nn/<B>.json --depth=4 --sprt
+```
+
+## Publishing a net to the web app
+
+`train.py`'s `--name` (via `npm run train:fit` or `npm run train`) writes the net
+into the catalog and registers it, so it becomes selectable in the browser:
+
+1. Train with a name (and optional description / default flag):
+   ```
+   npm run train:fit -- --name=my-net --note="what's different" [--set-default]
+   ```
+   → writes `web/public/nn/my-net.json` and adds an entry to
+   `web/public/nn/manifest.json`.
+2. Build (or `npm run dev`): `npm run build`.
+3. In the app, set an AI slot's engine to **Neural net** — the **net dropdown**
+   lists every catalog entry; pick `my-net`. The worker fetches that file from
+   `public/nn/` at runtime.
+
+To remove a net, delete its `web/public/nn/<name>.json` and its `manifest.json`
+entry. Keep at least one (the manifest `default`).
+
 ## Pooling data from several machines or runs
 
 Self-play scales out: generate on multiple computers, then combine. The records
@@ -131,10 +210,18 @@ are independent and order-agnostic, so merging is just concatenation.
 
 ## Notes / future work
 
-- `web/src/nn-weights.json` ships as a placeholder until you train; the NN engine
-  falls back to a material-only eval so it always plays.
+- If a net's weights fail to load (or none is selected), the NN engine falls back to
+  a material-only eval so it always plays. `loadWeights` also refuses a file whose
+  input size doesn't match the current `featureIndices` layout (so an old net after a
+  feature change can't silently produce garbage) — re-featurize and re-train.
 - For real NNUE speed, the first-layer accumulator could be updated incrementally
   through `applyMove` (currently pure-functional); recomputing from scratch is fine
   to start, but watch the fixed-time matches.
-- Targets are currently game-result only; blending in a shallow search score
-  (Stockfish-style `λ·eval + (1−λ)·result`) is a natural next improvement.
+- **Strength is currently signal-limited, not capacity-limited.** Adding width,
+  depth, or features tends to *overfit* the game-result-only target (measured: a
+  64-wide net is at parity with handcrafted; wider and king-relative-feature variants
+  both lost Elo). The unbiased lever is better *labels*, not a bigger net: generate
+  with deeper search (`--depth`), and bootstrap from the net's own play (`--eval=nn`).
+  Blending the handcrafted eval into the target (`λ·eval + (1−λ)·result`) would
+  densify the signal but reintroduces the teacher's bias the pure-result target was
+  chosen to avoid — so it's deliberately not used.
