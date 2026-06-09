@@ -118,47 +118,69 @@ function startEntry(s) {
   return { state: s, captured: { white: [], black: [] }, lastMove: null, san: null, check: false };
 }
 
-// The AI search runs in a worker. `aiSeq` tags each real-move request and
-// `ponderSeq` each ponder request, so a reply that arrives after the position
-// changed (new game, opponent moved, stop) is discarded by sequence mismatch.
-let aiSeq = 0;
-let ponderSeq = 0;
+// Each AI colour gets its OWN worker — its own thread and its own persistent
+// transposition table. In AI-vs-AI that lets both sides think at once: the side to
+// move runs its real search while the other side ponders the reply it expects, the
+// way two real engines trade ponder time. A worker *per colour* (not one shared
+// worker serving whoever is on move) is what makes the warmth land where it's
+// needed — White's pondering fills White's own table for White's next real search.
+// you-vs-AI uses only the AI colour's worker; the other sits idle.
 let aiThinking = false;
 let lastCommitAt = performance.now(); // for pacing AI moves (the watch delay)
-// While the human thinks, the AI ponders the position after its predicted reply
-// (`predictedReply`, from the last search). `ponderState` is that position and
-// `ponderBest` tracks the deepest iteration reached so we stop once it converges.
-let predictedReply = null;
-let ponderState = null;
-let ponderBest = 0;
-const PONDER_STEP_MS = 700; // ponder in short bursts so the worker stays responsive
-let aiWorker = createAiWorker();
+const PONDER_STEP_MS = 700; // ponder in short bursts so a worker stays responsive
+// Per-colour AI state. `predicted` is this colour's guess of the opponent's next
+// move (the `ponder` from its last real search); pondering searches the position
+// after that guessed move. `searchSeq`/`ponderSeq` discard replies that a position
+// change (new move, new game, stop) has superseded.
+const ai = { white: makeAiSlot('white'), black: makeAiSlot('black') };
+function makeAiSlot(color) {
+  return { color, worker: null, searchSeq: 0, ponderSeq: 0, predicted: null, ponderState: null, ponderBest: 0 };
+}
+spawnAiWorkers();
 
-function createAiWorker() {
+function createAiWorker(slot) {
   const w = new Worker(new URL('./aiWorker.js', import.meta.url), { type: 'module' });
   w.onmessage = ({ data }) => {
-    if (data.type === 'ponder') onPonderResult(data);
-    else onSearchResult(data);
+    if (data.type === 'ponder') onPonderResult(slot, data);
+    else onSearchResult(slot, data);
   };
   w.onerror = (e) => {
-    console.error('AI worker error:', e.message);
+    console.error(`AI worker (${slot.color}) error:`, e.message);
     aiThinking = false;
     updateStatusText();
   };
   return w;
 }
 
-// Cancel any pending/in-flight AI work. Terminating is the only way to stop a
-// deep search mid-think, so we replace the worker outright; that also discards
-// the persistent transposition table, which is correct for a hard reset.
+// (Re)create both workers and reset their per-colour state, invalidating any
+// in-flight replies (the recreated worker reuses the same slot object, so a stale
+// message from the terminated one still fails the bumped seq check).
+function spawnAiWorkers() {
+  for (const c of ['white', 'black']) {
+    if (ai[c].worker) ai[c].worker.terminate();
+    ai[c].worker = createAiWorker(ai[c]);
+    ai[c].searchSeq++;
+    ai[c].ponderSeq++;
+    ai[c].predicted = null;
+    ai[c].ponderState = null;
+    ai[c].ponderBest = 0;
+  }
+}
+
+// Bump both colours' sequence counters so any pending search/ponder reply is
+// discarded — a new position has superseded it (but the workers keep their warm
+// tables, unlike cancelAi which throws them away).
+function supersedeAi() {
+  for (const c of ['white', 'black']) { ai[c].searchSeq++; ai[c].ponderSeq++; }
+}
+
+// Cancel any pending/in-flight AI work. Terminating is the only way to stop a deep
+// search mid-think, so we replace both workers outright; that also discards their
+// persistent transposition tables, which is correct for a hard reset.
 function cancelAi() {
   clearTimeout(aiTimer);
-  aiSeq++;
-  ponderSeq++;
   aiThinking = false;
-  predictedReply = null;
-  aiWorker.terminate();
-  aiWorker = createAiWorker();
+  spawnAiWorkers();
   updateWakeLock();
 }
 
@@ -332,8 +354,7 @@ function recordMove(move) {
 function commit(move) {
   // A new position supersedes any pending search or ponder reply.
   clearTimeout(aiTimer);
-  aiSeq++;
-  ponderSeq++;
+  supersedeAi();
   aiThinking = false;
   const wasLive = viewIndex === history.length - 1;
   recordMove(move);
@@ -430,72 +451,85 @@ function playLocalMove(move) {
   }
 }
 
-// After every position change, decide what the worker should be doing: search
-// the real move when it's an AI's turn, or — in you-vs-AI while it's your turn —
-// ponder its predicted reply so the next real search starts warm.
+// After every position change, point each engine-controlled colour at the right
+// job: the side to move runs a real search; any other AI colour (only in AI-vs-AI)
+// ponders the reply it expects, so its next real search starts warm. Both run
+// concurrently on their own workers.
 function driveAi() {
   clearTimeout(aiTimer);
   updateWakeLock();
-  if (status.over) { aiThinking = false; updateStatusText(); return; }
-  if (aiToMove()) startSearch();
-  else if (canPonder()) startPonder();
-  else { aiThinking = false; updateStatusText(); }
-}
-
-// Think immediately (no pre-delay): the search overlaps the watch pause, so the
-// AI is never idle. The result is held until at least `ui.delay` has elapsed
-// since the last move, keeping AI-vs-AI watchable.
-function startSearch() {
-  const seq = ++aiSeq;
-  ponderSeq++; // a real search ends any ponder chain
-  aiThinking = true;
+  aiThinking = false;
+  if (!status.over) {
+    const movers = aiColors();
+    for (const c of ['white', 'black']) {
+      if (!movers.includes(c)) continue;
+      if (c === state.turn) startSearch(ai[c]);   // its move: real search
+      else startPonder(ai[c]);                     // idle: ponder the expected reply
+    }
+  }
   updateStatusText();
-  const { depth, maxMs, engine } = aiParams(state.turn);
-  aiWorker.postMessage({ type: 'search', seq, state, depth, maxMs, engine, posHistory: repWindow(state) });
 }
 
-function onSearchResult(data) {
-  if (data.seq !== aiSeq) return; // stale result for a superseded position
-  predictedReply = data.ponder || null;
-  if (!aiToMove() || !data.move) { aiThinking = false; updateStatusText(); return; }
+// Which colours are engine-controlled right now. In AI-vs-AI both sides are (while
+// running) so one searches while the other ponders; in you-vs-AI only the AI side.
+function aiColors() {
+  if (status.over) return [];
+  if (ui.mode === 'human-ai') return [opponent(ui.humanColor)];
+  if (ui.mode === 'ai-ai') return ui.running ? ['white', 'black'] : [];
+  return [];
+}
+
+// Think immediately (no pre-delay): the search overlaps the watch pause, so the AI
+// is never idle. The result is held until at least `ui.delay` has elapsed since the
+// last move, keeping AI-vs-AI watchable.
+function startSearch(slot) {
+  const seq = ++slot.searchSeq;
+  slot.ponderSeq++; // a real search supersedes this colour's ponder chain
+  aiThinking = true;
+  const { depth, maxMs, engine } = aiParams(slot.color);
+  slot.worker.postMessage({ type: 'search', seq, state, depth, maxMs, engine, posHistory: repWindow(state) });
+}
+
+function onSearchResult(slot, data) {
+  if (data.seq !== slot.searchSeq) return; // stale result for a superseded position
+  slot.predicted = data.ponder || null;    // remember the predicted opponent reply
+  // Only the side to move's real search yields a move to play (a ponder-side worker
+  // never reaches here as a real search). Re-check the turn: the position may have
+  // moved on while this reply was in flight.
+  if (!data.move || slot.color !== state.turn || !aiToMove()) { aiThinking = false; updateStatusText(); return; }
   const move = data.move;
   const seq = data.seq;
   const wait = Math.max(0, lastCommitAt + ui.delay - performance.now());
   aiTimer = setTimeout(() => {
-    if (aiSeq !== seq || !aiToMove()) return;
+    if (slot.searchSeq !== seq || slot.color !== state.turn) return;
     commit(move);
   }, wait);
 }
 
-// Ponder = think about the position we'd reach if the human plays the move the
-// AI predicted for them. On a hit, the real search reuses this work; on a miss,
-// the table still holds useful overlap. Done in repeated short bursts so a real
-// move request (the human moving) is picked up within one burst.
-function canPonder() {
-  return ui.mode === 'human-ai' && !status.over
-    && state.turn === ui.humanColor && !!predictedReply;
+// Ponder = think about the position we'd reach if the side to move plays the move
+// this colour predicted for it. On a hit the next real search reuses the work; on a
+// miss the table still holds useful overlap. Done in short bursts so a real move
+// request (once the position changes) is picked up within one burst.
+function startPonder(slot) {
+  if (!slot.predicted) return; // nothing predicted yet (e.g. the first ply)
+  const pm = status.legal.find((m) => m.from === slot.predicted.from && m.to === slot.predicted.to);
+  if (!pm) return; // stale/illegal guess — skip pondering this turn
+  slot.ponderState = applyMove(state, pm);
+  slot.ponderBest = 0;
+  const seq = ++slot.ponderSeq;
+  const { depth, engine } = aiParams(slot.color);
+  slot.worker.postMessage({ type: 'ponder', seq, state: slot.ponderState, depth, maxMs: PONDER_STEP_MS, engine, posHistory: repWindow(slot.ponderState) });
 }
 
-function startPonder() {
-  const pm = status.legal.find((m) => m.from === predictedReply.from && m.to === predictedReply.to);
-  if (!pm) { aiThinking = false; return; }
-  ponderState = applyMove(state, pm);
-  ponderBest = 0;
-  aiThinking = false; // pondering is background; the status still reads "your move"
-  updateStatusText();
-  const seq = ++ponderSeq;
-  const { depth, engine } = aiParams(state.turn);
-  aiWorker.postMessage({ type: 'ponder', seq, state: ponderState, depth, maxMs: PONDER_STEP_MS, engine, posHistory: repWindow(ponderState) });
-}
-
-function onPonderResult(data) {
-  if (data.seq !== ponderSeq || !canPonder()) return;
-  const { depth, engine } = aiParams(state.turn);
+function onPonderResult(slot, data) {
+  if (data.seq !== slot.ponderSeq) return;
+  if (slot.color === state.turn || !aiColors().includes(slot.color)) return; // no longer the idle side
+  const { depth, engine } = aiParams(slot.color);
   // Stop once we've searched to full strength or stopped making progress (e.g. a
   // forced line resolved), so we don't spin firing instant bursts.
-  if (data.reached >= depth || data.reached <= ponderBest) return;
-  ponderBest = data.reached;
-  aiWorker.postMessage({ type: 'ponder', seq: data.seq, state: ponderState, depth, maxMs: PONDER_STEP_MS, engine, posHistory: repWindow(ponderState) });
+  if (data.reached >= depth || data.reached <= slot.ponderBest) return;
+  slot.ponderBest = data.reached;
+  slot.worker.postMessage({ type: 'ponder', seq: data.seq, state: slot.ponderState, depth, maxMs: PONDER_STEP_MS, engine, posHistory: repWindow(slot.ponderState) });
 }
 
 // --- promotion picker ---
