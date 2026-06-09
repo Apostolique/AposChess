@@ -174,27 +174,40 @@
         </div>
         <div class="control-row" id="row-online" hidden>
           <div class="online-panel">
-            <div class="online-actions">
-              <label id="online-color-label">
-                Host as
-                <select id="online-color">
-                  <option value="white">White</option>
-                  <option value="black">Black</option>
-                  <option value="random">Random</option>
-                </select>
-              </label>
-              <button id="online-host" type="button">Host game</button>
-              <input id="online-code" type="text" maxlength="5" placeholder="Code"
-                     autocomplete="off" autocapitalize="characters" autocorrect="off"
-                     spellcheck="false" aria-label="Game code to join" />
-              <button id="online-join" type="button">Join</button>
-              <button id="online-find" type="button">Find a match</button>
-              <button id="online-swap" type="button" hidden>Swap sides</button>
-              <button id="online-leave" type="button" hidden>Leave</button>
+            <div id="online-setup" class="online-setup">
+              <button id="online-find" class="online-primary" type="button">Find a match</button>
+              <div class="online-or"><span>or play a friend</span></div>
+              <div class="online-friend">
+                <div class="online-block">
+                  <label id="online-color-label" class="online-field">
+                    <span class="online-field-label">Play as</span>
+                    <select id="online-color">
+                      <option value="white">White</option>
+                      <option value="black">Black</option>
+                      <option value="random">Random</option>
+                    </select>
+                  </label>
+                  <button id="online-host" class="online-block-btn" type="button">Host game</button>
+                </div>
+                <div class="online-or"><span>or</span></div>
+                <div class="online-block">
+                  <input id="online-code" type="text" maxlength="5" placeholder="Enter code"
+                         autocomplete="off" autocapitalize="characters" autocorrect="off"
+                         spellcheck="false" aria-label="Game code to join" />
+                  <button id="online-join" class="online-block-btn" type="button">Join</button>
+                </div>
+              </div>
             </div>
             <div id="online-share" class="online-share" hidden>
-              Share this code: <code id="online-code-out"></code>
-              <button id="online-copy" type="button">Copy link</button>
+              <span class="online-share-label">Share this code</span>
+              <button id="online-copy" class="online-copy" type="button" title="Copy invite link to clipboard">
+                <code id="online-code-out"></code>
+                <span id="online-copy-hint" class="online-copy-hint">Copy link</span>
+              </button>
+            </div>
+            <div class="online-live">
+              <button id="online-swap" type="button" hidden>Swap sides</button>
+              <button id="online-leave" type="button" hidden>Leave</button>
             </div>
             <p id="online-status" class="online-status" role="status" aria-live="polite"></p>
           </div>

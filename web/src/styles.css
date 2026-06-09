@@ -175,11 +175,58 @@ button:disabled:hover { background: var(--panel); } /* no hover lift when locked
 }
 
 /* Online (peer-to-peer) panel. */
-.online-panel { display: flex; flex-direction: column; gap: 10px; width: 100%; }
-.online-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.online-panel { display: flex; flex-direction: column; gap: 12px; width: 100%; }
+.online-setup { display: flex; flex-direction: column; gap: 12px; }
+
+/* Find a match: the primary, one-click path — full-width and accent-filled so it
+   reads as the recommended action above the friend-code controls. */
+.online-primary {
+  width: 100%;
+  padding: 10px 12px;
+  font-weight: 600;
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.online-primary:hover { background: #5f8742; }
+
+/* "or play a friend" divider, with a rule on each side of the label. */
+.online-or {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+.online-or::before, .online-or::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: #555049;
+}
+
+/* Host / Join grouped in a bordered card, each its own stacked block (a control
+   above its own full-width action button) split by an "or" divider — so a labeled
+   select never has to share a row height with a button. */
+.online-friend {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid #555049;
+  border-radius: 10px;
+}
+.online-block { display: flex; flex-direction: column; gap: 8px; }
+.online-block-btn { width: 100%; }
+/* Override .controls label (display: flex; flex-direction: column) so the "Play as"
+   label sits inline with the select. Needs the .controls prefix to out-specify it
+   — a bare .online-field loses and the label stays stacked above the dropdown. */
+.controls .online-field { display: flex; flex-direction: row; align-items: center; gap: 8px; margin: 0; color: var(--text); }
+.online-field-label { color: var(--muted); font-size: 0.85rem; white-space: nowrap; }
+.online-field select { flex: 1; max-width: none; }
 #online-code {
   font: inherit;
-  width: 6.5em;
+  width: 100%;
   padding: 8px 10px;
   border-radius: 8px;
   border: 1px solid #555049;
@@ -188,16 +235,49 @@ button:disabled:hover { background: var(--panel); } /* no hover lift when locked
   text-transform: uppercase;
   letter-spacing: 0.12em;
 }
-.online-share { font-size: 0.85rem; color: var(--muted); display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.online-share code {
+/* Typed codes are uppercase + spaced, but the placeholder shouldn't be — that
+   widened "Enter code" until it overflowed the box. */
+#online-code::placeholder { text-transform: none; letter-spacing: normal; }
+
+/* Share-code callout shown to the host while waiting for an opponent. */
+.online-share {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 10px 12px;
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  background: rgba(111, 155, 78, 0.1);
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+/* The code and "Copy link" hint are one clickable button: click anywhere on it
+   to copy the invite link. */
+.online-copy {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-left: auto;
+  padding: 4px 6px 4px 4px;
+  background: var(--panel);
+}
+.online-copy code {
   font-size: 1.05rem;
   letter-spacing: 0.18em;
   color: var(--text);
-  background: var(--panel);
-  border: 1px solid var(--accent);
+  background: var(--bg);
   border-radius: 6px;
   padding: 4px 10px;
 }
+.online-copy-hint { font-size: 0.85rem; color: var(--accent); }
+
+/* Live-session buttons (Cancel/Leave, host's Swap sides). Collapses to nothing
+   when both are hidden; a lone Leave/Cancel stretches full width. */
+.online-live { display: flex; gap: 8px; flex-wrap: wrap; }
+.online-live button { flex: 1; }
+.online-live button[hidden] { display: none; }
+
 .online-status { font-size: 0.85rem; color: var(--muted); margin: 0; min-height: 1.1em; }
 
 /* Square board sized by the --board variable. */
@@ -321,7 +401,7 @@ button:disabled:hover { background: var(--panel); } /* no hover lift when locked
   :root { --board: min(94vw, 78vh); }
   /* Stacked vertically, the 24px grid gap pushes the move list / controls far
      below the board — tighten it so more is visible without scrolling. */
-  .layout { grid-template-columns: var(--board); gap: 10px; }
+  .layout { grid-template-columns: var(--board); gap: 0px; }
   .controls, .side-col { width: var(--board); height: auto; }
   .moves { max-height: 36vh; }
   /* Put the move controls above the list so they don't require scrolling the

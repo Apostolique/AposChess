@@ -570,11 +570,7 @@ function setOnlinePhase(phase, detail = '') {
   // so you can't tear it down by accident — you must Cancel/Leave first, which
   // returns to 'idle' and re-enables it.
   $('mode').disabled = !idle;
-  $('online-host').hidden = !idle;
-  $('online-join').hidden = !idle;
-  $('online-find').hidden = !idle;
-  $('online-code').hidden = !idle;
-  $('online-color-label').hidden = !idle;
+  $('online-setup').hidden = !idle;
   $('online-share').hidden = phase !== 'hosting';
   $('online-leave').hidden = idle;
   $('online-leave').textContent = phase === 'connected' ? 'Leave' : 'Cancel';
@@ -1097,9 +1093,9 @@ $('online-swap').addEventListener('click', onlineSwap);
 $('online-copy').addEventListener('click', async () => {
   try {
     await navigator.clipboard.writeText(shareUrl($('online-code-out').textContent));
-    const b = $('online-copy');
-    b.textContent = 'Copied';
-    setTimeout(() => { b.textContent = 'Copy link'; }, 1200);
+    const hint = $('online-copy-hint');
+    hint.textContent = 'Copied';
+    setTimeout(() => { hint.textContent = 'Copy link'; }, 1200);
   } catch { /* clipboard may be blocked; the code is shown for manual copy */ }
 });
 
