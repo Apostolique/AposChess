@@ -48,7 +48,11 @@ try {
   process.exit(0);
 }
 
-const files = entries.filter((f) => f.endsWith('.jsonl')).map((f) => join(dataDir, f)).sort();
+// Merge only the RAW position files. `*.features.jsonl` are derived (per-net inputs
+// from featurize.mjs) and regenerable, so folding them into the raw dataset would
+// duplicate/poison it — skip them.
+const files = entries.filter((f) => f.endsWith('.jsonl') && !f.endsWith('.features.jsonl'))
+  .map((f) => join(dataDir, f)).sort();
 if (files.length === 0) {
   console.log(`No .jsonl files in ${dataDir}. Nothing to merge.`);
   process.exit(0);

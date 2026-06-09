@@ -69,8 +69,8 @@ though the net is now the teacher.
   with `--fresh`.
 
 That's the whole routine. The individual stages (`npm run train:gen`,
-`python training/train.py`, `npm run match`) still exist if you want to run one at
-a time, but `npm run train` is the normal path.
+`npm run train:featurize`, `python training/train.py`, `npm run match`) still exist
+if you want to run one at a time, but `npm run train` is the normal path.
 
 ## Pooling data from several machines or runs
 
@@ -82,24 +82,35 @@ are independent and order-agnostic, so merging is just concatenation.
    (both handcrafted, or both the same `nn-weights.json` for `--eval=nn`).
 2. Copy every machine's `training/data/*.jsonl` into one `training/data/` folder
    (any filenames).
-3. Fold them into one dataset and delete the leftovers:
+3. Fold them into one dataset and delete the leftovers (raw `*.jsonl` only — the
+   derived `*.features.jsonl` is skipped):
    ```
    npm run train:merge
    ```
-4. Train as usual — it reads the merged `selfplay.jsonl`.
+4. Featurize the merged raw dataset, then train:
+   ```
+   npm run train:featurize && npm run train:fit
+   ```
 
 ## How it fits together
 
+- **Position-primary data.** `npm run train:gen` writes the **raw** dataset
+  `selfplay.jsonl` = `{fen, r, g}` — board position, result (side-to-move view), game
+  id — and nothing net-specific (the generator doesn't import `nn.js`). A separate
+  step turns positions into net inputs:
+  `npm run train:featurize` applies the **current** `featureIndices` and writes
+  `selfplay.features.jsonl` = `{f, r, g}`, which the trainer reads. So changing the
+  feature set is a quick `featurize` pass, never a self-play regen — and the trainer
+  still needs no chess logic (it only sees `f`). Run order: `train:gen` →
+  `train:featurize` → `train:fit` (the full `npm run train` does all three).
 - **Feature definition is single-sourced** in `web/src/nn.js` (`featureIndices`):
-  12 piece-kinds × 64 squares (768 inputs) in canonical side-to-move orientation
-  (no separate side-to-move bit — the board is flipped for Black). The generator
-  writes those indices (and the position's `fen`), so the trainer needs no chess
-  logic — it only sees vectors. After changing `featureIndices`, run
-  `npm run train:refeaturize` to recompute the dataset's indices instead of
-  regenerating self-play — from the stored `fen`, or for pre-`fen` data by
-  reconstructing a canonical board from the existing `f` (works for any canonical
-  feature of board+turn; only features needing extra state like castling rights
-  require regenerating with FENs).
+  12 piece-kinds × 64 squares (768 inputs) in canonical side-to-move orientation (no
+  separate side-to-move bit — the board is flipped for Black). `featurize` takes each
+  position from its `fen`, or for legacy pre-`fen` records reconstructs the canonical
+  board from a stored `f` (works for any canonical board+turn feature; castling/move
+  counters need `fen`-bearing data). It also writes the input count into a
+  `*.meta.json` sidecar that the trainer reads, so `NUM_FEATURES` lives only in
+  `nn.js` — change features there and re-featurize; nothing to sync in Python.
 - **Target** is the pure game result (+1 / 0 / −1) from the **side-to-move's** view.
   Training on who actually won — rather than mimicking the handcrafted eval — is
   what lets the net *improve* on it instead of inheriting its blind spots.

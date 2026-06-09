@@ -27,6 +27,11 @@ const ui = {
   engineAi: 'handcrafted',
   engineWhite: 'handcrafted',
   engineBlack: 'handcrafted',
+  // Selected neural-net name per slot (from the public/nn catalog); filled once the
+  // manifest loads. Only consulted when that slot's engine is 'nn'.
+  netAi: null,
+  netWhite: null,
+  netBlack: null,
   // Per-slot custom depth/timeout, used when that slot's strength is 'custom'.
   custom: {
     ai: { depth: 8, ms: 6000 },
@@ -486,8 +491,8 @@ function startSearch(slot) {
   const seq = ++slot.searchSeq;
   slot.ponderSeq++; // a real search supersedes this colour's ponder chain
   aiThinking = true;
-  const { depth, maxMs, engine } = aiParams(slot.color);
-  slot.worker.postMessage({ type: 'search', seq, state, depth, maxMs, engine, posHistory: repWindow(state) });
+  const { depth, maxMs, engine, net } = aiParams(slot.color);
+  slot.worker.postMessage({ type: 'search', seq, state, depth, maxMs, engine, net, posHistory: repWindow(state) });
 }
 
 function onSearchResult(slot, data) {
@@ -517,19 +522,19 @@ function startPonder(slot) {
   slot.ponderState = applyMove(state, pm);
   slot.ponderBest = 0;
   const seq = ++slot.ponderSeq;
-  const { depth, engine } = aiParams(slot.color);
-  slot.worker.postMessage({ type: 'ponder', seq, state: slot.ponderState, depth, maxMs: PONDER_STEP_MS, engine, posHistory: repWindow(slot.ponderState) });
+  const { depth, engine, net } = aiParams(slot.color);
+  slot.worker.postMessage({ type: 'ponder', seq, state: slot.ponderState, depth, maxMs: PONDER_STEP_MS, engine, net, posHistory: repWindow(slot.ponderState) });
 }
 
 function onPonderResult(slot, data) {
   if (data.seq !== slot.ponderSeq) return;
   if (slot.color === state.turn || !aiColors().includes(slot.color)) return; // no longer the idle side
-  const { depth, engine } = aiParams(slot.color);
+  const { depth, engine, net } = aiParams(slot.color);
   // Stop once we've searched to full strength or stopped making progress (e.g. a
   // forced line resolved), so we don't spin firing instant bursts.
   if (data.reached >= depth || data.reached <= slot.ponderBest) return;
   slot.ponderBest = data.reached;
-  slot.worker.postMessage({ type: 'ponder', seq: data.seq, state: slot.ponderState, depth, maxMs: PONDER_STEP_MS, engine, posHistory: repWindow(slot.ponderState) });
+  slot.worker.postMessage({ type: 'ponder', seq: data.seq, state: slot.ponderState, depth, maxMs: PONDER_STEP_MS, engine, net, posHistory: repWindow(slot.ponderState) });
 }
 
 // --- promotion picker ---
@@ -846,6 +851,47 @@ function setEngineValue(slot, v) {
   if (el) el.checked = true;
 }
 
+// --- neural-net catalog (web/public/nn) --------------------------------------
+// The selectable nets are listed in public/nn/manifest.json; fetch it once, fill the
+// per-slot <select>s, and hand the worker the chosen net's full URL.
+let netCatalog = [];   // [{ name, file, arch, note }]
+let netDefault = null; // manifest default name
+const NET_UI_KEY = { ai: 'netAi', white: 'netWhite', black: 'netBlack' };
+const netOf = (slot) =>
+  slot === 'ai' ? ui.netAi : slot === 'white' ? ui.netWhite : ui.netBlack;
+
+// Absolute URL of a named net's weights file, so it resolves identically from the
+// worker (whose relative URLs would point under assets/) and the page. null if the
+// name isn't in the catalog.
+function netUrl(name) {
+  const entry = netCatalog.find((n) => n.name === name);
+  return entry ? new URL(`${import.meta.env.BASE_URL}nn/${entry.file}`, location.href).href : null;
+}
+
+async function loadNetCatalog() {
+  try {
+    const url = new URL(`${import.meta.env.BASE_URL}nn/manifest.json`, location.href).href;
+    const man = await fetch(url).then((r) => r.json());
+    netCatalog = Array.isArray(man.nets) ? man.nets : [];
+    netDefault = man.default || (netCatalog[0] && netCatalog[0].name) || null;
+  } catch {
+    netCatalog = []; netDefault = null; // no catalog -> nn falls back to material
+  }
+  for (const slot of ['ai', 'white', 'black']) {
+    const sel = $(`net-${slot}`);
+    sel.innerHTML = '';
+    for (const n of netCatalog) {
+      const opt = document.createElement('option');
+      opt.value = n.name;
+      opt.textContent = n.name;       // keep the option short so the <select> stays narrow
+      if (n.note) opt.title = n.note; // full description on hover
+      sel.appendChild(opt);
+    }
+    sel.value = netDefault || '';
+    ui[NET_UI_KEY[slot]] = sel.value || null;
+  }
+}
+
 function applyModeVisibility() {
   const m = ui.mode;
   $('side-control').hidden = m !== 'human-ai';
@@ -861,6 +907,8 @@ function applyModeVisibility() {
   toggleCustom('ai', m === 'human-ai' && ui.strengthAi === 'custom');
   toggleCustom('white', m === 'ai-ai' && ui.strengthWhite === 'custom');
   toggleCustom('black', m === 'ai-ai' && ui.strengthBlack === 'custom');
+  // The net picker appears only when a slot's engine is the neural net.
+  for (const slot of ['ai', 'white', 'black']) $(`net-field-${slot}`).hidden = engineOf(slot) !== 'nn';
 }
 
 function toggleCustom(slot, show) {
@@ -878,6 +926,7 @@ function applyAiLock() {
   }
   for (const slot of ['white', 'black']) {
     for (const r of document.querySelectorAll(`input[name="engine-${slot}"]`)) r.disabled = locked;
+    $(`net-${slot}`).disabled = locked;
   }
 }
 
@@ -886,13 +935,14 @@ function applyAiLock() {
 function aiParams(turn) {
   const slot = ui.mode === 'ai-ai' ? turn : 'ai';
   const engine = engineOf(slot);
+  const net = engine === 'nn' ? netUrl(netOf(slot)) : undefined; // weights URL for the worker
   const v = strengthOf(slot);
-  if (v !== 'custom') return { depth: parseInt(v, 10), maxMs: ui.maxMs, engine };
+  if (v !== 'custom') return { depth: parseInt(v, 10), maxMs: ui.maxMs, engine, net };
   // 0 means "no limit" for either field. Both unlimited would never return, so
   // fall back to the default time cap in that case.
   let { depth, ms } = ui.custom[slot];
   if (depth === 0 && ms === 0) ms = ui.maxMs;
-  return { depth: depth === 0 ? Infinity : depth, maxMs: ms === 0 ? Infinity : ms, engine };
+  return { depth: depth === 0 ? Infinity : depth, maxMs: ms === 0 ? Infinity : ms, engine, net };
 }
 
 // A PGN player name for one side: "Human" for a human-controlled slot, or a
@@ -903,7 +953,8 @@ function playerName(color) {
   const isAi = ui.mode === 'ai-ai' || (ui.mode === 'human-ai' && color !== ui.humanColor);
   if (!isAi) return 'Human';
   const { depth, maxMs, engine } = aiParams(color);
-  const e = engine === 'nn' ? 'Neural net' : 'Handcrafted';
+  const slot = ui.mode === 'ai-ai' ? color : 'ai';
+  const e = engine === 'nn' ? `Neural net (${netOf(slot) || '?'})` : 'Handcrafted';
   const d = depth === Infinity ? 'unlimited' : depth;
   const t = maxMs === Infinity ? 'no time limit' : `${maxMs}ms`;
   return `AI (${e}, depth ${d}, ${t})`;
@@ -1041,8 +1092,12 @@ $('depth-black').addEventListener('change', (e) => {
 });
 for (const slot of ['ai', 'white', 'black']) {
   for (const r of document.querySelectorAll(`input[name="engine-${slot}"]`)) {
-    r.addEventListener('change', () => { ui[ENGINE_UI_KEY[slot]] = engineValue(slot); });
+    r.addEventListener('change', () => {
+      ui[ENGINE_UI_KEY[slot]] = engineValue(slot);
+      $(`net-field-${slot}`).hidden = engineValue(slot) !== 'nn'; // reveal the net picker for nn
+    });
   }
+  $(`net-${slot}`).addEventListener('change', (e) => { ui[NET_UI_KEY[slot]] = e.target.value || null; });
 }
 for (const slot of ['ai', 'white', 'black']) {
   $(`custom-depth-${slot}`).addEventListener('change', (e) => {
@@ -1064,11 +1119,14 @@ $('new-game').addEventListener('click', () => {
 $('ai-swap').addEventListener('click', () => {
   [ui.strengthWhite, ui.strengthBlack] = [ui.strengthBlack, ui.strengthWhite];
   [ui.engineWhite, ui.engineBlack] = [ui.engineBlack, ui.engineWhite];
+  [ui.netWhite, ui.netBlack] = [ui.netBlack, ui.netWhite];
   [ui.custom.white, ui.custom.black] = [ui.custom.black, ui.custom.white];
   $('depth-white').value = ui.strengthWhite;
   $('depth-black').value = ui.strengthBlack;
   setEngineValue('white', ui.engineWhite);
   setEngineValue('black', ui.engineBlack);
+  $('net-white').value = ui.netWhite || '';
+  $('net-black').value = ui.netBlack || '';
   $('custom-depth-white').value = ui.custom.white.depth;
   $('custom-ms-white').value = ui.custom.white.ms;
   $('custom-depth-black').value = ui.custom.black.depth;
@@ -1200,6 +1258,7 @@ $('ai-toggle').addEventListener('click', () => {
 });
 
 syncControlsFromDom();
+loadNetCatalog(); // async: fills the per-slot net pickers from public/nn/manifest.json
 applyModeVisibility();
 if (ui.mode === 'online') setOnlinePhase('idle');
 if (ui.mode === 'editor') {

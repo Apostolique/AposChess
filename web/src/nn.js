@@ -83,6 +83,16 @@ const WEIGHTS = new Map();
 
 export function loadWeights(obj, slot = 'default') {
   const W = normalize(obj);
+  // Guard against a weights file whose input layer doesn't match the CURRENT feature
+  // layout — e.g. loading an old net after changing featureIndices. Without this the
+  // forward pass reads weights out of bounds and silently returns garbage; instead we
+  // refuse the file (material fallback) and say why.
+  if (W && W.arch[0] !== NUM_FEATURES) {
+    console.warn(`nn weights expect ${W.arch[0]} inputs but the current feature layout has `
+      + `${NUM_FEATURES}; ignoring these weights (material fallback). Re-featurize + re-train.`);
+    WEIGHTS.delete(slot);
+    return;
+  }
   if (W) WEIGHTS.set(slot, W); else WEIGHTS.delete(slot);
 }
 export function hasWeights(slot = 'default') { return WEIGHTS.has(slot); }

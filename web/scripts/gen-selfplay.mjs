@@ -3,12 +3,10 @@
 //
 // Self-play data generator for the neural-net evaluation. Plays games with the
 // existing engine (the "teacher") from randomized openings, and writes one JSONL
-// line per position: the active input feature indices ("f", from nn.js, so the
-// feature definition is single-sourced), the game's final result from the
-// SIDE-TO-MOVE's view ("r", matching the canonical, side-to-move feature
-// orientation; the White-view outcome is sign-flipped for Black-to-move positions),
-// the position's "fen" (so scripts/refeaturize.mjs can recompute "f" after a
-// feature-set change without regenerating self-play), and a
+// line per position — the RAW position, net-agnostic: the board "fen" (with correct
+// castling rights, since the generator keeps the full game state), the game's final
+// result from the SIDE-TO-MOVE's view ("r"; the White-view outcome is sign-flipped
+// for Black-to-move positions, matching the canonical features), and a
 // game id ("g") so the trainer can split train/val by GAME — every position in a
 // game shares one label and is highly correlated, so a position-level split would
 // leak a game across both sides and make the val loss (and early stopping)
@@ -16,12 +14,15 @@
 // appending) never collides as long as seeds differ (a collision would only group
 // two games together, which is harmless — it never straddles the split).
 //
-// The trainer (training/train.py) reads these vectors directly — it needs no chess
-// logic. Targets are pure game outcomes from the mover's view (+1 the side to move
-// went on to win / 0 draw / -1 it lost) so the net learns from who actually won
-// rather than mimicking (and inheriting the blind spots of) the handcrafted
-// evaluation. To iterate, regenerate with
-// --eval=nn once you have weights, so fresh data comes from the improving net.
+// This raw dataset is turned into per-net training inputs by scripts/featurize.mjs
+// (`npm run train:featurize`), which applies the current nn.js featureIndices and
+// writes selfplay.features.jsonl — so the trainer still needs no chess logic, and a
+// feature change is a quick featurize pass instead of regenerating self-play.
+// Targets are pure game outcomes from the mover's view (+1 the side to move went on
+// to win / 0 draw / -1 it lost) so the net learns from who actually won rather than
+// mimicking (and inheriting the blind spots of) the handcrafted evaluation. To
+// iterate, regenerate with --eval=nn once you have weights, so fresh data comes from
+// the improving net.
 //
 // Games run in parallel across worker threads (scripts/genWorker.mjs); this main
 // thread is the single writer to the output file, so parallel games never interleave

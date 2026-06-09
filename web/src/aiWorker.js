@@ -4,12 +4,13 @@
 // Runs the AI search off the main thread so deeper lookahead never freezes the
 // UI. Two request kinds, both tagged with a `seq` so a reply for a superseded
 // position is discarded by the page:
-//   { type: 'search', seq, state, depth, maxMs, engine } → { type: 'search', seq, move, ponder }
+//   { type: 'search', seq, state, depth, maxMs, engine, net } → { type: 'search', seq, move, ponder }
 //       a real move to play; `ponder` is the predicted opponent reply { from, to }.
-//   { type: 'ponder', seq, state, depth, maxMs, engine } → { type: 'ponder', seq, reached }
+//   { type: 'ponder', seq, state, depth, maxMs, engine, net } → { type: 'ponder', seq, reached }
 //       thinking on the opponent's turn; the move is irrelevant, the point is the
 //       warmed transposition table. `reached` is the deepest completed iteration.
-// `engine` picks the evaluation ('handcrafted' | 'nn'); see chooseMoveDetailed.
+// `engine` picks the evaluation ('handcrafted' | 'nn'); see chooseMoveDetailed. For
+// 'nn', `net` is the full URL of the selected weights file to load (see below).
 //
 // The table lives in the search module and is NOT cleared between messages, so a
 // real search reuses what pondering found (and vice versa). Hard resets (new
@@ -21,16 +22,39 @@
 import { chooseMoveDetailed, _internal } from './ai.js';
 import { parseFen } from './board.js';
 import { loadWeights } from './nn.js';
-import nnWeights from './nn-weights.json';
 
-// The trained net weights are a build-time asset, bundled in statically (a static
-// import keeps the worker a single chunk; a dynamic import would force a
-// code-splitting build the IIFE worker format rejects). A placeholder file (no
-// `arch`) leaves nn.js on its material fallback. Retrain -> rebuild to update.
-loadWeights(nnWeights);
+// Net weights are fetched at runtime from the public/ catalog (web/public/nn/) so
+// the user can pick among named nets without rebuilding — the worker no longer
+// carries a fixed weights blob. The page passes the chosen net's full URL in each
+// 'nn' request (it knows the document base; a worker's own relative URLs would
+// resolve against the worker script under assets/). fetch is not a dynamic import,
+// so the single-chunk IIFE worker build the format requires is unaffected. Until a
+// net loads, the nn eval falls back to material (nn.js).
+const netCache = new Map(); // url -> Promise<weights json>
+let currentNet = null;
 
-self.onmessage = ({ data }) => {
-  const { type, seq, state, depth, maxMs, posHistory, engine } = data;
+function fetchNet(url) {
+  let p = netCache.get(url);
+  if (!p) { p = fetch(url).then((r) => r.json()); netCache.set(url, p); }
+  return p;
+}
+
+// Make `url`'s weights the active net (default slot). Resets the TT on a real switch
+// so the table can't serve a different net's scores. A no-op once the net is current.
+async function ensureNet(url) {
+  if (!url || currentNet === url) return;
+  let w;
+  try { w = await fetchNet(url); }
+  catch { return; } // keep the current/material eval if the fetch fails
+  if (currentNet === url) return; // another message switched while we awaited
+  loadWeights(w);
+  _internal.resetTT();
+  currentNet = url;
+}
+
+self.onmessage = async ({ data }) => {
+  const { type, seq, state, depth, maxMs, posHistory, engine, net } = data;
+  if (engine === 'nn') await ensureNet(net); // load/switch the selected net first
   // posHistory is the live game's prior positions as FENs (compact to clone); the
   // search wants Zobrist hashes, so convert here, on the worker thread.
   const prevHashes = posHistory ? posHistory.map((f) => _internal.hashOf(parseFen(f))) : [];

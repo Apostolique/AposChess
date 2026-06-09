@@ -30,7 +30,9 @@ function findPython() {
 }
 
 const python = findPython();
-const cmd = `${python} "${trainPy}" ${process.argv.slice(2).join(' ')}`.trim();
-console.log(`> ${cmd}`);
-const r = spawnSync(cmd, { stdio: 'inherit', shell: true, cwd: repoDir });
+const forwarded = process.argv.slice(2);
+console.log(`> ${python} ${trainPy} ${forwarded.join(' ')}`);
+// Pass args as an array with shell:false so quoted multi-word values (e.g.
+// --note="plays badly") survive instead of being re-split by the shell.
+const r = spawnSync(python, [trainPy, ...forwarded], { stdio: 'inherit', cwd: repoDir });
 process.exit(r.status ?? 1);

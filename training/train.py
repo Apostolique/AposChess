@@ -31,7 +31,9 @@ import sys
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(THIS_DIR)
-DEFAULT_DATA = os.path.join(THIS_DIR, "data", "selfplay.jsonl")
+# The trainer reads the FEATURIZED data ({f,r,g}), produced from the raw positions
+# (selfplay.jsonl) by web/scripts/featurize.mjs (`npm run train:featurize`).
+DEFAULT_DATA = os.path.join(THIS_DIR, "data", "selfplay.features.jsonl")
 DEFAULT_OUT = os.path.join(REPO, "web", "src", "nn-weights.json")
 NN_CATALOG = os.path.join(REPO, "web", "public", "nn")  # named, app-selectable nets
 
@@ -55,10 +57,20 @@ def update_manifest(name, file, arch, note, set_default):
         json.dump(man, f, indent=2)
     return mpath
 
-# Must match nn.js NUM_FEATURES (the EmbeddingBag vocab size). 768 = the plain
-# piece-square block (12 piece-kinds × 64 squares). Keep in sync with nn.js if you
-# add feature blocks (e.g. king-relative buckets would multiply this).
-NUM_FEATURES = 12 * 64  # 768
+# The EmbeddingBag vocab size (nn.js NUM_FEATURES) is read from the sidecar that
+# featurize.mjs writes next to the data (<data>.meta.json), so it's never hand-synced
+# across the JS/Python split — nn.js is the single source. This is only the fallback
+# for data with no sidecar (hand-made / pre-sidecar): the original plain layout.
+DEFAULT_NUM_FEATURES = 12 * 64  # 768
+
+
+def read_num_features(data_path):
+    meta = (data_path[:-len(".jsonl")] if data_path.endswith(".jsonl") else data_path) + ".meta.json"
+    if os.path.exists(meta):
+        with open(meta) as f:
+            return int(json.load(f)["num_features"])
+    print(f"  (no {os.path.basename(meta)}; assuming num_features={DEFAULT_NUM_FEATURES})")
+    return DEFAULT_NUM_FEATURES
 
 
 def parse_args():
@@ -91,8 +103,8 @@ def parse_args():
 
 def load_data(path):
     if not os.path.exists(path):
-        sys.exit(f"No training data at {path}. Generate it first:\n"
-                 f"  cd web && npm run train:gen")
+        sys.exit(f"No training data at {path}. Generate raw positions, then featurize:\n"
+                 f"  cd web && npm run train:gen && npm run train:featurize")
     samples, targets, games = [], [], []
     with open(path, "r") as f:
         for line in f:
@@ -119,6 +131,8 @@ def main():
     hidden = [int(x) for x in str(args.hidden).split(",") if x.strip()]
     if not hidden:
         sys.exit("--hidden must be one or more positive integers (e.g. 128 or 256,32)")
+
+    num_features = read_num_features(args.data)  # from featurize.mjs sidecar (nn.js)
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -154,7 +168,7 @@ def main():
         # widths add dense ReLU layers; a final Linear(.,1) is the scalar head.
         def __init__(self, hidden):
             super().__init__()
-            self.emb = nn.EmbeddingBag(NUM_FEATURES, hidden[0], mode="sum")
+            self.emb = nn.EmbeddingBag(num_features, hidden[0], mode="sum")
             self.b0 = nn.Parameter(torch.zeros(hidden[0]))
             dims = hidden + [1]
             self.lins = nn.ModuleList(
@@ -174,7 +188,7 @@ def main():
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     loss_fn = nn.MSELoss()
     print(f"Training on {device}: {len(train_idx)} train / {n_val} val, "
-          f"hidden={hidden}, max epochs={args.epochs}, patience={args.patience}")
+          f"inputs={num_features}, hidden={hidden}, max epochs={args.epochs}, patience={args.patience}")
 
     def make_batch(sample_ids):
         # Pack variable-length feature lists into one flat tensor + bag offsets.
@@ -260,7 +274,7 @@ def main():
         })
 
     out = {
-        "arch": [NUM_FEATURES, *hidden, 1],
+        "arch": [num_features, *hidden, 1],
         "scale": args.scale,
         "layers": layers,
     }
@@ -274,7 +288,7 @@ def main():
           f"Rebuild the web app (or restart dev) to pick it up.")
     if args.name:
         mpath = update_manifest(args.name, f"{args.name}.json",
-                                [NUM_FEATURES, *hidden, 1], args.note, args.set_default)
+                                [num_features, *hidden, 1], args.note, args.set_default)
         print(f"Registered '{args.name}' in {mpath}.")
 
 

@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url';
 import { newGameState, toFen } from '../src/board.js';
 import { legalMoves, applyMove, gameStatus } from '../src/engine.js';
 import { chooseMove, _internal } from '../src/ai.js';
-import { featureIndices, loadWeights } from '../src/nn.js';
+import { loadWeights } from '../src/nn.js'; // only to set the nn teacher's weights (--eval=nn)
 
 const here = dirname(fileURLToPath(import.meta.url));
 const cfg = workerData.cfg;
@@ -82,13 +82,13 @@ parentPort.on('message', (msg) => {
   const gid = `${cfg.seed.toString(36)}-${g}`; // unique per run; groups one game
   let lines = '';
   for (const st of positions) {
-    const { board, turn } = st;
-    // Canonical features are side-to-move-relative, so the label must be too:
-    // flip the White-view game result for Black-to-move positions.
-    const r = turn === 'white' ? result : -result;
-    // `fen` lets scripts/refeaturize.mjs recompute `f` after a feature-set change
-    // without regenerating self-play; the trainer ignores it and reads `f` directly.
-    lines += JSON.stringify({ f: featureIndices(board, turn), r, g: gid, fen: toFen(st) }) + '\n';
+    // Store the raw position + outcome only — net-agnostic. Features for a specific
+    // net are derived later by scripts/featurize.mjs. The label is the result from
+    // the SIDE-TO-MOVE's view (so it matches the canonical features featurize emits):
+    // flip the White-view result for Black-to-move positions. The full state's FEN
+    // carries correct castling rights, so a future castling-dependent feature works.
+    const r = st.turn === 'white' ? result : -result;
+    lines += JSON.stringify({ fen: toFen(st), r, g: gid }) + '\n';
   }
   parentPort.postMessage({ type: 'result', g, lines, nPositions: positions.length });
 });

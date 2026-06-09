@@ -4,7 +4,7 @@
 // One-command training pipeline for the neural-net evaluation. Runs the whole
 // loop so you don't have to chain the steps by hand:
 //
-//   generate self-play data  ->  train (auto epochs)  ->  [match]  ->  [build]
+//   generate positions  ->  featurize  ->  train (auto epochs)  ->  [match]  ->  [build]
 //
 // With --generations=N it repeats gen+train N times, and from the 2nd generation
 // on it generates data with the freshly trained net (--eval=nn), so the net
@@ -36,6 +36,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const webDir = resolve(here, '..');
 const repoDir = resolve(webDir, '..');
 const genScript = resolve(here, 'gen-selfplay.mjs');
+const featurizeScript = resolve(here, 'featurize.mjs');
 const matchScript = resolve(here, 'selfplay.mjs');
 const trainPy = resolve(repoDir, 'training', 'train.py');
 const dataFile = resolve(repoDir, 'training', 'data', 'selfplay.jsonl');
@@ -122,21 +123,25 @@ for (let g = 0; g < cfg.generations; g++) {
   if (cfg.jobs !== undefined) genArgs.push(`--jobs=${cfg.jobs}`);
   runNode('Generate self-play data', genScript, genArgs);
 
-  // 2. Train (early stopping picks the epoch count; exports src/nn-weights.json).
+  // 2. Featurize the raw positions into training inputs for the current net
+  //    (selfplay.jsonl -> selfplay.features.jsonl) so a feature change is picked up.
+  runNode('Featurize positions', featurizeScript, []);
+
+  // 3. Train (early stopping picks the epoch count; exports src/nn-weights.json).
   let trainCmd = `${python} "${trainPy}"`;
   if (cfg.hidden) trainCmd += ` --hidden=${cfg.hidden}`;
   if (cfg.patience) trainCmd += ` --patience=${cfg.patience}`;
   runShell('Train network', trainCmd);
 }
 
-// 3. Optional strength check against the handcrafted eval.
+// 4. Optional strength check against the handcrafted eval.
 if (cfg.match > 0) {
   const matchArgs = [`--games=${cfg.match}`, `--depth=${cfg.depth}`, '--eval-a=nn'];
   if (cfg.jobs !== undefined) matchArgs.push(`--jobs=${cfg.jobs}`);
   runNode('Measure vs handcrafted', matchScript, matchArgs);
 }
 
-// 4. Bundle the new weights into the deployable app.
+// 5. Bundle the new weights into the deployable app.
 if (cfg.build) runShell('Build web app', 'npm run build', webDir);
 
 const mins = ((Date.now() - t0) / 60000).toFixed(1);

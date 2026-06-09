@@ -111,6 +111,11 @@ fieldset.ai-group legend {
 .custom-fields { display: flex; gap: 12px; align-items: end; flex-basis: 100%; }
 .custom-fields .hint { white-space: nowrap; } /* keep "(0 = ∞)" on one line */
 .engine-field { display: flex; flex-direction: column; gap: 4px; }
+/* The net picker stacks its label over the dropdown like the engine toggle, and the
+   <select> is width-capped so a long net name can't stretch the controls column
+   (which would push the panel below the board). The full name still shows when open. */
+.net-field { display: flex; flex-direction: column; gap: 4px; }
+.net-field select { max-width: 14rem; }
 .seg-label { font-size: 0.8rem; color: var(--muted); }
 .seg {
   display: inline-flex;

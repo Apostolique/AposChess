@@ -13,7 +13,7 @@
     "train": "node scripts/train-pipeline.mjs",
     "train:gen": "node scripts/gen-selfplay.mjs",
     "train:fit": "node scripts/train-fit.mjs",
-    "train:refeaturize": "node scripts/refeaturize.mjs",
+    "train:featurize": "node scripts/featurize.mjs",
     "train:merge": "node scripts/merge-data.mjs"
   },
   "dependencies": {
