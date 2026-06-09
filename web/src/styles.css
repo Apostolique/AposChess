@@ -319,13 +319,18 @@ button:disabled:hover { background: var(--panel); } /* no hover lift when locked
 /* Stack the columns (controls, board, sidebar) on narrow screens. */
 @media (max-width: 980px) {
   :root { --board: min(94vw, 78vh); }
-  .layout { grid-template-columns: var(--board); }
+  /* Stacked vertically, the 24px grid gap pushes the move list / controls far
+     below the board — tighten it so more is visible without scrolling. */
+  .layout { grid-template-columns: var(--board); gap: 10px; }
   .controls, .side-col { width: var(--board); height: auto; }
   .moves { max-height: 36vh; }
   /* Put the move controls above the list so they don't require scrolling the
      list down and back up. status (order 0) stays on top. */
   .side-col .nav { order: 1; }
   .side-col .moves { order: 2; }
+  /* ...but keep the PGN import/export at the very bottom (default order 0 would
+     otherwise float it up near status). */
+  .side-col .pgn-row { order: 3; }
 
   /* On mobile (like Lichess), drop the rank numbers and tuck the file letters
      into the bottom-left corner of the squares, inside the board. */
