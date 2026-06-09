@@ -30,7 +30,9 @@
 // Usage (run from web/):
 //   npm run train:gen -- [options]
 // Options:
-//   --games=N       games to play (default 200)
+//   --games=N       games to play (default 200); 'inf'/'forever' runs until Ctrl-C
+//   --forever       alias for --games=inf: generate indefinitely, flushing each
+//                   game as it finishes; press Ctrl-C to stop (in-flight games drain)
 //   --jobs=N        parallel worker threads (default: CPU core count)
 //   --depth=D       fixed-depth search per move (default 4)
 //   --movetime=MS   use a time budget per move instead of fixed depth
@@ -54,9 +56,16 @@ const args = Object.fromEntries(
   }),
 );
 const num = (v, d) => (v === undefined ? d : Number(v));
+// 'inf'/'infinity'/'forever' (or the --forever flag) means run until interrupted.
+const parseGames = (v, d) => {
+  if (args.forever) return Infinity;
+  if (v === undefined) return d;
+  if (typeof v === 'string' && /^(inf|infinity|forever)$/i.test(v)) return Infinity;
+  return Number(v);
+};
 
 const cfg = {
-  games: num(args.games, 200),
+  games: parseGames(args.games, 200),
   depth: args.depth !== undefined ? Number(args.depth) : (args.movetime !== undefined ? null : 4),
   movetime: num(args.movetime, 50),
   openings: num(args.openings, 8),
@@ -82,7 +91,8 @@ if (cfg.evalName === 'nn') {
 
 mkdirSync(dirname(cfg.out), { recursive: true });
 const fresh = !existsSync(cfg.out);
-console.log(`Generating ${cfg.games} games -> ${cfg.out}${fresh ? '' : ' (appending)'}`);
+const forever = !Number.isFinite(cfg.games);
+console.log(`Generating ${forever ? 'games forever (Ctrl-C to stop)' : `${cfg.games} games`} -> ${cfg.out}${fresh ? '' : ' (appending)'}`);
 console.log(`  ${cfg.depth != null ? `depth ${cfg.depth}` : `${cfg.movetime}ms/move`} | eval ${cfg.evalName} | openings ${cfg.openings} | jobs ${jobs} | seed ${cfg.seed}`);
 
 // Format a duration in seconds as "Mm SSs" (or "SSs" under a minute).
@@ -95,14 +105,25 @@ const t0 = Date.now();
 let totalPositions = 0;
 let doneGames = 0;
 let nextGame = 0;
+let stopping = false; // set on Ctrl-C in forever mode: stop dispatching, let in-flight games drain
 
 await new Promise((resolve_) => {
   const pool = [];
   let live = jobs;
   const retire = () => { if (--live === 0) resolve_(); };
 
+  // In forever mode, a SIGINT stops new dispatches; workers finish their current
+  // game (already flushed on completion) and then retire, so the run ends cleanly.
+  if (forever) {
+    process.on('SIGINT', () => {
+      if (stopping) return;
+      stopping = true;
+      process.stdout.write('\n  Stopping: draining in-flight games...\n');
+    });
+  }
+
   const dispatch = (w) => {
-    if (nextGame >= cfg.games) { w.terminate(); return; } // exit -> retire
+    if (stopping || nextGame >= cfg.games) { w.terminate(); return; } // exit -> retire
     w.postMessage({ type: 'play', g: nextGame++ });
   };
 
@@ -116,11 +137,18 @@ await new Promise((resolve_) => {
         totalPositions += msg.nPositions;
         doneGames++;
         const elapsed = (Date.now() - t0) / 1000;
-        const eta = doneGames < cfg.games ? ` | ETA ${fmt((elapsed / doneGames) * (cfg.games - doneGames))}` : '';
-        process.stdout.write(
-          `\r  ${doneGames}/${cfg.games} games | ${cfg.games - doneGames} left | `
-          + `${totalPositions} positions | ${fmt(elapsed)} elapsed${eta}      `,
-        );
+        if (forever) {
+          process.stdout.write(
+            `\r  ${doneGames} games | ${totalPositions} positions | `
+            + `${fmt(elapsed)} elapsed | ${(doneGames / (elapsed / 60)).toFixed(1)} games/min      `,
+          );
+        } else {
+          const eta = doneGames < cfg.games ? ` | ETA ${fmt((elapsed / doneGames) * (cfg.games - doneGames))}` : '';
+          process.stdout.write(
+            `\r  ${doneGames}/${cfg.games} games | ${cfg.games - doneGames} left | `
+            + `${totalPositions} positions | ${fmt(elapsed)} elapsed${eta}      `,
+          );
+        }
         dispatch(w);
       }
     });
