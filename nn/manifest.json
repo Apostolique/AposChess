@@ -1,0 +1,11 @@
+{
+  "default": "balanced-64",
+  "nets": [
+    {
+      "name": "balanced-64",
+      "file": "balanced-64.json",
+      "arch": [768, 64, 1],
+      "note": "Baseline 64-wide net (~parity with the handcrafted eval)."
+    }
+  ]
+}
