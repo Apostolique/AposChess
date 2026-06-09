@@ -12,7 +12,7 @@ import { readFileSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { newGameState } from '../src/board.js';
+import { newGameState, toFen } from '../src/board.js';
 import { legalMoves, applyMove, gameStatus } from '../src/engine.js';
 import { chooseMove, _internal } from '../src/ai.js';
 import { featureIndices, loadWeights } from '../src/nn.js';
@@ -53,7 +53,9 @@ function playGame(rng) {
     }
     // Record real (post-opening) positions only; random opening moves aren't the
     // engine's choices, but the positions themselves are still fine training data.
-    positions.push({ board: state.board, turn: state.turn });
+    // Keep the whole state so we can serialize a FEN (applyMove returns fresh
+    // states, so the reference stays valid as the game continues).
+    positions.push(state);
 
     let move;
     if (ply < cfg.openings) {
@@ -79,11 +81,14 @@ parentPort.on('message', (msg) => {
   const { positions, result } = playGame(makeRng(gameSeed(g)));
   const gid = `${cfg.seed.toString(36)}-${g}`; // unique per run; groups one game
   let lines = '';
-  for (const { board, turn } of positions) {
+  for (const st of positions) {
+    const { board, turn } = st;
     // Canonical features are side-to-move-relative, so the label must be too:
     // flip the White-view game result for Black-to-move positions.
     const r = turn === 'white' ? result : -result;
-    lines += JSON.stringify({ f: featureIndices(board, turn), r, g: gid }) + '\n';
+    // `fen` lets scripts/refeaturize.mjs recompute `f` after a feature-set change
+    // without regenerating self-play; the trainer ignores it and reads `f` directly.
+    lines += JSON.stringify({ f: featureIndices(board, turn), r, g: gid, fen: toFen(st) }) + '\n';
   }
   parentPort.postMessage({ type: 'result', g, lines, nPositions: positions.length });
 });

@@ -285,7 +285,12 @@ function evalStm(board, turn) {
 // self-play tools read them from disk — see nn.js. For true NNUE speed an
 // accumulator would later be threaded through applyMove (it is currently
 // pure-functional); recomputing from scratch is fine to start.
-const evalNN = nnEvaluate;
+// The nn eval reads weights from a named slot (see nn.js). The slot is chosen per
+// search by chooseMoveDetailed (the engine string may be 'nn:<slot>'); 'default'
+// matches the single-net behaviour. Slots let the match runner pit two nets at once
+// and the app offer a choice of nets.
+let nnSlot = 'default';
+const evalNN = (board, turn) => nnEvaluate(board, turn, nnSlot);
 
 const EVALS = { handcrafted: evalStm, nn: evalNN };
 let activeEval = evalStm;
@@ -301,6 +306,22 @@ let activeEval = evalStm;
 // engines — stay byte-for-byte unchanged; only the nn keys move out of the way.
 const EVAL_KEYS = { handcrafted: 0n, nn: 0x9e3779b97f4a7c15n };
 let evalKey = 0n;
+
+// Distinct TT namespace per nn slot, so a single instance that switches nets mid-run
+// can't read one net's cached scores under another's (same hazard as the per-eval
+// keys above). 'default' stays 0n, so single-net behaviour — and the match runner's
+// separate-instance engines — keep byte-for-byte identical keys.
+const slotKeys = new Map([['default', 0n]]);
+function slotKey(slot) {
+  let k = slotKeys.get(slot);
+  if (k === undefined) {
+    k = 0xcbf29ce484222325n;
+    for (let i = 0; i < slot.length; i++) k = ((k ^ BigInt(slot.charCodeAt(i))) * 0x100000001b3n) & 0xffffffffffffffffn;
+    k |= 1n; // nonzero, so it never collides with 'default'
+    slotKeys.set(slot, k);
+  }
+  return k;
+}
 
 function hasNonPawn(board, color) {
   for (const p of board) if (p && p.color === color && p.role !== 'p' && p.role !== 'k') return true;
@@ -477,8 +498,12 @@ function search(state, depth, alpha, beta, ply, canNull, hash, deadline) {
 // `halfmove` plies) can ever recur, so the caller need only pass that window; doing
 // so keeps the per-node repetition lookup set tiny (usually empty).
 export function chooseMoveDetailed(state, maxDepth = 2, rand = Math.random, maxMs = Infinity, useTT = true, prevHashes = [], engine = 'handcrafted') {
-  activeEval = EVALS[engine] || evalStm;
-  evalKey = EVAL_KEYS[engine] || 0n;
+  // engine is 'handcrafted', 'nn', or 'nn:<slot>' (a specific net). Split off the slot.
+  const colon = engine.indexOf(':');
+  const evalName = colon < 0 ? engine : engine.slice(0, colon);
+  nnSlot = colon < 0 ? 'default' : engine.slice(colon + 1);
+  activeEval = EVALS[evalName] || evalStm;
+  evalKey = (EVAL_KEYS[evalName] || 0n) ^ slotKey(nnSlot);
   const root = legalMoves(state);
   if (root.length === 0) return { move: null, ponder: null, depth: 0 };
 

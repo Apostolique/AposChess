@@ -33,15 +33,48 @@ THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(THIS_DIR)
 DEFAULT_DATA = os.path.join(THIS_DIR, "data", "selfplay.jsonl")
 DEFAULT_OUT = os.path.join(REPO, "web", "src", "nn-weights.json")
+NN_CATALOG = os.path.join(REPO, "web", "public", "nn")  # named, app-selectable nets
 
-NUM_FEATURES = 12 * 64  # must match nn.js (768; canonical side-to-move layout)
+
+def update_manifest(name, file, arch, note, set_default):
+    """Register a net in web/public/nn/manifest.json (read/modify/write)."""
+    mpath = os.path.join(NN_CATALOG, "manifest.json")
+    man = {"default": name, "nets": []}
+    if os.path.exists(mpath):
+        with open(mpath) as f:
+            man = json.load(f)
+    nets = [n for n in man.get("nets", []) if n.get("name") != name]
+    nets.append({"name": name, "file": file, "arch": arch, "note": note})
+    nets.sort(key=lambda n: n["name"])
+    man["nets"] = nets
+    # First net, an explicit request, or a dangling default all (re)point the default.
+    if set_default or not man.get("default") or \
+            not any(n["name"] == man["default"] for n in nets):
+        man["default"] = name
+    with open(mpath, "w") as f:
+        json.dump(man, f, indent=2)
+    return mpath
+
+# Must match nn.js NUM_FEATURES (the EmbeddingBag vocab size). 768 = the plain
+# piece-square block (12 piece-kinds × 64 squares). Keep in sync with nn.js if you
+# add feature blocks (e.g. king-relative buckets would multiply this).
+NUM_FEATURES = 12 * 64  # 768
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="Train the AposChess NN evaluation.")
     p.add_argument("--data", default=DEFAULT_DATA, help="JSONL training data")
     p.add_argument("--out", default=DEFAULT_OUT, help="weights output (JSON for nn.js)")
-    p.add_argument("--hidden", type=int, default=64, help="hidden layer size")
+    p.add_argument("--name", default=None,
+                   help="publish to the web net catalog under this name: writes "
+                        "web/public/nn/<name>.json and registers it in manifest.json "
+                        "(so it's selectable in the app). Overrides --out.")
+    p.add_argument("--note", default="", help="description shown in the catalog (with --name)")
+    p.add_argument("--set-default", action="store_true",
+                   help="make this net the catalog default (with --name)")
+    p.add_argument("--hidden", type=str, default="128",
+                   help="hidden layer size(s); a comma list adds depth, "
+                        "e.g. --hidden=128 or --hidden=256,32")
     p.add_argument("--epochs", type=int, default=200,
                    help="max epochs; early stopping usually ends sooner")
     p.add_argument("--patience", type=int, default=8,
@@ -83,6 +116,10 @@ def main():
     import torch
     from torch import nn
 
+    hidden = [int(x) for x in str(args.hidden).split(",") if x.strip()]
+    if not hidden:
+        sys.exit("--hidden must be one or more positive integers (e.g. 128 or 256,32)")
+
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
@@ -112,23 +149,32 @@ def main():
           f"({len(train_idx)} / {n_val} positions)")
 
     class Net(nn.Module):
-        def __init__(self, h):
+        # hidden is a list of layer widths. The first (sparse) layer is an
+        # EmbeddingBag(sum) over active features == nn.js's column-add; any further
+        # widths add dense ReLU layers; a final Linear(.,1) is the scalar head.
+        def __init__(self, hidden):
             super().__init__()
-            self.emb = nn.EmbeddingBag(NUM_FEATURES, h, mode="sum")
-            self.b0 = nn.Parameter(torch.zeros(h))
-            self.head = nn.Linear(h, 1)
+            self.emb = nn.EmbeddingBag(NUM_FEATURES, hidden[0], mode="sum")
+            self.b0 = nn.Parameter(torch.zeros(hidden[0]))
+            dims = hidden + [1]
+            self.lins = nn.ModuleList(
+                [nn.Linear(dims[i], dims[i + 1]) for i in range(len(hidden))])
 
         def forward(self, flat, offs):
-            x = self.emb(flat, offs) + self.b0
-            x = torch.relu(x)
-            return self.head(x).squeeze(-1)
+            x = torch.relu(self.emb(flat, offs) + self.b0)
+            last = len(self.lins) - 1
+            for i, lin in enumerate(self.lins):
+                x = lin(x)
+                if i < last:
+                    x = torch.relu(x)
+            return x.squeeze(-1)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = Net(args.hidden).to(device)
+    model = Net(hidden).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     loss_fn = nn.MSELoss()
     print(f"Training on {device}: {len(train_idx)} train / {n_val} val, "
-          f"hidden={args.hidden}, max epochs={args.epochs}, patience={args.patience}")
+          f"hidden={hidden}, max epochs={args.epochs}, patience={args.patience}")
 
     def make_batch(sample_ids):
         # Pack variable-length feature lists into one flat tensor + bag offsets.
@@ -194,27 +240,42 @@ def main():
     model.load_state_dict(best_state)
     print(f"Best val {best_val:.4f} at epoch {best_epoch}.")
 
-    # Export in nn.js's layout. EmbeddingBag.weight is [NUM_FEATURES, hidden] =
-    # exactly the input-major [feature, h] order nn.js reads as w0[f*hidden + h].
+    # Export in nn.js's layout (generic `layers`). Every layer's w is input-major
+    # and flattened as w[i*outDim + o]:
+    #   layer 0  = EmbeddingBag.weight, already [NUM_FEATURES, h0] = [feature, h].
+    #   layers k = nn.Linear, whose weight is [out, in]; transpose to [in, out].
     model.cpu().eval()
-    w0 = model.emb.weight.detach().numpy().reshape(-1).tolist()
-    b0 = model.b0.detach().numpy().reshape(-1).tolist()
-    w1 = model.head.weight.detach().numpy().reshape(-1).tolist()
-    b1 = model.head.bias.detach().numpy().reshape(-1).tolist()
+
+    def rnd(a):
+        return [round(float(x), 6) for x in a.reshape(-1).tolist()]
+
+    layers = [{
+        "w": rnd(model.emb.weight.detach().numpy()),
+        "b": rnd(model.b0.detach().numpy()),
+    }]
+    for lin in model.lins:
+        layers.append({
+            "w": rnd(lin.weight.detach().numpy().T),  # [out,in] -> [in,out]
+            "b": rnd(lin.bias.detach().numpy()),
+        })
 
     out = {
-        "arch": [NUM_FEATURES, args.hidden, 1],
+        "arch": [NUM_FEATURES, *hidden, 1],
         "scale": args.scale,
-        "w0": [round(x, 6) for x in w0],
-        "b0": [round(x, 6) for x in b0],
-        "w1": [round(x, 6) for x in w1],
-        "b1": [round(x, 6) for x in b1],
+        "layers": layers,
     }
-    os.makedirs(os.path.dirname(args.out), exist_ok=True)
-    with open(args.out, "w") as f:
+    # --name publishes into the web catalog (web/public/nn/<name>.json) and registers
+    # it in the manifest; otherwise write the plain --out file (the Node-tools default).
+    out_path = os.path.join(NN_CATALOG, f"{args.name}.json") if args.name else args.out
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w") as f:
         json.dump(out, f)
-    print(f"Wrote {args.out} ({os.path.getsize(args.out) // 1024} KB). "
+    print(f"Wrote {out_path} ({os.path.getsize(out_path) // 1024} KB). "
           f"Rebuild the web app (or restart dev) to pick it up.")
+    if args.name:
+        mpath = update_manifest(args.name, f"{args.name}.json",
+                                [NUM_FEATURES, *hidden, 1], args.note, args.set_default)
+        print(f"Registered '{args.name}' in {mpath}.")
 
 
 if __name__ == "__main__":

@@ -3,10 +3,12 @@
 //
 // Self-play data generator for the neural-net evaluation. Plays games with the
 // existing engine (the "teacher") from randomized openings, and writes one JSONL
-// line per position: the active input feature indices (from nn.js, so the feature
-// definition is single-sourced), the game's final result from the SIDE-TO-MOVE's
-// view (matching the canonical, side-to-move feature orientation; the White-view
-// outcome is sign-flipped for Black-to-move positions), and a
+// line per position: the active input feature indices ("f", from nn.js, so the
+// feature definition is single-sourced), the game's final result from the
+// SIDE-TO-MOVE's view ("r", matching the canonical, side-to-move feature
+// orientation; the White-view outcome is sign-flipped for Black-to-move positions),
+// the position's "fen" (so scripts/refeaturize.mjs can recompute "f" after a
+// feature-set change without regenerating self-play), and a
 // game id ("g") so the trainer can split train/val by GAME — every position in a
 // game shares one label and is highly correlated, so a position-level split would
 // leak a game across both sides and make the val loss (and early stopping)

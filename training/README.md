@@ -91,18 +91,28 @@ are independent and order-agnostic, so merging is just concatenation.
 ## How it fits together
 
 - **Feature definition is single-sourced** in `web/src/nn.js` (`featureIndices`):
-  12 piece-kinds × 64 squares + a side-to-move bit (769 inputs). The generator
-  writes those indices, so the trainer needs no chess logic — it only sees vectors.
-- **Target** is the pure game result (+1 / 0 / −1, White's view). Training on who
-  actually won — rather than mimicking the handcrafted eval — is what lets the net
-  *improve* on it instead of inheriting its blind spots.
-- **Network**: sparse input → ReLU hidden (default 64) → scalar, squashed with
-  `tanh` and scaled to centipawns. Small enough to recompute at every search leaf.
+  12 piece-kinds × 64 squares (768 inputs) in canonical side-to-move orientation
+  (no separate side-to-move bit — the board is flipped for Black). The generator
+  writes those indices (and the position's `fen`), so the trainer needs no chess
+  logic — it only sees vectors. After changing `featureIndices`, run
+  `npm run train:refeaturize` to recompute the dataset's indices instead of
+  regenerating self-play — from the stored `fen`, or for pre-`fen` data by
+  reconstructing a canonical board from the existing `f` (works for any canonical
+  feature of board+turn; only features needing extra state like castling rights
+  require regenerating with FENs).
+- **Target** is the pure game result (+1 / 0 / −1) from the **side-to-move's** view.
+  Training on who actually won — rather than mimicking the handcrafted eval — is
+  what lets the net *improve* on it instead of inheriting its blind spots.
+- **Network**: sparse input → one or more ReLU hidden layers → scalar, squashed
+  with `tanh` and scaled to centipawns. `--hidden` sets the hidden widths (default
+  `128`; a comma list like `256,32` adds depth). Small enough to recompute at every
+  search leaf, but bigger/deeper trades node speed — gate with `npm run match`.
 
 ## Knobs worth trying
 
 - `--games`, `--depth` (generator): more/deeper games = better but slower data.
-- `--hidden`, `--lr` (trainer): network capacity and learning rate.
+- `--hidden`, `--lr` (trainer): network capacity (one width, or a comma list such
+  as `256,32` for a deeper net) and learning rate.
 - `--epochs` (max cap) / `--patience` (early-stopping tolerance): normally leave
   these — early stopping picks the real epoch count. Raise `--patience` if it's
   stopping too eagerly; set `--patience 0` to disable and run all `--epochs`.

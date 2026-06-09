@@ -21,18 +21,27 @@ import { loadWeights } from '../src/nn.js';
 
 const cfg = workerData.cfg;
 
-// Load nn weights if either engine uses them — otherwise the nn eval silently
-// falls back to material-only (nn.js). Both ai.js instances share one nn.js module.
-if (cfg.evalA === 'nn' || cfg.evalB === 'nn') {
+// Load nn weights per side into its own slot ('a'/'b') so two different nets can
+// play head-to-head; both ai.js instances share one nn.js module, but each reads its
+// own slot. An omitted --weights-* falls back to the shipped src/nn-weights.json; a
+// missing/placeholder file leaves that side on nn.js's material fallback. The eval
+// name passed to the search is 'nn:a' / 'nn:b' so each instance picks its slot.
+const defaultWeights = new URL('../src/nn-weights.json', import.meta.url);
+function loadSlot(path, slot) {
   try {
-    loadWeights(JSON.parse(readFileSync(new URL('../src/nn-weights.json', import.meta.url), 'utf8')));
-  } catch { /* fall back to material eval */ }
+    loadWeights(JSON.parse(readFileSync(path ?? defaultWeights, 'utf8')), slot);
+  } catch { /* fall back to material eval for this slot */ }
 }
+if (cfg.evalA === 'nn') loadSlot(cfg.weightsA, 'a');
+if (cfg.evalB === 'nn') loadSlot(cfg.weightsB, 'b');
 
 const engineARel = cfg.engineA.replace(/^\.\//, '');
 const baselineRel = cfg.baseline.replace(/^\.\//, '');
 const modA = await import(new URL(`../src/${engineARel}?a`, import.meta.url));
 const modB = await import(new URL(`../src/${baselineRel}?b`, import.meta.url));
+
+const evalNameA = cfg.evalA === 'nn' ? 'nn:a' : cfg.evalA;
+const evalNameB = cfg.evalB === 'nn' ? 'nn:b' : cfg.evalB;
 
 // Mulberry32: small deterministic PRNG.
 function makeRng(seed) {
@@ -54,8 +63,8 @@ function makePlayer(mod, { depth, movetime, evalName }) {
   };
 }
 
-const A = makePlayer(modA, { depth: cfg.depth, movetime: cfg.movetime, evalName: cfg.evalA });
-const B = makePlayer(modB, { depth: cfg.depthB, movetime: cfg.movetimeB, evalName: cfg.evalB });
+const A = makePlayer(modA, { depth: cfg.depth, movetime: cfg.movetime, evalName: evalNameA });
+const B = makePlayer(modB, { depth: cfg.depthB, movetime: cfg.movetimeB, evalName: evalNameB });
 
 // Play one game; `whiteIsA` decides which engine has White. Returns A's score:
 // 1 win, 0.5 draw, 0 loss.

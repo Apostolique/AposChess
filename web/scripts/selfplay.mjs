@@ -34,6 +34,10 @@
 //                       node scripts/selfplay.mjs --baseline=ai.baseline.js
 //                       (delete web/src/ai.baseline.js afterwards)
 //   --eval-a=NAME     evaluation for engine A: 'handcrafted' (default) or 'nn'
+//   --weights-a=FILE  nn weights for engine A (when --eval-a=nn); default the
+//                     shipped src/nn-weights.json. Use with --weights-b for a direct
+//                     net-vs-net match: --eval-a=nn --eval-b=nn --weights-a=X --weights-b=Y
+//   --weights-b=FILE  nn weights for engine B (when --eval-b=nn)
 //   --eval-b=NAME     evaluation for engine B (default 'handcrafted'). Lets you pit
 //                     the neural-net eval against the handcrafted one in one file.
 //   --no-tt           disable the transposition table for both engines
@@ -54,6 +58,7 @@
 
 import { Worker } from 'node:worker_threads';
 import { cpus } from 'node:os';
+import { resolve } from 'node:path';
 
 // --- args --------------------------------------------------------------------
 const args = Object.fromEntries(
@@ -74,6 +79,11 @@ const cfg = {
   baseline: typeof args.baseline === 'string' ? args.baseline : './ai.js',
   evalA: typeof args['eval-a'] === 'string' ? args['eval-a'] : 'handcrafted',
   evalB: typeof args['eval-b'] === 'string' ? args['eval-b'] : 'handcrafted',
+  // Per-side nn weights (only used when the matching eval is 'nn'). Each side loads
+  // its file into its own slot, so two nets play head-to-head; omit to use the
+  // shipped src/nn-weights.json. Resolved against the current dir for intuitive paths.
+  weightsA: typeof args['weights-a'] === 'string' ? resolve(process.cwd(), args['weights-a']) : null,
+  weightsB: typeof args['weights-b'] === 'string' ? resolve(process.cwd(), args['weights-b']) : null,
   useTT: !args['no-tt'],
   openings: num(args.openings, 6),
   maxmoves: num(args.maxmoves, 200),
@@ -150,8 +160,9 @@ function report(scores, done) {
 }
 
 // --- run ---------------------------------------------------------------------
-const tag = (file, ev) => (ev === 'handcrafted' ? file : `${file} [${ev}]`);
-console.log(`A = ${tag(cfg.engineA, cfg.evalA)}  vs  B = ${tag(cfg.baseline, cfg.evalB)}`);
+const basename = (p) => (p ? p.replace(/^.*[\\/]/, '') : 'nn-weights.json');
+const tag = (file, ev, w) => (ev === 'handcrafted' ? file : `${file} [${ev}:${basename(w)}]`);
+console.log(`A = ${tag(cfg.engineA, cfg.evalA, cfg.weightsA)}  vs  B = ${tag(cfg.baseline, cfg.evalB, cfg.weightsB)}`);
 console.log(
   `${cfg.depth != null ? `depth ${cfg.depth}` : `${cfg.movetime}ms/move`} | ` +
   `openings ${cfg.openings} plies | TT ${cfg.useTT ? 'on' : 'off'} | jobs ${jobs} | ` +
