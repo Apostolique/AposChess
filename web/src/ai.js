@@ -164,11 +164,13 @@ const ttReset = () => { ttGen.fill(0); ttCurGen = 0; };
 const ttBumpGen = () => { ttCurGen = (ttCurGen % 65535) + 1; };
 
 function ttProbe(hash) {
+  hash ^= evalKey; // namespace the table by active eval (see EVAL_KEYS)
   const idx = Number(hash & TT_MASK);
   return ttGen[idx] !== 0 && ttKey[idx] === BigInt.asIntN(64, hash) ? idx : -1;
 }
 
 function ttStore(hash, depth, score, flag, move) {
+  hash ^= evalKey; // namespace the table by active eval (see EVAL_KEYS)
   const idx = Number(hash & TT_MASK);
   const k = BigInt.asIntN(64, hash);
   // Replace if the slot is empty, holds this same position, is left over from an
@@ -287,6 +289,18 @@ const evalNN = nnEvaluate;
 
 const EVALS = { handcrafted: evalStm, nn: evalNN };
 let activeEval = evalStm;
+
+// The transposition table persists across searches and — in AI-vs-AI on a single
+// worker — is shared by both colours, which may use *different* evals. Entries are
+// keyed by position hash alone, which says nothing about which eval produced the
+// stored score, so without namespacing an nn search and a handcrafted search would
+// read each other's scores through the table and corrupt both (cutoffs, bounds,
+// move ordering). XOR a per-eval constant into the TT key (only there — see
+// ttProbe/ttStore) so each eval occupies a disjoint slice of the table. Handcrafted
+// uses 0n, so single-eval behaviour — and the match runner's separate-instance
+// engines — stay byte-for-byte unchanged; only the nn keys move out of the way.
+const EVAL_KEYS = { handcrafted: 0n, nn: 0x9e3779b97f4a7c15n };
+let evalKey = 0n;
 
 function hasNonPawn(board, color) {
   for (const p of board) if (p && p.color === color && p.role !== 'p' && p.role !== 'k') return true;
@@ -464,6 +478,7 @@ function search(state, depth, alpha, beta, ply, canNull, hash, deadline) {
 // so keeps the per-node repetition lookup set tiny (usually empty).
 export function chooseMoveDetailed(state, maxDepth = 2, rand = Math.random, maxMs = Infinity, useTT = true, prevHashes = [], engine = 'handcrafted') {
   activeEval = EVALS[engine] || evalStm;
+  evalKey = EVAL_KEYS[engine] || 0n;
   const root = legalMoves(state);
   if (root.length === 0) return { move: null, ponder: null, depth: 0 };
 
