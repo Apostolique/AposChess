@@ -14,7 +14,7 @@ import { fileURLToPath } from 'node:url';
 
 import { newGameState, toFen } from '../src/board.js';
 import { legalMoves, applyMove, gameStatus } from '../src/engine.js';
-import { chooseMove, _internal } from '../src/ai.js';
+import { chooseMoveDetailed, _internal } from '../src/ai.js';
 import { loadWeights } from '../src/nn.js'; // only to set the nn teacher's weights (--eval=nn)
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -42,6 +42,7 @@ function playGame(rng) {
   const pick = (arr) => arr[Math.floor(rng() * arr.length)];
   let state = newGameState();
   const positions = [];
+  const scores = []; // parallel to positions: the search value (cp, stm-relative) or null
   const seen = [];
   let result = 0;
 
@@ -51,24 +52,25 @@ function playGame(rng) {
       result = status.result === 'checkmate' ? (status.winner === 'white' ? 1 : -1) : 0;
       break;
     }
-    // Record real (post-opening) positions only; random opening moves aren't the
-    // engine's choices, but the positions themselves are still fine training data.
-    // Keep the whole state so we can serialize a FEN (applyMove returns fresh
-    // states, so the reference stays valid as the game continues).
+    // Record every position (openings included). The random opening moves aren't the
+    // engine's choices, but the positions themselves are fine training data. Keep the
+    // whole state so we can serialize a FEN (applyMove returns fresh states, so the
+    // reference stays valid as the game continues).
     positions.push(state);
 
-    let move;
-    if (ply < cfg.openings) {
-      move = pick(status.legal);
-    } else {
-      const prev = seen.map((s) => _internal.hashOf(s));
-      move = chooseMove(state, cfg.depth ?? 99, rng,
-        cfg.depth != null ? Infinity : cfg.movetime, true, prev, cfg.evalName);
-    }
+    // Search every position to record its value `v` (cp, stm-relative) — a uniform
+    // TD/bootstrap target across the whole dataset, including the openings. Opening
+    // plies still PLAY a random move for variety, but `v` is the net's value of the
+    // position itself, independent of the (random) move chosen next.
+    const prev = seen.map((s) => _internal.hashOf(s));
+    const r = chooseMoveDetailed(state, cfg.depth ?? 99, rng,
+      cfg.depth != null ? Infinity : cfg.movetime, true, prev, cfg.evalName);
+    const move = ply < cfg.openings ? pick(status.legal) : r.move;
+    scores.push(r.score);
     seen.push(state);
     state = applyMove(state, move);
   }
-  return { positions, result };
+  return { positions, scores, result };
 }
 
 // Per-game seed: decorrelate the base seed with the game index so each game is
@@ -78,17 +80,21 @@ const gameSeed = (g) => (((cfg.seed >>> 0) ^ Math.imul(g + 1, 0x9e3779b1)) >>> 0
 parentPort.on('message', (msg) => {
   if (msg.type !== 'play') return;
   const g = msg.g;
-  const { positions, result } = playGame(makeRng(gameSeed(g)));
+  const { positions, scores, result } = playGame(makeRng(gameSeed(g)));
   const gid = `${cfg.seed.toString(36)}-${g}`; // unique per run; groups one game
   let lines = '';
-  for (const st of positions) {
-    // Store the raw position + outcome only — net-agnostic. Features for a specific
-    // net are derived later by scripts/featurize.mjs. The label is the result from
-    // the SIDE-TO-MOVE's view (so it matches the canonical features featurize emits):
-    // flip the White-view result for Black-to-move positions. The full state's FEN
-    // carries correct castling rights, so a future castling-dependent feature works.
+  for (let i = 0; i < positions.length; i++) {
+    const st = positions[i];
+    // Store the raw position + outcome — net-agnostic. Features for a specific net are
+    // derived later by scripts/featurize.mjs. `r` is the result from the SIDE-TO-MOVE's
+    // view (matching the canonical features); the FEN carries correct castling.
     const r = st.turn === 'white' ? result : -result;
-    lines += JSON.stringify({ fen: toFen(st), r, g: gid }) + '\n';
+    const rec = { fen: toFen(st), r, g: gid };
+    // `v` = the search's value of this position (cp, side-to-move-relative) for TD /
+    // bootstrap targets; omitted for random opening plies. With --eval=nn it's the
+    // net's own deeper-search value — an unbiased bootstrap signal (train.py --lambda).
+    if (scores[i] != null) rec.v = scores[i];
+    lines += JSON.stringify(rec) + '\n';
   }
   parentPort.postMessage({ type: 'result', g, lines, nPositions: positions.length });
 });

@@ -91,7 +91,9 @@ for await (const line of rl) {
     ? (fromFen++, parseFen(rec.fen))
     : (fromFeatures++, boardFromFeatures(rec.f));
   const f = featureIndices(board, turn);
-  if (!out.write(JSON.stringify({ f, r: rec.r, g: rec.g }) + '\n')) {
+  const o = { f, r: rec.r, g: rec.g };
+  if (rec.v != null) o.v = rec.v; // search value, for TD/bootstrap targets (train.py --lambda)
+  if (!out.write(JSON.stringify(o) + '\n')) {
     await new Promise((res) => out.once('drain', res)); // respect backpressure on a big file
   }
 }

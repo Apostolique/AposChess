@@ -74,6 +74,59 @@ That's the whole routine. The individual stages (`npm run train:gen`,
 `npm run train:featurize`, `python training/train.py`, `npm run match`) still exist
 if you want to run one at a time, but `npm run train` is the normal path.
 
+## Unattended improvement: the gated loop (`train:loop`)
+
+`npm run train` overwrites the net each cycle and can regress (you watch the score and
+roll back by hand). `npm run train:loop` automates the **safe** version — gated
+expert-iteration that can run all day and **never regresses**:
+
+```
+npm run train:loop -- --fresh --batch=200 --depth=6 --gate-games=400 --elo1=5
+```
+
+Each cycle: generate games with the **champion** (deep search → better labels) →
+featurize → train a **candidate** (same shape as the champion) → play
+**candidate vs champion** as an SPRT → **promote the candidate only if it wins**
+(accepts H1). Otherwise the champion is kept. So the champion only ever moves uphill.
+
+- The champion is `web/src/nn-weights.json`. On each promotion it's also published to
+  the catalog as **`loop-champion`**, so you can play the current champion in the app
+  (rebuild for the production bundle; `npm run dev` serves it live).
+- Runs forever until `Ctrl-C` (or pass `--cycles=N`). Per-cycle decisions are printed
+  and appended to `training/data/loop/loop.log`.
+- `--fresh` starts the dataset over — recommended, so the bootstrap is built from the
+  champion's deep-search games rather than the old depth-4 handcrafted set.
+- Options: `--batch`, `--depth` (generation), `--gate-games`, `--gate-depth`, `--elo1`
+  (promotion bar, Elo over the champion), `--hidden` (candidate shape; default =
+  champion's), `--lambda` (TD target mix, below), `--jobs`.
+
+### TD / bootstrap targets (`--lambda`)
+
+By default each position's training target is the **game result** (`±1/0`). With
+`--lambda=L` (L < 1) the target becomes `L·result + (1−L)·tanh(v/scale)`, where `v` is
+the **search value** of that position recorded at generation time. With `--eval=nn`
+generation (what the loop uses) `v` is the *net's own deeper-search* value — so the
+candidate's static eval learns to predict what currently costs a depth-`D` search.
+That's the NNUE-style trick and the most direct lever against the signal-limited
+ceiling, and it stays **unbiased** (it's the net bootstrapping off its own search, not
+the handcrafted eval). Try e.g. `--lambda=0.5`:
+
+```
+npm run train:loop -- --batch=200 --depth=6 --lambda=0.5 --elo1=5
+```
+
+Caveat: only use `--lambda<1` on **nn-generated** data. Handcrafted-played games record
+the *handcrafted* search value, so leaning on it there reintroduces the bias the
+pure-result target avoids. (Positions without a `v` — random openings, legacy data —
+always fall back to the pure result.)
+
+**Honest expectation.** This makes the loop *safe*, not *guaranteed to improve*. The
+net is signal-limited (see below), so the gate may rarely fire — that's informative,
+not a bug: it's telling you replaying same-strength games isn't adding information.
+The lever that makes the gate actually fire is better *labels* (deeper `--depth`,
+self-play from a stronger champion), not more cycles. Matches are slow, so expect a
+handful of cycles per hour.
+
 ## Trying new ideas (recipes)
 
 Every idea follows the same shape: **train a candidate, then compare it head-to-head
@@ -174,8 +227,10 @@ are independent and order-agnostic, so merging is just concatenation.
 ## How it fits together
 
 - **Position-primary data.** `npm run train:gen` writes the **raw** dataset
-  `selfplay.jsonl` = `{fen, r, g}` — board position, result (side-to-move view), game
-  id — and nothing net-specific (the generator doesn't import `nn.js`). A separate
+  `selfplay.jsonl` = `{fen, r, g, v}` — board position, result (side-to-move view), game
+  id, and the search value `v` of the position (cp, side-to-move-relative; omitted for
+  random openings) for TD targets — and nothing net-specific (the generator doesn't
+  import `nn.js`). A separate
   step turns positions into net inputs:
   `npm run train:featurize` applies the **current** `featureIndices` and writes
   `selfplay.features.jsonl` = `{f, r, g}`, which the trainer reads. So changing the
@@ -221,7 +276,7 @@ are independent and order-agnostic, so merging is just concatenation.
   depth, or features tends to *overfit* the game-result-only target (measured: a
   64-wide net is at parity with handcrafted; wider and king-relative-feature variants
   both lost Elo). The unbiased lever is better *labels*, not a bigger net: generate
-  with deeper search (`--depth`), and bootstrap from the net's own play (`--eval=nn`).
-  Blending the handcrafted eval into the target (`λ·eval + (1−λ)·result`) would
-  densify the signal but reintroduces the teacher's bias the pure-result target was
-  chosen to avoid — so it's deliberately not used.
+  with deeper search (`--depth`), bootstrap from the net's own play (`--eval=nn`), and
+  blend the net's **own search value** into the target via `--lambda` (TD targets,
+  above) — that densifies the signal without the handcrafted bias. Blending the
+  *handcrafted* eval would reintroduce that bias, so it's deliberately avoided.

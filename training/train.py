@@ -96,6 +96,11 @@ def parse_args():
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--scale", type=float, default=600.0,
                    help="centipawns at tanh saturation (written into the weights)")
+    p.add_argument("--lambda", dest="lam", type=float, default=1.0,
+                   help="TD/bootstrap mix: target = lam*result + (1-lam)*tanh(v/scale), "
+                        "where v is the recorded per-position search value. 1.0 = pure "
+                        "game result (default). <1 leans on the search value — use only "
+                        "with nn-generated data (handcrafted v reintroduces its bias).")
     p.add_argument("--val", type=float, default=0.05, help="validation fraction")
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
@@ -105,7 +110,7 @@ def load_data(path):
     if not os.path.exists(path):
         sys.exit(f"No training data at {path}. Generate raw positions, then featurize:\n"
                  f"  cd web && npm run train:gen && npm run train:featurize")
-    samples, targets, games = [], [], []
+    samples, targets, values, games = [], [], [], []
     with open(path, "r") as f:
         for line in f:
             line = line.strip()
@@ -114,12 +119,13 @@ def load_data(path):
             rec = json.loads(line)
             samples.append(rec["f"])
             targets.append(float(rec["r"]))
+            values.append(rec.get("v", None))  # per-position search value (cp) or None
             # No "g" (pre-migration data) -> give the row its own unique id so it
             # stays a singleton "game"; this can never leak across the split.
             games.append(rec.get("g", f"_nog_{len(games)}"))
     if not targets:
         sys.exit(f"{path} has no samples.")
-    return samples, targets, games
+    return samples, targets, values, games
 
 
 def main():
@@ -137,10 +143,21 @@ def main():
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    samples, targets, games = load_data(args.data)
+    samples, targets, values, games = load_data(args.data)
     n = len(targets)
 
-    targets_t = torch.tensor(targets, dtype=torch.float32)
+    # TD/bootstrap target: blend the game result with the recorded search value
+    # (target = lam*result + (1-lam)*tanh(v/scale)). lam=1 -> pure result (unchanged).
+    # Positions without a `v` (random openings / legacy data) always use the result.
+    if args.lam >= 1.0:
+        blended = targets
+    else:
+        import math
+        blended = [r if v is None else args.lam * r + (1.0 - args.lam) * math.tanh(v / args.scale)
+                   for r, v in zip(targets, values)]
+        n_boot = sum(1 for v in values if v is not None)
+        print(f"TD target: lambda={args.lam}, {n_boot}/{n} positions have a search value")
+    targets_t = torch.tensor(blended, dtype=torch.float32)
 
     # Split by GAME, not by position (see header): group rows by game id, shuffle
     # the games, then send whole games to val/train so no game straddles the split.

@@ -38,6 +38,8 @@
 //                     shipped src/nn-weights.json. Use with --weights-b for a direct
 //                     net-vs-net match: --eval-a=nn --eval-b=nn --weights-a=X --weights-b=Y
 //   --weights-b=FILE  nn weights for engine B (when --eval-b=nn)
+//   --result-file=F   write a JSON summary {games,wins,draws,losses,score,elo,llr,
+//                     sprt} at the end (for orchestration, e.g. the gated train:loop)
 //   --eval-b=NAME     evaluation for engine B (default 'handcrafted'). Lets you pit
 //                     the neural-net eval against the handcrafted one in one file.
 //   --no-tt           disable the transposition table for both engines
@@ -59,6 +61,7 @@
 import { Worker } from 'node:worker_threads';
 import { cpus } from 'node:os';
 import { resolve } from 'node:path';
+import { writeFileSync } from 'node:fs';
 
 // --- args --------------------------------------------------------------------
 const args = Object.fromEntries(
@@ -84,6 +87,8 @@ const cfg = {
   // shipped src/nn-weights.json. Resolved against the current dir for intuitive paths.
   weightsA: typeof args['weights-a'] === 'string' ? resolve(process.cwd(), args['weights-a']) : null,
   weightsB: typeof args['weights-b'] === 'string' ? resolve(process.cwd(), args['weights-b']) : null,
+  // Optional machine-readable result (for orchestration, e.g. the gated train:loop).
+  resultFile: typeof args['result-file'] === 'string' ? resolve(process.cwd(), args['result-file']) : null,
   useTT: !args['no-tt'],
   openings: num(args.openings, 6),
   maxmoves: num(args.maxmoves, 200),
@@ -254,4 +259,19 @@ if (cfg.sprt) {
   if (decided === 'H1') console.log(`SPRT: accept H1 — A is stronger than B by ≳${cfg.elo0}..${cfg.elo1} Elo.`);
   else if (decided === 'H0') console.log(`SPRT: accept H0 — A is NOT a ${cfg.elo1}-Elo improvement over B.`);
   else console.log('SPRT: inconclusive within the game budget — raise --games or widen [elo0, elo1].');
+}
+
+// Machine-readable summary for orchestration (train:loop reads this to gate).
+if (cfg.resultFile) {
+  const n = scores.length, S = scores.reduce((a, b) => a + b, 0), p = S / n;
+  writeFileSync(cfg.resultFile, JSON.stringify({
+    games: n,
+    wins: scores.filter((s) => s === 1).length,
+    draws: scores.filter((s) => s === 0.5).length,
+    losses: scores.filter((s) => s === 0).length,
+    score: p,
+    elo: eloFromScore(p),
+    llr: cfg.sprt ? llr(scores, cfg.elo0, cfg.elo1) : null,
+    sprt: cfg.sprt ? (decided || 'inconclusive') : null, // 'H1' = A better, 'H0' = not
+  }, null, 2));
 }

@@ -522,6 +522,7 @@ export function chooseMoveDetailed(state, maxDepth = 2, rand = Math.random, maxM
   const deadline = now() + maxMs;
   let bestMove = root[0];
   let completed = 0;
+  let rootScore = 0; // side-to-move-relative value (cp) of the last completed depth
 
   // Backstop so an unbounded (maxDepth = Infinity) search still terminates even
   // if the deadline were also infinite; real searches abort on time long before.
@@ -544,7 +545,7 @@ export function chooseMoveDetailed(state, maxDepth = 2, rand = Math.random, maxM
       if (score > bestScore) { bestScore = score; localBest = m; }
       if (score > alpha) alpha = score;
     }
-    if (!aborted) { bestMove = localBest; completed = depth; }
+    if (!aborted) { bestMove = localBest; completed = depth; rootScore = bestScore; }
     if (aborted || bestScore >= MATE_THRESH) break;
   }
 
@@ -554,7 +555,7 @@ export function chooseMoveDetailed(state, maxDepth = 2, rand = Math.random, maxM
     const i = ttProbe(hashAfter(rootHash, state, bestMove));
     if (i >= 0 && ttMove[i]) ponder = { from: (ttMove[i] / 64) | 0, to: ttMove[i] % 64 };
   }
-  return { move: bestMove, ponder, depth: completed };
+  return { move: bestMove, ponder, depth: completed, score: rootScore };
 }
 
 export function chooseMove(state, maxDepth, rand, maxMs, useTT, prevHashes, engine) {

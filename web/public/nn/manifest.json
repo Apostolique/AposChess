@@ -24,6 +24,16 @@
       "note": ""
     },
     {
+      "name": "loop-champion",
+      "file": "loop-champion.json",
+      "arch": [
+        768,
+        64,
+        1
+      ],
+      "note": "Latest gated train:loop champion."
+    },
+    {
       "name": "random-noise",
       "file": "random-noise.json",
       "arch": [

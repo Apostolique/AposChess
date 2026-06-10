@@ -14,6 +14,7 @@
     "train:gen": "node scripts/gen-selfplay.mjs",
     "train:fit": "node scripts/train-fit.mjs",
     "train:featurize": "node scripts/featurize.mjs",
+    "train:loop": "node scripts/train-loop.mjs",
     "train:merge": "node scripts/merge-data.mjs"
   },
   "dependencies": {
