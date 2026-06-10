@@ -37,6 +37,14 @@
 //   --hidden=H      candidate architecture (default: same shape as the champion)
 //   --jobs=N        parallel workers for gen + match
 //   --fresh         clear the dataset before the first cycle (clean deep-search start)
+//   --refresh-frac=P  after each PROMOTION, recompute `v` on a random fraction P of the
+//                   dataset with the new champion (value iteration; 0 = off, default).
+//                   Only runs on promotion — between promotions the champion (hence v)
+//                   is unchanged, so a refresh would just recompute identical values.
+//                   Cost scales with P × depth; e.g. P=0.2 touches the whole set every
+//                   ~5 promotions. Re-featurize happens next cycle, so it flows in.
+//   --refresh-depth=D  search depth for the refresh (default 3 — cheap, like the
+//                   backfilled majority; a depth-6 refresh of a big fraction is hours)
 
 import { spawnSync } from 'node:child_process';
 import {
@@ -55,6 +63,7 @@ mkdirSync(loopDir, { recursive: true });
 const genScript = resolve(here, 'gen-selfplay.mjs');
 const featurizeScript = resolve(here, 'featurize.mjs');
 const matchScript = resolve(here, 'selfplay.mjs');
+const refreshScript = resolve(here, 'refresh-v.mjs');
 const trainPy = resolve(repoDir, 'training', 'train.py');
 
 const rawFile = join(dataDir, 'selfplay.jsonl');
@@ -86,6 +95,14 @@ const cfg = {
   hidden: typeof args.hidden === 'string' ? args.hidden : null,
   jobs: args.jobs,
   fresh: !!args.fresh,
+  // After each PROMOTION (the only time the champion — hence the `v` target — changes),
+  // recompute `v` on a random fraction of the dataset with the new champion (value
+  // iteration). 0 = off. Partial keeps cost amortized and average staleness ~1/frac
+  // promotions. Refresh search depth defaults to the gen depth.
+  refreshFrac: num(args['refresh-frac'], 0),
+  // Cheap by default (depth 3, like the backfilled majority): a depth-6 refresh of a
+  // big fraction is many hours. Raise it to trade speed for value accuracy.
+  refreshDepth: num(args['refresh-depth'], 3),
 };
 
 function findPython() {
@@ -145,7 +162,9 @@ if (cfg.fresh && existsSync(rawFile)) { rmSync(rawFile); log('Cleared dataset (-
 
 const hidden = championHidden();
 log(`train:loop start — batch ${cfg.batch} @ depth ${cfg.depth} | gate ${cfg.gateGames}g @ depth ${cfg.gateDepth} `
-  + `SPRT(0,${cfg.elo1}) | candidate hidden=[${hidden}] λ=${cfg.lam} | cycles ${cfg.cycles === Infinity ? '∞' : cfg.cycles}`);
+  + `SPRT(0,${cfg.elo1}) | candidate hidden=[${hidden}] λ=${cfg.lam} | `
+  + `refresh ${cfg.refreshFrac > 0 ? `${(cfg.refreshFrac * 100).toFixed(0)}% @ depth ${cfg.refreshDepth} on promotion` : 'off'} | `
+  + `cycles ${cfg.cycles === Infinity ? '∞' : cfg.cycles}`);
 
 const jobArg = cfg.jobs !== undefined ? [`--jobs=${cfg.jobs}`] : [];
 let promotions = 0;
@@ -183,6 +202,15 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
     promotions++;
     log(`cycle ${c}: PROMOTED ✓  candidate ${pct}% / Elo ${res.elo.toFixed(0)} over champion `
       + `(${res.games} games). New champion published as 'loop-champion'. Total promotions: ${promotions}.`);
+    // The champion (hence the `v` target) just changed: value-iterate by recomputing
+    // `v` on a fraction of the dataset with the NEW champion. Optional maintenance —
+    // a failure shouldn't kill the loop, so we don't gate on its result (a Ctrl-C
+    // still propagates via the `stopping` flag and ends the run after this cycle).
+    if (cfg.refreshFrac > 0) {
+      run(`Refresh v (${(cfg.refreshFrac * 100).toFixed(0)}% @ depth ${cfg.refreshDepth}, new champion)`,
+        process.execPath, [refreshScript, '--refresh', `--frac=${cfg.refreshFrac}`,
+          `--weights=${champion}`, `--depth=${cfg.refreshDepth}`, ...jobArg]);
+    }
   } else {
     log(`cycle ${c}: kept champion — candidate ${pct}% / Elo ${res.elo.toFixed(0)} `
       + `(SPRT ${res.sprt}, ${res.games} games). Not a significant gain.`);
