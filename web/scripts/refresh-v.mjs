@@ -24,7 +24,7 @@
 // Usage (run from web/):
 //   node scripts/refresh-v.mjs [--refresh] [--frac=P] [--depth=D] [--jobs=N]
 //                              [--weights=FILE] [--in=FILE] [--out=FILE] [--seed=S]
-// Defaults: depth 3, jobs = CPU cores, weights = ./src/nn-weights.json (the champion),
+// Defaults: depth 6, jobs = CPU cores, weights = ./src/nn-weights.json (the champion),
 //           in/out = ../training/data/selfplay.jsonl (atomic replace), seed 1.
 
 import { Worker } from 'node:worker_threads';
@@ -42,7 +42,7 @@ const args = Object.fromEntries(process.argv.slice(2).map((a) => {
 }));
 const refresh = !!args.refresh;
 const frac = args.frac !== undefined ? Number(args.frac) : 1.0;
-const depth = args.depth !== undefined ? Number(args.depth) : 3;
+const depth = args.depth !== undefined ? Number(args.depth) : 6;
 const jobs = Math.max(1, args.jobs !== undefined ? Number(args.jobs) : cpus().length);
 const seed = args.seed !== undefined ? Number(args.seed) : 1;
 const weights = typeof args.weights === 'string'
