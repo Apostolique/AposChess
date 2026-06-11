@@ -90,7 +90,20 @@ the champion, **warm-started from the champion's weights** so it fine-tunes on t
 grown dataset in a few epochs; `--cold` restores from-scratch training) → play
 **candidate vs champion** as an SPRT → **promote the candidate only if it wins**
 (accepts H1). Otherwise the champion is kept. So the champion only ever moves uphill.
-On promotion it can also **refresh the value targets** (`--refresh-frac`, below).
+On promotion it can also **refresh the value targets** (`--refresh-frac`, below), and
+every cycle it refreshes a small slice regardless (`--refresh-cycle`, below).
+
+**Candidate lineage (sub-threshold gains accumulate).** A mature champion's real
+per-cycle gains are often +10-ish Elo — genuinely positive but below what the SPRT can
+certify, so cycle after cycle would train a slightly-better candidate and throw it
+away, then re-derive roughly the same candidate from the same champion on a dataset
+that grew only ~2%. Instead, when the gate is **inconclusive but the candidate scored
+≥ 50%**, the candidate is kept (`loop/lineage.json`) and the next cycle's candidate
+warm-starts **from it** rather than from the champion — so those small gains compound
+across cycles until the lineage clears the gate in one decided match. The champion
+stays protected (only an H1 promotes); a candidate that scores < 50% (or a decided H0)
+resets the lineage back to the champion. The lineage survives a `Ctrl-C` restart and
+is discarded automatically on `--cold` or a `--hidden` shape change.
 
 The gate's games are themselves **harvested into the dataset** (`--no-harvest` to
 disable): up to `--gate-games` per cycle — comparable volume to generation, already
@@ -116,14 +129,15 @@ deep-label anchor and guarantees fixed data volume even when the SPRT stops earl
   outside the repo, or with a `--batch` large enough to rebuild real volume. The
   normal path **omits it** and lets the dataset accumulate (and be maintained — see
   "Dataset maintenance").
-- Options: `--batch`, `--depth` (generation), `--gate-games`, `--gate-depth`, `--elo1`
-  (promotion bar, below), `--hidden` (candidate shape; default = champion's),
+- Options: `--batch`, `--depth` (generation), `--gate-games` (default 800), `--gate-depth`,
+  `--elo1` (promotion bar, below), `--hidden` (candidate shape; default = champion's),
   `--lambda` (TD target mix, below), `--cold` (random-init candidates instead of
-  warm-starting from the champion), `--skip-gen` (skip the FIRST cycle's generation
-  and gate the dataset as it stands — resume after a Ctrl-C mid-generation without
-  regenerating; completed games were already flushed), `--no-harvest` (don't save
-  gate games into the dataset), `--refresh-frac` / `--refresh-depth` (value-target
-  refresh, see "Dataset maintenance"), `--jobs`.
+  warm-starting from the lineage/champion), `--skip-gen` (skip the FIRST cycle's
+  generation and gate the dataset as it stands — resume after a Ctrl-C mid-generation
+  without regenerating; completed games were already flushed), `--no-harvest` (don't
+  save gate games into the dataset), `--refresh-cycle` / `--refresh-cycle-depth`
+  (per-cycle value refresh, default 1% at the generation depth) and `--refresh-frac` /
+  `--refresh-depth` (on-promotion refresh — see "Dataset maintenance"), `--jobs`.
 
 ### The promotion gate: `--elo1` vs `--gate-games` (calibrate them together)
 
@@ -133,10 +147,13 @@ is making `elo1` too small for the cap: SPRT evidence accrues ~`(elo1−elo0)²`
 tiny band needs huge samples. With `[0, 5]` over 400 games a candidate must be **≈ +170
 Elo** to ever trip H1 — so genuine +40/+60 improvements get rejected and the loop
 **stalls** (it keeps training better candidates and discarding them, the champion never
-moves, generation never improves). The default is therefore **`elo1=20`**, which decides
-a +50-class candidate well within 400 games while still requiring a real gain. As gains
-shrink with maturity, **raise `--gate-games`** (e.g. 800–1500) rather than lowering
-`elo1` — more games is the sound way to detect a smaller edge.
+moves, generation never improves). The default is therefore **`elo1=20`** with a
+**default cap of 800 games**, which decides a +50-class candidate quickly and gives an
+honest +20–30 candidate a realistic shot at reaching the H1 boundary before the cap. As
+gains shrink with maturity, **raise `--gate-games`** further (e.g. 1500) rather than
+lowering `elo1` — more games is the sound way to detect a smaller edge. (Candidates in
+the +10 range stay genuinely undecidable at sane game counts; the **lineage** mechanism
+above is what stops those gains from being wasted.)
 
 ### TD / bootstrap targets (`--lambda`)
 
@@ -179,9 +196,12 @@ train:featurize`).
 
 Recompute `v` with the **current champion**. This is value iteration: re-bootstrap the
 TD targets from the improved value function (only the `v` part of
-`λ·result + (1−λ)·tanh(v/scale)` moves; `result` is untouched). It only helps **after a
-promotion** — between promotions the champion, and so `v`, is unchanged, and a refresh
-just recomputes identical numbers.
+`λ·result + (1−λ)·tanh(v/scale)` moves; `result` is untouched). Note this helps even
+**between promotions**: at any given moment most of the dataset's `v` values were
+written by *older* champions (or by shallower searches — gate harvests at
+`--gate-depth`, the depth-3 backfill), so re-labeling a random slice with the current
+champion upgrades targets regardless of whether the champion just changed. Only records
+the current champion already labeled at the same depth are true no-ops.
 
 ```
 # fill v only where it's missing (e.g. legacy/opening records):
@@ -196,11 +216,16 @@ hours; refreshing a fraction `P` each time amortizes that cost and keeps the *av
 synchronized all-stale→all-fresh lurch. (Pure-random `P` has a coupon-collector tail; a
 future champion-version stamp would enable exact oldest-first coverage.)
 
-**Wired into the loop.** `train:loop --refresh-frac=P` runs this **after each promotion**
-(using the just-promoted champion); the refreshed `v` flows into the next cycle's
-featurize. `--refresh-depth` sets the search depth (default **3** — cheap, like the
-backfilled majority; a depth-6 refresh of a large fraction is many hours). Off by
-default. Typical:
+**Wired into the loop, two ways.** `train:loop --refresh-cycle=P` (default **0.01**)
+refreshes a small slice **every cycle** between generation and featurize, at
+`--refresh-cycle-depth` (default = the generation `--depth`, so re-labels match the
+deep-label anchor) — the steady drip that keeps average staleness bounded. Rule of
+thumb: 1% of a ~2.5M-position set at depth 6 costs about as much as generating a
+200-game batch. Separately, `--refresh-frac=P` runs a bigger pass **after each
+promotion** (using the just-promoted champion) at `--refresh-depth` (default **3** —
+cheap, like the backfilled majority; a depth-6 refresh of a large fraction is many
+hours). Both seed the slice differently each run, so successive refreshes cover
+different parts of the set. Typical:
 
 ```
 npm run train:loop -- --batch=200 --depth=6 --lambda=0.5 --refresh-frac=0.2

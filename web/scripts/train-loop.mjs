@@ -24,7 +24,8 @@
 //   --batch=N       games generated per cycle (default 200)
 //   --depth=D       search depth while generating (default 6 — deeper = better labels)
 //   --cycles=N      stop after N cycles (default: run forever until Ctrl-C)
-//   --gate-games=N  max games in the candidate-vs-champion match (default 400)
+//   --gate-games=N  max games in the candidate-vs-champion match (default 800 — mature
+//                   gains are small, and small edges need more games to clear the SPRT)
 //   --gate-depth=D  search depth for the gating match (default 4)
 //   --elo1=E        SPRT H1 promotion threshold in Elo (default 20; elo0 is 0). This
 //                   is the SMALLEST gain worth promoting; it must be wide enough that
@@ -63,6 +64,24 @@
 //                   ~5 promotions. Re-featurize happens next cycle, so it flows in.
 //   --refresh-depth=D  search depth for the refresh (default 3 — cheap, like the
 //                   backfilled majority; a depth-6 refresh of a big fraction is hours)
+//   --refresh-cycle=P  EVERY cycle (between generation and featurize), recompute `v` on
+//                   a random fraction P of the dataset with the current champion
+//                   (default 0.01; 0 = off). Unlike --refresh-frac this helps between
+//                   promotions too: most records carry `v` from OLDER champions (or
+//                   shallower gate-harvest/backfill searches), so re-labeling them with
+//                   the current champion steadily upgrades the TD target even while the
+//                   champion is unchanged. Rule of thumb: 1% of a ~2.5M-position set at
+//                   depth 6 costs about as much as generating a 200-game batch.
+//   --refresh-cycle-depth=D  search depth for the per-cycle refresh (default: --depth,
+//                   so the re-labels match generation's deep-label quality)
+//
+// Candidate lineage (automatic, disabled by --cold): when the gate is inconclusive but
+// the candidate scored >= 50%, the candidate is KEPT (loop/lineage.json) and the next
+// cycle's candidate warm-starts from IT instead of the champion — so sub-threshold
+// gains (+10-ish Elo, real but below the SPRT's resolution) accumulate across cycles
+// until the lineage clears the gate, instead of being re-derived and discarded every
+// cycle. The champion is still protected by the gate; a candidate scoring < 50% (or a
+// decided H0) resets the lineage back to the champion.
 
 import { spawnSync } from 'node:child_process';
 import {
@@ -90,6 +109,7 @@ const rawFile = join(dataDir, 'selfplay.jsonl');
 const featFile = join(dataDir, 'selfplay.features.jsonl');
 const champion = resolve(webDir, 'src', 'nn-weights.json');
 const candidate = join(loopDir, 'candidate.json');
+const lineage = join(loopDir, 'lineage.json'); // rejected-but-positive candidate, warm-start source
 const prevChampion = join(loopDir, 'champion-prev.json');
 const resultFile = join(loopDir, 'match.json');
 const logFile = join(loopDir, 'loop.log');
@@ -108,7 +128,7 @@ const cfg = {
   batch: num(args.batch, 200),
   depth: num(args.depth, 6),
   cycles: args.cycles !== undefined ? Number(args.cycles) : Infinity,
-  gateGames: num(args['gate-games'], 400),
+  gateGames: num(args['gate-games'], 800),
   gateDepth: num(args['gate-depth'], 4),
   elo1: num(args.elo1, 20), // wide enough that SPRT can decide within --gate-games
   lam: num(args.lambda, 1), // TD target mix passed to train.py (1 = pure result)
@@ -126,6 +146,12 @@ const cfg = {
   // Cheap by default (depth 3, like the backfilled majority): a depth-6 refresh of a
   // big fraction is many hours. Raise it to trade speed for value accuracy.
   refreshDepth: num(args['refresh-depth'], 3),
+  // Per-cycle refresh: a small slice of the dataset re-labeled with the current champion
+  // every cycle. Helps between promotions too — most `v` in the set came from older
+  // champions or shallower searches, so "unchanged champion" does NOT mean "nothing to
+  // refresh"; only records the current champion already labeled at this depth are no-ops.
+  refreshCycle: num(args['refresh-cycle'], 0.01),
+  refreshCycleDepth: num(args['refresh-cycle-depth'], num(args.depth, 6)),
 };
 
 function findPython() {
@@ -168,6 +194,9 @@ function run(label, cmd, argv, cwd = webDir) {
   console.log(`\n--- ${label} — ${hms()} ---`);
   const r = spawnSync(cmd, argv, { stdio: 'inherit', cwd });
   if (r.signal) { stopping = true; return false; }
+  // Windows delivers console Ctrl-C to the whole process group; the child then exits
+  // with STATUS_CONTROL_C_EXIT (0xC000013A) instead of a signal — an interrupt, not a crash.
+  if (r.status === 0xC000013A) { stopping = true; log(`${label} interrupted (Ctrl-C); stopping loop.`); return false; }
   if (r.status !== 0) { log(`${label} FAILED (exit ${r.status}); stopping loop.`); return false; }
   return true;
 }
@@ -188,9 +217,23 @@ if (!existsSync(champion)) {
 if (cfg.fresh && existsSync(rawFile)) { rmSync(rawFile); log('Cleared dataset (--fresh).'); }
 
 const hidden = championHidden();
+// A leftover lineage only makes sense for the warm path and the current candidate
+// shape; otherwise start the lineage over from the champion.
+if (existsSync(lineage)) {
+  let drop = cfg.cold ? 'cold run' : null;
+  if (!drop) {
+    try {
+      const a = JSON.parse(readFileSync(lineage, 'utf8')).arch;
+      if (!Array.isArray(a) || a.slice(1, -1).join(',') !== hidden) drop = 'shape mismatch';
+    } catch { drop = 'unreadable'; }
+  }
+  if (drop) { rmSync(lineage); log(`Discarded stale lineage (${drop}).`); }
+}
 log(`train:loop start — batch ${cfg.batch} @ depth ${cfg.depth} | gate ${cfg.gateGames}g @ depth ${cfg.gateDepth} `
-  + `SPRT(0,${cfg.elo1}) | candidate hidden=[${hidden}] λ=${cfg.lam} ${cfg.cold ? 'cold' : 'warm'} start | `
-  + `refresh ${cfg.refreshFrac > 0 ? `${(cfg.refreshFrac * 100).toFixed(0)}% @ depth ${cfg.refreshDepth} on promotion` : 'off'} | `
+  + `SPRT(0,${cfg.elo1}) | candidate hidden=[${hidden}] λ=${cfg.lam} ${cfg.cold ? 'cold' : 'warm'} start`
+  + `${existsSync(lineage) ? ' (resuming lineage)' : ''} | `
+  + `refresh/cycle ${cfg.refreshCycle > 0 ? `${(cfg.refreshCycle * 100).toFixed(1)}% @ depth ${cfg.refreshCycleDepth}` : 'off'} | `
+  + `refresh on promotion ${cfg.refreshFrac > 0 ? `${(cfg.refreshFrac * 100).toFixed(0)}% @ depth ${cfg.refreshDepth}` : 'off'} | `
   + `cycles ${cfg.cycles === Infinity ? '∞' : cfg.cycles}`);
 
 const jobArg = cfg.jobs !== undefined ? [`--jobs=${cfg.jobs}`] : [];
@@ -209,17 +252,31 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
   } else if (!run('Generate (champion self-play)', process.execPath,
     [genScript, `--games=${cfg.batch}`, `--depth=${cfg.depth}`, '--eval=nn', ...jobArg])) break;
 
-  // 2. Featurize the raw positions for the current feature set.
+  // 1b. Per-cycle value refresh: re-label a small random slice of the dataset with the
+  //     current champion. Most records carry `v` from older champions or shallower
+  //     searches, so this upgrades targets even between promotions. The seed varies per
+  //     cycle so coverage spreads across the set instead of re-picking the same slice.
+  if (cfg.refreshCycle > 0) {
+    if (!run(`Refresh v (${(cfg.refreshCycle * 100).toFixed(1)}% @ depth ${cfg.refreshCycleDepth})`,
+      process.execPath, [refreshScript, '--refresh', `--frac=${cfg.refreshCycle}`,
+        `--weights=${champion}`, `--depth=${cfg.refreshCycleDepth}`, `--seed=${Date.now()}`,
+        ...jobArg])) break;
+  }
+
+  // 2. Featurize the raw positions for the current feature set. (After a refresh this
+  //    is a full pass — the in-place rewrite invalidates the incremental prefix.)
   if (!run('Featurize', process.execPath, [featurizeScript])) break;
 
   // 3. Train a candidate (same shape as the champion) to a side file. --lambda blends
   //    the champion's search value into the target (TD/bootstrap) when < 1. Unless
-  //    --cold, the candidate warm-starts from the champion's weights, so it
-  //    fine-tunes on the grown dataset in a few epochs instead of relearning from
-  //    scratch (train.py ignores --init gracefully if the shapes don't match).
-  if (!run('Train candidate', python,
+  //    --cold, the candidate warm-starts from the lineage (a previous rejected-but-
+  //    positive candidate) when one exists, else from the champion — so sub-threshold
+  //    gains accumulate instead of being re-derived and discarded every cycle
+  //    (train.py ignores --init gracefully if the shapes don't match).
+  const initFile = !cfg.cold && existsSync(lineage) ? lineage : champion;
+  if (!run(`Train candidate${initFile === lineage ? ' (warm-start from lineage)' : ''}`, python,
     [trainPy, `--hidden=${hidden}`, `--out=${candidate}`, `--lambda=${cfg.lam}`,
-      ...(cfg.cold ? [] : [`--init=${champion}`])])) break;
+      ...(cfg.cold ? [] : [`--init=${initFile}`])])) break;
 
   // 4. Gate: candidate (A) vs champion (B), SPRT(0, elo1). Unless --no-harvest,
   //    the gate's games are appended to the dataset (they're already paid for;
@@ -240,6 +297,7 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
     const arch = JSON.parse(readFileSync(candidate, 'utf8')).arch;
     copyFileSync(champion, prevChampion);   // backup for safety
     copyFileSync(candidate, champion);      // candidate becomes champion
+    if (existsSync(lineage)) rmSync(lineage); // lineage cleared the gate; next start = new champion
     upsertManifest(arch); copyFileSync(candidate, loopChampPub); // make it playable
     promotions++;
     log(`cycle ${c}: PROMOTED ✓  candidate ${pct}% / Elo +${res.elo.toFixed(0)} over champion `
@@ -249,15 +307,26 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
     // `v` on a fraction of the dataset with the NEW champion. Optional maintenance —
     // a failure shouldn't kill the loop, so we don't gate on its result (a Ctrl-C
     // still propagates via the `stopping` flag and ends the run after this cycle).
+    // Seeded per run so successive refreshes cover different slices of the set.
     if (cfg.refreshFrac > 0) {
       run(`Refresh v (${(cfg.refreshFrac * 100).toFixed(0)}% @ depth ${cfg.refreshDepth}, new champion)`,
         process.execPath, [refreshScript, '--refresh', `--frac=${cfg.refreshFrac}`,
-          `--weights=${champion}`, `--depth=${cfg.refreshDepth}`, ...jobArg]);
+          `--weights=${champion}`, `--depth=${cfg.refreshDepth}`, `--seed=${Date.now()}`, ...jobArg]);
     }
-  } else {
+  } else if (!cfg.cold && res.sprt !== 'H0' && res.score >= 0.5) {
+    // Inconclusive but not losing: keep the candidate as the lineage so the next
+    // cycle builds on its (sub-threshold) gain instead of rederiving it from the
+    // champion. The champion itself is untouched — the gate still protects it.
+    copyFileSync(candidate, lineage);
     log(`cycle ${c}: kept champion — candidate ${pct}% / Elo ${res.elo.toFixed(0)} `
       + `(SPRT ${res.sprt}, ${res.games} games, cycle took ${fmtDur((Date.now() - cycleT0) / 1000)}). `
-      + 'Not a significant gain.');
+      + 'Below the gate; candidate kept as lineage for the next cycle.');
+  } else {
+    const hadLineage = existsSync(lineage);
+    if (hadLineage) rmSync(lineage);
+    log(`cycle ${c}: kept champion — candidate ${pct}% / Elo ${res.elo.toFixed(0)} `
+      + `(SPRT ${res.sprt}, ${res.games} games, cycle took ${fmtDur((Date.now() - cycleT0) / 1000)}). `
+      + `Not a gain.${hadLineage ? ' Lineage reset to the champion.' : ''}`);
   }
 }
 

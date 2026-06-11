@@ -297,9 +297,21 @@ function pointAdvantage(board, color) {
 }
 
 function renderTray(el, color, board, caps) {
-  const pieces = [...caps[color]].sort((a, b) => POINTS[b.role] - POINTS[a.role]);
-  el.querySelector('.caps').innerHTML = pieces
-    .map((p) => `<span class="cap-${p.color}">${SHAPE[p.role]}</span>`)
+  // Lichess-style material diff: equal captures cancel out per role, so each tray
+  // shows only this side's surplus (if both sides took a pawn, neither shows one).
+  const countRoles = (list) => {
+    const c = {};
+    for (const p of list) c[p.role] = (c[p.role] || 0) + 1;
+    return c;
+  };
+  const mine = countRoles(caps[color]);
+  const theirs = countRoles(caps[opponent(color)]);
+  const surplus = [];
+  for (const role of ['q', 'r', 'b', 'n', 'p']) { // descending value, like the old sort
+    for (let i = (mine[role] || 0) - (theirs[role] || 0); i > 0; i--) surplus.push(role);
+  }
+  el.querySelector('.caps').innerHTML = surplus
+    .map((role) => `<span class="cap-${opponent(color)}">${SHAPE[role]}</span>`)
     .join('');
   const adv = pointAdvantage(board, color);
   el.querySelector('.adv').textContent = adv > 0 ? `+${adv}` : '';

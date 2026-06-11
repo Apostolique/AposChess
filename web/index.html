@@ -29,7 +29,11 @@
     </header>
 
     <div class="layout">
-      <section class="controls">
+      <!-- The primary actions (mode + new game/start) are their own grid area so the
+           mobile layout can keep them glued to the board while the rest of the
+           controls drop below it. On desktop they render exactly where they used
+           to: at the top of the left column. -->
+      <section class="actions">
         <div class="control-row">
           <label>
             Mode
@@ -53,7 +57,9 @@
           <button id="new-game" type="button">New game</button>
           <button id="ai-toggle" type="button" hidden>Start</button>
         </div>
+      </section>
 
+      <section class="controls">
         <fieldset class="ai-group" id="row-ai" hidden>
           <legend>Opponent</legend>
           <div class="control-row">
