@@ -118,8 +118,41 @@ fieldset.ai-group legend {
 .net-field select { max-width: 14rem; }
 /* A checkbox + text label that reads inline (the checkbox to the left of the
    words), overriding the default column stacking of .controls label. */
-.check-field { flex-direction: row !important; align-items: center; gap: 6px; }
-.check-field input { margin: 0; }
+.check-field { flex-direction: row !important; align-items: center; gap: 8px; cursor: pointer; }
+/* The native checkbox is browser-drawn (light widget on our dark panel), so it's
+   redrawn from scratch to match the other controls: panel background, the shared
+   border, accent fill + white check when ticked. */
+.check-field input[type="checkbox"] {
+  appearance: none;
+  -webkit-appearance: none;
+  flex: none;
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  border: 1px solid #555049;
+  border-radius: 5px;
+  background: var(--panel);
+  cursor: pointer;
+  display: grid;
+  place-content: center;
+}
+.check-field input[type="checkbox"]:checked {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.check-field input[type="checkbox"]:checked::before {
+  content: '';
+  width: 11px;
+  height: 11px;
+  background: #fff;
+  clip-path: polygon(14% 44%, 0 62%, 40% 100%, 100% 18%, 84% 4%, 38% 70%);
+}
+.check-field input[type="checkbox"]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.check-field input[type="checkbox"]:disabled { opacity: 0.45; cursor: not-allowed; }
+.check-field:has(input:disabled) { cursor: not-allowed; }
 .seg-label { font-size: 0.8rem; color: var(--muted); }
 .seg {
   display: inline-flex;
