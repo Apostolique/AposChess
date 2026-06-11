@@ -93,7 +93,7 @@ function knightMoves(board, i, color, moves) {
       const cf = f + df * k, cr = r + dr * k;
       if (!onBoard(cf, cr) || board[sq(cf, cr)]) break; // blocked: can't turn here or continue
       // Then step one square to either side, perpendicular to the travel.
-      const perps = df === 0 ? [[1, 0], [-1, 0]] : [[0, 1], [0, -1]];
+      const perps = df === 0 ? PERP_V : PERP_H;
       for (const [pf, pr] of perps) {
         const tf = cf + pf, tr = cr + pr;
         if (!onBoard(tf, tr)) continue;
@@ -191,25 +191,34 @@ export function kingAttacked(board, color) {
   return kingAttackedAt(board, color, findKing(board, color));
 }
 
+// Side-step directions for a knight's perpendicular step, hoisted so the hot
+// check test below allocates nothing per call.
+const PERP_V = [[1, 0], [-1, 0]]; // travel was vertical (df === 0)
+const PERP_H = [[0, 1], [0, -1]];
+
 // Same test as kingAttacked, but with the king's square supplied so the legal-move
 // filter can locate the king once instead of rescanning the board for every move.
 function kingAttackedAt(board, color, k) {
   if (k < 0) return false;
   const enemy = color === 'white' ? 'black' : 'white';
   const kf = fileOf(k), kr = rankOf(k);
-  const isEnemy = (f, r, role) => {
-    if (!onBoard(f, r)) return false;
-    const p = board[sq(f, r)];
-    return p && p.color === enemy && p.role === role;
-  };
 
   // Pawn: captures straight forward, so an enemy pawn one square "behind" the
   // king (from the enemy's point of view) attacks it.
-  const ef = enemy === 'white' ? 1 : -1;
-  if (isEnemy(kf, kr - ef, 'p')) return true;
+  const pr = kr - (enemy === 'white' ? 1 : -1);
+  if (pr >= 0 && pr <= 7) {
+    const p = board[sq(kf, pr)];
+    if (p && p.color === enemy && p.role === 'p') return true;
+  }
 
   // Enemy king on an adjacent square.
-  for (const [df, dr] of ALL8) if (isEnemy(kf + df, kr + dr, 'k')) return true;
+  for (const [df, dr] of ALL8) {
+    const f = kf + df, r = kr + dr;
+    if (onBoard(f, r)) {
+      const p = board[sq(f, r)];
+      if (p && p.color === enemy && p.role === 'k') return true;
+    }
+  }
 
   // Normal slides: the first piece along each ray, if it is the matching slider.
   for (const [df, dr] of ORTHO) {
@@ -236,7 +245,7 @@ function kingAttackedAt(board, color, k) {
   for (const [sf, sr] of ORTHO) {
     const cf = kf - sf, cr = kr - sr;
     if (!onBoard(cf, cr) || board[sq(cf, cr)]) continue;
-    const perps = sf === 0 ? [[1, 0], [-1, 0]] : [[0, 1], [0, -1]];
+    const perps = sf === 0 ? PERP_V : PERP_H;
     for (const [df, dr] of perps) {
       let f = cf - df, r = cr - dr;
       while (onBoard(f, r)) {
@@ -333,6 +342,34 @@ export function legalMoves(state) {
   }
   addCastling(state, color, legal);
   return legal;
+}
+
+// Is there ANY legal move for the side to move? Early-exits on the first legal
+// pseudo-move — usually the very first one tried — so it's far cheaper than
+// legalMoves().length when the answer is "yes" (the overwhelmingly common case).
+// Used by the quiescence search, which searches only tactical moves but must
+// still distinguish "quiet position" from stalemate. `pseudo` lets a caller that
+// already generated the pseudo-moves pass them in. Castling can be the only
+// legal move in rare positions (vacating the king square can open a knight path
+// that makes every normal king step illegal while the castle stays legal), so
+// when no pseudo-move is legal, fall back to the full generator for exactness.
+export function hasLegalMove(state, pseudo = null) {
+  const color = state.turn;
+  const board = state.board;
+  const kingSq = findKing(board, color);
+  const moves = pseudo || generatePseudoMoves(board, color);
+  for (const m of moves) {
+    // Make/unmake on the live board, exactly as in legalMoves().
+    const moved = board[m.from];
+    const captured = board[m.to];
+    board[m.to] = moved;
+    board[m.from] = null;
+    const ok = !kingAttackedAt(board, color, moved.role === 'k' ? m.to : kingSq);
+    board[m.from] = moved;
+    board[m.to] = captured;
+    if (ok) return true;
+  }
+  return legalMoves(state).length > 0; // exotic: castling as the only legal move
 }
 
 // Draw by insufficient material. Only the unambiguous case is claimed: bare

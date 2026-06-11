@@ -43,7 +43,7 @@ function playGame(rng) {
   let state = newGameState();
   const positions = [];
   const scores = []; // parallel to positions: the search value (cp, stm-relative) or null
-  const seen = [];
+  const seenHashes = []; // Zobrist hash of every earlier position, maintained incrementally
   let result = 0;
 
   for (let ply = 0; ply < cfg.maxmoves; ply++) {
@@ -62,12 +62,15 @@ function playGame(rng) {
     // TD/bootstrap target across the whole dataset, including the openings. Opening
     // plies still PLAY a random move for variety, but `v` is the net's value of the
     // position itself, independent of the (random) move chosen next.
-    const prev = seen.map((s) => _internal.hashOf(s));
+    // Only positions since the last irreversible move (the last `halfmove` plies)
+    // can ever recur, so that window is all the repetition detection needs — and
+    // each position is hashed once per game, not once per remaining ply.
+    const prev = seenHashes.slice(-(state.halfmove + 1));
     const r = chooseMoveDetailed(state, cfg.depth ?? 99, rng,
       cfg.depth != null ? Infinity : cfg.movetime, true, prev, cfg.evalName);
     const move = ply < cfg.openings ? pick(status.legal) : r.move;
     scores.push(r.score);
-    seen.push(state);
+    seenHashes.push(_internal.hashOf(state));
     state = applyMove(state, move);
   }
   return { positions, scores, result };

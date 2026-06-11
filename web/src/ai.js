@@ -24,7 +24,7 @@
 // Legality is guaranteed regardless: every move comes from legalMoves(), so
 // pruning only changes which legal move is chosen, never whether it is legal.
 
-import { legalMoves, applyMove, kingAttacked, generatePseudoMoves } from './engine.js';
+import { legalMoves, applyMove, kingAttacked, generatePseudoMoves, hasLegalMove } from './engine.js';
 import { opponent } from './board.js';
 import { evaluate as nnEvaluate } from './nn.js';
 
@@ -360,25 +360,56 @@ function qsearch(state, alpha, beta, qdepth) {
   }
   if (qdepth <= 0) return best;
 
-  let moves = legalMoves(state);
-  if (moves.length === 0) return inCheck ? -MATE : 0;
-  if (!inCheck) moves = moves.filter((m) => m.capture || m.promotion || m.jump);
+  // In check, every evasion must be searched, so the full legal generator is the
+  // right tool (and detects mate).
+  if (inCheck) {
+    const moves = legalMoves(state);
+    if (moves.length === 0) return -MATE;
+    orderMoves(moves, state.board, 0, 0);
+    for (const m of moves) {
+      const score = -qsearch(applyMove(state, m), -beta, -alpha, qdepth - 1);
+      if (score > best) best = score;
+      if (best > alpha) alpha = best;
+      if (alpha >= beta) break;
+    }
+    return best;
+  }
+
+  // Not in check: only tactical moves (captures/jumps/promotions) get searched,
+  // so generate pseudo-moves and legality-check just those, lazily, after delta
+  // pruning. The previous legalMoves() call here paid a make/unmake king-safety
+  // test for every quiet move only to filter them all out — and quiet qsearch
+  // nodes are the most visited nodes in the whole search. Castling is never
+  // tactical, so pseudo-moves cover everything this loop can search.
+  const pseudo = generatePseudoMoves(state.board, state.turn);
+  const moves = [];
+  for (const m of pseudo) if (m.capture || m.promotion || m.jump) moves.push(m);
   orderMoves(moves, state.board, 0, 0);
 
+  let sawLegal = false;
   for (const m of moves) {
-    // Delta pruning: when not in check, a plain capture whose best case (winning
-    // the victim outright) still can't climb within DELTA_MARGIN of alpha is
-    // hopeless — skip it. Jumps and promotions are never pruned: the variant's
-    // tactics live there, and a non-capturing jump has no victim to bound.
-    if (!inCheck && m.capture && !m.promotion && !m.jump) {
+    // Delta pruning: a plain capture whose best case (winning the victim
+    // outright) still can't climb within DELTA_MARGIN of alpha is hopeless —
+    // skip it. Jumps and promotions are never pruned: the variant's tactics
+    // live there, and a non-capturing jump has no victim to bound.
+    if (m.capture && !m.promotion && !m.jump) {
       const victim = state.board[m.to];
       if (victim && standPat + VALUE[victim.role] + DELTA_MARGIN <= alpha) continue;
     }
-    const score = -qsearch(applyMove(state, m), -beta, -alpha, qdepth - 1);
+    const child = applyMove(state, m);
+    if (kingAttacked(child.board, state.turn)) continue; // illegal: leaves own king in check
+    sawLegal = true;
+    const score = -qsearch(child, -beta, -alpha, qdepth - 1);
     if (score > best) best = score;
     if (best > alpha) alpha = best;
     if (alpha >= beta) break;
   }
+
+  // Stalemate must still score 0 exactly as legalMoves().length === 0 used to:
+  // if nothing legal was searched (no tactical moves, all illegal, or all
+  // delta-pruned), ask the early-exit existence test — usually one make/unmake —
+  // before standing pat.
+  if (!sawLegal && !hasLegalMove(state, pseudo)) return 0;
   return best;
 }
 
@@ -497,15 +528,25 @@ function search(state, depth, alpha, beta, ply, canNull, hash, deadline) {
 // Only positions since the last irreversible move (capture/pawn move — i.e. the last
 // `halfmove` plies) can ever recur, so the caller need only pass that window; doing
 // so keeps the per-node repetition lookup set tiny (usually empty).
-export function chooseMoveDetailed(state, maxDepth = 2, rand = Math.random, maxMs = Infinity, useTT = true, prevHashes = [], engine = 'handcrafted') {
+export function chooseMoveDetailed(state, maxDepth = 2, rand = Math.random, maxMs = Infinity, useTT = true, prevHashes = [], engine = 'handcrafted', excludeKeys = null) {
   // engine is 'handcrafted', 'nn', or 'nn:<slot>' (a specific net). Split off the slot.
   const colon = engine.indexOf(':');
   const evalName = colon < 0 ? engine : engine.slice(0, colon);
   nnSlot = colon < 0 ? 'default' : engine.slice(colon + 1);
   activeEval = EVALS[evalName] || evalStm;
   evalKey = (EVAL_KEYS[evalName] || 0n) ^ slotKey(nnSlot);
-  const root = legalMoves(state);
+  let root = legalMoves(state);
   if (root.length === 0) return { move: null, ponder: null, depth: 0 };
+
+  // Optional opening-variety filter: drop root moves whose key (from*64+to) is in
+  // excludeKeys, so the caller can forbid a few recently-played openings. Only the
+  // root is touched — the search below is unchanged — and if the filter would leave
+  // no move (every legal move excluded) the full list is kept, so a move is always
+  // returned.
+  if (excludeKeys && excludeKeys.size) {
+    const kept = root.filter((m) => !excludeKeys.has(keyOf(m)));
+    if (kept.length) root = kept;
+  }
 
   for (let i = root.length - 1; i > 0; i--) {
     const j = Math.floor(rand() * (i + 1));
@@ -558,8 +599,8 @@ export function chooseMoveDetailed(state, maxDepth = 2, rand = Math.random, maxM
   return { move: bestMove, ponder, depth: completed, score: rootScore };
 }
 
-export function chooseMove(state, maxDepth, rand, maxMs, useTT, prevHashes, engine) {
-  return chooseMoveDetailed(state, maxDepth, rand, maxMs, useTT, prevHashes, engine).move;
+export function chooseMove(state, maxDepth, rand, maxMs, useTT, prevHashes, engine, excludeKeys) {
+  return chooseMoveDetailed(state, maxDepth, rand, maxMs, useTT, prevHashes, engine, excludeKeys).move;
 }
 
 // Exposed for tests only: Zobrist hash equivalence check + table reset so a

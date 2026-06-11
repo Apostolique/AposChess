@@ -35,6 +35,10 @@
 //                   pure game result; <1 leans on the champion's own search value,
 //                   an unbiased bootstrap — recorded because generation uses the net)
 //   --hidden=H      candidate architecture (default: same shape as the champion)
+//   --cold          train each candidate from random init instead of warm-starting
+//                   from the champion (warm start fine-tunes in a few epochs and
+//                   starts at champion strength; cold occasionally explores a
+//                   different basin but relearns everything each cycle)
 //   --jobs=N        parallel workers for gen + match
 //   --fresh         clear the dataset before the first cycle (clean deep-search start)
 //   --refresh-frac=P  after each PROMOTION, recompute `v` on a random fraction P of the
@@ -95,6 +99,7 @@ const cfg = {
   hidden: typeof args.hidden === 'string' ? args.hidden : null,
   jobs: args.jobs,
   fresh: !!args.fresh,
+  cold: !!args.cold,
   // After each PROMOTION (the only time the champion — hence the `v` target — changes),
   // recompute `v` on a random fraction of the dataset with the new champion (value
   // iteration). 0 = off. Partial keeps cost amortized and average staleness ~1/frac
@@ -162,7 +167,7 @@ if (cfg.fresh && existsSync(rawFile)) { rmSync(rawFile); log('Cleared dataset (-
 
 const hidden = championHidden();
 log(`train:loop start — batch ${cfg.batch} @ depth ${cfg.depth} | gate ${cfg.gateGames}g @ depth ${cfg.gateDepth} `
-  + `SPRT(0,${cfg.elo1}) | candidate hidden=[${hidden}] λ=${cfg.lam} | `
+  + `SPRT(0,${cfg.elo1}) | candidate hidden=[${hidden}] λ=${cfg.lam} ${cfg.cold ? 'cold' : 'warm'} start | `
   + `refresh ${cfg.refreshFrac > 0 ? `${(cfg.refreshFrac * 100).toFixed(0)}% @ depth ${cfg.refreshDepth} on promotion` : 'off'} | `
   + `cycles ${cfg.cycles === Infinity ? '∞' : cfg.cycles}`);
 
@@ -179,9 +184,13 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
   if (!run('Featurize', process.execPath, [featurizeScript])) break;
 
   // 3. Train a candidate (same shape as the champion) to a side file. --lambda blends
-  //    the champion's search value into the target (TD/bootstrap) when < 1.
+  //    the champion's search value into the target (TD/bootstrap) when < 1. Unless
+  //    --cold, the candidate warm-starts from the champion's weights, so it
+  //    fine-tunes on the grown dataset in a few epochs instead of relearning from
+  //    scratch (train.py ignores --init gracefully if the shapes don't match).
   if (!run('Train candidate', python,
-    [trainPy, `--hidden=${hidden}`, `--out=${candidate}`, `--lambda=${cfg.lam}`])) break;
+    [trainPy, `--hidden=${hidden}`, `--out=${candidate}`, `--lambda=${cfg.lam}`,
+      ...(cfg.cold ? [] : [`--init=${champion}`])])) break;
 
   // 4. Gate: candidate (A) vs champion (B), SPRT(0, elo1).
   if (existsSync(resultFile)) rmSync(resultFile);

@@ -19,15 +19,27 @@
 // Streamed line by line (never loaded whole), written to a temp file that replaces
 // the target only after a complete pass, so an interrupted run can't corrupt it.
 //
+// INCREMENTAL: the raw dataset is append-only in the common case (the generator
+// appends whole games), so the meta sidecar records how many raw bytes were
+// processed, a hash of the tail of that prefix, and the output size. When the
+// current raw file still starts with that exact prefix (size grew, tail hash
+// matches) and the output is exactly as we left it, only the appended tail is
+// featurized and appended — turning the per-cycle cost from "whole dataset" into
+// "new games only". Anything else (refresh-v / dedup-cap rewrites, a feature-set
+// change via num_features, an interrupted append) falls back to the full pass.
+//
 // Usage (run from web/):
 //   npm run train:featurize
 // Options:
 //   --in=FILE    raw dataset to read   (default ../training/data/selfplay.jsonl)
 //   --out=FILE   features to write      (default ../training/data/selfplay.features.jsonl)
+//   --full       force a full rebuild (skip the incremental fast path)
 
 import {
   createReadStream, createWriteStream, existsSync, rmSync, renameSync, statSync, writeFileSync,
+  readFileSync, openSync, readSync, closeSync,
 } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { createInterface } from 'node:readline';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -76,12 +88,60 @@ if (!existsSync(inFile)) {
 
 const mb = (bytes) => (bytes / 1e6).toFixed(1) + ' MB';
 const tmp = outFile + '.tmp';
+// The sidecar carries num_features for train.py plus the incremental state. Keep
+// it next to the data with a matching name: <data>.meta.json (strip .jsonl, add
+// .meta.json).
+const metaFile = outFile.replace(/\.jsonl$/, '') + '.meta.json';
 
-console.log(`Featurizing ${inFile} (${mb(statSync(inFile).size)})`);
+// Hash the tail (up to 64 KB) of the first `prefixBytes` of `file` — enough to
+// detect an in-place rewrite (refresh-v / dedup-cap touch lines everywhere, and
+// the file's own growth moves the boundary) without reading the whole prefix.
+const TAIL = 64 * 1024;
+function tailHash(file, prefixBytes) {
+  const len = Math.min(TAIL, prefixBytes);
+  const buf = Buffer.alloc(len);
+  const fd = openSync(file, 'r');
+  try {
+    readSync(fd, buf, 0, len, prefixBytes - len);
+  } finally {
+    closeSync(fd);
+  }
+  return createHash('sha1').update(buf).digest('hex');
+}
+
+// Snapshot the raw size up front and process exactly that prefix, so the recorded
+// state stays correct even if a generator appends while we run.
+const rawSize = statSync(inFile).size;
+
+// Try the incremental fast path: same feature layout, the raw file still begins
+// with the prefix we already processed, and the output is exactly as we left it.
+let meta = null;
+try { meta = JSON.parse(readFileSync(metaFile, 'utf8')); } catch { /* no sidecar yet */ }
+const inc = !args.full && meta && meta.num_features === NUM_FEATURES && meta.incremental
+  && meta.incremental.rawBytes <= rawSize
+  && existsSync(outFile) && statSync(outFile).size === meta.incremental.outBytes
+  && tailHash(inFile, meta.incremental.rawBytes) === meta.incremental.rawTailHash;
+const startAt = inc ? meta.incremental.rawBytes : 0;
+
+if (inc && startAt === rawSize) {
+  console.log(`Featurized data is up to date (${mb(rawSize)} raw, ${mb(statSync(outFile).size)} out).`);
+  process.exit(0);
+}
+console.log(inc
+  ? `Featurizing ${inFile} incrementally (${mb(rawSize - startAt)} new of ${mb(rawSize)})`
+  : `Featurizing ${inFile} (${mb(rawSize)}, full pass)`);
 console.log(`  -> ${outFile}`);
 
-const out = createWriteStream(tmp);
-const rl = createInterface({ input: createReadStream(inFile), crlfDelay: Infinity });
+// Incremental appends straight to the output (an interrupted append leaves a size
+// mismatch, which forces a clean full rebuild next run); a full pass goes through
+// a temp file that replaces the target only after completing.
+const out = inc
+  ? createWriteStream(outFile, { flags: 'a' })
+  : createWriteStream(tmp);
+const rl = createInterface({
+  input: createReadStream(inFile, { start: startAt, end: Math.max(startAt, rawSize - 1) }),
+  crlfDelay: Infinity,
+});
 
 let fromFen = 0, fromFeatures = 0;
 for await (const line of rl) {
@@ -99,18 +159,27 @@ for await (const line of rl) {
 }
 await new Promise((res) => out.end(res));
 
-// Replace the target only now that the full pass succeeded (Windows rename can't
-// overwrite, so remove first).
-if (existsSync(outFile)) rmSync(outFile);
-renameSync(tmp, outFile);
+if (!inc) {
+  // Replace the target only now that the full pass succeeded (Windows rename can't
+  // overwrite, so remove first).
+  if (existsSync(outFile)) rmSync(outFile);
+  renameSync(tmp, outFile);
+}
 
-// Stamp the input size (nn.js NUM_FEATURES) into a sidecar so train.py uses the
-// SAME value — no hand-syncing a constant in two languages. Keep it next to the
-// data with a matching name: <data>.meta.json (strip .jsonl, add .meta.json).
-const metaFile = outFile.replace(/\.jsonl$/, '') + '.meta.json';
-writeFileSync(metaFile, JSON.stringify({ num_features: NUM_FEATURES }, null, 2) + '\n');
+// Stamp the input size (nn.js NUM_FEATURES) into the sidecar so train.py uses the
+// SAME value — no hand-syncing a constant in two languages — plus the incremental
+// state for the next run.
+writeFileSync(metaFile, JSON.stringify({
+  num_features: NUM_FEATURES,
+  incremental: {
+    rawBytes: rawSize,
+    rawTailHash: tailHash(inFile, rawSize),
+    outBytes: statSync(outFile).size,
+  },
+}, null, 2) + '\n');
 
 const src = fromFen && fromFeatures ? `${fromFen} from fen, ${fromFeatures} from legacy features`
   : fromFeatures ? 'from legacy features (no fen)' : 'from fen';
-console.log(`\nDone: ${fromFen + fromFeatures} positions featurized (${mb(statSync(outFile).size)}) — ${src}.`);
+console.log(`\nDone: ${fromFen + fromFeatures} positions featurized${inc ? ' (incremental)' : ''} `
+  + `(${mb(statSync(outFile).size)} total) — ${src}.`);
 console.log(`Wrote ${metaFile} (num_features=${NUM_FEATURES}).`);

@@ -42,7 +42,18 @@ const ui = {
   delay: 450,          // ms pause before an AI move, so play is watchable
   running: false,      // AI-vs-AI loop active
   started: false,      // AI-vs-AI game has been started at least once (Pause/Resume vs Start)
+  // AI-vs-AI opening variety: when on, the engine's first move (White) is forbidden
+  // from matching its last few games, so consecutive games open differently.
+  varyOpenings: false,
+  recentOpenings: [],  // move keys (from*64+to) of recent games' opening moves, oldest first
 };
+
+// How many recent opening moves to remember/forbid, so the engines cycle through a
+// few different first moves before one can recur.
+const OPENING_HISTORY = 4;
+// The standard initial position's FEN: the opening-variety filter only applies to a
+// true fresh game from here, never to a loaded/edited starting position.
+const STANDARD_START_FEN = toFen(newGameState());
 
 let state = newGameState();
 let status = gameStatus(state);
@@ -362,7 +373,12 @@ function commit(move) {
   supersedeAi();
   aiThinking = false;
   const wasLive = viewIndex === history.length - 1;
+  // If this is the opening move the variety filter constrained, remember it so the
+  // next game's filter forbids it (checked before recordMove advances the ply).
+  const isVariedOpening = ui.mode === 'ai-ai' && ui.varyOpenings
+    && history.length === 1 && toFen(state) === STANDARD_START_FEN;
   recordMove(move);
+  if (isVariedOpening) rememberOpening(move);
   if (wasLive) viewIndex = history.length - 1; // follow the game unless reviewing
   lastCommitAt = performance.now();
   // Only sound the new move if we're following the live game; while reviewing an
@@ -492,7 +508,27 @@ function startSearch(slot) {
   slot.ponderSeq++; // a real search supersedes this colour's ponder chain
   aiThinking = true;
   const { depth, maxMs, engine, net } = aiParams(slot.color);
-  slot.worker.postMessage({ type: 'search', seq, state, depth, maxMs, engine, net, posHistory: repWindow(state) });
+  slot.worker.postMessage({ type: 'search', seq, state, depth, maxMs, engine, net, posHistory: repWindow(state), exclude: openingExclude() });
+}
+
+// Move keys to forbid for the game's very first move, so an AI-vs-AI game doesn't
+// replay a recent opening. Active only in AI-vs-AI with the option on, only on the
+// opening ply of a standard fresh game (a loaded/edited start is left alone). The
+// search applies this to White's first move; the game diverges from there.
+function openingExclude() {
+  if (ui.mode !== 'ai-ai' || !ui.varyOpenings) return undefined;
+  if (history.length !== 1) return undefined;             // not the opening ply
+  if (toFen(state) !== STANDARD_START_FEN) return undefined; // loaded/edited start — don't constrain
+  return ui.recentOpenings.length ? ui.recentOpenings.slice() : undefined;
+}
+
+// Remember an opening move so later games avoid it (rolling window, most-recent last;
+// re-playing a remembered move just moves it to the front of the window).
+function rememberOpening(move) {
+  const key = move.from * 64 + move.to;
+  ui.recentOpenings = ui.recentOpenings.filter((k) => k !== key);
+  ui.recentOpenings.push(key);
+  while (ui.recentOpenings.length > OPENING_HISTORY) ui.recentOpenings.shift();
 }
 
 function onSearchResult(slot, data) {
@@ -977,6 +1013,7 @@ function syncControlsFromDom() {
   ui.engineAi = engineValue('ai');
   ui.engineWhite = engineValue('white');
   ui.engineBlack = engineValue('black');
+  ui.varyOpenings = $('vary-openings').checked;
   for (const slot of ['ai', 'white', 'black']) {
     ui.custom[slot].depth = clampInt($(`custom-depth-${slot}`).value, 0, 40, 8);
     ui.custom[slot].ms = clampInt($(`custom-ms-${slot}`).value, 0, 60000, 6000);
@@ -1109,6 +1146,10 @@ for (const slot of ['ai', 'white', 'black']) {
     e.target.value = ui.custom[slot].ms;
   });
 }
+$('vary-openings').addEventListener('change', (e) => {
+  ui.varyOpenings = e.target.checked;
+  ui.recentOpenings = []; // start a fresh rotation when the option is toggled
+});
 $('new-game').addEventListener('click', () => {
   if (ui.mode === 'online' && onlineConnected) online.send({ t: 'reset' });
   newGame();

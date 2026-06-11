@@ -53,7 +53,7 @@ async function ensureNet(url) {
 }
 
 self.onmessage = async ({ data }) => {
-  const { type, seq, state, depth, maxMs, posHistory, engine, net } = data;
+  const { type, seq, state, depth, maxMs, posHistory, engine, net, exclude } = data;
   if (engine === 'nn') await ensureNet(net); // load/switch the selected net first
   // posHistory is the live game's prior positions as FENs (compact to clone); the
   // search wants Zobrist hashes, so convert here, on the worker thread.
@@ -63,6 +63,9 @@ self.onmessage = async ({ data }) => {
     self.postMessage({ type: 'ponder', seq, reached });
     return;
   }
-  const { move, ponder } = chooseMoveDetailed(state, depth, Math.random, maxMs, true, prevHashes, engine);
+  // `exclude` (move keys to skip at the root) drives the opening-variety option, so a
+  // fresh AI-vs-AI game doesn't replay a recent opening; only on the game's first move.
+  const excludeKeys = exclude && exclude.length ? new Set(exclude) : null;
+  const { move, ponder } = chooseMoveDetailed(state, depth, Math.random, maxMs, true, prevHashes, engine, excludeKeys);
   self.postMessage({ type: 'search', seq, move, ponder });
 };

@@ -87,6 +87,11 @@ def parse_args():
     p.add_argument("--hidden", type=str, default="128",
                    help="hidden layer size(s); a comma list adds depth, "
                         "e.g. --hidden=128 or --hidden=256,32")
+    p.add_argument("--init", default=None,
+                   help="warm-start from an existing weights file (e.g. the current "
+                        "champion) instead of random init — converges in far fewer "
+                        "epochs on a mostly-unchanged dataset. The file's arch must "
+                        "match --hidden/the feature layout, else it is ignored.")
     p.add_argument("--epochs", type=int, default=200,
                    help="max epochs; early stopping usually ends sooner")
     p.add_argument("--patience", type=int, default=8,
@@ -106,26 +111,74 @@ def parse_args():
     return p.parse_args()
 
 
-def load_data(path):
+def load_data(path, np):
+    """Read the featurized JSONL and pack it into dense arrays.
+
+    Feature lists are variable-length, so they are packed into one fixed-width
+    int32 matrix padded with a dedicated padding index (= num_features, filled in
+    by the caller); the model's EmbeddingBag uses padding_idx so the padding
+    contributes exactly zero. A whole batch is then a single tensor indexing op
+    instead of a pure-Python packing loop — the old per-batch make_batch loop
+    dominated CPU training time on a millions-of-rows dataset.
+    """
     if not os.path.exists(path):
         sys.exit(f"No training data at {path}. Generate raw positions, then featurize:\n"
                  f"  cd web && npm run train:gen && npm run train:featurize")
-    samples, targets, values, games = [], [], [], []
+    feats, targets, values, games = [], [], [], []
+    max_f = 1
     with open(path, "r") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
             rec = json.loads(line)
-            samples.append(rec["f"])
+            fr = rec["f"]
+            feats.append(fr)
+            if len(fr) > max_f:
+                max_f = len(fr)
             targets.append(float(rec["r"]))
-            values.append(rec.get("v", None))  # per-position search value (cp) or None
+            v = rec.get("v")  # per-position search value (cp) or absent
+            values.append(float("nan") if v is None else float(v))
             # No "g" (pre-migration data) -> give the row its own unique id so it
             # stays a singleton "game"; this can never leak across the split.
             games.append(rec.get("g", f"_nog_{len(games)}"))
     if not targets:
         sys.exit(f"{path} has no samples.")
-    return samples, targets, values, games
+    return (feats, np.asarray(targets, np.float32), np.asarray(values, np.float32),
+            games, max_f)
+
+
+def warm_start(model, path, arch, np, torch):
+    """Initialize the model from an existing weights file (the champion).
+
+    Returns the file's scale on success (the caller adopts it so the squash
+    matches the init), or None if the file is missing/placeholder/wrong shape —
+    then training proceeds from random init exactly as without --init.
+    """
+    try:
+        with open(path) as f:
+            obj = json.load(f)
+    except OSError:
+        print(f"--init: cannot read {path}; training from scratch.")
+        return None
+    layers = obj.get("layers")
+    if not layers and obj.get("w0"):  # legacy single-hidden-layer layout
+        layers = [{"w": obj["w0"], "b": obj["b0"]}, {"w": obj["w1"], "b": obj["b1"]}]
+    if not obj.get("arch") or not layers or list(obj["arch"]) != arch:
+        print(f"--init: {os.path.basename(path)} arch {obj.get('arch')} != {arch}; "
+              "training from scratch.")
+        return None
+    with torch.no_grad():
+        h0 = arch[1]
+        model.emb.weight[:arch[0]] = torch.tensor(
+            np.asarray(layers[0]["w"], np.float32).reshape(arch[0], h0))
+        model.b0.copy_(torch.tensor(np.asarray(layers[0]["b"], np.float32)))
+        for i, lin in enumerate(model.lins):
+            w = np.asarray(layers[i + 1]["w"], np.float32).reshape(arch[i + 1], arch[i + 2])
+            lin.weight.copy_(torch.tensor(w.T))  # [in,out] -> [out,in]
+            lin.bias.copy_(torch.tensor(np.asarray(layers[i + 1]["b"], np.float32)))
+    print(f"Warm start: initialized from {os.path.basename(path)}.")
+    return obj.get("scale")
 
 
 def main():
@@ -143,21 +196,15 @@ def main():
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    samples, targets, values, games = load_data(args.data)
+    feats, targets, values, games, max_f = load_data(args.data, np)
     n = len(targets)
 
-    # TD/bootstrap target: blend the game result with the recorded search value
-    # (target = lam*result + (1-lam)*tanh(v/scale)). lam=1 -> pure result (unchanged).
-    # Positions without a `v` (random openings / legacy data) always use the result.
-    if args.lam >= 1.0:
-        blended = targets
-    else:
-        import math
-        blended = [r if v is None else args.lam * r + (1.0 - args.lam) * math.tanh(v / args.scale)
-                   for r, v in zip(targets, values)]
-        n_boot = sum(1 for v in values if v is not None)
-        print(f"TD target: lambda={args.lam}, {n_boot}/{n} positions have a search value")
-    targets_t = torch.tensor(blended, dtype=torch.float32)
+    # Pack the variable-length feature lists into one padded int32 matrix (see
+    # load_data); index num_features is the padding row.
+    mat = np.full((n, max_f), num_features, dtype=np.int32)
+    for i, fr in enumerate(feats):
+        mat[i, :len(fr)] = fr
+    del feats
 
     # Split by GAME, not by position (see header): group rows by game id, shuffle
     # the games, then send whole games to val/train so no game straddles the split.
@@ -183,16 +230,20 @@ def main():
         # hidden is a list of layer widths. The first (sparse) layer is an
         # EmbeddingBag(sum) over active features == nn.js's column-add; any further
         # widths add dense ReLU layers; a final Linear(.,1) is the scalar head.
+        # The vocab has one extra row — the padding index — so a batch is a fixed-
+        # width int matrix (padding contributes zero and gets no gradient); the
+        # export below drops that row.
         def __init__(self, hidden):
             super().__init__()
-            self.emb = nn.EmbeddingBag(num_features, hidden[0], mode="sum")
+            self.emb = nn.EmbeddingBag(num_features + 1, hidden[0], mode="sum",
+                                       padding_idx=num_features)
             self.b0 = nn.Parameter(torch.zeros(hidden[0]))
             dims = hidden + [1]
             self.lins = nn.ModuleList(
                 [nn.Linear(dims[i], dims[i + 1]) for i in range(len(hidden))])
 
-        def forward(self, flat, offs):
-            x = torch.relu(self.emb(flat, offs) + self.b0)
+        def forward(self, rows):
+            x = torch.relu(self.emb(rows) + self.b0)
             last = len(self.lins) - 1
             for i, lin in enumerate(self.lins):
                 x = lin(x)
@@ -202,33 +253,48 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = Net(hidden).to(device)
+
+    # Warm start (--init): begin from the champion's weights so a candidate on a
+    # mostly-unchanged dataset fine-tunes in a few epochs instead of relearning
+    # everything from scratch. The init file's scale is adopted (the net's output
+    # is calibrated to it), overriding --scale if they differ.
+    if args.init:
+        init_scale = warm_start(model, args.init, [num_features, *hidden, 1], np, torch)
+        if init_scale is not None and init_scale != args.scale:
+            print(f"Adopting scale {init_scale} from --init (was {args.scale}).")
+            args.scale = init_scale
+
+    # TD/bootstrap target: blend the game result with the recorded search value
+    # (target = lam*result + (1-lam)*tanh(v/scale)). lam=1 -> pure result (unchanged).
+    # Positions without a `v` (random openings / legacy data) always use the result.
+    # Computed after --init so the blend uses the adopted scale.
+    if args.lam >= 1.0:
+        blended = targets
+    else:
+        has_v = ~np.isnan(values)
+        blended = np.where(
+            has_v,
+            args.lam * targets + (1.0 - args.lam) * np.tanh(values / args.scale),
+            targets).astype(np.float32)
+        print(f"TD target: lambda={args.lam}, {int(has_v.sum())}/{n} positions have a search value")
+    # Whole-dataset tensors; batches are plain row-indexing (and a device copy
+    # when training on GPU — a no-op on CPU).
+    mat_t = torch.from_numpy(mat).to(device)
+    targets_t = torch.from_numpy(blended).to(device)
+
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     loss_fn = nn.MSELoss()
     print(f"Training on {device}: {len(train_idx)} train / {n_val} val, "
           f"inputs={num_features}, hidden={hidden}, max epochs={args.epochs}, patience={args.patience}")
-
-    def make_batch(sample_ids):
-        # Pack variable-length feature lists into one flat tensor + bag offsets.
-        flat, offs = [], []
-        pos = 0
-        for i in sample_ids.tolist():
-            offs.append(pos)
-            f = samples[i]
-            flat.extend(f)
-            pos += len(f)
-        flat = torch.tensor(flat, dtype=torch.long, device=device)
-        offs = torch.tensor(offs, dtype=torch.long, device=device)
-        tgt = targets_t[sample_ids].to(device)
-        return flat, offs, tgt
 
     def evaluate(idx):
         model.eval()
         with torch.no_grad():
             total = 0.0
             for s in range(0, len(idx), args.batch):
-                flat, offs, tgt = make_batch(idx[s:s + args.batch])
-                pred = torch.tanh(model(flat, offs))
-                total += loss_fn(pred, tgt).item() * len(tgt)
+                b = idx[s:s + args.batch].to(device)
+                pred = torch.tanh(model(mat_t[b]))
+                total += loss_fn(pred, targets_t[b]).item() * len(b)
         return total / len(idx)
 
     # Early stopping: keep the weights with the lowest validation loss and stop
@@ -245,13 +311,13 @@ def main():
         order = train_idx[torch.randperm(len(train_idx))]
         run = 0.0
         for s in range(0, len(order), args.batch):
-            flat, offs, tgt = make_batch(order[s:s + args.batch])
-            pred = torch.tanh(model(flat, offs))
-            loss = loss_fn(pred, tgt)
+            b = order[s:s + args.batch].to(device)
+            pred = torch.tanh(model(mat_t[b]))
+            loss = loss_fn(pred, targets_t[b])
             opt.zero_grad()
             loss.backward()
             opt.step()
-            run += loss.item() * len(tgt)
+            run += loss.item() * len(b)
         tr = run / len(order)
         va = evaluate(val_idx)
 
@@ -281,7 +347,8 @@ def main():
         return [round(float(x), 6) for x in a.reshape(-1).tolist()]
 
     layers = [{
-        "w": rnd(model.emb.weight.detach().numpy()),
+        # Drop the padding row (the extra vocab entry) — nn.js indexes 0..NUM_FEATURES-1.
+        "w": rnd(model.emb.weight.detach().numpy()[:num_features]),
         "b": rnd(model.b0.detach().numpy()),
     }]
     for lin in model.lins:

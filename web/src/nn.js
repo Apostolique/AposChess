@@ -81,6 +81,85 @@ function normalize(obj) {
 // arch) clears the slot so evaluate() falls back to material for it.
 const WEIGHTS = new Map();
 
+// The forward pass runs at every search leaf, so each net is "compiled" at load
+// time into a specialized closure: weights copied into Float64Arrays (contiguous,
+// unboxed — the same 64-bit values as the JSON numbers, so results are bit-identical
+// to reading the plain arrays), activation buffers preallocated, and every layer
+// reference captured as a closure constant V8 can keep in registers. The feature
+// indices are computed inline (no array) — the loop mirrors featureIndices, which
+// stays the layout's single source of truth: keep the two in sync. Measured ~1.4x
+// over the original plain-array version; a generic property-walking version of the
+// same code was ~0.85x (slower than the original), hence the per-net closures.
+function compile(W) {
+  const layers = W.layers.map((L) => ({ w: Float64Array.from(L.w), b: Float64Array.from(L.b) }));
+  const scale = W.scale;
+  const w0 = layers[0].w, b0 = layers[0].b;
+  const H0 = b0.length;
+  const act0 = new Float64Array(H0);
+
+  // Layer 0 (shared by both shapes): sparse input -> first hidden, ReLU'd into act0.
+  // Only a board's worth of features are active, so this is a handful of column adds
+  // even recomputed from scratch.
+  function inputLayer(board, turn) {
+    const act = act0;
+    act.set(b0); // pre-activations seeded with the bias
+    const flip = turn === 'black';
+    for (let i = 0; i < 64; i++) {
+      const p = board[i];
+      if (!p) continue;
+      const side = p.color === turn ? 0 : 1; // 0 = us (side to move), 1 = them
+      const sq = flip ? i ^ 56 : i;
+      const off = ((PIECE_INDEX[p.role] * 2 + side) * 64 + sq) * H0;
+      for (let h = 0; h < H0; h++) act[h] += w0[off + h];
+    }
+    for (let h = 0; h < H0; h++) if (act[h] < 0) act[h] = 0; // ReLU
+    return act;
+  }
+
+  if (layers.length === 2) {
+    // The common shape: one hidden layer + scalar head, fully specialized.
+    const wf = layers[1].w;
+    const bf = layers[1].b[0];
+    return (board, turn) => {
+      const act = inputLayer(board, turn);
+      let out = bf;
+      for (let i = 0; i < H0; i++) out += act[i] * wf[i];
+      // Canonical features make the output already side-to-move-relative — no flip.
+      return Math.round(Math.tanh(out) * scale);
+    };
+  }
+
+  // Deeper nets: generic dense ReLU layers between the input layer and the head.
+  let widest = H0;
+  for (const L of layers) widest = Math.max(widest, L.b.length);
+  const bufA = new Float64Array(widest);
+  const bufB = new Float64Array(widest);
+  return (board, turn) => {
+    let act = inputLayer(board, turn);
+    let dim = H0;
+    for (let li = 1; li < layers.length - 1; li++) {
+      const L = layers[li];
+      const w = L.w;
+      const outDim = L.b.length;
+      const next = act === bufA ? bufB : bufA; // alternate scratch buffers
+      next.set(L.b);
+      for (let i = 0; i < dim; i++) {
+        const a = act[i];
+        if (a === 0) continue; // post-ReLU inputs are mostly zero
+        const off = i * outDim;
+        for (let o = 0; o < outDim; o++) next[o] += a * w[off + o];
+      }
+      for (let o = 0; o < outDim; o++) if (next[o] < 0) next[o] = 0; // ReLU
+      act = next; dim = outDim;
+    }
+    const Lf = layers[layers.length - 1];
+    const wf = Lf.w;
+    let out = Lf.b[0];
+    for (let i = 0; i < dim; i++) out += act[i] * wf[i];
+    return Math.round(Math.tanh(out) * scale);
+  };
+}
+
 export function loadWeights(obj, slot = 'default') {
   const W = normalize(obj);
   // Guard against a weights file whose input layer doesn't match the CURRENT feature
@@ -93,7 +172,7 @@ export function loadWeights(obj, slot = 'default') {
     WEIGHTS.delete(slot);
     return;
   }
-  if (W) WEIGHTS.set(slot, W); else WEIGHTS.delete(slot);
+  if (W) WEIGHTS.set(slot, compile(W)); else WEIGHTS.delete(slot);
 }
 export function hasWeights(slot = 'default') { return WEIGHTS.has(slot); }
 
@@ -110,46 +189,13 @@ function materialWhite(board) {
   return s;
 }
 
-// Centipawn evaluation from the side-to-move's perspective, using the net in `slot`.
+// Centipawn evaluation from the side-to-move's perspective, using the net in `slot`
+// (a closure compiled at load time — see compile()).
 export function evaluate(board, turn, slot = 'default') {
-  const W = WEIGHTS.get(slot);
-  if (!W) {
+  const fn = WEIGHTS.get(slot);
+  if (!fn) {
     const s = materialWhite(board);
     return turn === 'white' ? s : -s;
   }
-  const layers = W.layers;
-
-  // Layer 0: sparse input -> first hidden. Only a board's worth of features are
-  // active, so this is a handful of column adds even recomputed from scratch.
-  const L0 = layers[0];
-  const H0 = L0.b.length;
-  let act = L0.b.slice(); // pre-activations seeded with the bias
-  for (const f of featureIndices(board, turn)) {
-    const off = f * H0;
-    for (let h = 0; h < H0; h++) act[h] += L0.w[off + h];
-  }
-  for (let h = 0; h < H0; h++) if (act[h] < 0) act[h] = 0; // ReLU
-
-  // Dense hidden layers (everything between the first and the scalar head), ReLU.
-  for (let li = 1; li < layers.length - 1; li++) {
-    const L = layers[li];
-    const outDim = L.b.length;
-    const next = L.b.slice();
-    for (let i = 0; i < act.length; i++) {
-      const a = act[i];
-      if (a === 0) continue; // post-ReLU inputs are mostly zero
-      const off = i * outDim;
-      for (let o = 0; o < outDim; o++) next[o] += a * L.w[off + o];
-    }
-    for (let o = 0; o < outDim; o++) if (next[o] < 0) next[o] = 0; // ReLU
-    act = next;
-  }
-
-  // Scalar head (final layer): no activation, just the linear combination.
-  const Lf = layers[layers.length - 1];
-  let out = Lf.b[0];
-  for (let i = 0; i < act.length; i++) out += act[i] * Lf.w[i];
-
-  // Canonical features make the output already side-to-move-relative — no flip.
-  return Math.round(Math.tanh(out) * W.scale);
+  return fn(board, turn);
 }
