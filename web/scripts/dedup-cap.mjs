@@ -31,6 +31,7 @@ import { fileURLToPath } from 'node:url';
 
 import { parseFen } from '../src/board.js';
 import { featureIndices } from '../src/nn.js';
+import { fmtDur, fmtNum, fmtMB, liveStatus, everyMs } from './fmt.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const args = Object.fromEntries(process.argv.slice(2).map((a) => {
@@ -70,8 +71,11 @@ function mulberry32(a) {
   };
 }
 
-const mb = (b) => (b / 1e6).toFixed(1) + ' MB';
-console.log(`dedup-cap: ${inFile} (${mb(statSync(inFile).size)}) | cap ${cap}${dryRun ? ' | DRY RUN' : ''}`);
+console.log(`dedup-cap: ${inFile} (${fmtMB(statSync(inFile).size)}) | cap ${cap} | seed ${seed}${dryRun ? ' | DRY RUN' : ''}`);
+
+const t0 = Date.now();
+const status = liveStatus();
+let tick = everyMs(500);
 
 // --- pass 1: count occurrences per input -----------------------------------------
 const counts = new Map();
@@ -81,19 +85,22 @@ let total = 0;
   for await (const line of rl) {
     if (!line) continue;
     total++;
+    if (tick()) status.update(`  pass 1/2: counting — ${fmtNum(total)} positions read`);
     const rec = JSON.parse(line);
     if (typeof rec.fen !== 'string') continue; // shouldn't happen post-migration
     const k = keyOf(rec.fen);
     counts.set(k, (counts.get(k) || 0) + 1);
   }
 }
+status.clear();
 let unique = counts.size, over = 0, maxCount = 0, kept = 0;
 for (const c of counts.values()) {
   if (c > maxCount) maxCount = c;
   if (c > cap) { over++; kept += cap; } else kept += c;
 }
-console.log(`  ${total} positions | ${unique} unique inputs | ${over} over cap (most-duplicated: ${maxCount}x)`);
-console.log(`  expected after cap: ~${kept} positions (${(100 * (1 - kept / total)).toFixed(1)}% removed)`);
+console.log(`  ${fmtNum(total)} positions | ${fmtNum(unique)} unique inputs | `
+  + `${fmtNum(over)} over cap (most-duplicated: ${fmtNum(maxCount)}x)`);
+console.log(`  expected after cap: ~${fmtNum(kept)} positions (${(100 * (1 - kept / total)).toFixed(1)}% removed)`);
 
 if (dryRun) { console.log('  (dry run — nothing written)'); process.exit(0); }
 
@@ -103,17 +110,23 @@ const out = createWriteStream(tmp);
 const write = async (s) => { if (!out.write(s)) await new Promise((r) => out.once('drain', r)); };
 const rng = mulberry32(seed);
 let written = 0;
+tick = everyMs(500);
 {
   const rl = createInterface({ input: createReadStream(inFile), crlfDelay: Infinity });
+  let scanned = 0;
   for await (const line of rl) {
     if (!line) continue;
+    scanned++;
+    if (tick()) status.update(`  pass 2/2: thinning — ${fmtNum(written)} kept of ${fmtNum(scanned)} read`);
     const rec = JSON.parse(line);
     const c = typeof rec.fen === 'string' ? counts.get(keyOf(rec.fen)) : 1;
     if (c <= cap || rng() < cap / c) { await write(line + '\n'); written++; }
   }
 }
 await new Promise((r) => out.end(r));
+status.clear();
 if (existsSync(outFile)) rmSync(outFile);
 renameSync(tmp, outFile);
-console.log(`Done: ${written} positions kept (${(100 * (1 - written / total)).toFixed(1)}% removed) `
-  + `-> ${outFile} (${mb(statSync(outFile).size)}). Re-featurize next:  npm run train:featurize`);
+console.log(`Done: ${fmtNum(written)} positions kept (${(100 * (1 - written / total)).toFixed(1)}% removed) `
+  + `in ${fmtDur((Date.now() - t0) / 1000)} -> ${outFile} (${fmtMB(statSync(outFile).size)}).`);
+console.log('Re-featurize next:  npm run train:featurize');

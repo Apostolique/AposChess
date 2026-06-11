@@ -126,7 +126,9 @@ for (let i = 0; i < jobs; i++) {
   const w = new Worker(new URL('./backfillWorker.mjs', import.meta.url), { workerData: { weights, depth } });
   pool.push(w);
   w.on('message', (msg) => {
-    if (msg.type === 'ready') { idle.push(w); pump(); return; }
+    // Re-check finalization: if the input closed with nothing to compute before the
+    // workers booted, this is the only event left that can complete "all idle".
+    if (msg.type === 'ready') { idle.push(w); pump(); maybeFinalize(); return; }
     if (msg.type !== 'done') return;
     ready.set(msg.u, msg.lines); flush();
     donePos += msg.n; gamesDone++; totalFallbacks += msg.fallbacks;

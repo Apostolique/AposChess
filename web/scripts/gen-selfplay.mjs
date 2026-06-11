@@ -45,11 +45,13 @@
 //   --out=FILE      output path (default ../training/data/selfplay.jsonl); appends
 //   --seed=S        RNG seed (default Date.now())
 
-import { mkdirSync, appendFileSync, existsSync, readFileSync } from 'node:fs';
+import { mkdirSync, appendFileSync, existsSync, readFileSync, statSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Worker } from 'node:worker_threads';
 import { cpus } from 'node:os';
+
+import { fmtDur, fmtNum, fmtMB, liveStatus } from './fmt.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const args = Object.fromEntries(
@@ -98,12 +100,7 @@ const forever = !Number.isFinite(cfg.games);
 console.log(`Generating ${forever ? 'games forever (Ctrl-C to stop)' : `${cfg.games} games`} -> ${cfg.out}${fresh ? '' : ' (appending)'}`);
 console.log(`  ${cfg.depth != null ? `depth ${cfg.depth}` : `${cfg.movetime}ms/move`} | eval ${cfg.evalName} | openings ${cfg.openings} | jobs ${jobs} | seed ${cfg.seed}`);
 
-// Format a duration in seconds as "Mm SSs" (or "SSs" under a minute).
-function fmt(secs) {
-  secs = Math.round(secs);
-  return secs < 60 ? `${secs}s` : `${Math.floor(secs / 60)}m ${String(secs % 60).padStart(2, '0')}s`;
-}
-
+const status = liveStatus();
 const t0 = Date.now();
 let totalPositions = 0;
 let doneGames = 0;
@@ -121,7 +118,8 @@ await new Promise((resolve_) => {
     process.on('SIGINT', () => {
       if (stopping) return;
       stopping = true;
-      process.stdout.write('\n  Stopping: draining in-flight games...\n');
+      status.clear();
+      console.log('  Stopping: draining in-flight games...');
     });
   }
 
@@ -140,23 +138,22 @@ await new Promise((resolve_) => {
         totalPositions += msg.nPositions;
         doneGames++;
         const elapsed = (Date.now() - t0) / 1000;
-        if (forever) {
-          process.stdout.write(
-            `\r  ${doneGames} games | ${totalPositions} positions | `
-            + `${fmt(elapsed)} elapsed | ${(doneGames / (elapsed / 60)).toFixed(1)} games/min      `,
-          );
-        } else {
-          const eta = doneGames < cfg.games ? ` | ETA ${fmt((elapsed / doneGames) * (cfg.games - doneGames))}` : '';
-          process.stdout.write(
-            `\r  ${doneGames}/${cfg.games} games | ${cfg.games - doneGames} left | `
-            + `${totalPositions} positions | ${fmt(elapsed)} elapsed${eta}      `,
-          );
-        }
+        const head = forever ? `${doneGames} games` : `${doneGames}/${cfg.games} games`;
+        const eta = !forever && doneGames < cfg.games
+          ? ` | ETA ${fmtDur((elapsed / doneGames) * (cfg.games - doneGames))}` : '';
+        status.update(`  ${head} | ${fmtNum(totalPositions)} positions | `
+          + `${(doneGames / (elapsed / 60)).toFixed(1)} games/min | ${fmtDur(elapsed)} elapsed${eta}`);
         dispatch(w);
       }
     });
-    w.on('error', (err) => { console.error('\nworker error:', err); w.terminate(); });
+    w.on('error', (err) => { console.error('\ngenerator worker error:', err); w.terminate(); });
     w.on('exit', retire);
   }
 });
-console.log(`\nDone: ${totalPositions} positions written in ${fmt((Date.now() - t0) / 1000)}.`);
+status.clear();
+{
+  const el = (Date.now() - t0) / 1000;
+  const size = existsSync(cfg.out) ? ` Dataset now ${fmtMB(statSync(cfg.out).size)}.` : '';
+  console.log(`Done: ${doneGames} games, ${fmtNum(totalPositions)} positions in ${fmtDur(el)} `
+    + `(${(doneGames / (el / 60)).toFixed(1)} games/min).${size}`);
+}

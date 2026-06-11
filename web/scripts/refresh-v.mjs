@@ -34,6 +34,8 @@ import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { cpus } from 'node:os';
 
+import { fmtDur, fmtNum, fmtMB, liveStatus, everyMs } from './fmt.mjs';
+
 const here = dirname(fileURLToPath(import.meta.url));
 const args = Object.fromEntries(process.argv.slice(2).map((a) => {
   const m = a.replace(/^--/, '').split('='); return [m[0], m.length > 1 ? m[1] : true];
@@ -55,8 +57,10 @@ if (!existsSync(inFile)) { console.error(`No dataset at ${inFile}`); process.exi
 const B = 64;                              // positions per worker batch
 const CAP = Math.max(jobs * B * 8, 20000); // max outstanding (un-emitted) lines
 const t0 = Date.now();
-const fmt = (s) => { s = Math.round(s); return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, '0')}s`; };
-console.log(`refresh-v: ${inFile} | depth ${depth} | jobs ${jobs} | weights ${weights.replace(/^.*[\\/]/, '')}`);
+const status = liveStatus();
+const tick = everyMs(1000);
+console.log(`refresh-v: ${inFile} (${fmtMB(statSync(inFile).size)}) | depth ${depth} | jobs ${jobs} | `
+  + `weights ${weights.replace(/^.*[\\/]/, '')} | seed ${seed}`);
 console.log(`  mode: ${refresh ? `refresh ${(frac * 100).toFixed(0)}% of existing v + fill missing` : 'fill missing v only'} -> ${outFile}`);
 
 function mulberry32(a) {
@@ -87,13 +91,13 @@ function maybeFinalize() {
   if (finalized || !inputEnded || batch.length || queue.length || idle.length !== pool.length) return;
   finalized = true;
   flush();
-  process.stdout.write('\n');
+  status.clear();
   for (const w of pool) w.terminate();
   out.end(() => {
     if (existsSync(outFile)) rmSync(outFile);
     renameSync(tmp, outFile);
-    console.log(`Done: ${filled} filled, ${refreshed} refreshed, ${passed} unchanged (${lineIdx} total) `
-      + `in ${fmt((Date.now() - t0) / 1000)} -> ${outFile} (${(statSync(outFile).size / 1e6).toFixed(1)} MB).`);
+    console.log(`Done: ${fmtNum(filled)} filled, ${fmtNum(refreshed)} refreshed, ${fmtNum(passed)} unchanged `
+      + `(${fmtNum(lineIdx)} total) in ${fmtDur((Date.now() - t0) / 1000)} -> ${outFile} (${fmtMB(statSync(outFile).size)}).`);
     console.log('Re-featurize next:  npm run train:featurize');
   });
 }
@@ -120,7 +124,10 @@ for (let i = 0; i < jobs; i++) {
   const w = new Worker(new URL('./refreshWorker.mjs', import.meta.url), { workerData: { weights, depth } });
   pool.push(w);
   w.on('message', (msg) => {
-    if (msg.type === 'ready') { idle.push(w); pump(); return; }
+    // A worker turning ready can complete the "all idle" condition, so re-check
+    // finalization — otherwise a run where NO record needs a value (input closes
+    // before the workers finish booting) waits forever on a 'done' that never comes.
+    if (msg.type === 'ready') { idle.push(w); pump(); maybeFinalize(); return; }
     if (msg.type !== 'done') return;
     for (const { idx, v } of msg.vs) {
       const rec = pendingRec.get(idx); pendingRec.delete(idx);
@@ -129,14 +136,15 @@ for (let i = 0; i < jobs; i++) {
     }
     computed += msg.vs.length;
     flush();
-    if (computed % 20000 < B) {
+    if (tick()) {
       const el = (Date.now() - t0) / 1000;
-      process.stdout.write(`\r  ${computed} computed | ${(computed / Math.max(el, 0.001)).toFixed(0)}/s | ${fmt(el)}   `);
+      status.update(`  ${fmtNum(computed)} values computed | ${(computed / Math.max(el, 0.001)).toFixed(0)}/s | `
+        + `${fmtDur(el)} elapsed | ${fmtNum(lineIdx)} lines read`);
     }
     idle.push(w);
     if (!inputEnded && lineIdx - nextEmit <= CAP) rl.resume();
     pump();
     maybeFinalize();
   });
-  w.on('error', (e) => { console.error('\nworker error:', e); });
+  w.on('error', (e) => { console.error('\nrefresh worker error:', e); });
 }

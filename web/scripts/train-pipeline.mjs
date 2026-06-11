@@ -32,6 +32,8 @@ import { existsSync, rmSync, copyFileSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { fmtDur } from './fmt.mjs';
+
 const here = dirname(fileURLToPath(import.meta.url));
 const webDir = resolve(here, '..');
 const repoDir = resolve(webDir, '..');
@@ -144,8 +146,7 @@ if (cfg.match > 0) {
 // 5. Bundle the new weights into the deployable app.
 if (cfg.build) runShell('Build web app', 'npm run build', webDir);
 
-const mins = ((Date.now() - t0) / 60000).toFixed(1);
-console.log(`\n✅ Pipeline done in ${mins} min. New weights: web/src/nn-weights.json`);
+console.log(`\n✅ Pipeline done in ${fmtDur((Date.now() - t0) / 1000)}. New weights: web/src/nn-weights.json`);
 console.log('   Pick "Engine → Neural net" in the app (npm run dev reloads weights; '
   + 'the production build is already updated).');
 if (cfg.match === 0) {

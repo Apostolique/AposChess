@@ -71,6 +71,8 @@ import { cpus } from 'node:os';
 import { resolve, dirname } from 'node:path';
 import { writeFileSync, appendFileSync, mkdirSync } from 'node:fs';
 
+import { fmtDur, fmtNum, liveStatus } from './fmt.mjs';
+
 // --- args --------------------------------------------------------------------
 const args = Object.fromEntries(
   process.argv.slice(2).map((a) => {
@@ -120,12 +122,6 @@ const scoreFromElo = (e) => 1 / (1 + Math.pow(10, -e / 400));
 // Confidence interval for the reported Elo: z-multiplier and its matching label,
 // kept together so the bracket and the "N% CI" text can't drift apart.
 const CI = { z: 1.96, label: '95%' };
-
-// Format a duration in seconds as "Mm SSs" (or "SSs" under a minute).
-function fmt(secs) {
-  secs = Math.round(secs);
-  return secs < 60 ? `${secs}s` : `${Math.floor(secs / 60)}m ${String(secs % 60).padStart(2, '0')}s`;
-}
 
 // Generalized SPRT (normal approximation): log-likelihood ratio that the true mean
 // score corresponds to elo1 rather than elo0, using the observed score variance.
@@ -180,7 +176,7 @@ const tag = (file, ev, w) => (ev === 'handcrafted' ? file : `${file} [${ev}:${ba
 console.log(`A = ${tag(cfg.engineA, cfg.evalA, cfg.weightsA)}  vs  B = ${tag(cfg.baseline, cfg.evalB, cfg.weightsB)}`);
 console.log(
   `${cfg.depth != null ? `depth ${cfg.depth}` : `${cfg.movetime}ms/move`} | ` +
-  `openings ${cfg.openings} plies | TT ${cfg.useTT ? 'on' : 'off'} | jobs ${jobs} | ` +
+  `openings ${cfg.openings} plies | TT ${cfg.useTT ? 'on' : 'off'} | jobs ${jobs} | seed ${cfg.seed} | ` +
   `${cfg.sprt ? `SPRT[${cfg.elo0},${cfg.elo1}] α=${cfg.alpha} β=${cfg.beta}` : `${cfg.games} games`}`,
 );
 
@@ -193,7 +189,7 @@ let decided = null;
 // A single in-place status line (carriage-return) refreshed after every game, so a
 // long match never looks frozen between the milestone reports. Lightweight on
 // purpose (no Elo/CI — that's the milestone report's job); just live progress.
-let liveLen = 0;
+const status = liveStatus();
 function live() {
   const n = scores.length;
   const S = scores.reduce((a, b) => a + b, 0);
@@ -202,16 +198,14 @@ function live() {
   const losses = scores.filter((s) => s === 0).length;
   const elapsed = (Date.now() - t0) / 1000;
   let s = `  game ${n}/${cfg.games} | A +${wins} =${draws} -${losses} | `
-    + `${(100 * S / n).toFixed(1)}% | ${fmt(elapsed)} elapsed`;
+    + `${(100 * S / n).toFixed(1)}% | ${fmtDur(elapsed)} elapsed`;
   // ETA assumes the full game budget; with SPRT the match may stop sooner, so it's
   // an upper bound. Drop it once we're done / decided.
-  if (!decided && n < cfg.games) s += ` | ETA ${fmt((elapsed / n) * (cfg.games - n))}`;
+  if (!decided && n < cfg.games) s += ` | ETA ${fmtDur((elapsed / n) * (cfg.games - n))}`;
   if (cfg.sprt) s += ` | LLR ${llr(scores, cfg.elo0, cfg.elo1).toFixed(2)} `
     + `[${sprtLower.toFixed(2)}, ${sprtUpper.toFixed(2)}]`;
-  process.stdout.write('\r' + s.padEnd(liveLen));
-  liveLen = s.length;
+  status.update(s);
 }
-const clearLive = () => process.stdout.write('\r' + ' '.repeat(liveLen) + '\r');
 
 // Record a finished pair's two scores and refresh the display / SPRT verdict.
 function record(pairScores) {
@@ -227,9 +221,8 @@ function record(pairScores) {
   // Commit a permanent milestone snapshot (full Elo/CI) without losing the live
   // line: overwrite it, then the next live() redraws on the fresh line below.
   if ((scores.length / 2) % 5 === 0 || decided) {
-    clearLive();
+    status.clear();
     console.log('  ' + report(scores, false));
-    liveLen = 0;
   }
 }
 
@@ -264,14 +257,17 @@ await new Promise((resolve) => {
         else dispatch(w);
       }
     });
-    w.on('error', (err) => { console.error('\nworker error:', err); w.terminate(); });
+    w.on('error', (err) => { console.error('\nmatch worker error:', err); w.terminate(); });
     w.on('exit', retire);
   }
 });
 
-clearLive();
+status.clear();
 console.log(report(scores, true));
-console.log(`elapsed ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+{
+  const el = (Date.now() - t0) / 1000;
+  console.log(`elapsed ${fmtDur(el)} (${(scores.length / (el / 60)).toFixed(0)} games/min)`);
+}
 if (cfg.sprt) {
   if (decided === 'H1') console.log(`SPRT: accept H1 — A is stronger than B by ≳${cfg.elo0}..${cfg.elo1} Elo.`);
   else if (decided === 'H0') console.log(`SPRT: accept H0 — A is NOT a ${cfg.elo1}-Elo improvement over B.`);
@@ -304,8 +300,8 @@ if (cfg.saveGames && harvested.length) {
   }
   mkdirSync(dirname(cfg.saveGames), { recursive: true });
   appendFileSync(cfg.saveGames, lines);
-  console.log(`Saved ${nPos} positions from ${harvested.length * 2} games to ${cfg.saveGames} `
-    + `(v kept from the stronger engine ${winner.toUpperCase()} on ${nKept}).`);
+  console.log(`Saved ${fmtNum(nPos)} positions from ${harvested.length * 2} games to ${cfg.saveGames} `
+    + `(v kept from the stronger engine ${winner.toUpperCase()} on ${fmtNum(nKept)}).`);
 }
 
 // Machine-readable summary for orchestration (train:loop reads this to gate).

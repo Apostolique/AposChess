@@ -46,6 +46,7 @@ import { fileURLToPath } from 'node:url';
 
 import { parseFen } from '../src/board.js';
 import { featureIndices, PIECE_SQUARE_FEATURES, NUM_FEATURES } from '../src/nn.js';
+import { fmtDur, fmtNum, fmtMB, liveStatus, everyMs } from './fmt.mjs';
 
 // Rebuild a canonical board from stored feature indices (the legacy fallback when a
 // record has no `fen`). The plain piece-square block (indices < PIECE_SQUARE_FEATURES)
@@ -86,7 +87,6 @@ if (!existsSync(inFile)) {
   process.exit(1);
 }
 
-const mb = (bytes) => (bytes / 1e6).toFixed(1) + ' MB';
 const tmp = outFile + '.tmp';
 // The sidecar carries num_features for train.py plus the incremental state. Keep
 // it next to the data with a matching name: <data>.meta.json (strip .jsonl, add
@@ -124,12 +124,12 @@ const inc = !args.full && meta && meta.num_features === NUM_FEATURES && meta.inc
 const startAt = inc ? meta.incremental.rawBytes : 0;
 
 if (inc && startAt === rawSize) {
-  console.log(`Featurized data is up to date (${mb(rawSize)} raw, ${mb(statSync(outFile).size)} out).`);
+  console.log(`Featurized data is up to date (${fmtMB(rawSize)} raw, ${fmtMB(statSync(outFile).size)} out).`);
   process.exit(0);
 }
 console.log(inc
-  ? `Featurizing ${inFile} incrementally (${mb(rawSize - startAt)} new of ${mb(rawSize)})`
-  : `Featurizing ${inFile} (${mb(rawSize)}, full pass)`);
+  ? `Featurizing ${inFile} incrementally (${fmtMB(rawSize - startAt)} new of ${fmtMB(rawSize)})`
+  : `Featurizing ${inFile} (${fmtMB(rawSize)}, full pass)`);
 console.log(`  -> ${outFile}`);
 
 // Incremental appends straight to the output (an interrupted append leaves a size
@@ -143,9 +143,24 @@ const rl = createInterface({
   crlfDelay: Infinity,
 });
 
+// Live progress: lines are ASCII (FEN + JSON), so line lengths track the byte
+// offset closely enough for a percentage and ETA over the prefix being processed.
+const status = liveStatus();
+const tick = everyMs(500);
+const t0 = Date.now();
+const span = rawSize - startAt;
+let bytesDone = 0;
+
 let fromFen = 0, fromFeatures = 0;
 for await (const line of rl) {
   if (!line) continue;
+  bytesDone += line.length + 1;
+  const n = fromFen + fromFeatures;
+  if (tick() && n) {
+    const el = (Date.now() - t0) / 1000;
+    status.update(`  ${fmtNum(n)} positions | ${(100 * bytesDone / span).toFixed(1)}% | `
+      + `${fmtNum(n / el)}/s | ETA ${fmtDur((span - bytesDone) / (bytesDone / el))}`);
+  }
   const rec = JSON.parse(line);
   const { board, turn } = typeof rec.fen === 'string'
     ? (fromFen++, parseFen(rec.fen))
@@ -178,8 +193,9 @@ writeFileSync(metaFile, JSON.stringify({
   },
 }, null, 2) + '\n');
 
-const src = fromFen && fromFeatures ? `${fromFen} from fen, ${fromFeatures} from legacy features`
-  : fromFeatures ? 'from legacy features (no fen)' : 'from fen';
-console.log(`\nDone: ${fromFen + fromFeatures} positions featurized${inc ? ' (incremental)' : ''} `
-  + `(${mb(statSync(outFile).size)} total) — ${src}.`);
-console.log(`Wrote ${metaFile} (num_features=${NUM_FEATURES}).`);
+status.clear();
+console.log(`Done: ${fmtNum(fromFen + fromFeatures)} positions featurized${inc ? ' (incremental)' : ''} `
+  + `in ${fmtDur((Date.now() - t0) / 1000)} (${fmtMB(statSync(outFile).size)} total, num_features=${NUM_FEATURES}).`);
+if (fromFeatures) {
+  console.log(`  ${fmtNum(fromFeatures)} legacy records had no fen — rebuilt from stored features.`);
+}

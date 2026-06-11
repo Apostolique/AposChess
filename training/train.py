@@ -28,6 +28,19 @@ import argparse
 import json
 import os
 import sys
+import time
+
+
+def fmt_dur(secs):
+    """Format a duration like the Node scripts: '45s', '3m 02s', '1h 04m'."""
+    secs = round(secs)
+    if secs < 60:
+        return f"{secs}s"
+    m, s = divmod(secs, 60)
+    if m < 60:
+        return f"{m}m {s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h {m:02d}m"
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(THIS_DIR)
@@ -222,9 +235,9 @@ def main():
     train_idx = torch.tensor(
         [i for gid in game_ids if gid not in val_set for i in by_game[gid]], dtype=torch.long)
     n_val = len(val_idx)
-    print(f"Loaded {n} positions in {len(game_ids)} games from {args.data}")
-    print(f"Split by game: {len(game_ids) - n_val_games} train / {n_val_games} val games "
-          f"({len(train_idx)} / {n_val} positions)")
+    print(f"Loaded {n:,} positions in {len(game_ids):,} games from {args.data}")
+    print(f"Split by game: {len(game_ids) - n_val_games:,} train / {n_val_games:,} val games "
+          f"({len(train_idx):,} / {n_val:,} positions)")
 
     class Net(nn.Module):
         # hidden is a list of layer widths. The first (sparse) layer is an
@@ -276,7 +289,7 @@ def main():
             has_v,
             args.lam * targets + (1.0 - args.lam) * np.tanh(values / args.scale),
             targets).astype(np.float32)
-        print(f"TD target: lambda={args.lam}, {int(has_v.sum())}/{n} positions have a search value")
+        print(f"TD target: lambda={args.lam}, {int(has_v.sum()):,}/{n:,} positions have a search value")
     # Whole-dataset tensors; batches are plain row-indexing (and a device copy
     # when training on GPU — a no-op on CPU).
     mat_t = torch.from_numpy(mat).to(device)
@@ -284,7 +297,7 @@ def main():
 
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     loss_fn = nn.MSELoss()
-    print(f"Training on {device}: {len(train_idx)} train / {n_val} val, "
+    print(f"Training on {device}: {len(train_idx):,} train / {n_val:,} val, "
           f"inputs={num_features}, hidden={hidden}, max epochs={args.epochs}, patience={args.patience}")
 
     def evaluate(idx):
@@ -306,7 +319,9 @@ def main():
     best_state = copy.deepcopy(model.state_dict())
     best_epoch = 0
     stale = 0
+    t_train = time.time()
     for epoch in range(args.epochs):
+        t_epoch = time.time()
         model.train()
         order = train_idx[torch.randperm(len(train_idx))]
         run = 0.0
@@ -327,7 +342,8 @@ def main():
             best_state = copy.deepcopy(model.state_dict())
         else:
             stale += 1
-        print(f"  epoch {epoch + 1:>3}/{args.epochs}  train {tr:.4f}  val {va:.4f}"
+        print(f"  epoch {epoch + 1:>3}/{args.epochs}  train {tr:.4f}  val {va:.4f}  "
+              f"{time.time() - t_epoch:4.0f}s"
               f"{'  *best' if improved else f'  (no improvement {stale}/{args.patience})'}")
         if args.patience and stale >= args.patience:
             print(f"Early stop: no val improvement for {args.patience} epochs.")
@@ -335,7 +351,8 @@ def main():
 
     # Restore and export the best net (lowest val loss), not the final epoch's.
     model.load_state_dict(best_state)
-    print(f"Best val {best_val:.4f} at epoch {best_epoch}.")
+    print(f"Best val {best_val:.4f} at epoch {best_epoch} "
+          f"(trained {fmt_dur(time.time() - t_train)}).")
 
     # Export in nn.js's layout (generic `layers`). Every layer's w is input-major
     # and flattened as w[i*outDim + o]:

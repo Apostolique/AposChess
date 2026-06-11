@@ -71,6 +71,8 @@ import {
 import { dirname, resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { fmtDur, fmtMB } from './fmt.mjs';
+
 const here = dirname(fileURLToPath(import.meta.url));
 const webDir = resolve(here, '..');
 const repoDir = resolve(webDir, '..');
@@ -147,8 +149,12 @@ function championHidden() {
 }
 
 const stamp = () => new Date().toISOString().replace('T', ' ').slice(0, 19);
+const hms = () => new Date().toTimeString().slice(0, 8);
+// Console lines carry a local time-of-day stamp: the loop runs unattended for
+// hours, so "when did this happen" matters when scrolling back. The log file
+// keeps the full ISO stamp.
 function log(line) {
-  console.log(line);
+  console.log(`[${hms()}] ${line}`);
   appendFileSync(logFile, `[${stamp()}] ${line}\n`);
 }
 
@@ -159,7 +165,7 @@ process.on('SIGINT', () => { stopping = true; console.log('\n  Ctrl-C: stopping 
 // status — treat that as "stop", not a hard failure.
 function run(label, cmd, argv, cwd = webDir) {
   if (stopping) return false;
-  console.log(`\n--- ${label} ---`);
+  console.log(`\n--- ${label} — ${hms()} ---`);
   const r = spawnSync(cmd, argv, { stdio: 'inherit', cwd });
   if (r.signal) { stopping = true; return false; }
   if (r.status !== 0) { log(`${label} FAILED (exit ${r.status}); stopping loop.`); return false; }
@@ -188,9 +194,12 @@ log(`train:loop start — batch ${cfg.batch} @ depth ${cfg.depth} | gate ${cfg.g
   + `cycles ${cfg.cycles === Infinity ? '∞' : cfg.cycles}`);
 
 const jobArg = cfg.jobs !== undefined ? [`--jobs=${cfg.jobs}`] : [];
+const loopT0 = Date.now();
 let promotions = 0;
 for (let c = 1; c <= cfg.cycles && !stopping; c++) {
-  log(`===== cycle ${c}${cfg.cycles === Infinity ? '' : `/${cfg.cycles}`} =====`);
+  const cycleT0 = Date.now();
+  const dataset = existsSync(rawFile) ? ` — dataset ${fmtMB(statSync(rawFile).size)}` : '';
+  log(`===== cycle ${c}${cfg.cycles === Infinity ? '' : `/${cfg.cycles}`}${dataset} =====`);
 
   // 1. Generate games with the champion (deeper search than the eval sees).
   //    --skip-gen: on the first cycle only, gate the games an interrupted earlier
@@ -233,8 +242,9 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
     copyFileSync(candidate, champion);      // candidate becomes champion
     upsertManifest(arch); copyFileSync(candidate, loopChampPub); // make it playable
     promotions++;
-    log(`cycle ${c}: PROMOTED ✓  candidate ${pct}% / Elo ${res.elo.toFixed(0)} over champion `
-      + `(${res.games} games). New champion published as 'loop-champion'. Total promotions: ${promotions}.`);
+    log(`cycle ${c}: PROMOTED ✓  candidate ${pct}% / Elo +${res.elo.toFixed(0)} over champion `
+      + `(${res.games} games, cycle took ${fmtDur((Date.now() - cycleT0) / 1000)}). `
+      + `New champion published as 'loop-champion'. Total promotions: ${promotions}.`);
     // The champion (hence the `v` target) just changed: value-iterate by recomputing
     // `v` on a fraction of the dataset with the NEW champion. Optional maintenance —
     // a failure shouldn't kill the loop, so we don't gate on its result (a Ctrl-C
@@ -246,10 +256,11 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
     }
   } else {
     log(`cycle ${c}: kept champion — candidate ${pct}% / Elo ${res.elo.toFixed(0)} `
-      + `(SPRT ${res.sprt}, ${res.games} games). Not a significant gain.`);
+      + `(SPRT ${res.sprt}, ${res.games} games, cycle took ${fmtDur((Date.now() - cycleT0) / 1000)}). `
+      + 'Not a significant gain.');
   }
 }
 
-log(`train:loop stopped after ${promotions} promotion(s). `
+log(`train:loop stopped after ${promotions} promotion(s) in ${fmtDur((Date.now() - loopT0) / 1000)}. `
   + `Champion: web/src/nn-weights.json${promotions ? " (also catalog 'loop-champion')" : ''}.`);
 if (promotions) console.log('Run `npm run build` to ship the new champion in the production bundle.');
