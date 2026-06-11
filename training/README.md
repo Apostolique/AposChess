@@ -92,6 +92,16 @@ grown dataset in a few epochs; `--cold` restores from-scratch training) → play
 (accepts H1). Otherwise the champion is kept. So the champion only ever moves uphill.
 On promotion it can also **refresh the value targets** (`--refresh-frac`, below).
 
+The gate's games are themselves **harvested into the dataset** (`--no-harvest` to
+disable): up to `--gate-games` per cycle — comparable volume to generation, already
+paid for. Their search value `v` is kept only on positions where the engine the gate
+proved **stronger** was to move (the weaker engine's opinion is a worse target — the
+same staleness logic as the `v`-refresh); the other side's positions carry just the
+game outcome, which the trainer already handles. Note gate games are played at
+`--gate-depth` (shallower labels than generation's `--depth`), which is why
+harvesting supplements generation rather than replacing it — generation stays the
+deep-label anchor and guarantees fixed data volume even when the SPRT stops early.
+
 - The champion is `web/src/nn-weights.json`. On each promotion it's also published to
   the catalog as **`loop-champion`**, so you can play the current champion in the app
   (rebuild for the production bundle; `npm run dev` serves it live).
@@ -109,7 +119,10 @@ On promotion it can also **refresh the value targets** (`--refresh-frac`, below)
 - Options: `--batch`, `--depth` (generation), `--gate-games`, `--gate-depth`, `--elo1`
   (promotion bar, below), `--hidden` (candidate shape; default = champion's),
   `--lambda` (TD target mix, below), `--cold` (random-init candidates instead of
-  warm-starting from the champion), `--refresh-frac` / `--refresh-depth` (value-target
+  warm-starting from the champion), `--skip-gen` (skip the FIRST cycle's generation
+  and gate the dataset as it stands — resume after a Ctrl-C mid-generation without
+  regenerating; completed games were already flushed), `--no-harvest` (don't save
+  gate games into the dataset), `--refresh-frac` / `--refresh-depth` (value-target
   refresh, see "Dataset maintenance"), `--jobs`.
 
 ### The promotion gate: `--elo1` vs `--gate-games` (calibrate them together)

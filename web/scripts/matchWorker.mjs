@@ -15,7 +15,7 @@
 import { parentPort, workerData } from 'node:worker_threads';
 import { readFileSync } from 'node:fs';
 
-import { newGameState } from '../src/board.js';
+import { newGameState, toFen } from '../src/board.js';
 import { legalMoves, applyMove, gameStatus } from '../src/engine.js';
 import { loadWeights } from '../src/nn.js';
 
@@ -56,8 +56,11 @@ function makeRng(seed) {
 
 function makePlayer(mod, { depth, movetime, evalName }) {
   return {
+    // Full detail ({ move, score, … }) so --save-games can record the mover's
+    // search value `v` alongside the position; chooseMove is just a wrapper over
+    // this, so plain matches behave identically.
     move: (state, rng, prevHashes) =>
-      mod.chooseMove(state, depth ?? 99, rng, depth != null ? Infinity : movetime, cfg.useTT, prevHashes, evalName),
+      mod.chooseMoveDetailed(state, depth ?? 99, rng, depth != null ? Infinity : movetime, cfg.useTT, prevHashes, evalName),
     hashOf: mod._internal.hashOf,
     resetTT: () => mod._internal.resetTT(),
   };
@@ -66,29 +69,42 @@ function makePlayer(mod, { depth, movetime, evalName }) {
 const A = makePlayer(modA, { depth: cfg.depth, movetime: cfg.movetime, evalName: evalNameA });
 const B = makePlayer(modB, { depth: cfg.depthB, movetime: cfg.movetimeB, evalName: evalNameB });
 
-// Play one game; `whiteIsA` decides which engine has White. Returns A's score:
-// 1 win, 0.5 draw, 0 loss.
-function playGame(openingState, whiteIsA, rng) {
+// Play one game; `whiteIsA` decides which engine has White. Returns A's score
+// (1 win, 0.5 draw, 0 loss) and, when `collect` is set (--save-games), one record
+// per searched position: { fen, r, v, mover } — the position, the game result from
+// the SIDE-TO-MOVE's view, the mover's search value (cp, stm-relative; the same
+// semantics the data generator records), and which engine ('a'/'b') was to move,
+// so the harvester can keep `v` only from the engine the match proves stronger.
+function playGame(openingState, whiteIsA, rng, collect) {
   A.resetTT();
   B.resetTT();
   let st = openingState;
   const seen = [];
+  const recs = collect ? [] : null;
+  let resultWhite = 0; // +1 White won, -1 Black won, 0 draw
   for (let ply = 0; ply < cfg.maxmoves; ply++) {
     const status = gameStatus(st);
     if (status.over) {
-      if (status.result !== 'checkmate') return 0.5;
-      const winnerIsA = (status.winner === 'white') === whiteIsA;
-      return winnerIsA ? 1 : 0;
+      if (status.result === 'checkmate') resultWhite = status.winner === 'white' ? 1 : -1;
+      break;
     }
     const aToMove = (st.turn === 'white') === whiteIsA;
     const player = aToMove ? A : B;
     seen.push(st);
     const window = seen.slice(-(st.halfmove + 1));
-    const mv = player.move(st, rng, window.map(player.hashOf));
-    if (!mv) return 0.5;
-    st = applyMove(st, mv);
+    const r = player.move(st, rng, window.map(player.hashOf));
+    if (!r.move) break; // safety: scored as a draw
+    if (recs) recs.push({ fen: toFen(st), turn: st.turn, v: r.score, mover: aToMove ? 'a' : 'b' });
+    st = applyMove(st, r.move);
   }
-  return 0.5;
+  if (recs) {
+    for (const rec of recs) {
+      rec.r = rec.turn === 'white' ? resultWhite : -resultWhite;
+      delete rec.turn;
+    }
+  }
+  const score = resultWhite === 0 ? 0.5 : ((resultWhite === 1) === whiteIsA ? 1 : 0);
+  return { score, recs };
 }
 
 function makeOpening(rng) {
@@ -108,14 +124,19 @@ function pairSeed(pair) {
   return (((cfg.seed >>> 0) ^ Math.imul(pair + 1, 0x9e3779b1)) >>> 0);
 }
 
-// Play the pair (same opening, colors reversed) and report A's two scores.
+// Play the pair (same opening, colors reversed) and report A's two scores, plus
+// the games' position records when --save-games is harvesting.
 parentPort.on('message', (msg) => {
   if (msg.type !== 'play') return;
+  const collect = !!cfg.saveGames;
   const rng = makeRng(pairSeed(msg.pair));
   const opening = makeOpening(rng);
-  const sWhite = playGame(opening, true, rng);  // A as White
-  const sBlack = playGame(opening, false, rng); // A as Black, same opening
-  parentPort.postMessage({ type: 'result', pair: msg.pair, scores: [sWhite, sBlack] });
+  const gW = playGame(opening, true, rng, collect);  // A as White
+  const gB = playGame(opening, false, rng, collect); // A as Black, same opening
+  parentPort.postMessage({
+    type: 'result', pair: msg.pair, scores: [gW.score, gB.score],
+    recs: collect ? [gW.recs, gB.recs] : null,
+  });
 });
 
 parentPort.postMessage({ type: 'ready' });

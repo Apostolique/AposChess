@@ -40,6 +40,14 @@
 //   --weights-b=FILE  nn weights for engine B (when --eval-b=nn)
 //   --result-file=F   write a JSON summary {games,wins,draws,losses,score,elo,llr,
 //                     sprt} at the end (for orchestration, e.g. the gated train:loop)
+//   --save-games=F    harvest the match's games as training data: append one JSONL
+//                     line per searched position ({fen, r, g, v?} — the generator's
+//                     raw format) to F when the match ends. The search value `v` is
+//                     kept only on positions where the engine the match proved
+//                     STRONGER (by final score; tie -> B, the baseline) was to
+//                     move — the weaker engine's opinion is a worse target, so its
+//                     positions carry just the outcome. Games are buffered until
+//                     the verdict, since the winner isn't known until the end.
 //   --eval-b=NAME     evaluation for engine B (default 'handcrafted'). Lets you pit
 //                     the neural-net eval against the handcrafted one in one file.
 //   --no-tt           disable the transposition table for both engines
@@ -60,8 +68,8 @@
 
 import { Worker } from 'node:worker_threads';
 import { cpus } from 'node:os';
-import { resolve } from 'node:path';
-import { writeFileSync } from 'node:fs';
+import { resolve, dirname } from 'node:path';
+import { writeFileSync, appendFileSync, mkdirSync } from 'node:fs';
 
 // --- args --------------------------------------------------------------------
 const args = Object.fromEntries(
@@ -89,6 +97,8 @@ const cfg = {
   weightsB: typeof args['weights-b'] === 'string' ? resolve(process.cwd(), args['weights-b']) : null,
   // Optional machine-readable result (for orchestration, e.g. the gated train:loop).
   resultFile: typeof args['result-file'] === 'string' ? resolve(process.cwd(), args['result-file']) : null,
+  // Optional game harvesting: append the played positions as raw training data.
+  saveGames: typeof args['save-games'] === 'string' ? resolve(process.cwd(), args['save-games']) : null,
   useTT: !args['no-tt'],
   openings: num(args.openings, 6),
   maxmoves: num(args.maxmoves, 200),
@@ -223,6 +233,12 @@ function record(pairScores) {
   }
 }
 
+// Game harvesting buffer (--save-games): completed pairs' position records, held
+// until the end of the match — only then is the stronger engine known, which
+// decides whose search values survive. Pairs in flight when SPRT stops are lost,
+// which is fine (their scores aren't counted either).
+const harvested = [];
+
 // Worker pool: pull-model dispatch (hand each idle worker the next pair index) so
 // load stays balanced regardless of per-game time, and SPRT can stop promptly.
 let nextPair = 0;
@@ -242,6 +258,7 @@ await new Promise((resolve) => {
     w.on('message', (msg) => {
       if (msg.type === 'ready') { dispatch(w); return; }
       if (msg.type === 'result') {
+        if (msg.recs) harvested.push({ pair: msg.pair, recs: msg.recs });
         record(msg.scores);
         if (decided) pool.forEach((p) => p.terminate()); // stop everyone at once
         else dispatch(w);
@@ -259,6 +276,36 @@ if (cfg.sprt) {
   if (decided === 'H1') console.log(`SPRT: accept H1 — A is stronger than B by ≳${cfg.elo0}..${cfg.elo1} Elo.`);
   else if (decided === 'H0') console.log(`SPRT: accept H0 — A is NOT a ${cfg.elo1}-Elo improvement over B.`);
   else console.log('SPRT: inconclusive within the game budget — raise --games or widen [elo0, elo1].');
+}
+
+// Harvest (--save-games): append the buffered games as raw training data, in the
+// generator's exact format ({fen, r, g, v?}). `v` survives only on positions where
+// the engine the match proved stronger was to move (final score; tie -> B, the
+// established baseline) — the weaker engine's positions keep just the outcome,
+// which train.py already handles (no-`v` rows fall back to the pure result).
+if (cfg.saveGames && harvested.length) {
+  const p = scores.reduce((a, b) => a + b, 0) / scores.length;
+  const winner = p > 0.5 ? 'a' : 'b';
+  let lines = '';
+  let nPos = 0;
+  let nKept = 0;
+  for (const { pair, recs } of harvested) {
+    for (let gi = 0; gi < recs.length; gi++) {
+      // Unique per run + pair + color, same role as the generator's game id ("g"
+      // groups a game for the trainer's by-game train/val split).
+      const gid = `m${cfg.seed.toString(36)}-${pair}${gi === 0 ? 'w' : 'b'}`;
+      for (const rec of recs[gi]) {
+        const o = { fen: rec.fen, r: rec.r, g: gid };
+        if (rec.mover === winner && rec.v != null) { o.v = rec.v; nKept++; }
+        lines += JSON.stringify(o) + '\n';
+        nPos++;
+      }
+    }
+  }
+  mkdirSync(dirname(cfg.saveGames), { recursive: true });
+  appendFileSync(cfg.saveGames, lines);
+  console.log(`Saved ${nPos} positions from ${harvested.length * 2} games to ${cfg.saveGames} `
+    + `(v kept from the stronger engine ${winner.toUpperCase()} on ${nKept}).`);
 }
 
 // Machine-readable summary for orchestration (train:loop reads this to gate).

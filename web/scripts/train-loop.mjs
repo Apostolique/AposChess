@@ -39,6 +39,20 @@
 //                   from the champion (warm start fine-tunes in a few epochs and
 //                   starts at champion strength; cold occasionally explores a
 //                   different basin but relearns everything each cycle)
+//   --skip-gen      skip generation on the FIRST cycle and go straight to
+//                   featurize -> train -> gate on the dataset as it stands. Use it
+//                   to resume after interrupting a run mid-generation: completed
+//                   games were already flushed to the dataset, so this gates them
+//                   instead of generating a whole new batch first. Later cycles
+//                   generate normally.
+//   --no-harvest    don't save the gate match's games into the dataset. By default
+//                   the gate's games (up to --gate-games per cycle — comparable
+//                   volume to generation, already paid for) are appended to
+//                   selfplay.jsonl via the match runner's --save-games, with the
+//                   search value `v` kept only from the engine the gate proved
+//                   stronger; the next cycle's (incremental) featurize folds them
+//                   in. Note they're played at --gate-depth, shallower labels than
+//                   generation's --depth.
 //   --jobs=N        parallel workers for gen + match
 //   --fresh         clear the dataset before the first cycle (clean deep-search start)
 //   --refresh-frac=P  after each PROMOTION, recompute `v` on a random fraction P of the
@@ -100,6 +114,8 @@ const cfg = {
   jobs: args.jobs,
   fresh: !!args.fresh,
   cold: !!args.cold,
+  skipGen: !!args['skip-gen'],
+  harvest: !args['no-harvest'],
   // After each PROMOTION (the only time the champion — hence the `v` target — changes),
   // recompute `v` on a random fraction of the dataset with the new champion (value
   // iteration). 0 = off. Partial keeps cost amortized and average staleness ~1/frac
@@ -177,7 +193,11 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
   log(`===== cycle ${c}${cfg.cycles === Infinity ? '' : `/${cfg.cycles}`} =====`);
 
   // 1. Generate games with the champion (deeper search than the eval sees).
-  if (!run('Generate (champion self-play)', process.execPath,
+  //    --skip-gen: on the first cycle only, gate the games an interrupted earlier
+  //    run already flushed to the dataset instead of generating a new batch.
+  if (c === 1 && cfg.skipGen) {
+    log('Skipping generation (--skip-gen): gating the existing dataset.');
+  } else if (!run('Generate (champion self-play)', process.execPath,
     [genScript, `--games=${cfg.batch}`, `--depth=${cfg.depth}`, '--eval=nn', ...jobArg])) break;
 
   // 2. Featurize the raw positions for the current feature set.
@@ -192,12 +212,16 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
     [trainPy, `--hidden=${hidden}`, `--out=${candidate}`, `--lambda=${cfg.lam}`,
       ...(cfg.cold ? [] : [`--init=${champion}`])])) break;
 
-  // 4. Gate: candidate (A) vs champion (B), SPRT(0, elo1).
+  // 4. Gate: candidate (A) vs champion (B), SPRT(0, elo1). Unless --no-harvest,
+  //    the gate's games are appended to the dataset (they're already paid for;
+  //    `v` survives only from the side the gate proves stronger) and the next
+  //    cycle's incremental featurize folds them in.
   if (existsSync(resultFile)) rmSync(resultFile);
   if (!run('Gate: candidate vs champion', process.execPath,
     [matchScript, '--eval-a=nn', `--weights-a=${candidate}`, '--eval-b=nn', `--weights-b=${champion}`,
       `--depth=${cfg.gateDepth}`, '--sprt', '--elo0=0', `--elo1=${cfg.elo1}`,
-      `--games=${cfg.gateGames}`, `--result-file=${resultFile}`, ...jobArg])) break;
+      `--games=${cfg.gateGames}`, `--result-file=${resultFile}`,
+      ...(cfg.harvest ? [`--save-games=${rawFile}`, `--seed=${Date.now()}`] : []), ...jobArg])) break;
 
   // 5. Promote only on a significant win (SPRT accepted H1). Never regress.
   let res;
