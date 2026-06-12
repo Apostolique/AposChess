@@ -18,7 +18,7 @@ const boardEl = document.getElementById('board');
 const $ = (id) => document.getElementById(id);
 
 const ui = {
-  mode: 'human-human', // 'human-human' | 'human-ai' | 'ai-ai' | 'online'
+  mode: 'human-human', // 'human-human' | 'human-ai' | 'ai-ai' | 'online' | 'puzzle' | 'editor'
   humanColor: 'white', // which side the human controls in 'human-ai'
   // AI strength per slot: a preset depth string '1'..'7', or 'custom'.
   strengthAi: '2',     // opponent strength in 'human-ai'
@@ -240,6 +240,10 @@ function controllableColor() {
   if (ui.mode === 'human-human') return state.turn;
   if (ui.mode === 'human-ai' && state.turn === ui.humanColor) return state.turn;
   if (ui.mode === 'online' && onlineConnected && state.turn === onlineColor) return state.turn;
+  // Puzzle: the solver's side, while the puzzle is live (not solved/revealed and
+  // not waiting on the scripted reply, which is "the opponent's turn").
+  if (ui.mode === 'puzzle' && puzzle && (puzzlePhase === 'playing' || puzzlePhase === 'wrong')
+      && state.turn === puzzleColor) return state.turn;
   return undefined;
 }
 
@@ -255,6 +259,7 @@ function aiToMove() {
 function viewColor() {
   if (ui.mode === 'human-ai') return ui.humanColor;
   if (ui.mode === 'online') return onlineColor || 'white';
+  if (ui.mode === 'puzzle') return puzzleColor;
   return 'white';
 }
 
@@ -332,6 +337,23 @@ function updateStatusText() {
   if (ui.mode === 'editor') {
     el.classList.remove('over');
     el.textContent = `Editing — ${editorTurn === 'white' ? 'White' : 'Black'} to move. Switch Mode to play.`;
+    return;
+  }
+  if (ui.mode === 'puzzle') {
+    renderPuzzleMeta();
+    el.classList.toggle('over', puzzlePhase === 'solved' || puzzlePhase === 'revealed');
+    if (!puzzle) {
+      el.textContent = puzzleCatalog === null ? 'Loading puzzles…'
+        : puzzleCatalog.length === 0 ? 'No puzzles available.'
+        : 'No puzzles match these filters.';
+      return;
+    }
+    const side = puzzleColor === 'white' ? 'White' : 'Black';
+    if (puzzlePhase === 'solved') el.textContent = 'Solved! Well done.';
+    else if (puzzlePhase === 'revealed') el.textContent = 'Solution shown.';
+    else if (puzzlePhase === 'wrong') el.textContent = 'Not the move — try again.';
+    else if (state.turn !== puzzleColor) el.textContent = '…';
+    else el.textContent = `${side} to move — find the best move${status.check ? ' (check!)' : ''}.`;
     return;
   }
   el.classList.toggle('over', status.over);
@@ -481,6 +503,7 @@ function onUserMove(orig, dest) {
 // as a minimal {from,to,promotion} so the other client reconstructs the identical
 // engine move from its own legalMoves (no chance of the two games diverging).
 function playLocalMove(move) {
+  if (ui.mode === 'puzzle') { playPuzzleMove(move); return; }
   commit(move);
   if (ui.mode === 'online' && online && onlineConnected) {
     online.send({ t: 'move', from: move.from, to: move.to, promotion: move.promotion || null });
@@ -586,6 +609,200 @@ function onPonderResult(slot, data) {
   if (data.reached >= depth || data.reached <= slot.ponderBest) return;
   slot.ponderBest = data.reached;
   slot.worker.postMessage({ type: 'ponder', seq: data.seq, state: slot.ponderState, depth, maxMs: PONDER_STEP_MS, engine, net, posHistory: repWindow(slot.ponderState) });
+}
+
+// --- puzzle mode ---
+// Puzzles come from public/puzzles.json (mined by scripts/mine-puzzles.mjs —
+// fetched at runtime like the nn catalog, so adding puzzles needs no rebuild).
+// Each entry is { fen, moves, kind, themes, difficulty, mateIn? } where `moves` is
+// the full solution line in from-to(-promotion) square names, solver's moves at the
+// even indices. The solver plays the side to move in `fen`; correct moves commit
+// into the normal game machinery (history, sounds, review all work), the scripted
+// reply follows after the watch delay, and a wrong move snaps back — unless it
+// delivers checkmate on the spot, which is accepted: the mined line is the unique
+// *best* line, but mate is mate.
+let puzzleCatalog = null;  // null until fetched; [] if the fetch failed or was empty
+let puzzleList = [];       // current filtered, shuffled play order
+let puzzleIdx = -1;        // position in puzzleList
+let puzzle = null;         // the active catalog entry
+let puzzleColor = 'white'; // the solver's side (the side to move in the puzzle FEN)
+let puzzlePhase = 'idle';  // 'playing' | 'wrong' | 'solved' | 'revealed' | 'idle'
+let puzzleStep = 0;        // index into puzzle.moves of the next expected move
+let puzzleTimer = null;    // pending scripted reply / solution playback step
+
+const puzzleUci = (m) => squareName(m.from) + squareName(m.to) + (m.promotion || '');
+
+// Filter predicates for the two selects. Difficulty is the mining depth at which
+// the engine first finds the key move (1 = sees it immediately).
+const PUZZLE_DIFFICULTY = {
+  easy: (p) => p.difficulty <= 2,
+  medium: (p) => p.difficulty === 3 || p.difficulty === 4,
+  hard: (p) => p.difficulty >= 5,
+};
+const PUZZLE_THEME = {
+  mate: (p) => p.kind === 'mate',
+  jump: (p) => p.themes.includes('jump') || p.themes.includes('jump-capture'),
+  'jump-block': (p) => p.themes.includes('jump-block'),
+  knight: (p) => p.themes.includes('knight') || p.themes.includes('knight-block'),
+  sacrifice: (p) => p.themes.includes('sacrifice'),
+  promotion: (p) => p.themes.includes('promotion'),
+};
+
+async function enterPuzzleMode() {
+  clearTimeout(puzzleTimer);
+  render(); // lock the board while the catalog loads
+  if (!puzzleCatalog) {
+    try {
+      const url = new URL(import.meta.env.BASE_URL + 'puzzles.json', location.href).href;
+      const data = await fetch(url).then((r) => r.json());
+      puzzleCatalog = Array.isArray(data.puzzles) ? data.puzzles : [];
+    } catch { puzzleCatalog = []; }
+    if (ui.mode !== 'puzzle') return; // switched away while the fetch was in flight
+  }
+  refilterPuzzles();
+  nextPuzzle();
+}
+
+// Rebuild the play order from the current filter selects: filter, then shuffle so
+// "Next puzzle" walks a fresh random order (repeats only after the list wraps).
+function refilterPuzzles() {
+  const diff = PUZZLE_DIFFICULTY[$('puzzle-difficulty').value];
+  const theme = PUZZLE_THEME[$('puzzle-theme').value];
+  puzzleList = (puzzleCatalog || []).filter((p) => (!diff || diff(p)) && (!theme || theme(p)));
+  for (let i = puzzleList.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [puzzleList[i], puzzleList[j]] = [puzzleList[j], puzzleList[i]];
+  }
+  puzzleIdx = -1;
+}
+
+function nextPuzzle() {
+  if (puzzleList.length === 0) {
+    clearTimeout(puzzleTimer);
+    puzzle = null;
+    puzzlePhase = 'idle';
+    cg.setAutoShapes([]);
+    render();
+    return;
+  }
+  puzzleIdx = (puzzleIdx + 1) % puzzleList.length;
+  loadPuzzle(puzzleList[puzzleIdx]);
+}
+
+// Reset the live game to the puzzle's position (the same bookkeeping as loadGame,
+// minus the replay) and arm the solution tracking. When the catalog carries the
+// lead-in (`prefen` + `opening`, the blunder that created the puzzle), start one
+// ply earlier and animate the opponent playing it — seeing the move that just
+// happened is half the orientation (and how lichess puzzles open).
+function loadPuzzle(p) {
+  clearTimeout(puzzleTimer);
+  cancelAi();
+  ui.running = false;
+  ui.started = false;
+  syncToggleLabel();
+  state = parseFen(p.fen);
+  status = gameStatus(state);
+  let lead = null;
+  if (p.prefen && p.opening) {
+    const pre = parseFen(p.prefen);
+    const preStatus = gameStatus(pre);
+    lead = preStatus.legal.find((m) => puzzleUci(m) === p.opening) || null;
+    if (lead) { state = pre; status = preStatus; } // fall back to the puzzle position if not
+  }
+  captured = { white: [], black: [] };
+  history = [startEntry(state)];
+  repFens = [toFen(state)];
+  viewIndex = 0;
+  posCounts = new Map();
+  countPosition(state);
+  lastCommitAt = performance.now();
+  puzzle = p;
+  puzzleColor = lead ? opponent(state.turn) : state.turn; // the solver = the side to move in p.fen
+  puzzlePhase = 'playing';
+  puzzleStep = 0;
+  cg.setAutoShapes([]);
+  render();
+  // Let the starting position paint, then play the blunder (commit animates it and
+  // sounds it like any move); the board unlocks for the solver when it lands.
+  if (lead) puzzleTimer = setTimeout(() => commit(lead), 650);
+}
+
+// A solver move from the board. The expected move is accepted and committed; any
+// other move that mates on the spot also solves the puzzle; everything else snaps
+// back for another try.
+function playPuzzleMove(move) {
+  if (!puzzle || (puzzlePhase !== 'playing' && puzzlePhase !== 'wrong')) { render(); return; }
+  cg.setAutoShapes([]);
+  if (puzzleUci(move) === puzzle.moves[puzzleStep]) {
+    puzzleStep++;
+    puzzlePhase = 'playing';
+    const done = puzzleStep >= puzzle.moves.length;
+    if (done) puzzlePhase = 'solved';
+    commit(move);
+    if (done) playConnectSound();
+    else schedulePuzzleReply();
+    return;
+  }
+  if (gameStatus(applyMove(state, move)).result === 'checkmate') {
+    puzzleStep = puzzle.moves.length;
+    puzzlePhase = 'solved';
+    commit(move);
+    playConnectSound();
+    return;
+  }
+  puzzlePhase = 'wrong';
+  render(); // chessground already moved the piece; redraw from the unchanged state
+}
+
+// Play the scripted opponent reply after the watch delay, then hand back to the
+// solver. A reply missing from legalMoves means the catalog and engine disagree
+// (e.g. a rule change since mining) — end the puzzle as solved rather than strand it.
+function schedulePuzzleReply() {
+  puzzleTimer = setTimeout(() => {
+    const m = status.legal.find((x) => puzzleUci(x) === puzzle.moves[puzzleStep]);
+    if (!m) { puzzlePhase = 'solved'; render(); return; }
+    puzzleStep++;
+    commit(m);
+  }, ui.delay);
+}
+
+// Reveal: play out the rest of the line (from wherever the solver got to) with a
+// readable pause between moves. The board locks (phase 'revealed').
+function revealPuzzleSolution() {
+  if (!puzzle || puzzlePhase === 'solved' || puzzlePhase === 'revealed') return;
+  clearTimeout(puzzleTimer);
+  goTo(history.length - 1); // make sure we're at the live position before extending it
+  puzzlePhase = 'revealed';
+  cg.setAutoShapes([]);
+  const step = () => {
+    if (puzzleStep >= puzzle.moves.length) return;
+    const m = status.legal.find((x) => puzzleUci(x) === puzzle.moves[puzzleStep]);
+    if (!m) return;
+    puzzleStep++;
+    commit(m);
+    puzzleTimer = setTimeout(step, 600);
+  };
+  step();
+}
+
+function puzzleHint() {
+  if (!puzzle || (puzzlePhase !== 'playing' && puzzlePhase !== 'wrong')) return;
+  if (state.turn !== puzzleColor || viewIndex !== history.length - 1) return;
+  cg.setAutoShapes([{ orig: puzzle.moves[puzzleStep].slice(0, 2), brush: 'green' }]);
+}
+
+// The line under the puzzle buttons: progress while solving; kind, difficulty and
+// themes only once the puzzle is over (they'd spoil the answer).
+function renderPuzzleMeta() {
+  const el = $('puzzle-meta');
+  if (ui.mode !== 'puzzle' || !puzzle) { el.textContent = ''; return; }
+  let s = `Puzzle ${puzzleIdx + 1} / ${puzzleList.length}`;
+  if (puzzlePhase === 'solved' || puzzlePhase === 'revealed') {
+    s += puzzle.kind === 'mate' ? ` · mate in ${puzzle.mateIn}` : ' · winning tactic';
+    s += ` · difficulty ${puzzle.difficulty}`;
+    if (puzzle.themes.length) s += ` · ${puzzle.themes.join(', ')}`;
+  }
+  el.textContent = s;
 }
 
 // --- promotion picker ---
@@ -862,6 +1079,14 @@ function newGame() {
 // then show the final position. Keeps the current mode (so you can load a line and
 // let the AIs continue from it), but leaves AI-vs-AI paused until you press Start.
 function loadGame(start, moves) {
+  // Importing a game while in puzzle mode replaces the puzzle — clear it so solver
+  // moves on the imported position aren't checked against a stale solution.
+  if (ui.mode === 'puzzle') {
+    clearTimeout(puzzleTimer);
+    puzzle = null;
+    puzzlePhase = 'idle';
+    cg.setAutoShapes([]);
+  }
   cancelAi();
   ui.running = false;
   ui.started = false;
@@ -947,6 +1172,9 @@ function applyModeVisibility() {
   const m = ui.mode;
   $('side-control').hidden = m !== 'human-ai';
   $('ai-toggle').hidden = m !== 'ai-ai';
+  // Puzzles have their own Retry/Next buttons; "New game" would be ambiguous there.
+  $('new-game').hidden = m === 'puzzle';
+  $('row-puzzle').hidden = m !== 'puzzle';
   $('row-ai-swap').hidden = m !== 'ai-ai';
   $('row-online').hidden = m !== 'online';
   // human-ai: one colour-agnostic AI row. ai-ai: separate White/Black rows.
@@ -1113,17 +1341,28 @@ $('mode').addEventListener('change', (e) => {
     ui.mode = e.target.value;
     if (ui.mode === 'online') { applyModeVisibility(); setOnlinePhase('idle'); newGame(); return; }
     applyModeVisibility();
+    if (ui.mode === 'puzzle') { enterPuzzleMode(); return; } // a puzzle replaces the edited board
     loadGame(edited, []); // start a new game from the edited position, then continue
     return;
   }
 
   ui.mode = e.target.value;
   if (prev === 'online' && ui.mode !== 'online') { leaveOnline(); setUrlCode(''); }
+  // Leaving puzzles keeps the position (so it can be analyzed in another mode), but
+  // drops the puzzle itself: no pending reply, no hint arrow, no stale solution.
+  if (prev === 'puzzle' && ui.mode !== 'puzzle') {
+    clearTimeout(puzzleTimer);
+    puzzle = null;
+    puzzlePhase = 'idle';
+    cg.setAutoShapes([]);
+    renderPuzzleMeta();
+  }
   applyModeVisibility();
   if (ui.mode === 'editor') { enterEditor(); return; }
   // Online needs a clean handshake, so it still starts a fresh game; every other
   // mode change continues the current position (there's a New game button per mode).
   if (ui.mode === 'online') { setOnlinePhase('idle'); newGame(); return; }
+  if (ui.mode === 'puzzle') { enterPuzzleMode(); return; }
   handoffControl();
 });
 $('side').addEventListener('change', (e) => {
@@ -1189,6 +1428,19 @@ $('ai-swap').addEventListener('click', () => {
   $('custom-ms-black').value = ui.custom.black.ms;
   applyModeVisibility(); // reveal/hide each row's custom inputs to match
 });
+
+// Puzzle panel controls. A filter change redeals from the newly-filtered list.
+$('puzzle-retry').addEventListener('click', () => { if (puzzle) loadPuzzle(puzzle); });
+$('puzzle-hint').addEventListener('click', puzzleHint);
+$('puzzle-solution').addEventListener('click', revealPuzzleSolution);
+$('puzzle-next').addEventListener('click', nextPuzzle);
+for (const id of ['puzzle-difficulty', 'puzzle-theme']) {
+  $(id).addEventListener('change', () => {
+    if (puzzleCatalog === null) return; // catalog still loading; enterPuzzleMode will filter
+    refilterPuzzles();
+    nextPuzzle();
+  });
+}
 
 // Online panel controls.
 $('online-host').addEventListener('click', startHost);
@@ -1319,6 +1571,8 @@ applyModeVisibility();
 if (ui.mode === 'online') setOnlinePhase('idle');
 if (ui.mode === 'editor') {
   enterEditor(); // a restored editor mode needs the editable board set up
+} else if (ui.mode === 'puzzle') {
+  enterPuzzleMode(); // a restored puzzle mode fetches the catalog and deals a puzzle
 } else {
   render();
   driveAi(); // if a restored mode has the AI to move first

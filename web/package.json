@@ -15,7 +15,8 @@
     "train:fit": "node scripts/train-fit.mjs",
     "train:featurize": "node scripts/featurize.mjs",
     "train:loop": "node scripts/train-loop.mjs",
-    "train:merge": "node scripts/merge-data.mjs"
+    "train:merge": "node scripts/merge-data.mjs",
+    "puzzles:mine": "node scripts/mine-puzzles.mjs"
   },
   "dependencies": {
     "@lichess-org/chessground": "^10.1.1",

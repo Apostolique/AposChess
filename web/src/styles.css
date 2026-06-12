@@ -455,6 +455,12 @@ button:disabled:hover { background: var(--panel); } /* no hover lift when locked
 .editor-actions button { flex: 1; padding: 8px 6px; }
 .editor-hint { margin: 0; color: var(--muted); font-size: 0.8rem; }
 
+/* Puzzle panel: action buttons share the row evenly; the meta line (progress, and
+   after solving the kind/difficulty/themes) sits quietly underneath. */
+.puzzle-actions { margin-top: 10px; gap: 6px; }
+.puzzle-actions button { flex: 1; padding: 8px 6px; }
+.puzzle-meta { margin: 8px 0 0; color: var(--muted); font-size: 0.8rem; min-height: 1.1em; }
+
 /* Stack the sections on narrow screens — BOARD FIRST. The primary actions (mode,
    New game, Start) re-stack directly under the board, so starting/restarting a
    game never means scrolling away from it; the AI config, online panel, and rules

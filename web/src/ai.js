@@ -605,4 +605,4 @@ export function chooseMove(state, maxDepth, rand, maxMs, useTT, prevHashes, engi
 
 // Exposed for tests only: Zobrist hash equivalence check + table reset so a
 // benchmark/test can start each game from a cold table despite persistence.
-export const _internal = { hashOf, hashAfter, resetTT: ttReset, evalStm };
+export const _internal = { hashOf, hashAfter, resetTT: ttReset, evalStm, MATE, MATE_THRESH };
