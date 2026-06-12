@@ -1,0 +1,30 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * Board + piece theme, assets from Lichess (lichess-org/lila):
+ *   - board:  public/images/board/blue2.jpg (the lila authors & pirouetti, AGPLv3+)
+ *   - pieces: public/piece/merida (Armando Hernandez Marroquin, GPLv2+)
+ * Loaded AFTER chessground.brown.css, whose cg-board rule this overrides; brown.css
+ * stays imported for its neutral interactive-square styles (move dests, last move,
+ * check, selected) and coordinate colors, which read fine on the blue board.
+ * This file replaces the chessground.cburnett.css piece-set import entirely.
+ * Vite resolves the url()s and emits/inlines the assets, so they work under the
+ * relative `base: './'` (GitHub Pages project path) unlike `/public` absolute urls.
+ */
+
+cg-board {
+  background-color: #dee3e6; /* blue2's light square, shown while the jpg loads */
+  background-image: url('./assets/board/blue2.jpg');
+}
+
+.cg-wrap piece.pawn.white { background-image: url('./assets/pieces/merida/wP.svg'); }
+.cg-wrap piece.knight.white { background-image: url('./assets/pieces/merida/wN.svg'); }
+.cg-wrap piece.bishop.white { background-image: url('./assets/pieces/merida/wB.svg'); }
+.cg-wrap piece.rook.white { background-image: url('./assets/pieces/merida/wR.svg'); }
+.cg-wrap piece.queen.white { background-image: url('./assets/pieces/merida/wQ.svg'); }
+.cg-wrap piece.king.white { background-image: url('./assets/pieces/merida/wK.svg'); }
+.cg-wrap piece.pawn.black { background-image: url('./assets/pieces/merida/bP.svg'); }
+.cg-wrap piece.knight.black { background-image: url('./assets/pieces/merida/bN.svg'); }
+.cg-wrap piece.bishop.black { background-image: url('./assets/pieces/merida/bB.svg'); }
+.cg-wrap piece.rook.black { background-image: url('./assets/pieces/merida/bR.svg'); }
+.cg-wrap piece.queen.black { background-image: url('./assets/pieces/merida/bQ.svg'); }
+.cg-wrap piece.king.black { background-image: url('./assets/pieces/merida/bK.svg'); }

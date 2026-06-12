@@ -384,13 +384,21 @@ button:disabled:hover { background: var(--panel); } /* no hover lift when locked
   min-height: 28px;
   margin: 6px 2px;
 }
-.tray .caps {
-  font-size: 22px;
-  line-height: 1;
-  letter-spacing: -2px; /* overlap pieces slightly, as Lichess does */
+.tray .caps { display: flex; align-items: center; }
+/* Captured pieces are Lichess's mono set (single grey silhouettes — the tray they
+   sit in already says whose they were), slightly overlapped as Lichess does. */
+.cap {
+  width: 24px;
+  height: 24px;
+  flex: none;
+  background-size: cover;
 }
-.cap-white { color: #f4f1ec; text-shadow: 0 0 1px #000, 0 0 2px #000; }
-.cap-black { color: #14110f; text-shadow: 0 0 1px #8a837b, 0 0 2px #6f9b4e33; }
+.cap + .cap { margin-left: -7px; }
+.cap-p { background-image: url('./assets/pieces/mono/P.svg'); }
+.cap-n { background-image: url('./assets/pieces/mono/N.svg'); }
+.cap-b { background-image: url('./assets/pieces/mono/B.svg'); }
+.cap-r { background-image: url('./assets/pieces/mono/R.svg'); }
+.cap-q { background-image: url('./assets/pieces/mono/Q.svg'); }
 .tray .adv {
   font-size: 0.85rem;
   color: var(--muted);

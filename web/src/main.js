@@ -2,8 +2,10 @@
 // Copyright (C) 2019-2026 Jean-David Moisan
 import { Chessground } from '@lichess-org/chessground';
 import '@lichess-org/chessground/assets/chessground.base.css';
+// brown.css is kept for its interactive-square styles + coord colors; the board
+// texture and piece set it bundles are overridden by board-theme.css (blue2 + merida).
 import '@lichess-org/chessground/assets/chessground.brown.css';
-import '@lichess-org/chessground/assets/chessground.cburnett.css';
+import './board-theme.css';
 import './styles.css';
 
 import { newGameState, parseFen, toFen, parseSquare, squareName, opponent } from './board.js';
@@ -283,7 +285,6 @@ function render() {
 }
 
 // --- captured pieces / material advantage (Lichess-style) ---
-const SHAPE = { p: '♟', n: '♞', b: '♝', r: '♜', q: '♛', k: '♚' };
 const POINTS = { p: 1, n: 3, b: 3, r: 5, q: 9, k: 0 };
 
 function pointAdvantage(board, color) {
@@ -310,8 +311,10 @@ function renderTray(el, color, board, caps) {
   for (const role of ['q', 'r', 'b', 'n', 'p']) { // descending value, like the old sort
     for (let i = (mine[role] || 0) - (theirs[role] || 0); i > 0; i--) surplus.push(role);
   }
+  // Mono (single-colour) piece glyphs, like Lichess's material diff — whose pieces
+  // they were is clear from which tray they're in, so colouring them is noise.
   el.querySelector('.caps').innerHTML = surplus
-    .map((role) => `<span class="cap-${opponent(color)}">${SHAPE[role]}</span>`)
+    .map((role) => `<span class="cap cap-${role}"></span>`)
     .join('');
   const adv = pointAdvantage(board, color);
   el.querySelector('.adv').textContent = adv > 0 ? `+${adv}` : '';
