@@ -198,6 +198,7 @@ function supersedeAi() {
 function cancelAi() {
   clearTimeout(aiTimer);
   aiThinking = false;
+  puzzleAiPending = false;
   spawnAiWorkers();
   updateWakeLock();
 }
@@ -240,11 +241,13 @@ function controllableColor() {
   if (ui.mode === 'human-human') return state.turn;
   if (ui.mode === 'human-ai' && state.turn === ui.humanColor) return state.turn;
   if (ui.mode === 'online' && onlineConnected && state.turn === onlineColor) return state.turn;
-  // Puzzle: the solver's side — while the puzzle is live (not solved/revealed and
-  // not waiting on the scripted reply), and likewise during the play-it-out
-  // free-play, where the engine drives the other side.
-  if (ui.mode === 'puzzle' && puzzle && state.turn === puzzleColor
-      && (puzzlePhase === 'playing' || puzzlePhase === 'wrong' || puzzlePhase === 'freeplay')) return state.turn;
+  // Puzzle: the solver's side while the puzzle is live (not solved/revealed and not
+  // waiting on the scripted reply). The play-it-out free-play is analysis: BOTH
+  // sides are hand-movable, with the engine only moving on request (AI move button).
+  if (ui.mode === 'puzzle' && puzzle) {
+    if (puzzlePhase === 'freeplay') return state.turn;
+    if ((puzzlePhase === 'playing' || puzzlePhase === 'wrong') && state.turn === puzzleColor) return state.turn;
+  }
   return undefined;
 }
 
@@ -252,7 +255,8 @@ function aiToMove() {
   if (status.over) return false;
   if (ui.mode === 'human-ai') return state.turn !== ui.humanColor;
   if (ui.mode === 'ai-ai') return ui.running;
-  if (ui.mode === 'puzzle') return puzzlePhase === 'freeplay' && state.turn !== puzzleColor;
+  // Puzzle free-play: only while a requested "AI move" is in flight.
+  if (ui.mode === 'puzzle') return puzzlePhase === 'freeplay' && puzzleAiPending;
   return false;
 }
 
@@ -273,12 +277,12 @@ function render() {
   const atLive = viewIndex === history.length - 1;
   let color = atLive ? controllableColor() : undefined;
   let dests = (atLive && color) ? destsMap(status.legal) : new Map();
-  // Puzzle play-it-out: reviewing isn't read-only — wherever it's the solver's turn
-  // in the viewed position, a move FORKS the game there (the continuation after it
-  // is discarded by onUserMove), so "what if I'd played differently" is one rewind
-  // away. Everywhere else an off-live view stays locked.
-  if (!atLive && ui.mode === 'puzzle' && puzzlePhase === 'freeplay' && entry.state.turn === puzzleColor) {
-    color = puzzleColor;
+  // Puzzle play-it-out: reviewing isn't read-only — EITHER side can move from any
+  // viewed position, which FORKS the game there (the continuation after it is
+  // discarded by onUserMove), so "what if" is one rewind away for both colours.
+  // Everywhere else an off-live view stays locked.
+  if (!atLive && ui.mode === 'puzzle' && puzzlePhase === 'freeplay') {
+    color = entry.state.turn;
     dests = destsMap(legalMoves(entry.state));
   }
   cg.set({
@@ -557,6 +561,7 @@ function driveAi() {
   clearTimeout(aiTimer);
   updateWakeLock();
   aiThinking = false;
+  puzzleAiPending = false; // any position change consumes/cancels a pending AI-move request
   if (!status.over) {
     const movers = aiColors();
     for (const c of ['white', 'black']) {
@@ -574,9 +579,8 @@ function aiColors() {
   if (status.over) return [];
   if (ui.mode === 'human-ai') return [opponent(ui.humanColor)];
   if (ui.mode === 'ai-ai') return ui.running ? ['white', 'black'] : [];
-  // Puzzle play-it-out: the engine takes the loser's side (the Opponent row's
-  // strength/engine settings drive it — aiParams maps puzzle mode to the 'ai' slot).
-  if (ui.mode === 'puzzle') return puzzlePhase === 'freeplay' ? [opponent(puzzleColor)] : [];
+  // Puzzle mode never drives the AI automatically — free-play engine moves are
+  // requested one at a time via the AI move button (requestPuzzleAiMove).
   return [];
 }
 
@@ -671,6 +675,11 @@ let puzzleColor = 'white'; // the solver's side (the side to move in the puzzle 
 let puzzlePhase = 'idle';  // 'playing' | 'wrong' | 'solved' | 'revealed' | 'idle'
 let puzzleStep = 0;        // index into puzzle.moves of the next expected move
 let puzzleTimer = null;    // pending scripted reply / solution playback step
+let puzzleAiPending = false; // a free-play "AI move" request is in flight
+
+// The play-it-out engine: a fixed strong default (the Opponent row isn't shown in
+// puzzle mode — analysis wants one good answer, not a sparring partner's level).
+const PUZZLE_AI = { depth: 7, engine: 'handcrafted' };
 
 const puzzleUci = (m) => squareName(m.from) + squareName(m.to) + (m.promotion || '');
 
@@ -848,7 +857,7 @@ function renderPuzzleMeta() {
       : puzzle.kind === 'defense' ? ' · defensive save' : ' · winning tactic';
     s += ` · difficulty ${puzzle.difficulty}`;
     if (puzzle.themes.length) s += ` · ${puzzle.themes.join(', ')}`;
-    if (puzzlePhase === 'freeplay') s += ' · playing it out — rewind to try other moves';
+    if (puzzlePhase === 'freeplay') s += ' · free play — move either side, rewind to fork, AI move on demand';
   }
   el.textContent = s;
 }
@@ -1223,17 +1232,18 @@ function applyModeVisibility() {
   // Puzzles have their own Retry/Next buttons; "New game" would be ambiguous there.
   $('new-game').hidden = m === 'puzzle';
   $('row-puzzle').hidden = m !== 'puzzle';
-  // The Opponent row also drives the engine in a puzzle's play-it-out free-play.
-  const aiRow = m === 'human-ai' || (m === 'puzzle' && puzzlePhase === 'freeplay');
+  // The puzzle panel swaps Play it out for the on-demand AI move button in free-play.
+  $('puzzle-continue').hidden = m === 'puzzle' && puzzlePhase === 'freeplay';
+  $('puzzle-ai-move').hidden = !(m === 'puzzle' && puzzlePhase === 'freeplay');
   $('row-ai-swap').hidden = m !== 'ai-ai';
   $('row-online').hidden = m !== 'online';
   // human-ai: one colour-agnostic AI row. ai-ai: separate White/Black rows.
-  $('row-ai').hidden = !aiRow;
+  $('row-ai').hidden = m !== 'human-ai';
   $('row-white').hidden = m !== 'ai-ai';
   $('row-black').hidden = m !== 'ai-ai';
   $('row-editor').hidden = m !== 'editor';
   // A row's custom depth/timeout inputs appear only when its strength is "Custom".
-  toggleCustom('ai', aiRow && ui.strengthAi === 'custom');
+  toggleCustom('ai', m === 'human-ai' && ui.strengthAi === 'custom');
   toggleCustom('white', m === 'ai-ai' && ui.strengthWhite === 'custom');
   toggleCustom('black', m === 'ai-ai' && ui.strengthBlack === 'custom');
   // The net picker appears only when a slot's engine is the neural net.
@@ -1262,6 +1272,9 @@ function applyAiLock() {
 // Search params for the AI playing `turn`: a preset depth + the default cap, or
 // that slot's custom depth + timeout when its strength is set to "Custom".
 function aiParams(turn) {
+  // Puzzle free-play "AI move" requests use the fixed analysis default — the
+  // Opponent row isn't shown (or consulted) in puzzle mode.
+  if (ui.mode === 'puzzle') return { depth: PUZZLE_AI.depth, maxMs: ui.maxMs, engine: PUZZLE_AI.engine, net: undefined };
   const slot = ui.mode === 'ai-ai' ? turn : 'ai';
   const engine = engineOf(slot);
   const net = engine === 'nn' ? netUrl(netOf(slot)) : undefined; // weights URL for the worker
@@ -1484,19 +1497,29 @@ $('puzzle-retry').addEventListener('click', () => { if (puzzle) loadPuzzle(puzzl
 $('puzzle-hint').addEventListener('click', puzzleHint);
 $('puzzle-solution').addEventListener('click', revealPuzzleSolution);
 $('puzzle-next').addEventListener('click', nextPuzzle);
-// "Play it out": stay in puzzle mode and let the engine pick up the loser's side,
-// so the win (or save) can be converted in place — it's often not obvious how the
-// game unfolds after the tactic lands. The Opponent row appears to control the
-// engine, and reviewing becomes forkable: rewind to any of your moves and play a
-// different one (see onUserMove/truncateToView).
+// "Play it out": stay in puzzle mode and analyze freely — it's often not obvious
+// how the game unfolds after the tactic lands. Both sides are hand-movable,
+// reviewing becomes forkable (rewind and play a different move — see
+// onUserMove/truncateToView), and the AI move button asks the engine for the next
+// move of whichever side is to move.
 $('puzzle-continue').addEventListener('click', () => {
   if (!puzzle || puzzlePhase === 'freeplay') return;
   clearTimeout(puzzleTimer);
   puzzlePhase = 'freeplay';
   cg.setAutoShapes([]);
-  applyModeVisibility(); // reveal the Opponent row that drives the play-out engine
+  applyModeVisibility(); // swap the panel's Play it out button for AI move
   render();
-  driveAi();
+});
+
+// One engine move on demand, for the side to move at the VIEWED position (asking
+// from a rewound ply forks the game there first, like playing a move would).
+$('puzzle-ai-move').addEventListener('click', () => {
+  if (ui.mode !== 'puzzle' || puzzlePhase !== 'freeplay' || puzzleAiPending) return;
+  if (viewIndex !== history.length - 1) truncateToView();
+  if (status.over) { render(); return; }
+  puzzleAiPending = true;
+  startSearch(ai[state.turn]); // commits via the normal onSearchResult path
+  updateStatusText();          // "… is thinking"
 });
 for (const id of ['puzzle-difficulty', 'puzzle-theme']) {
   $(id).addEventListener('change', () => {
