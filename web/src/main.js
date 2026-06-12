@@ -79,9 +79,6 @@ function playConnectSound() {
   connectSound.currentTime = 0;
   connectSound.play().catch(() => {}); // gesture-unlocked by the Host/Join click
 }
-// captured[color] = list of opponent pieces that `color` has captured (live game).
-let captured = { white: [], black: [] };
-
 // Move history for review. Each entry is a snapshot after a ply; index 0 is the
 // start position. `viewIndex` is the position shown on the board, which may lag
 // the live game while the user steps back through earlier moves.
@@ -133,7 +130,7 @@ let matchSession = null; // active matchmaking queue search (or null)
 let matchmade = false;
 
 function startEntry(s) {
-  return { state: s, captured: { white: [], black: [] }, lastMove: null, san: null, check: false };
+  return { state: s, lastMove: null, san: null, check: false };
 }
 
 // Each AI colour gets its OWN worker — its own thread and its own persistent
@@ -302,9 +299,10 @@ function render() {
   renderMoveList();
   updateStatusText();
   applyAiLock();
+  syncEvalBar();
 }
 
-// --- captured pieces / material advantage (Lichess-style) ---
+// --- material difference / advantage trays (Lichess-style) ---
 const POINTS = { p: 1, n: 3, b: 3, r: 5, q: 9, k: 0 };
 
 function pointAdvantage(board, color) {
@@ -317,18 +315,20 @@ function pointAdvantage(board, color) {
   return color === 'white' ? diff : -diff;
 }
 
-function renderTray(el, color, board, caps) {
-  // Lichess-style material diff: equal captures cancel out per role, so each tray
-  // shows only this side's surplus (if both sides took a pawn, neither shows one).
-  const countRoles = (list) => {
-    const c = {};
-    for (const p of list) c[p.role] = (c[p.role] || 0) + 1;
-    return c;
-  };
-  const mine = countRoles(caps[color]);
-  const theirs = countRoles(caps[opponent(color)]);
+function renderTray(el, color, board) {
+  // Lichess-style material diff, derived from the BOARD rather than capture
+  // history: per role, show this side's surplus of pieces still standing. Equal
+  // trades cancel per role for free, and promotion reads correctly — a pawn
+  // promoting to a knight shows as being up a knight (capture history would keep
+  // crediting the long-gone pawn, then "a knight" to whoever captures the
+  // promoted piece, while the point score said something else entirely).
+  const counts = { white: {}, black: {} };
+  for (const p of board) {
+    if (p) counts[p.color][p.role] = (counts[p.color][p.role] || 0) + 1;
+  }
+  const mine = counts[color], theirs = counts[opponent(color)];
   const surplus = [];
-  for (const role of ['q', 'r', 'b', 'n', 'p']) { // descending value, like the old sort
+  for (const role of ['q', 'r', 'b', 'n', 'p']) { // descending value
     for (let i = (mine[role] || 0) - (theirs[role] || 0); i > 0; i--) surplus.push(role);
   }
   // Mono (single-colour) piece glyphs, like Lichess's material diff — whose pieces
@@ -343,8 +343,8 @@ function renderTray(el, color, board, caps) {
 function renderTrays(entry) {
   // Bottom player matches board orientation; top player is the opponent.
   const bottom = viewColor();
-  renderTray($('tray-bottom'), bottom, entry.state.board, entry.captured);
-  renderTray($('tray-top'), opponent(bottom), entry.state.board, entry.captured);
+  renderTray($('tray-bottom'), bottom, entry.state.board);
+  renderTray($('tray-top'), opponent(bottom), entry.state.board);
 }
 
 function updateStatusText() {
@@ -396,14 +396,10 @@ function updateStatusText() {
   }
 }
 
-// Apply one move to the live game and record it (state, status, captured tray,
-// history snapshot, repetition FEN). Shared by interactive play (`commit`) and bulk
-// replay (`loadGame`); does no rendering, sound, or AI driving of its own.
+// Apply one move to the live game and record it (state, status, history snapshot,
+// repetition FEN). Shared by interactive play (`commit`) and bulk replay
+// (`loadGame`); does no rendering, sound, or AI driving of its own.
 function recordMove(move) {
-  if (move.capture) {
-    const taken = state.board[move.to]; // occupant of the landing square (incl. jumps)
-    if (taken) captured[state.turn].push(taken);
-  }
   const pre = state;
   state = applyMove(pre, move);
   status = gameStatus(state);
@@ -414,7 +410,6 @@ function recordMove(move) {
   }
   history.push({
     state,
-    captured: { white: [...captured.white], black: [...captured.black] },
     lastMove: move,
     san: toSan(pre, move, status),
     check: status.check,
@@ -502,15 +497,14 @@ function goTo(index) {
 }
 
 // Make the viewed ply the live end of the game: drop everything after it and
-// rebuild the live bookkeeping (state, status, captured, repetition counts) from
-// the snapshot. Backs the rewind-and-fork in puzzle play-it-out.
+// rebuild the live bookkeeping (state, status, repetition counts) from the
+// snapshot. Backs the rewind-and-fork in puzzle play-it-out.
 function truncateToView() {
   history.length = viewIndex + 1;
   repFens.length = viewIndex + 1;
   const entry = history[viewIndex];
   state = entry.state;
   status = gameStatus(state);
-  captured = { white: [...entry.captured.white], black: [...entry.captured.black] };
   // Threefold tracking is forward-only, so recount over the surviving line.
   posCounts = new Map();
   for (const f of repFens) {
@@ -763,7 +757,6 @@ function loadPuzzle(p) {
     lead = preStatus.legal.find((m) => puzzleUci(m) === p.opening) || null;
     if (lead) { state = pre; status = preStatus; } // fall back to the puzzle position if not
   }
-  captured = { white: [], black: [] };
   history = [startEntry(state)];
   repFens = [toFen(state)];
   viewIndex = 0;
@@ -860,6 +853,106 @@ function renderPuzzleMeta() {
     if (puzzlePhase === 'freeplay') s += ' · free play — move either side, rewind to fork, AI move on demand';
   }
   el.textContent = s;
+}
+
+// --- eval bar (puzzle play-it-out) ---
+// A Lichess-style vertical gauge beside the board, shown only during free-play
+// (showing it while solving would spoil the puzzle). The white fill's height is
+// White's winning chances; the CSS height transition animates each update. A
+// dedicated THIRD worker evaluates the VIEWED position (so review navigation and
+// forking refresh the bar) and never competes with the per-colour play workers;
+// it's terminated whenever the bar hides, since its idle transposition table
+// holds ~20 MB. Requests are throttled to one in flight: a position change while
+// one is out marks it dirty and re-requests on the reply, so mashing the review
+// arrows queues at most one extra search.
+const EVAL_BAR = { depth: 6, maxMs: 1500, engine: 'handcrafted' };
+// Scores beyond this magnitude encode a forced mate (ai.js MATE = 1,000,000; no
+// real centipawn eval comes anywhere near) — pin the bar to the winner's end.
+const EVAL_BAR_MATE = 500_000;
+const evalBar = { worker: null, seq: 0, pending: false, dirty: false, fen: null, turn: 'white' };
+
+const evalBarVisible = () => ui.mode === 'puzzle' && puzzlePhase === 'freeplay' && !!puzzle;
+
+function createEvalBarWorker() {
+  const w = new Worker(new URL('./aiWorker.js', import.meta.url), { type: 'module' });
+  w.onmessage = ({ data }) => {
+    if (data.type !== 'search' || data.seq !== evalBar.seq) return;
+    evalBar.pending = false;
+    if (evalBar.dirty) { evalBar.dirty = false; evalBar.fen = null; requestEvalBar(); return; }
+    if (!evalBarVisible() || typeof data.score !== 'number') return;
+    // The search score is side-to-move-relative; the bar wants White's view.
+    paintEvalBar(evalBar.turn === 'white' ? data.score : -data.score);
+  };
+  w.onerror = (e) => console.error('Eval-bar worker error:', e.message);
+  return w;
+}
+
+// Centipawns (White's view) -> percentage of the bar that is white. Lichess's
+// cp -> winning-chance sigmoid, clamped so a non-mate eval always leaves a
+// sliver of the losing side visible; only a forced mate pins the bar.
+function evalBarPct(whiteCp) {
+  if (whiteCp >= EVAL_BAR_MATE) return 100;
+  if (whiteCp <= -EVAL_BAR_MATE) return 0;
+  const winChance = 2 / (1 + Math.exp(-0.00368208 * whiteCp)) - 1;
+  return Math.max(2, Math.min(98, 50 + 50 * winChance));
+}
+
+function paintEvalBar(whiteCp) {
+  const el = $('eval-bar');
+  el.querySelector('.eval-fill').style.height = evalBarPct(whiteCp) + '%';
+  el.title = whiteCp >= EVAL_BAR_MATE ? 'White has forced mate'
+    : whiteCp <= -EVAL_BAR_MATE ? 'Black has forced mate'
+    : `Eval: ${(whiteCp >= 0 ? '+' : '') + (whiteCp / 100).toFixed(1)}`;
+}
+
+// Show/hide the bar for the current mode+phase and keep its value tracking the
+// viewed position. Called from render() and applyModeVisibility(), so every path
+// that changes the position, the view, or the phase lands here; the fen check
+// makes repeat calls free.
+function syncEvalBar() {
+  const el = $('eval-bar');
+  if (!evalBarVisible()) {
+    if (!el.hidden) {
+      el.hidden = true;
+      cg.redrawAll(); // the board takes its width back — re-measure
+    }
+    if (evalBar.worker) { evalBar.worker.terminate(); evalBar.worker = null; }
+    evalBar.seq++; // invalidate any in-flight reply
+    evalBar.pending = evalBar.dirty = false;
+    evalBar.fen = null;
+    return;
+  }
+  if (el.hidden) {
+    el.hidden = false;
+    el.querySelector('.eval-fill').style.height = '50%'; // neutral until the first eval lands
+    el.title = '';
+    cg.redrawAll(); // the board shrank to make room — re-measure
+  }
+  el.classList.toggle('flipped', viewColor() === 'black'); // white fill sits at White's end
+  requestEvalBar();
+}
+
+function requestEvalBar() {
+  const fen = repFens[viewIndex];
+  if (fen === evalBar.fen) return; // already showing (or searching) this position
+  if (evalBar.pending) { evalBar.dirty = true; return; }
+  evalBar.fen = fen;
+  const st = history[viewIndex].state;
+  // Terminal positions need no search (and have no moves to search).
+  const here = viewIndex === history.length - 1 ? status : gameStatus(st);
+  if (here.over) {
+    paintEvalBar(here.result === 'checkmate' ? (here.winner === 'white' ? EVAL_BAR_MATE : -EVAL_BAR_MATE) : 0);
+    return;
+  }
+  if (!evalBar.worker) evalBar.worker = createEvalBarWorker();
+  evalBar.pending = true;
+  evalBar.turn = st.turn;
+  evalBar.worker.postMessage({
+    type: 'search', seq: ++evalBar.seq, state: st,
+    depth: EVAL_BAR.depth, maxMs: EVAL_BAR.maxMs, engine: EVAL_BAR.engine,
+    // The repetition window up to the VIEWED ply (same trimming as repWindow).
+    posHistory: repFens.slice(0, viewIndex + 1).slice(-(st.halfmove + 1)),
+  });
 }
 
 // --- promotion picker ---
@@ -1120,7 +1213,6 @@ function newGame() {
   syncToggleLabel();
   state = newGameState();
   status = gameStatus(state);
-  captured = { white: [], black: [] };
   history = [startEntry(state)];
   repFens = [toFen(state)];
   viewIndex = 0;
@@ -1150,7 +1242,6 @@ function loadGame(start, moves) {
   syncToggleLabel();
   state = start;
   status = gameStatus(state);
-  captured = { white: [], black: [] };
   history = [startEntry(state)];
   repFens = [toFen(state)];
   posCounts = new Map();
@@ -1248,6 +1339,9 @@ function applyModeVisibility() {
   toggleCustom('black', m === 'ai-ai' && ui.strengthBlack === 'custom');
   // The net picker appears only when a slot's engine is the neural net.
   for (const slot of ['ai', 'white', 'black']) $(`net-field-${slot}`).hidden = engineOf(slot) !== 'nn';
+  // The eval bar is phase-dependent (puzzle free-play only); this covers the paths
+  // that change mode/phase without a render (e.g. switching into the editor).
+  syncEvalBar();
 }
 
 function toggleCustom(slot, show) {
@@ -1349,7 +1443,7 @@ function enterEditor() {
     movable: { free: true, color: 'both', showDests: false, dests: new Map() },
     draggable: { enabled: true, deleteOnDropOff: true },
   });
-  renderTrays({ state, captured: { white: [], black: [] } });
+  renderTrays({ state });
   updateStatusText();
 }
 

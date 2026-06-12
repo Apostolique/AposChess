@@ -4,8 +4,10 @@
 // Runs the AI search off the main thread so deeper lookahead never freezes the
 // UI. Two request kinds, both tagged with a `seq` so a reply for a superseded
 // position is discarded by the page:
-//   { type: 'search', seq, state, depth, maxMs, engine, net } → { type: 'search', seq, move, ponder }
-//       a real move to play; `ponder` is the predicted opponent reply { from, to }.
+//   { type: 'search', seq, state, depth, maxMs, engine, net } → { type: 'search', seq, move, ponder, score }
+//       a real move to play; `ponder` is the predicted opponent reply { from, to };
+//       `score` is the root value (centipawns, side-to-move-relative — the eval bar
+//       reads it; the play path ignores it).
 //   { type: 'ponder', seq, state, depth, maxMs, engine, net } → { type: 'ponder', seq, reached }
 //       thinking on the opponent's turn; the move is irrelevant, the point is the
 //       warmed transposition table. `reached` is the deepest completed iteration.
@@ -66,6 +68,6 @@ self.onmessage = async ({ data }) => {
   // `exclude` (move keys to skip at the root) drives the opening-variety option, so a
   // fresh AI-vs-AI game doesn't replay a recent opening; only on the game's first move.
   const excludeKeys = exclude && exclude.length ? new Set(exclude) : null;
-  const { move, ponder } = chooseMoveDetailed(state, depth, Math.random, maxMs, true, prevHashes, engine, excludeKeys);
-  self.postMessage({ type: 'search', seq, move, ponder });
+  const { move, ponder, score } = chooseMoveDetailed(state, depth, Math.random, maxMs, true, prevHashes, engine, excludeKeys);
+  self.postMessage({ type: 'search', seq, move, ponder, score });
 };
