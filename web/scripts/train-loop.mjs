@@ -74,6 +74,10 @@
 //                   depth 6 costs about as much as generating a 200-game batch.
 //   --refresh-cycle-depth=D  search depth for the per-cycle refresh (default: --depth,
 //                   so the re-labels match generation's deep-label quality)
+//   --no-refresh    skip ALL value refreshing (both --refresh-cycle and --refresh-frac),
+//                   regardless of their values — shorthand for --refresh-cycle=0 with no
+//                   promotion refresh, for when you want the fastest possible cycles and
+//                   accept the staler `v` targets
 //
 // Candidate lineage (automatic, disabled by --cold): when the gate is inconclusive but
 // the candidate scored >= 50%, the candidate is KEPT (loop/lineage.json) and the next
@@ -142,7 +146,8 @@ const cfg = {
   // recompute `v` on a random fraction of the dataset with the new champion (value
   // iteration). 0 = off. Partial keeps cost amortized and average staleness ~1/frac
   // promotions. Refresh search depth defaults to the gen depth.
-  refreshFrac: num(args['refresh-frac'], 0),
+  // --no-refresh zeroes both, overriding any explicit fractions.
+  refreshFrac: args['no-refresh'] ? 0 : num(args['refresh-frac'], 0),
   // Cheap by default (depth 3, like the backfilled majority): a depth-6 refresh of a
   // big fraction is many hours. Raise it to trade speed for value accuracy.
   refreshDepth: num(args['refresh-depth'], 3),
@@ -150,7 +155,7 @@ const cfg = {
   // every cycle. Helps between promotions too — most `v` in the set came from older
   // champions or shallower searches, so "unchanged champion" does NOT mean "nothing to
   // refresh"; only records the current champion already labeled at this depth are no-ops.
-  refreshCycle: num(args['refresh-cycle'], 0.01),
+  refreshCycle: args['no-refresh'] ? 0 : num(args['refresh-cycle'], 0.01),
   refreshCycleDepth: num(args['refresh-cycle-depth'], num(args.depth, 6)),
 };
 

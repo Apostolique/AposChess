@@ -137,7 +137,9 @@ deep-label anchor and guarantees fixed data volume even when the SPRT stops earl
   without regenerating; completed games were already flushed), `--no-harvest` (don't
   save gate games into the dataset), `--refresh-cycle` / `--refresh-cycle-depth`
   (per-cycle value refresh, default 1% at the generation depth) and `--refresh-frac` /
-  `--refresh-depth` (on-promotion refresh — see "Dataset maintenance"), `--jobs`.
+  `--refresh-depth` (on-promotion refresh — see "Dataset maintenance"), `--no-refresh`
+  (skip both refreshes for the fastest cycles, at the cost of staler `v` targets),
+  `--jobs`.
 
 ### The promotion gate: `--elo1` vs `--gate-games` (calibrate them together)
 
