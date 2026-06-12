@@ -23,12 +23,27 @@
 //   node scripts/mine-puzzles.mjs [--depth=6] [--jobs=N] [--eval=nn|handcrafted]
 //     [--weights=FILE] [--in=FILE] [--out=FILE] [--seed=1] [--append]
 //     [--swing=400]    blunder size (prev.v + v) that nominates a candidate
+//     [--pre-floor=-200]  the blunderer's eval BEFORE the blunder must be at least
+//                      this (cp, their view). A side that was already lost isn't
+//                      blundering, it's delaying — "finish the long-decided mate"
+//                      isn't a puzzle. This also guarantees the solver wasn't
+//                      already winning, so the key move CREATES the win.
 //     [--min-move=10]  puzzle position must be at this fullmove or later — the
 //                      generator opens every game with random plies (gen default 8,
 //                      i.e. through move 4), and "punish the random opening move"
 //                      makes for boring puzzles nobody would blunder into for real
 //     [--win=500]      best move must score at least this (cp) — or mate
 //     [--second=150]   runner-up move must score at most this (uniqueness)
+//     [--line-gap=250] continuation moves stay in the solution while they beat the
+//                      runner-up by this margin — clearly best, not necessarily the
+//                      only win, so the line plays THROUGH the payoff (capturing
+//                      the cornered queen) instead of stopping just before it
+//     [--save-floor=-150]  defense puzzles: the only-move save must keep the solver
+//                      at least this (cp). Each candidate is mined from both sides
+//                      of the blunder — a WIN puzzle from the position after it
+//                      ('razor-edge'-tagged when every alternative outright loses)
+//                      and a DEFENSE (only-move) puzzle from the position before it,
+//                      where the game's own engine fell off the tightrope
 //     [--max-candidates=6000]  cap on candidates verified (seeded sample)
 //     [--limit=400]            stop after this many accepted puzzles
 //     [--min-difficulty=1]     drop puzzles solved at a shallower depth
@@ -57,6 +72,9 @@ const jobs = Math.max(1, num('jobs', cpus().length));
 const seed = num('seed', 1);
 const swing = num('swing', 400);
 const minMove = num('min-move', 10);
+const preFloor = num('pre-floor', -200);
+const lineGap = num('line-gap', 250);
+const saveFloor = num('save-floor', -150);
 const win = num('win', 500);
 const second = num('second', 150);
 const maxCandidates = num('max-candidates', 6000);
@@ -83,7 +101,7 @@ const t0 = Date.now();
 const status = liveStatus();
 const tick = everyMs(1000);
 console.log(`mine-puzzles: ${inFile} (${fmtMB(statSync(inFile).size)}) | depth ${depth} | jobs ${jobs} | seed ${seed}`);
-console.log(`  gates: swing>=${swing} | move>=${minMove} | win>=${win} | second<=${second} | difficulty>=${minDifficulty} | limit ${limit} of <=${fmtNum(maxCandidates)} candidates`);
+console.log(`  gates: swing>=${swing} | pre>=${preFloor} | move>=${minMove} | win>=${win} | second<=${second} | line-gap>=${lineGap} | difficulty>=${minDifficulty} | limit ${limit} of <=${fmtNum(maxCandidates)} candidates`);
 
 // --- phase 1: scan the dataset for blunder-punish candidates ----------------------
 // The position key ignores the move counters (board + turn + castling) so the same
@@ -96,16 +114,19 @@ const vMin = Math.max(300, win - 150);
 const candidates = [];
 const seen = new Set();
 {
-  let prev = null, lineIdx = 0;
+  let prev = null, prevPrev = null, lineIdx = 0;
   const rl = createInterface({ input: createReadStream(inFile), crlfDelay: Infinity });
   for await (const line of rl) {
     const idx = lineIdx++;
-    if (!line) { prev = null; continue; }
+    if (!line) { prev = null; prevPrev = null; continue; }
     let rec;
-    try { rec = JSON.parse(line); } catch { prev = null; continue; }
+    try { rec = JSON.parse(line); } catch { prev = null; prevPrev = null; continue; }
     const pair = prev && prev.g === rec.g && typeof prev.v === 'number' && typeof prev.fen === 'string';
     if (pair && typeof rec.v === 'number' && typeof rec.fen === 'string'
         && rec.v >= vMin && prev.v + rec.v >= swing
+        // The blunderer must not have been lost already: a dead-lost side "blundering"
+        // is just delaying the end, and the solver was then already winning anyway.
+        && prev.v >= preFloor
         // Skip the opening: the generator's first plies are RANDOM moves, and
         // punishing one of those isn't a tactic anyone needs to learn. The FEN's
         // fullmove counter survives dataset rewrites (dedup-cap), unlike line order.
@@ -114,11 +135,18 @@ const seen = new Set();
       if (!seen.has(key)) {
         seen.add(key);
         // prevFen is the position BEFORE the blunder: the worker derives the blunder
-        // move from it, so the app can show the opponent playing it (the lichess-style
-        // lead-in) before handing the position to the solver.
-        candidates.push({ id: `${rec.g}#${idx}`, fen: rec.fen, prevFen: prev.fen });
+        // move from it for the win puzzle's lead-in, and mines it as a defense
+        // (only-move) puzzle of its own — prevPrevFen then serves as THAT puzzle's
+        // lead-in, the same way.
+        candidates.push({
+          id: `${rec.g}#${idx}`,
+          fen: rec.fen,
+          prevFen: prev.fen,
+          prevPrevFen: prevPrev && prevPrev.g === rec.g && typeof prevPrev.fen === 'string' ? prevPrev.fen : undefined,
+        });
       }
     }
+    prevPrev = prev;
     prev = rec;
     if (tick()) status.update(`  scanning… ${fmtNum(lineIdx)} lines, ${fmtNum(candidates.length)} candidates`);
   }
@@ -161,7 +189,7 @@ await new Promise((done) => {
   let reportedEngine = null;
   for (let i = 0; i < jobs; i++) {
     const w = new Worker(new URL('./puzzleWorker.mjs', import.meta.url), {
-      workerData: { weights, depth, win, second, maxSolverMoves, eval: evalName },
+      workerData: { weights, depth, win, second, lineGap, saveFloor, maxSolverMoves, eval: evalName },
     });
     pool.push(w);
     w.on('message', (msg) => {
@@ -177,12 +205,18 @@ await new Promise((done) => {
       if (msg.type !== 'done') return;
       for (const r of msg.results) {
         verified++;
-        if (r.puzzle) {
-          if (r.puzzle.difficulty >= minDifficulty) { puzzles.push(r.puzzle); accepted++; }
-          else rejects['too-easy'] = (rejects['too-easy'] || 0) + 1;
-        } else {
-          rejects[r.reject] = (rejects[r.reject] || 0) + 1;
-          if (r.error) console.error(`\n  worker error on a candidate: ${r.error}`);
+        // Each candidate yields two outcomes: the win mine (post-blunder position)
+        // and the defense mine (pre-blunder position). Tally them separately so the
+        // reject histogram stays readable ('d-' prefixes the defense side).
+        for (const [tag, res] of [['', r.win], ['d-', r.defense]]) {
+          if (!res) continue;
+          if (res.puzzle) {
+            if (res.puzzle.difficulty >= minDifficulty) { puzzles.push(res.puzzle); accepted++; }
+            else rejects[tag + 'too-easy'] = (rejects[tag + 'too-easy'] || 0) + 1;
+          } else {
+            rejects[tag + res.reject] = (rejects[tag + res.reject] || 0) + 1;
+            if (res.error) console.error(`\n  worker error on a candidate: ${res.error}`);
+          }
         }
       }
       if (accepted >= limit && !stopped) { stopped = true; queue.length = 0; }

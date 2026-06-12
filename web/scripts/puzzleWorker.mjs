@@ -27,9 +27,20 @@
 //                 Depth 1 = "take the hanging piece"; the deeper the engine has
 //                 to look, the harder the tactic.
 //
-// The TT is reset per candidate so verification is independent of whatever was
-// searched before; within a candidate the ladder/uniqueness/line searches share
-// the warm table (correct — entries are position-keyed).
+// Each candidate is mined from BOTH sides of the blunder:
+//   - a WIN puzzle from the post-blunder position (punish it) — tagged
+//     'razor-edge' when the runner-up move doesn't merely fail to win but LOSES
+//     outright (play it right you win, play it wrong you lose);
+//   - a DEFENSE puzzle from the PRE-blunder position (the game's own engine
+//     fell off this tightrope, which is what nominated it): kind 'defense' when
+//     exactly one move holds (best ≥ saveFloor) while every alternative loses
+//     (runner-up ≤ -win) — tagged 'mate-threat' when the alternatives lose to
+//     forced mate. If the pre-blunder best move turns out to WIN, it's mined as
+//     a missed-win puzzle through the normal win path instead.
+//
+// The TT is reset per mined position so verification is independent of whatever
+// was searched before; within one position the ladder/uniqueness/line searches
+// share the warm table (correct — entries are position-keyed).
 
 import { parentPort, workerData } from 'node:worker_threads';
 import { readFileSync } from 'node:fs';
@@ -39,7 +50,7 @@ import { legalMoves, applyMove, gameStatus, generatePseudoMoves, safetyZones } f
 import { chooseMoveDetailed, _internal } from '../src/ai.js';
 import { loadWeights, hasWeights } from '../src/nn.js';
 
-const { weights, depth, win, second, maxSolverMoves } = workerData;
+const { weights, depth, win, second, lineGap, saveFloor, maxSolverMoves } = workerData;
 const { resetTT, MATE_THRESH } = _internal;
 
 // Same engine-selection policy as the rest of the tools: the champion net when it
@@ -67,19 +78,19 @@ const best = (state, rand, d = depth) => chooseMoveDetailed(state, d, rand, Infi
 const secondBest = (state, rand, excludeMove) =>
   chooseMoveDetailed(state, depth, rand, Infinity, true, [], engine, new Set([keyOf(excludeMove)]));
 
-// Is `m` the only move good enough here? `score` is m's already-computed score.
-// Unique = m wins (or mates) while the runner-up clearly doesn't. A position with
-// a single legal move is trivially unique (and free to test).
+// Is `m` the only move good enough to BE the puzzle? (The first move's test — line
+// continuations use the looser clearly-best rule in the walk below.) `score` is m's
+// already-computed score. Unique = m wins (or mates) while the runner-up clearly
+// doesn't. A position with a single legal move is trivially unique (and free to test).
 function uniqueness(state, legal, m, score, rand) {
   if (legal.length === 1) return { unique: true, second: -Infinity };
   const alt = secondBest(state, rand, m);
   const s2 = alt.score;
   if (score >= MATE_THRESH) {
-    // Mate: reject only if an equally-fast mate exists (s2 >= score means the
-    // alternative mates at least as quickly — the solver shouldn't have to guess
-    // between them). A slower mate or a mere material win still counts as unique
-    // *for line continuation*, but for the FIRST move we also want the win itself
-    // to be non-obvious — the caller applies the stricter `second` cap there.
+    // Mate: an equally-fast second mate (s2 >= score) means the solver would have
+    // to guess between them — not unique. A slower mate or a mere material win is
+    // fine here; the caller additionally applies the `second` cap so the win as a
+    // whole is non-obvious.
     return { unique: s2 < score, second: s2 };
   }
   return { unique: score >= win && s2 <= second, second: s2 };
@@ -146,9 +157,9 @@ function deriveOpening(prevFen, fen) {
   return null;
 }
 
-function minePuzzle(item) {
-  const rand = mulberry32(item.seed);
-  const state = parseFen(item.fen);
+function mineWin(fen, leadFen, id, seed) {
+  const rand = mulberry32(seed);
+  const state = parseFen(fen);
   const status = gameStatus(state);
   if (status.over) return { reject: 'over' };
   if (status.legal.length < 2) return { reject: 'forced' }; // nothing to find
@@ -178,6 +189,9 @@ function minePuzzle(item) {
   // --- walk the solution line -------------------------------------------------
   const line = [top.move];
   const themes = new Set(themesOf(state, top.move));
+  // Razor edge: not only is the key move the single way to win — every other move
+  // outright LOSES. Maximum-tension puzzles; u.second is the best of the rest.
+  if (u.second <= -win) themes.add('razor-edge');
   let cur = applyMove(state, top.move);
   let kind = 'win';
   // Accepted-sacrifice detection: run the line's material ledger (captures only)
@@ -205,8 +219,20 @@ function minePuzzle(item) {
 
     const next = best(afterReply, rand);
     if (isMate && next.score < MATE_THRESH) return { reject: 'unsound' }; // search disagrees with itself
-    const nu = uniqueness(afterReply, st.legal, next.move, next.score, rand);
-    if (!nu.unique) break; // several good moves: the player has converted — stop here
+    // Continuation rule: unlike the FIRST move (which must be the only good one —
+    // that's the puzzle's premise), a follow-up only has to be CLEARLY BEST, beating
+    // the runner-up by lineGap. Otherwise the line stops the moment a second move
+    // also wins, which cuts combinations off right before the payoff ("...and now
+    // take the cornered queen" never appears because two captures both won). Two
+    // genuinely equal continuations still stop the line — either works, and the app
+    // can only script one. Mate lines instead stop on an equally-fast second mate.
+    if (st.legal.length > 1) {
+      const alt = secondBest(afterReply, rand, next.move);
+      const ok = next.score >= MATE_THRESH
+        ? alt.score < next.score
+        : next.score >= win && next.score - alt.score >= lineGap;
+      if (!ok) break; // converted: several moves are fine from here — stop
+    }
 
     // The pair is now part of the line — ledger the reply's capture (a break above
     // means the reply never happens, so its capture must not count).
@@ -221,7 +247,7 @@ function minePuzzle(item) {
 
   const solverMoves = Math.ceil(line.length / 2);
   const puzzle = {
-    id: item.id,
+    id,
     fen: toFen(state),
     moves: line.map(uci),
     kind,
@@ -230,19 +256,103 @@ function minePuzzle(item) {
     score: Math.round(s1),
   };
   if (kind === 'mate') puzzle.mateIn = solverMoves;
-  const opening = deriveOpening(item.prevFen, item.fen);
-  if (opening) { puzzle.prefen = item.prevFen; puzzle.opening = opening; }
+  const opening = deriveOpening(leadFen, fen);
+  if (opening) { puzzle.prefen = leadFen; puzzle.opening = opening; }
+  return { puzzle };
+}
+
+// The pre-blunder position as an only-move puzzle: the game's engine had ONE move
+// that held and didn't find it. kind 'defense' = the best move keeps the solver at
+// least at saveFloor while every alternative loses decisively; if the best move
+// actually WINS, the position is a missed win and is mined through mineWin instead
+// (where the razor-edge tag will usually apply).
+function mineDefense(item) {
+  if (!item.prevFen) return { reject: 'no-prev' };
+  const seed = (item.seed ^ 0x55555555) >>> 0; // independent stream from the win mine
+  const rand = mulberry32(seed);
+  const state = parseFen(item.prevFen);
+  const status = gameStatus(state);
+  if (status.over) return { reject: 'over' };
+  if (status.legal.length < 2) return { reject: 'forced' }; // "only move" with no choice isn't a puzzle
+
+  resetTT();
+  const ladder = [];
+  for (let d = 1; d <= depth; d++) ladder.push(best(state, rand, d));
+  const top = ladder[depth - 1];
+  const s1 = top.score;
+  if (s1 >= win) return mineWin(item.prevFen, item.prevPrevFen, item.id + 'w', seed); // a missed win, not a save
+  if (s1 < saveFloor) return { reject: 'lost-anyway' }; // nothing holds — no save to find
+  const alt = secondBest(state, rand, top.move);
+  if (alt.score > -win) return { reject: 'not-tight' }; // a second move also survives
+
+  let solveDepth = depth;
+  const bk = keyOf(top.move);
+  for (let d = depth - 1; d >= 1 && keyOf(ladder[d - 1].move) === bk; d--) solveDepth = d;
+
+  // Walk the tightrope: scripted best replies, and the solver's follow-up stays in
+  // the line only while it is STILL the only move that holds. The line ends when
+  // the danger has passed (several moves hold), the position resolves (a draw end
+  // is a successful save), or the cap is hit.
+  const line = [top.move];
+  const themes = new Set(themesOf(state, top.move));
+  if (alt.score <= -MATE_THRESH) themes.add('mate-threat'); // the mistakes lose to forced mate
+  const capValue = (s, m) => (m.capture && s.board[m.to] ? VALUE[s.board[m.to].role] : 0);
+  let matDelta = capValue(state, top.move);
+  let minDelta = 0;
+  let cur = applyMove(state, top.move);
+
+  for (;;) {
+    let st = gameStatus(cur);
+    if (st.over) break; // a draw end (e.g. stalemate trick) is the save succeeding
+    if ((line.length + 1) / 2 > maxSolverMoves) break;
+
+    const reply = best(cur, rand);
+    const afterReply = applyMove(cur, reply.move);
+    st = gameStatus(afterReply);
+    if (st.over) {
+      if (st.result === 'checkmate') return { reject: 'unsound' }; // the "save" got mated
+      break;
+    }
+
+    const next = best(afterReply, rand);
+    if (next.score < saveFloor || next.score >= win) break; // line over: collapsed (noise) or flipped to winning
+    if (st.legal.length > 1) {
+      const alt2 = secondBest(afterReply, rand, next.move);
+      if (alt2.score > -win) break; // danger passed: more than one move holds now
+    }
+
+    matDelta -= capValue(cur, reply.move);
+    minDelta = Math.min(minDelta, matDelta);
+    line.push(reply.move, next.move);
+    for (const th of themesOf(afterReply, next.move)) themes.add(th);
+    matDelta += capValue(afterReply, next.move);
+    cur = applyMove(afterReply, next.move);
+  }
+  if (minDelta <= -250) themes.add('sacrifice');
+
+  const puzzle = {
+    id: item.id + 'd',
+    fen: toFen(state),
+    moves: line.map(uci),
+    kind: 'defense',
+    themes: [...themes],
+    difficulty: solveDepth,
+    score: Math.round(s1),
+  };
+  const opening = deriveOpening(item.prevPrevFen, item.prevFen);
+  if (opening) { puzzle.prefen = item.prevPrevFen; puzzle.opening = opening; }
   return { puzzle };
 }
 
 parentPort.on('message', (msg) => {
   if (msg.type !== 'batch') return;
   const results = msg.items.map((item) => {
-    try {
-      return { idx: item.idx, ...minePuzzle(item) };
-    } catch (e) {
-      return { idx: item.idx, reject: 'error', error: String(e && e.message || e) };
-    }
+    const out = { idx: item.idx };
+    try { out.win = mineWin(item.fen, item.prevFen, item.id, item.seed); }
+    catch (e) { out.win = { reject: 'error', error: String(e && e.message || e) }; }
+    try { out.defense = mineDefense(item); }
+    catch (e) { out.defense = { reject: 'error', error: String(e && e.message || e) }; }
+    return out;
   });
   parentPort.postMessage({ type: 'done', results });
 });

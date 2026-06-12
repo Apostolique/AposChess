@@ -9,7 +9,7 @@ import './board-theme.css';
 import './styles.css';
 
 import { newGameState, parseFen, toFen, parseSquare, squareName, opponent } from './board.js';
-import { applyMove, gameStatus, destsMap } from './engine.js';
+import { applyMove, gameStatus, destsMap, legalMoves } from './engine.js';
 import { hostGame, joinGame, normalizeCode, CODE_LENGTH } from './online.js';
 import { findMatch } from './queue.js';
 import { exportPgn, importPgn } from './pgn.js';
@@ -240,10 +240,11 @@ function controllableColor() {
   if (ui.mode === 'human-human') return state.turn;
   if (ui.mode === 'human-ai' && state.turn === ui.humanColor) return state.turn;
   if (ui.mode === 'online' && onlineConnected && state.turn === onlineColor) return state.turn;
-  // Puzzle: the solver's side, while the puzzle is live (not solved/revealed and
-  // not waiting on the scripted reply, which is "the opponent's turn").
-  if (ui.mode === 'puzzle' && puzzle && (puzzlePhase === 'playing' || puzzlePhase === 'wrong')
-      && state.turn === puzzleColor) return state.turn;
+  // Puzzle: the solver's side — while the puzzle is live (not solved/revealed and
+  // not waiting on the scripted reply), and likewise during the play-it-out
+  // free-play, where the engine drives the other side.
+  if (ui.mode === 'puzzle' && puzzle && state.turn === puzzleColor
+      && (puzzlePhase === 'playing' || puzzlePhase === 'wrong' || puzzlePhase === 'freeplay')) return state.turn;
   return undefined;
 }
 
@@ -251,6 +252,7 @@ function aiToMove() {
   if (status.over) return false;
   if (ui.mode === 'human-ai') return state.turn !== ui.humanColor;
   if (ui.mode === 'ai-ai') return ui.running;
+  if (ui.mode === 'puzzle') return puzzlePhase === 'freeplay' && state.turn !== puzzleColor;
   return false;
 }
 
@@ -269,18 +271,27 @@ function render() {
   if (ui.mode === 'editor') { updateStatusText(); applyAiLock(); return; }
   const entry = history[viewIndex];
   const atLive = viewIndex === history.length - 1;
-  const color = atLive ? controllableColor() : undefined;
+  let color = atLive ? controllableColor() : undefined;
+  let dests = (atLive && color) ? destsMap(status.legal) : new Map();
+  // Puzzle play-it-out: reviewing isn't read-only — wherever it's the solver's turn
+  // in the viewed position, a move FORKS the game there (the continuation after it
+  // is discarded by onUserMove), so "what if I'd played differently" is one rewind
+  // away. Everywhere else an off-live view stays locked.
+  if (!atLive && ui.mode === 'puzzle' && puzzlePhase === 'freeplay' && entry.state.turn === puzzleColor) {
+    color = puzzleColor;
+    dests = destsMap(legalMoves(entry.state));
+  }
   cg.set({
     fen: toFen(entry.state),
     turnColor: entry.state.turn,
     orientation: viewColor(),
     lastMove: entry.lastMove ? [squareName(entry.lastMove.from), squareName(entry.lastMove.to)] : undefined,
     check: entry.check ? entry.state.turn : false,
-    viewOnly: !atLive, // lock the board while reviewing an earlier position
+    viewOnly: !atLive && !color, // lock the board while reviewing, unless forking is allowed
     // Explicitly restore non-editor settings (free placement, delete-on-drop-off,
     // and the move-destination dots) — cg.set merges, so the editor's overrides
     // would otherwise persist after leaving it.
-    movable: { free: false, showDests: true, color, dests: (atLive && color) ? destsMap(status.legal) : new Map() },
+    movable: { free: false, showDests: true, color, dests },
     draggable: { deleteOnDropOff: false },
   });
   renderTrays(entry);
@@ -339,8 +350,10 @@ function updateStatusText() {
     el.textContent = `Editing — ${editorTurn === 'white' ? 'White' : 'Black'} to move. Switch Mode to play.`;
     return;
   }
-  if (ui.mode === 'puzzle') {
-    renderPuzzleMeta();
+  if (ui.mode === 'puzzle') renderPuzzleMeta();
+  // The play-it-out free-play reads like a normal game (thinking/check/result), so
+  // it falls through to the regular status text below.
+  if (ui.mode === 'puzzle' && puzzlePhase !== 'freeplay') {
     el.classList.toggle('over', puzzlePhase === 'solved' || puzzlePhase === 'revealed');
     if (!puzzle) {
       el.textContent = puzzleCatalog === null ? 'Loading puzzles…'
@@ -353,6 +366,7 @@ function updateStatusText() {
     else if (puzzlePhase === 'revealed') el.textContent = 'Solution shown.';
     else if (puzzlePhase === 'wrong') el.textContent = 'Not the move — try again.';
     else if (state.turn !== puzzleColor) el.textContent = '…';
+    else if (puzzle.kind === 'defense') el.textContent = `${side} to move — only one move doesn't lose. Find it${status.check ? ' (check!)' : ''}.`;
     else el.textContent = `${side} to move — find the best move${status.check ? ' (check!)' : ''}.`;
     return;
   }
@@ -483,10 +497,35 @@ function goTo(index) {
   render();
 }
 
+// Make the viewed ply the live end of the game: drop everything after it and
+// rebuild the live bookkeeping (state, status, captured, repetition counts) from
+// the snapshot. Backs the rewind-and-fork in puzzle play-it-out.
+function truncateToView() {
+  history.length = viewIndex + 1;
+  repFens.length = viewIndex + 1;
+  const entry = history[viewIndex];
+  state = entry.state;
+  status = gameStatus(state);
+  captured = { white: [...entry.captured.white], black: [...entry.captured.black] };
+  // Threefold tracking is forward-only, so recount over the surviving line.
+  posCounts = new Map();
+  for (const f of repFens) {
+    const k = f.split(' ', 3).join(' '); // same identity as positionKey
+    posCounts.set(k, (posCounts.get(k) || 0) + 1);
+  }
+}
+
 // chessground reports a legal (from, to); resolve it to an engine move,
 // asking for a promotion piece when several moves share that destination.
 function onUserMove(orig, dest) {
   if (ui.mode === 'editor') return; // free placement: chessground keeps the move, no game logic
+  // A move played while reviewing (only enabled in puzzle play-it-out — everywhere
+  // else an off-live board is view-only) forks the game at the viewed ply: the
+  // moves after it are discarded and this move becomes the new continuation.
+  if (viewIndex !== history.length - 1) {
+    if (!(ui.mode === 'puzzle' && puzzlePhase === 'freeplay')) { render(); return; }
+    truncateToView();
+  }
   const from = parseSquare(orig), to = parseSquare(dest);
   const matches = status.legal.filter((m) => m.from === from && m.to === to);
   if (matches.length === 0) { render(); return; }
@@ -503,7 +542,7 @@ function onUserMove(orig, dest) {
 // as a minimal {from,to,promotion} so the other client reconstructs the identical
 // engine move from its own legalMoves (no chance of the two games diverging).
 function playLocalMove(move) {
-  if (ui.mode === 'puzzle') { playPuzzleMove(move); return; }
+  if (ui.mode === 'puzzle' && puzzlePhase !== 'freeplay') { playPuzzleMove(move); return; }
   commit(move);
   if (ui.mode === 'online' && online && onlineConnected) {
     online.send({ t: 'move', from: move.from, to: move.to, promotion: move.promotion || null });
@@ -535,6 +574,9 @@ function aiColors() {
   if (status.over) return [];
   if (ui.mode === 'human-ai') return [opponent(ui.humanColor)];
   if (ui.mode === 'ai-ai') return ui.running ? ['white', 'black'] : [];
+  // Puzzle play-it-out: the engine takes the loser's side (the Opponent row's
+  // strength/engine settings drive it — aiParams maps puzzle mode to the 'ai' slot).
+  if (ui.mode === 'puzzle') return puzzlePhase === 'freeplay' ? [opponent(puzzleColor)] : [];
   return [];
 }
 
@@ -641,6 +683,8 @@ const PUZZLE_DIFFICULTY = {
 };
 const PUZZLE_THEME = {
   mate: (p) => p.kind === 'mate',
+  'razor-edge': (p) => p.themes.includes('razor-edge'), // the right move wins, everything else loses
+  defense: (p) => p.kind === 'defense',                 // only-move saves
   jump: (p) => p.themes.includes('jump') || p.themes.includes('jump-capture'),
   'jump-block': (p) => p.themes.includes('jump-block'),
   knight: (p) => p.themes.includes('knight') || p.themes.includes('knight-block'),
@@ -682,6 +726,7 @@ function nextPuzzle() {
     puzzle = null;
     puzzlePhase = 'idle';
     cg.setAutoShapes([]);
+    applyModeVisibility();
     render();
     return;
   }
@@ -721,6 +766,7 @@ function loadPuzzle(p) {
   puzzlePhase = 'playing';
   puzzleStep = 0;
   cg.setAutoShapes([]);
+  applyModeVisibility(); // re-hide the Opponent row if we're leaving a play-it-out
   render();
   // Let the starting position paint, then play the blunder (commit animates it and
   // sounds it like any move); the board unlocks for the solver when it lands.
@@ -769,7 +815,7 @@ function schedulePuzzleReply() {
 // Reveal: play out the rest of the line (from wherever the solver got to) with a
 // readable pause between moves. The board locks (phase 'revealed').
 function revealPuzzleSolution() {
-  if (!puzzle || puzzlePhase === 'solved' || puzzlePhase === 'revealed') return;
+  if (!puzzle || puzzlePhase !== 'playing' && puzzlePhase !== 'wrong') return;
   clearTimeout(puzzleTimer);
   goTo(history.length - 1); // make sure we're at the live position before extending it
   puzzlePhase = 'revealed';
@@ -797,10 +843,12 @@ function renderPuzzleMeta() {
   const el = $('puzzle-meta');
   if (ui.mode !== 'puzzle' || !puzzle) { el.textContent = ''; return; }
   let s = `Puzzle ${puzzleIdx + 1} / ${puzzleList.length}`;
-  if (puzzlePhase === 'solved' || puzzlePhase === 'revealed') {
-    s += puzzle.kind === 'mate' ? ` · mate in ${puzzle.mateIn}` : ' · winning tactic';
+  if (puzzlePhase === 'solved' || puzzlePhase === 'revealed' || puzzlePhase === 'freeplay') {
+    s += puzzle.kind === 'mate' ? ` · mate in ${puzzle.mateIn}`
+      : puzzle.kind === 'defense' ? ' · defensive save' : ' · winning tactic';
     s += ` · difficulty ${puzzle.difficulty}`;
     if (puzzle.themes.length) s += ` · ${puzzle.themes.join(', ')}`;
+    if (puzzlePhase === 'freeplay') s += ' · playing it out — rewind to try other moves';
   }
   el.textContent = s;
 }
@@ -1175,15 +1223,17 @@ function applyModeVisibility() {
   // Puzzles have their own Retry/Next buttons; "New game" would be ambiguous there.
   $('new-game').hidden = m === 'puzzle';
   $('row-puzzle').hidden = m !== 'puzzle';
+  // The Opponent row also drives the engine in a puzzle's play-it-out free-play.
+  const aiRow = m === 'human-ai' || (m === 'puzzle' && puzzlePhase === 'freeplay');
   $('row-ai-swap').hidden = m !== 'ai-ai';
   $('row-online').hidden = m !== 'online';
   // human-ai: one colour-agnostic AI row. ai-ai: separate White/Black rows.
-  $('row-ai').hidden = m !== 'human-ai';
+  $('row-ai').hidden = !aiRow;
   $('row-white').hidden = m !== 'ai-ai';
   $('row-black').hidden = m !== 'ai-ai';
   $('row-editor').hidden = m !== 'editor';
   // A row's custom depth/timeout inputs appear only when its strength is "Custom".
-  toggleCustom('ai', m === 'human-ai' && ui.strengthAi === 'custom');
+  toggleCustom('ai', aiRow && ui.strengthAi === 'custom');
   toggleCustom('white', m === 'ai-ai' && ui.strengthWhite === 'custom');
   toggleCustom('black', m === 'ai-ai' && ui.strengthBlack === 'custom');
   // The net picker appears only when a slot's engine is the neural net.
@@ -1434,6 +1484,20 @@ $('puzzle-retry').addEventListener('click', () => { if (puzzle) loadPuzzle(puzzl
 $('puzzle-hint').addEventListener('click', puzzleHint);
 $('puzzle-solution').addEventListener('click', revealPuzzleSolution);
 $('puzzle-next').addEventListener('click', nextPuzzle);
+// "Play it out": stay in puzzle mode and let the engine pick up the loser's side,
+// so the win (or save) can be converted in place — it's often not obvious how the
+// game unfolds after the tactic lands. The Opponent row appears to control the
+// engine, and reviewing becomes forkable: rewind to any of your moves and play a
+// different one (see onUserMove/truncateToView).
+$('puzzle-continue').addEventListener('click', () => {
+  if (!puzzle || puzzlePhase === 'freeplay') return;
+  clearTimeout(puzzleTimer);
+  puzzlePhase = 'freeplay';
+  cg.setAutoShapes([]);
+  applyModeVisibility(); // reveal the Opponent row that drives the play-out engine
+  render();
+  driveAi();
+});
 for (const id of ['puzzle-difficulty', 'puzzle-theme']) {
   $(id).addEventListener('change', () => {
     if (puzzleCatalog === null) return; // catalog still loading; enterPuzzleMode will filter
