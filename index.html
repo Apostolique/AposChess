@@ -21,8 +21,8 @@
 
     gtag('config', 'G-TYM1QSCNLT');
   </script>
-  <script type="module" crossorigin src="./assets/index-BrJ64xCq.js"></script>
-  <link rel="stylesheet" crossorigin href="./assets/index-BG9abErX.css">
+  <script type="module" crossorigin src="./assets/index-Ch1KgoTe.js"></script>
+  <link rel="stylesheet" crossorigin href="./assets/index-DVsdnS4j.css">
 </head>
 <body>
   <main class="app">
@@ -31,10 +31,11 @@
     </header>
 
     <div class="layout">
-      <!-- The primary actions (mode + new game/start) are their own grid area so the
-           mobile layout can keep them glued to the board while the rest of the
-           controls drop below it. On desktop they render exactly where they used
-           to: at the top of the left column. -->
+      <!-- The primary actions (mode + new game/start, and the puzzle panel — its
+           Retry/Hint/Next buttons are the primary actions of puzzle mode) are their
+           own grid area so the mobile layout can keep them glued to the board while
+           the rest of the controls drop below it. On desktop they render exactly
+           where they used to: at the top of the left column. -->
       <section class="actions">
         <div class="control-row">
           <label>
@@ -60,6 +61,44 @@
           <button id="new-game" type="button">New game</button>
           <button id="ai-toggle" type="button" hidden>Start</button>
         </div>
+
+        <fieldset class="ai-group" id="row-puzzle" hidden>
+          <legend>Puzzle</legend>
+          <div class="control-row">
+            <label>
+              Difficulty
+              <select id="puzzle-difficulty">
+                <option value="any">Any</option>
+                <option value="easy">Easy</option>
+                <option value="medium">Medium</option>
+                <option value="hard">Hard</option>
+              </select>
+            </label>
+            <label>
+              Theme
+              <select id="puzzle-theme">
+                <option value="any">Any</option>
+                <option value="mate">Checkmate</option>
+                <option value="razor-edge">Razor edge — win or lose</option>
+                <option value="defense">Only safe move</option>
+                <option value="jump">Jumps</option>
+                <option value="jump-block">Block a jump</option>
+                <option value="knight">Knight tricks</option>
+                <option value="sacrifice">Sacrifice</option>
+                <option value="promotion">Promotion</option>
+              </select>
+            </label>
+          </div>
+          <div class="control-row puzzle-actions">
+            <button id="puzzle-retry" type="button" title="Restart this puzzle from the beginning">Retry</button>
+            <button id="puzzle-hint" type="button" title="Highlight the piece that moves next">Hint</button>
+            <button id="puzzle-solution" type="button" title="Play out the solution">Solution</button>
+            <button id="puzzle-next" type="button" title="Jump to another puzzle">Next puzzle</button>
+            <button id="puzzle-continue" type="button" title="Explore from here — move either side freely, rewind to try different moves, and ask the engine for a move when you want one">Play it out</button>
+            <button id="puzzle-ai-move" type="button" hidden title="Let the engine (handcrafted, depth 7) play the next move for whichever side is to move">AI move</button>
+          </div>
+          <p id="puzzle-meta" class="puzzle-meta"></p>
+        </fieldset>
       </section>
 
       <section class="controls">
@@ -237,43 +276,6 @@
             <p id="online-status" class="online-status" role="status" aria-live="polite"></p>
           </div>
         </div>
-        <fieldset class="ai-group" id="row-puzzle" hidden>
-          <legend>Puzzle</legend>
-          <div class="control-row">
-            <label>
-              Difficulty
-              <select id="puzzle-difficulty">
-                <option value="any">Any</option>
-                <option value="easy">Easy</option>
-                <option value="medium">Medium</option>
-                <option value="hard">Hard</option>
-              </select>
-            </label>
-            <label>
-              Theme
-              <select id="puzzle-theme">
-                <option value="any">Any</option>
-                <option value="mate">Checkmate</option>
-                <option value="razor-edge">Razor edge — win or lose</option>
-                <option value="defense">Only safe move</option>
-                <option value="jump">Jumps</option>
-                <option value="jump-block">Block a jump</option>
-                <option value="knight">Knight tricks</option>
-                <option value="sacrifice">Sacrifice</option>
-                <option value="promotion">Promotion</option>
-              </select>
-            </label>
-          </div>
-          <div class="control-row puzzle-actions">
-            <button id="puzzle-retry" type="button" title="Restart this puzzle from the beginning">Retry</button>
-            <button id="puzzle-hint" type="button" title="Highlight the piece that moves next">Hint</button>
-            <button id="puzzle-solution" type="button" title="Play out the solution">Solution</button>
-            <button id="puzzle-next" type="button" title="Jump to another puzzle">Next puzzle</button>
-            <button id="puzzle-continue" type="button" title="Explore from here — move either side freely, rewind to try different moves, and ask the engine for a move when you want one">Play it out</button>
-            <button id="puzzle-ai-move" type="button" hidden title="Let the engine (handcrafted, depth 7) play the next move for whichever side is to move">AI move</button>
-          </div>
-          <p id="puzzle-meta" class="puzzle-meta"></p>
-        </fieldset>
         <div class="control-row" id="row-editor" hidden>
           <div class="editor-panel">
             <div class="editor-palette" id="editor-palette">
@@ -318,7 +320,14 @@
 
       <div class="board-col">
         <div id="tray-top" class="tray"><span class="caps"></span><span class="adv"></span></div>
-        <div id="board" class="cg-wrap"></div>
+        <!-- Eval bar (puzzle play-it-out): Lichess-style vertical gauge; the white
+             fill grows toward whichever side is winning. Hidden outside free-play. -->
+        <div class="board-row">
+          <div id="eval-bar" class="eval-bar" hidden>
+            <div class="eval-fill"></div>
+          </div>
+          <div id="board" class="cg-wrap"></div>
+        </div>
         <div id="tray-bottom" class="tray"><span class="caps"></span><span class="adv"></span></div>
       </div>
 
