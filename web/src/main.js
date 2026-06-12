@@ -88,7 +88,9 @@ function playConnectSound() {
 }
 // Move history for review. Each entry is a snapshot after a ply; index 0 is the
 // start position. `viewIndex` is the position shown on the board, which may lag
-// the live game while the user steps back through earlier moves.
+// the live game while the user steps back through earlier moves. Each entry also
+// carries `evals` — what each engine's eval bar showed while that position was
+// live (White's view; null = no opinion yet) — so review replays the bars too.
 let history = [startEntry(state)];
 let viewIndex = 0;
 
@@ -137,7 +139,7 @@ let matchSession = null; // active matchmaking queue search (or null)
 let matchmade = false;
 
 function startEntry(s) {
-  return { state: s, lastMove: null, san: null, check: false };
+  return { state: s, lastMove: null, san: null, check: false, evals: { white: null, black: null } };
 }
 
 // Each AI colour gets its OWN worker — its own thread and its own persistent
@@ -156,10 +158,7 @@ const PONDER_STEP_MS = 700; // ponder in short bursts so a worker stays responsi
 // change (new move, new game, stop) has superseded.
 const ai = { white: makeAiSlot('white'), black: makeAiSlot('black') };
 function makeAiSlot(color) {
-  // `lastEval` is this engine's own latest root score in White's view (for the
-  // AI-vs-AI eval bars); null until its first search. Reset by newGame/loadGame
-  // (fresh position), NOT by spawnAiWorkers — pausing shouldn't blank the bars.
-  return { color, worker: null, searchSeq: 0, ponderSeq: 0, predicted: null, ponderState: null, ponderBest: 0, lastEval: null };
+  return { color, worker: null, searchSeq: 0, ponderSeq: 0, predicted: null, ponderState: null, ponderBest: 0 };
 }
 spawnAiWorkers();
 
@@ -425,6 +424,10 @@ function recordMove(move) {
     lastMove: move,
     san: toSan(pre, move, status),
     check: status.check,
+    // Carry the engines' opinions forward: the mover's score for this move is
+    // already stamped on the pre-move entry (onSearchResult), so the new live
+    // entry starts from both engines' latest views.
+    evals: { ...history[history.length - 1].evals },
   });
   repFens.push(toFen(state));
 }
@@ -625,9 +628,11 @@ function onSearchResult(slot, data) {
   if (data.seq !== slot.searchSeq) return; // stale result for a superseded position
   slot.predicted = data.ponder || null;    // remember the predicted opponent reply
   // This engine's own opinion of the position it just searched (side-to-move
-  // relative, i.e. this colour's view), kept in White's view for the eval bars.
+  // relative, i.e. this colour's view), stamped in White's view on the live
+  // history entry — the position it searched (the seq check above rules out a
+  // superseded position) — so review can replay the eval bars ply by ply.
   if (typeof data.score === 'number') {
-    slot.lastEval = slot.color === 'white' ? data.score : -data.score;
+    history[history.length - 1].evals[slot.color] = slot.color === 'white' ? data.score : -data.score;
     if (duelBarsVisible()) paintDuelBars();
   }
   // Only the side to move's real search yields a move to play (a ponder-side worker
@@ -884,11 +889,13 @@ function renderPuzzleMeta() {
 //     idle transposition table holds ~20 MB. Requests are throttled to one in
 //     flight: a position change while one is out marks it dirty and re-requests
 //     on the reply, so mashing the review arrows queues at most one extra search.
-//   - AI-vs-AI "Eval bars" option (both bars): each engine's OWN latest root
-//     score — already carried by every search reply, so this costs no extra
-//     compute and shows genuinely different opinions when the engines use
-//     different evals. The bottom engine's bar sits left of the board, the top
-//     engine's right; a bar updates when its engine finishes a real search.
+//   - AI-vs-AI "Eval bars" option (both bars): each engine's OWN root score —
+//     already carried by every search reply, so this costs no extra compute
+//     and shows genuinely different opinions when the engines use different
+//     evals. Scores are stored per history entry (what each bar showed while
+//     that ply was live), so review navigation replays the bars ply by ply.
+//     The bottom engine's bar sits left of the board, the top engine's right;
+//     the live bars update when an engine finishes a real search.
 const EVAL_BAR = { depth: 6, maxMs: 1500, engine: 'handcrafted' };
 // Scores beyond this magnitude encode a forced mate (ai.js MATE = 1,000,000; no
 // real centipawn eval comes anywhere near) — pin the bar to the winner's end.
@@ -935,14 +942,17 @@ function paintEvalBarEl(el, whiteCp, who) {
 // The puzzle bar (left, dedicated worker).
 function paintEvalBar(whiteCp) { paintEvalBarEl($('eval-bar-left'), whiteCp, 'Eval'); }
 
-// The AI-vs-AI duel bars: each engine's own latest score (recorded by
-// onSearchResult in White's view) — bottom engine left, top engine right, so a
-// board flip swaps which bar shows which engine.
+// The AI-vs-AI duel bars: each engine's own score at the VIEWED ply (recorded
+// per history entry by onSearchResult in White's view), so stepping back shows
+// what the engines thought at the time, not their latest opinion — bottom
+// engine left, top engine right, so a board flip swaps which bar shows which
+// engine.
 function paintDuelBars() {
   const bottom = viewColor();
+  const evals = history[viewIndex].evals;
   const name = (c) => `${c === 'white' ? 'White' : 'Black'} engine`;
-  paintEvalBarEl($('eval-bar-left'), ai[bottom].lastEval, name(bottom));
-  paintEvalBarEl($('eval-bar-right'), ai[opponent(bottom)].lastEval, name(opponent(bottom)));
+  paintEvalBarEl($('eval-bar-left'), evals[bottom], name(bottom));
+  paintEvalBarEl($('eval-bar-right'), evals[opponent(bottom)], name(opponent(bottom)));
 }
 
 // Show/hide the bars for the current mode+phase and keep their values current.
@@ -1255,7 +1265,6 @@ function onOnlineData(msg) {
 // --- controls ---
 function newGame() {
   cancelAi();
-  ai.white.lastEval = ai.black.lastEval = null; // fresh position — neutral eval bars
   ui.running = false;
   ui.started = false;
   syncToggleLabel();
@@ -1285,7 +1294,6 @@ function loadGame(start, moves) {
     cg.setAutoShapes([]);
   }
   cancelAi();
-  ai.white.lastEval = ai.black.lastEval = null; // fresh position — neutral eval bars
   ui.running = false;
   ui.started = false;
   syncToggleLabel();
