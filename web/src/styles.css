@@ -343,19 +343,20 @@ button:disabled:hover { background: var(--panel); } /* no hover lift when locked
   margin-bottom: 22px;
 }
 
-/* Eval bar (puzzle play-it-out): a Lichess-style vertical gauge beside the board.
+/* Eval bars: Lichess-style vertical gauges beside the board (puzzle play-it-out
+   shows the left one; the AI-vs-AI Eval bars option shows both, one per engine).
    The white fill's height is White's winning chances (a sigmoid over the engine
    eval, set inline by main.js); the CSS height transition is what animates it.
    It's anchored to whichever end of the board White sits at (.flipped when Black
-   is at the bottom). When the bar is visible the board gives up its width
-   (16px bar + 10px gap = 26px) so the pair still fits the --board grid column —
-   main.js calls cg.redrawAll() on the toggle so chessground re-measures. */
+   is at the bottom). main.js sets .bars-1/.bars-2 on the row for how many bars
+   are visible: the board gives up 26px per bar (16px bar + 10px gap) so the row
+   still fits the --board grid column — and calls cg.redrawAll() on a layout
+   change so chessground re-measures. */
 .board-row { display: flex; gap: 10px; }
 .eval-bar {
   flex: none;
   position: relative;
   width: 16px;
-  height: calc(var(--board) - 26px); /* matches the shrunk board below */
   background: #1a1714; /* the unfilled remainder reads as Black's share */
   border: 1px solid #555049;
   border-radius: 6px;
@@ -381,10 +382,16 @@ button:disabled:hover { background: var(--panel); } /* no hover lift when locked
   margin-top: -1px;
   background: var(--accent);
 }
-.eval-bar:not([hidden]) + #board {
+.board-row.bars-1 #board {
   width: calc(var(--board) - 26px);
   height: calc(var(--board) - 26px);
 }
+.board-row.bars-1 .eval-bar { height: calc(var(--board) - 26px); }
+.board-row.bars-2 #board {
+  width: calc(var(--board) - 52px);
+  height: calc(var(--board) - 52px);
+}
+.board-row.bars-2 .eval-bar { height: calc(var(--board) - 52px); }
 
 /* Coordinates (chessground draws them inside .cg-wrap). Defaults place them with
    fixed px offsets that look shifted on small boards and force UPPERCASE; override

@@ -233,6 +233,10 @@
             <input type="checkbox" id="vary-openings" />
             Vary openings
           </label>
+          <label class="check-field" title="Show each engine's own evaluation beside the board — the bottom engine's bar on the left, the top engine's on the right. The white fill is how strong White's position looks to that engine; the bars can disagree when the engines use different evaluations.">
+            <input type="checkbox" id="show-evals" />
+            Eval bars
+          </label>
         </div>
         <div class="control-row" id="row-online" hidden>
           <div class="online-panel">
@@ -318,13 +322,19 @@
 
       <div class="board-col">
         <div id="tray-top" class="tray"><span class="caps"></span><span class="adv"></span></div>
-        <!-- Eval bar (puzzle play-it-out): Lichess-style vertical gauge; the white
-             fill grows toward whichever side is winning. Hidden outside free-play. -->
+        <!-- Eval bars: Lichess-style vertical gauges; the white fill grows toward
+             whichever side is winning. Puzzle play-it-out uses the left one (a
+             dedicated worker evaluates the viewed position); the AI-vs-AI "Eval
+             bars" option uses both — each engine's own latest search score, the
+             bottom engine's bar on the left, the top engine's on the right. -->
         <div class="board-row">
-          <div id="eval-bar" class="eval-bar" hidden>
+          <div id="eval-bar-left" class="eval-bar" hidden>
             <div class="eval-fill"></div>
           </div>
           <div id="board" class="cg-wrap"></div>
+          <div id="eval-bar-right" class="eval-bar" hidden>
+            <div class="eval-fill"></div>
+          </div>
         </div>
         <div id="tray-bottom" class="tray"><span class="caps"></span><span class="adv"></span></div>
       </div>
@@ -337,6 +347,7 @@
           <button id="nav-prev" type="button" title="Previous (←)">◀</button>
           <button id="nav-next" type="button" title="Next (→)">▶</button>
           <button id="nav-last" type="button" title="Latest (End)">⏭</button>
+          <button id="flip-board" type="button" title="Flip the board — switch your point of view">⇅</button>
         </div>
         <div class="pgn-row">
           <button id="export-pgn" type="button" title="Copy this game as PGN to the clipboard (downloads a file if the clipboard is blocked)">Export PGN</button>

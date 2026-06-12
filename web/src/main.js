@@ -48,6 +48,13 @@ const ui = {
   // from matching its last few games, so consecutive games open differently.
   varyOpenings: false,
   recentOpenings: [],  // move keys (from*64+to) of recent games' opening moves, oldest first
+  // AI-vs-AI: show each engine's own evaluation as a bar beside the board
+  // (bottom engine left, top engine right). See the eval-bars section.
+  showEvalBars: false,
+  // Flip board: invert the point of view (board orientation, trays, eval-bar
+  // sides). A pure view toggle, reset when the mode changes so mode-specific
+  // auto-orientation (puzzles, online colour) starts out right.
+  flipped: false,
 };
 
 // How many recent opening moves to remember/forbid, so the engines cycle through a
@@ -149,7 +156,10 @@ const PONDER_STEP_MS = 700; // ponder in short bursts so a worker stays responsi
 // change (new move, new game, stop) has superseded.
 const ai = { white: makeAiSlot('white'), black: makeAiSlot('black') };
 function makeAiSlot(color) {
-  return { color, worker: null, searchSeq: 0, ponderSeq: 0, predicted: null, ponderState: null, ponderBest: 0 };
+  // `lastEval` is this engine's own latest root score in White's view (for the
+  // AI-vs-AI eval bars); null until its first search. Reset by newGame/loadGame
+  // (fresh position), NOT by spawnAiWorkers — pausing shouldn't blank the bars.
+  return { color, worker: null, searchSeq: 0, ponderSeq: 0, predicted: null, ponderState: null, ponderBest: 0, lastEval: null };
 }
 spawnAiWorkers();
 
@@ -258,12 +268,14 @@ function aiToMove() {
 }
 
 // The colour shown at the bottom of the board (board orientation + bottom tray):
-// the human's side in you-vs-AI, this client's side online, else White.
+// the human's side in you-vs-AI, this client's side online, else White — then
+// inverted while the Flip board toggle is on.
 function viewColor() {
-  if (ui.mode === 'human-ai') return ui.humanColor;
-  if (ui.mode === 'online') return onlineColor || 'white';
-  if (ui.mode === 'puzzle') return puzzleColor;
-  return 'white';
+  let c = 'white';
+  if (ui.mode === 'human-ai') c = ui.humanColor;
+  else if (ui.mode === 'online') c = onlineColor || 'white';
+  else if (ui.mode === 'puzzle') c = puzzleColor;
+  return ui.flipped ? opponent(c) : c;
 }
 
 function render() {
@@ -612,6 +624,12 @@ function rememberOpening(move) {
 function onSearchResult(slot, data) {
   if (data.seq !== slot.searchSeq) return; // stale result for a superseded position
   slot.predicted = data.ponder || null;    // remember the predicted opponent reply
+  // This engine's own opinion of the position it just searched (side-to-move
+  // relative, i.e. this colour's view), kept in White's view for the eval bars.
+  if (typeof data.score === 'number') {
+    slot.lastEval = slot.color === 'white' ? data.score : -data.score;
+    if (duelBarsVisible()) paintDuelBars();
+  }
   // Only the side to move's real search yields a move to play (a ponder-side worker
   // never reaches here as a real search). Re-check the turn: the position may have
   // moved on while this reply was in flight.
@@ -855,23 +873,30 @@ function renderPuzzleMeta() {
   el.textContent = s;
 }
 
-// --- eval bar (puzzle play-it-out) ---
-// A Lichess-style vertical gauge beside the board, shown only during free-play
-// (showing it while solving would spoil the puzzle). The white fill's height is
-// White's winning chances; the CSS height transition animates each update. A
-// dedicated THIRD worker evaluates the VIEWED position (so review navigation and
-// forking refresh the bar) and never competes with the per-colour play workers;
-// it's terminated whenever the bar hides, since its idle transposition table
-// holds ~20 MB. Requests are throttled to one in flight: a position change while
-// one is out marks it dirty and re-requests on the reply, so mashing the review
-// arrows queues at most one extra search.
+// --- eval bars ---
+// Lichess-style vertical gauges beside the board; the white fill's height is
+// White's winning chances and the CSS height transition animates each update.
+// Two users, mutually exclusive by mode:
+//   - Puzzle play-it-out (left bar only; shown while solving it would spoil the
+//     puzzle): a dedicated THIRD worker evaluates the VIEWED position (so review
+//     navigation and forking refresh the bar) and never competes with the
+//     per-colour play workers; it's terminated whenever the bar hides, since its
+//     idle transposition table holds ~20 MB. Requests are throttled to one in
+//     flight: a position change while one is out marks it dirty and re-requests
+//     on the reply, so mashing the review arrows queues at most one extra search.
+//   - AI-vs-AI "Eval bars" option (both bars): each engine's OWN latest root
+//     score — already carried by every search reply, so this costs no extra
+//     compute and shows genuinely different opinions when the engines use
+//     different evals. The bottom engine's bar sits left of the board, the top
+//     engine's right; a bar updates when its engine finishes a real search.
 const EVAL_BAR = { depth: 6, maxMs: 1500, engine: 'handcrafted' };
 // Scores beyond this magnitude encode a forced mate (ai.js MATE = 1,000,000; no
 // real centipawn eval comes anywhere near) — pin the bar to the winner's end.
 const EVAL_BAR_MATE = 500_000;
 const evalBar = { worker: null, seq: 0, pending: false, dirty: false, fen: null, turn: 'white' };
 
-const evalBarVisible = () => ui.mode === 'puzzle' && puzzlePhase === 'freeplay' && !!puzzle;
+const puzzleBarVisible = () => ui.mode === 'puzzle' && puzzlePhase === 'freeplay' && !!puzzle;
+const duelBarsVisible = () => ui.mode === 'ai-ai' && ui.showEvalBars;
 
 function createEvalBarWorker() {
   const w = new Worker(new URL('./aiWorker.js', import.meta.url), { type: 'module' });
@@ -879,7 +904,7 @@ function createEvalBarWorker() {
     if (data.type !== 'search' || data.seq !== evalBar.seq) return;
     evalBar.pending = false;
     if (evalBar.dirty) { evalBar.dirty = false; evalBar.fen = null; requestEvalBar(); return; }
-    if (!evalBarVisible() || typeof data.score !== 'number') return;
+    if (!puzzleBarVisible() || typeof data.score !== 'number') return;
     // The search score is side-to-move-relative; the bar wants White's view.
     paintEvalBar(evalBar.turn === 'white' ? data.score : -data.score);
   };
@@ -897,39 +922,61 @@ function evalBarPct(whiteCp) {
   return Math.max(2, Math.min(98, 50 + 50 * winChance));
 }
 
-function paintEvalBar(whiteCp) {
-  const el = $('eval-bar');
-  el.querySelector('.eval-fill').style.height = evalBarPct(whiteCp) + '%';
-  el.title = whiteCp >= EVAL_BAR_MATE ? 'White has forced mate'
-    : whiteCp <= -EVAL_BAR_MATE ? 'Black has forced mate'
-    : `Eval: ${(whiteCp >= 0 ? '+' : '') + (whiteCp / 100).toFixed(1)}`;
+// Paint one bar element. `whiteCp` is centipawns from White's view (null = no
+// evaluation yet, neutral); `who` labels the hover tooltip.
+function paintEvalBarEl(el, whiteCp, who) {
+  el.querySelector('.eval-fill').style.height = (whiteCp == null ? 50 : evalBarPct(whiteCp)) + '%';
+  el.title = whiteCp == null ? `${who}: no evaluation yet`
+    : whiteCp >= EVAL_BAR_MATE ? `${who}: White has forced mate`
+    : whiteCp <= -EVAL_BAR_MATE ? `${who}: Black has forced mate`
+    : `${who}: ${(whiteCp >= 0 ? '+' : '') + (whiteCp / 100).toFixed(1)}`;
 }
 
-// Show/hide the bar for the current mode+phase and keep its value tracking the
-// viewed position. Called from render() and applyModeVisibility(), so every path
-// that changes the position, the view, or the phase lands here; the fen check
-// makes repeat calls free.
+// The puzzle bar (left, dedicated worker).
+function paintEvalBar(whiteCp) { paintEvalBarEl($('eval-bar-left'), whiteCp, 'Eval'); }
+
+// The AI-vs-AI duel bars: each engine's own latest score (recorded by
+// onSearchResult in White's view) — bottom engine left, top engine right, so a
+// board flip swaps which bar shows which engine.
+function paintDuelBars() {
+  const bottom = viewColor();
+  const name = (c) => `${c === 'white' ? 'White' : 'Black'} engine`;
+  paintEvalBarEl($('eval-bar-left'), ai[bottom].lastEval, name(bottom));
+  paintEvalBarEl($('eval-bar-right'), ai[opponent(bottom)].lastEval, name(opponent(bottom)));
+}
+
+// Show/hide the bars for the current mode+phase and keep their values current.
+// Called from render() and applyModeVisibility(), so every path that changes
+// the position, the view, the phase, or the option lands here; the puzzle-bar
+// fen check makes repeat calls free.
 function syncEvalBar() {
-  const el = $('eval-bar');
-  if (!evalBarVisible()) {
-    if (!el.hidden) {
-      el.hidden = true;
-      cg.redrawAll(); // the board takes its width back — re-measure
-    }
+  const left = $('eval-bar-left'), right = $('eval-bar-right');
+  const puzzleBar = puzzleBarVisible();
+  const duel = !puzzleBar && duelBarsVisible();
+  // The board cedes 26px per visible bar (see styles.css); resizing it means
+  // chessground must re-measure, so redraw only on a real layout change.
+  const row = left.parentElement;
+  const prevLayout = row.className;
+  row.classList.toggle('bars-1', puzzleBar);
+  row.classList.toggle('bars-2', duel);
+  if (puzzleBar && left.hidden) paintEvalBarEl(left, null, 'Eval'); // neutral until the first eval lands
+  left.hidden = !(puzzleBar || duel);
+  right.hidden = !duel;
+  if (row.className !== prevLayout) cg.redrawAll();
+  if (!puzzleBar) {
+    // The dedicated worker only serves the puzzle bar; drop it (and any
+    // in-flight reply) whenever that bar isn't showing.
     if (evalBar.worker) { evalBar.worker.terminate(); evalBar.worker = null; }
-    evalBar.seq++; // invalidate any in-flight reply
+    evalBar.seq++;
     evalBar.pending = evalBar.dirty = false;
     evalBar.fen = null;
-    return;
   }
-  if (el.hidden) {
-    el.hidden = false;
-    el.querySelector('.eval-fill').style.height = '50%'; // neutral until the first eval lands
-    el.title = '';
-    cg.redrawAll(); // the board shrank to make room — re-measure
-  }
-  el.classList.toggle('flipped', viewColor() === 'black'); // white fill sits at White's end
-  requestEvalBar();
+  if (!puzzleBar && !duel) return;
+  const flip = viewColor() === 'black'; // white fill sits at White's end
+  left.classList.toggle('flipped', flip);
+  right.classList.toggle('flipped', flip);
+  if (duel) paintDuelBars();
+  else requestEvalBar();
 }
 
 function requestEvalBar() {
@@ -1208,6 +1255,7 @@ function onOnlineData(msg) {
 // --- controls ---
 function newGame() {
   cancelAi();
+  ai.white.lastEval = ai.black.lastEval = null; // fresh position — neutral eval bars
   ui.running = false;
   ui.started = false;
   syncToggleLabel();
@@ -1237,6 +1285,7 @@ function loadGame(start, moves) {
     cg.setAutoShapes([]);
   }
   cancelAi();
+  ai.white.lastEval = ai.black.lastEval = null; // fresh position — neutral eval bars
   ui.running = false;
   ui.started = false;
   syncToggleLabel();
@@ -1414,6 +1463,7 @@ function syncControlsFromDom() {
   ui.engineWhite = engineValue('white');
   ui.engineBlack = engineValue('black');
   ui.varyOpenings = $('vary-openings').checked;
+  ui.showEvalBars = $('show-evals').checked;
   for (const slot of ['ai', 'white', 'black']) {
     ui.custom[slot].depth = clampInt($(`custom-depth-${slot}`).value, 0, 40, 8);
     ui.custom[slot].ms = clampInt($(`custom-ms-${slot}`).value, 0, 60000, 6000);
@@ -1496,6 +1546,7 @@ $('mode').addEventListener('change', (e) => {
       return;
     }
     ui.mode = e.target.value;
+    ui.flipped = false; // each mode auto-orients; don't carry a stale flip over
     if (ui.mode === 'online') { applyModeVisibility(); setOnlinePhase('idle'); newGame(); return; }
     applyModeVisibility();
     if (ui.mode === 'puzzle') { enterPuzzleMode(); return; } // a puzzle replaces the edited board
@@ -1504,6 +1555,7 @@ $('mode').addEventListener('change', (e) => {
   }
 
   ui.mode = e.target.value;
+  ui.flipped = false; // each mode auto-orients; don't carry a stale flip over
   if (prev === 'online' && ui.mode !== 'online') { leaveOnline(); setUrlCode(''); }
   // Leaving puzzles keeps the position (so it can be analyzed in another mode), but
   // drops the puzzle itself: no pending reply, no hint arrow, no stale solution.
@@ -1560,6 +1612,10 @@ for (const slot of ['ai', 'white', 'black']) {
 $('vary-openings').addEventListener('change', (e) => {
   ui.varyOpenings = e.target.checked;
   ui.recentOpenings = []; // start a fresh rotation when the option is toggled
+});
+$('show-evals').addEventListener('change', (e) => {
+  ui.showEvalBars = e.target.checked;
+  syncEvalBar(); // show/hide the duel bars without waiting for the next move
 });
 $('new-game').addEventListener('click', () => {
   if (ui.mode === 'online' && onlineConnected) online.send({ t: 'reset' });
@@ -1644,6 +1700,18 @@ $('online-copy').addEventListener('click', async () => {
     hint.textContent = 'Copied';
     setTimeout(() => { hint.textContent = 'Copy link'; }, 1200);
   } catch { /* clipboard may be blocked; the code is shown for manual copy */ }
+});
+
+// Flip board: a pure view toggle (orientation, trays, eval-bar sides). The
+// editor owns the board directly (render() skips it), so flip it in place.
+$('flip-board').addEventListener('click', () => {
+  ui.flipped = !ui.flipped;
+  if (ui.mode === 'editor') {
+    cg.set({ orientation: viewColor() });
+    renderTrays({ state });
+    return;
+  }
+  render();
 });
 
 // Review navigation: buttons, clicking a move, and arrow/Home/End keys.
