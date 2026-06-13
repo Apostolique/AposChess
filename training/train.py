@@ -112,6 +112,12 @@ def parse_args():
                         "(0 disables early stopping, runs all --epochs)")
     p.add_argument("--batch", type=int, default=8192)
     p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--wd", type=float, default=0.0,
+                   help="weight decay (AdamW). 0 = none (default, == plain Adam). "
+                        "A small value (e.g. 1e-4) regularizes the extra parameters "
+                        "of a wider net / richer feature set so they overfit less; "
+                        "the first-layer upgrade plan relies on this (docs/"
+                        "first-layer-strategy.md).")
     p.add_argument("--scale", type=float, default=600.0,
                    help="centipawns at tanh saturation (written into the weights)")
     p.add_argument("--lambda", dest="lam", type=float, default=1.0,
@@ -295,10 +301,14 @@ def main():
     mat_t = torch.from_numpy(mat).to(device)
     targets_t = torch.from_numpy(blended).to(device)
 
-    opt = torch.optim.Adam(model.parameters(), lr=args.lr)
+    # AdamW so --wd is decoupled weight decay (with wd=0 this is identical to the
+    # previous plain Adam). Weight decay is the regularizer the 2026-06 capacity
+    # experiments lacked — see docs/first-layer-strategy.md.
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
     loss_fn = nn.MSELoss()
     print(f"Training on {device}: {len(train_idx):,} train / {n_val:,} val, "
-          f"inputs={num_features}, hidden={hidden}, max epochs={args.epochs}, patience={args.patience}")
+          f"inputs={num_features}, hidden={hidden}, wd={args.wd}, "
+          f"max epochs={args.epochs}, patience={args.patience}")
 
     def evaluate(idx):
         model.eval()

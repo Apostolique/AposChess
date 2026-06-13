@@ -28,7 +28,12 @@ import { legalMoves, applyMove, kingAttacked, generatePseudoMoves, hasLegalMove 
 import { opponent } from './board.js';
 import { evaluate as nnEvaluate } from './nn.js';
 
-const VALUE = { p: 100, n: 300, b: 330, r: 500, q: 900, k: 0 };
+// Knight = 500 (≈ rook), not the standard-chess 300: this variant's knight is much
+// stronger than chess implies — in self-play, up a knight wins ~80%, statistically
+// identical to up a rook (~81%) and well above up a bishop (~70%), and an outcome
+// least-squares fit puts it at ~520cp. Adopted after a head-to-head SPRT vs the old
+// 300 table (+61 Elo ± 37). Every other piece already matched outcomes, so unchanged.
+const VALUE = { p: 100, n: 500, b: 330, r: 500, q: 900, k: 0 };
 const MATE = 1_000_000;
 const MATE_THRESH = MATE - 1000; // scores beyond this magnitude encode a forced mate
 const MAX_PLY = 64;

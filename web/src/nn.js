@@ -28,23 +28,54 @@
 const PIECE_INDEX = { p: 0, n: 1, b: 2, r: 3, q: 4, k: 5 };
 // One piece-square block: 12 piece-kinds (6 roles × 2 sides) × 64 squares, in
 // canonical side-to-move orientation. Exported so tools (refeaturize) can identify
-// the plain block when reconstructing a board from feature indices, and so a future
-// multi-block layout (e.g. king-relative buckets) can be sized off it.
-// (King-relative buckets were tried 2026-06-09 and lost Elo — the net is
-// signal/data-limited, not capacity-limited; see the nn-engine-plan memory.)
+// the plain block when reconstructing a board from feature indices, and so the
+// multi-block king-relative layout below can be sized off it.
 export const PIECE_SQUARE_FEATURES = 12 * 64; // 768
-export const NUM_FEATURES = PIECE_SQUARE_FEATURES; // 768
 
-// Active (set-to-1) input indices for a position. Sparse — typically ~17-32 of 768.
+// King-relative ("HalfK-quadrant") blocks (OFF by default — KING_BUCKETS = 0): every
+// piece is ALSO indexed by the side-to-move king's board quadrant, so the net can
+// value a piece by its relation to the (safety-zone-bearing) king. This is ADDITIVE —
+// the plain block stays active as the king-independent shared factor, which is
+// training-equivalent to Stockfish-style feature factorization with the plain feature
+// as the virtual one. Tried 2026-06-09 (outcome-only data) AND re-tried 2026-06-13 on
+// the denser λ-blended 3.74M-position signal with a weight-decay sweep: it lost ~33
+// Elo cold-vs-cold (king features OFF won), so king safety appears to be low-signal in
+// this variant — the net learns the variant's values fine from the plain block alone.
+// Scaffolding kept, dormant and verified, behind this switch for future feature work;
+// set KING_BUCKETS = 4 (and re-featurize) to revisit. See first-layer-strategy memo.
+const KING_BUCKETS = 0;
+export const NUM_FEATURES = PIECE_SQUARE_FEATURES * (1 + KING_BUCKETS); // 768
+
+// Quadrant (0-3) of a canonical square: rank-half (bit 1) and file-half (bit 0).
+function kingBucket(sq) { return ((sq >> 3) >= 4 ? 2 : 0) + ((sq & 7) >= 4 ? 1 : 0); }
+// Index of the side-to-move king's square (canonical) in `board`, or -1. Used to
+// pick the king-quadrant block; a king is always present in a real position.
+function ownKingSquare(board, turn, flip) {
+  for (let i = 0; i < 64; i++) {
+    const p = board[i];
+    if (p && p.role === 'k' && p.color === turn) return flip ? i ^ 56 : i;
+  }
+  return -1;
+}
+
+// Active (set-to-1) input indices for a position. Sparse: each piece fires its plain
+// index plus (when KING_BUCKETS > 0) its king-quadrant index, so ~2× the piece count.
 export function featureIndices(board, turn) {
   const idx = [];
   const flip = turn === 'black';
+  // Base offset of the king-quadrant block for this position (the side-to-move king's
+  // quadrant). 0 buckets → no king block (plain layout).
+  const kbase = KING_BUCKETS
+    ? PIECE_SQUARE_FEATURES * (1 + kingBucket(ownKingSquare(board, turn, flip)))
+    : 0;
   for (let i = 0; i < 64; i++) {
     const p = board[i];
     if (!p) continue;
     const side = p.color === turn ? 0 : 1; // 0 = us (side to move), 1 = them
     const sq = flip ? i ^ 56 : i;
-    idx.push((PIECE_INDEX[p.role] * 2 + side) * 64 + sq);
+    const kind = (PIECE_INDEX[p.role] * 2 + side) * 64 + sq;
+    idx.push(kind);                       // plain block (shared, king-independent factor)
+    if (KING_BUCKETS) idx.push(kbase + kind); // king-quadrant residual
   }
   return idx;
 }
@@ -104,13 +135,23 @@ function compile(W) {
     const act = act0;
     act.set(b0); // pre-activations seeded with the bias
     const flip = turn === 'black';
+    // Mirror featureIndices: each piece adds its plain column and (if king buckets are
+    // active) its king-quadrant column, keyed by the side-to-move king's quadrant.
+    const kbase = KING_BUCKETS
+      ? PIECE_SQUARE_FEATURES * (1 + kingBucket(ownKingSquare(board, turn, flip)))
+      : 0;
     for (let i = 0; i < 64; i++) {
       const p = board[i];
       if (!p) continue;
       const side = p.color === turn ? 0 : 1; // 0 = us (side to move), 1 = them
       const sq = flip ? i ^ 56 : i;
-      const off = ((PIECE_INDEX[p.role] * 2 + side) * 64 + sq) * H0;
+      const kind = (PIECE_INDEX[p.role] * 2 + side) * 64 + sq;
+      const off = kind * H0;
       for (let h = 0; h < H0; h++) act[h] += w0[off + h];
+      if (KING_BUCKETS) {
+        const offk = (kbase + kind) * H0;
+        for (let h = 0; h < H0; h++) act[h] += w0[offk + h];
+      }
     }
     for (let h = 0; h < H0; h++) if (act[h] < 0) act[h] = 0; // ReLU
     return act;
@@ -176,7 +217,7 @@ export function loadWeights(obj, slot = 'default') {
 }
 export function hasWeights(slot = 'default') { return WEIGHTS.has(slot); }
 
-const VALUE = { p: 100, n: 300, b: 330, r: 500, q: 900, k: 0 };
+const VALUE = { p: 100, n: 500, b: 330, r: 500, q: 900, k: 0 }; // knight ≈ rook (variant-calibrated, see ai.js)
 
 // Material-only fallback (white-relative), used until weights are trained so the
 // "Neural net" engine still plays a legal, if weak, game out of the box.
