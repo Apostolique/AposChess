@@ -21,8 +21,8 @@
 
     gtag('config', 'G-TYM1QSCNLT');
   </script>
-  <script type="module" crossorigin src="./assets/index-D9LzhALM.js"></script>
-  <link rel="stylesheet" crossorigin href="./assets/index-CP78BYrp.css">
+  <script type="module" crossorigin src="./assets/index-DtDFW7j5.js"></script>
+  <link rel="stylesheet" crossorigin href="./assets/index-Bf01kOaR.css">
 </head>
 <body>
   <main class="app">
@@ -100,6 +100,17 @@
           <p id="puzzle-meta" class="puzzle-meta"></p>
         </fieldset>
       </section>
+
+      <!-- Mobile-only section tabs: on narrow screens the move list, settings, and
+           rules would stack into a long scroll, so a tab bar (hidden on desktop, where
+           each has its own column) switches between them. The mode picker + action
+           buttons stay pinned above. body[data-mobile-tab] (set in main.js) drives the
+           CSS; the Settings tab hides itself for modes that have no settings. -->
+      <nav class="mobile-tabs" aria-label="Sections">
+        <button type="button" class="mobile-tab" data-mobile-tab="moves" aria-selected="true">Moves</button>
+        <button type="button" class="mobile-tab" id="tab-settings" data-mobile-tab="settings" aria-selected="false">Settings</button>
+        <button type="button" class="mobile-tab" data-mobile-tab="rules" aria-selected="false">Rules</button>
+      </nav>
 
       <section class="controls">
         <fieldset class="ai-group" id="row-ai" hidden>
