@@ -7,10 +7,15 @@
 //   { type: 'search', seq, state, depth, maxMs, engine, net } → { type: 'search', seq, move, ponder, score }
 //       a real move to play; `ponder` is the predicted opponent reply { from, to };
 //       `score` is the root value (centipawns, side-to-move-relative — the eval bar
-//       reads it; the play path ignores it).
-//   { type: 'ponder', seq, state, depth, maxMs, engine, net } → { type: 'ponder', seq, reached }
+//       reads it; the play path ignores it). While the search runs it also streams
+//       { type: 'progress', seq, score, depth } after each completed iterative-
+//       deepening depth, so the page can update the eval bar in real time instead
+//       of only when the move is played.
+//   { type: 'ponder', seq, state, depth, maxMs, engine, net } → { type: 'ponder', seq, reached, score }
 //       thinking on the opponent's turn; the move is irrelevant, the point is the
-//       warmed transposition table. `reached` is the deepest completed iteration.
+//       warmed transposition table. `reached` is the deepest completed iteration;
+//       `score` is the root value of the pondered position (so the idle engine's
+//       eval bar keeps refining during the opponent's turn).
 // `engine` picks the evaluation ('handcrafted' | 'nn'); see chooseMoveDetailed. For
 // 'nn', `net` is the full URL of the selected weights file to load (see below).
 //
@@ -61,13 +66,15 @@ self.onmessage = async ({ data }) => {
   // search wants Zobrist hashes, so convert here, on the worker thread.
   const prevHashes = posHistory ? posHistory.map((f) => _internal.hashOf(parseFen(f))) : [];
   if (type === 'ponder') {
-    const { depth: reached } = chooseMoveDetailed(state, depth, Math.random, maxMs, true, prevHashes, engine);
-    self.postMessage({ type: 'ponder', seq, reached });
+    const { depth: reached, score } = chooseMoveDetailed(state, depth, Math.random, maxMs, true, prevHashes, engine);
+    self.postMessage({ type: 'ponder', seq, reached, score });
     return;
   }
   // `exclude` (move keys to skip at the root) drives the opening-variety option, so a
   // fresh AI-vs-AI game doesn't replay a recent opening; only on the game's first move.
   const excludeKeys = exclude && exclude.length ? new Set(exclude) : null;
-  const { move, ponder, score } = chooseMoveDetailed(state, depth, Math.random, maxMs, true, prevHashes, engine, excludeKeys);
+  // Stream the best score after each completed depth so the eval bar climbs live.
+  const onProgress = (score, depth) => self.postMessage({ type: 'progress', seq, score, depth });
+  const { move, ponder, score } = chooseMoveDetailed(state, depth, Math.random, maxMs, true, prevHashes, engine, excludeKeys, onProgress);
   self.postMessage({ type: 'search', seq, move, ponder, score });
 };

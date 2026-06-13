@@ -165,7 +165,8 @@ spawnAiWorkers();
 function createAiWorker(slot) {
   const w = new Worker(new URL('./aiWorker.js', import.meta.url), { type: 'module' });
   w.onmessage = ({ data }) => {
-    if (data.type === 'ponder') onPonderResult(slot, data);
+    if (data.type === 'progress') onSearchProgress(slot, data);
+    else if (data.type === 'ponder') onPonderResult(slot, data);
     else onSearchResult(slot, data);
   };
   w.onerror = (e) => {
@@ -655,6 +656,19 @@ function onSearchResult(slot, data) {
   }, wait);
 }
 
+// A mid-search progress update from the side-to-move's worker: the engine's best
+// score at the latest finished iterative-deepening depth, posted while the deeper
+// iterations are still running, so the eval bar climbs in real time instead of only
+// settling when the move is played. Same staleness guard and White-view convention
+// as the final result — it stamps the live ply, which onSearchResult then refines
+// with the deepest score.
+function onSearchProgress(slot, data) {
+  if (data.seq !== slot.searchSeq) return; // stale: the position moved on
+  if (typeof data.score !== 'number') return;
+  history[history.length - 1].evals[slot.color] = slot.color === 'white' ? data.score : -data.score;
+  if (duelBarsVisible()) paintDuelBars();
+}
+
 // Ponder = think about the position we'd reach if the side to move plays the move
 // this colour predicted for it. On a hit the next real search reuses the work; on a
 // miss the table still holds useful overlap. Done in short bursts so a real move
@@ -673,6 +687,15 @@ function startPonder(slot) {
 function onPonderResult(slot, data) {
   if (data.seq !== slot.ponderSeq) return;
   if (slot.color === state.turn || !aiColors().includes(slot.color)) return; // no longer the idle side
+  // Keep the idle engine's bar live during the opponent's turn: the ponder score is
+  // its assessment of the position after the move it predicts the opponent will play
+  // (side-to-move-relative there = this colour), shown in White's view on the live
+  // ply just like a real search. If the prediction holds, the next real search picks
+  // up seamlessly; if not, the bar corrects when that search starts.
+  if (typeof data.score === 'number') {
+    history[history.length - 1].evals[slot.color] = slot.color === 'white' ? data.score : -data.score;
+    if (duelBarsVisible()) paintDuelBars();
+  }
   const { depth, engine, net } = aiParams(slot.color);
   // Stop once we've searched to full strength or stopped making progress (e.g. a
   // forced line resolved), so we don't spin firing instant bursts.
@@ -901,8 +924,11 @@ function renderPuzzleMeta() {
 //     and shows genuinely different opinions when the engines use different
 //     evals. Scores are stored per history entry (what each bar showed while
 //     that ply was live), so review navigation replays the bars ply by ply.
-//     The bottom engine's bar sits left of the board, the top engine's right;
-//     the live bars update when an engine finishes a real search.
+//     The bottom engine's bar sits left of the board, the top engine's right.
+//     The live bars update in real time: the side to move streams its best score
+//     after each search depth (onSearchProgress), and the idle engine refreshes its
+//     bar on each ponder burst (onPonderResult), so neither bar sits frozen between
+//     moves. The final per-ply value (onSearchResult) is what review replays.
 const EVAL_BAR = { depth: 6, maxMs: 1500, engine: 'handcrafted' };
 // Scores beyond this magnitude encode a forced mate (ai.js MATE = 1,000,000; no
 // real centipawn eval comes anywhere near) — pin the bar to the winner's end.

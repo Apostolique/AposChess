@@ -528,7 +528,7 @@ function search(state, depth, alpha, beta, ply, canNull, hash, deadline) {
 // Only positions since the last irreversible move (capture/pawn move — i.e. the last
 // `halfmove` plies) can ever recur, so the caller need only pass that window; doing
 // so keeps the per-node repetition lookup set tiny (usually empty).
-export function chooseMoveDetailed(state, maxDepth = 2, rand = Math.random, maxMs = Infinity, useTT = true, prevHashes = [], engine = 'handcrafted', excludeKeys = null) {
+export function chooseMoveDetailed(state, maxDepth = 2, rand = Math.random, maxMs = Infinity, useTT = true, prevHashes = [], engine = 'handcrafted', excludeKeys = null, onProgress = null) {
   // engine is 'handcrafted', 'nn', or 'nn:<slot>' (a specific net). Split off the slot.
   const colon = engine.indexOf(':');
   const evalName = colon < 0 ? engine : engine.slice(0, colon);
@@ -586,7 +586,12 @@ export function chooseMoveDetailed(state, maxDepth = 2, rand = Math.random, maxM
       if (score > bestScore) { bestScore = score; localBest = m; }
       if (score > alpha) alpha = score;
     }
-    if (!aborted) { bestMove = localBest; completed = depth; rootScore = bestScore; }
+    if (!aborted) {
+      bestMove = localBest; completed = depth; rootScore = bestScore;
+      // Report the best score at each finished iteration so a caller (the worker)
+      // can stream a live eval while the deeper iterations are still running.
+      if (onProgress) onProgress(rootScore, completed);
+    }
     if (aborted || bestScore >= MATE_THRESH) break;
   }
 
