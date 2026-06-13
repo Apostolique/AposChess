@@ -299,7 +299,14 @@ function render() {
     orientation: viewColor(),
     lastMove: entry.lastMove ? [squareName(entry.lastMove.from), squareName(entry.lastMove.to)] : undefined,
     check: entry.check ? entry.state.turn : false,
-    viewOnly: !atLive && !color, // lock the board while reviewing, unless forking is allowed
+    // NEVER viewOnly:true — chessground only binds its mouse/touch handlers during
+    // a redrawAll, and SKIPS binding them entirely while viewOnly is set (set()
+    // alone never rebinds). So any redrawAll that lands while a review lock was on
+    // (the eval bar appearing/hiding, an orientation change) would leave the board
+    // permanently dead to input, in every mode, until a lucky future redrawAll.
+    // The movable config below already locks the board fully on its own: with no
+    // colour and no dests, nothing can be selected, dragged, or moved.
+    viewOnly: false,
     // Explicitly restore non-editor settings (free placement, delete-on-drop-off,
     // and the move-destination dots) — cg.set merges, so the editor's overrides
     // would otherwise persist after leaving it.
@@ -1822,18 +1829,59 @@ $('ai-toggle').addEventListener('click', () => {
   }
 });
 
+// Set the app up for whatever ui.mode currently says — used at startup (where the
+// mode may have been restored by the browser) and again if a late form restoration
+// changes it (see resyncRestoredControls).
+function enterStartupMode() {
+  if (ui.mode === 'online') setOnlinePhase('idle');
+  if (ui.mode === 'editor') {
+    enterEditor(); // a restored editor mode needs the editable board set up
+  } else if (ui.mode === 'puzzle') {
+    enterPuzzleMode(); // a restored puzzle mode fetches the catalog and deals a puzzle
+  } else {
+    render();
+    driveAi(); // if a restored mode has the AI to move first
+  }
+}
+
 syncControlsFromDom();
 loadNetCatalog(); // async: fills the per-slot net pickers from public/nn/manifest.json
 applyModeVisibility();
-if (ui.mode === 'online') setOnlinePhase('idle');
-if (ui.mode === 'editor') {
-  enterEditor(); // a restored editor mode needs the editable board set up
-} else if (ui.mode === 'puzzle') {
-  enterPuzzleMode(); // a restored puzzle mode fetches the catalog and deals a puzzle
-} else {
-  render();
-  driveAi(); // if a restored mode has the AI to move first
+enterStartupMode();
+
+// Reopening a CLOSED tab also restores the controls' previous values — but unlike
+// a plain reload (restored before scripts run, which syncControlsFromDom above
+// handles), session restore lands them asynchronously, after startup already read
+// the markup defaults, and fires no change events. The visible controls then
+// disagree with the app (the mode dropdown says "Puzzles", the app is in
+// two-player) until the next manual change. No event marks the restoration, so
+// re-check the controls a few times shortly after load and re-enter the mode if
+// they changed under us.
+function controlsOutOfSync() {
+  if ($('mode').value !== ui.mode
+    || $('side').value !== ui.humanColor
+    || $('depth-ai').value !== ui.strengthAi
+    || $('depth-white').value !== ui.strengthWhite
+    || $('depth-black').value !== ui.strengthBlack
+    || engineValue('ai') !== ui.engineAi
+    || engineValue('white') !== ui.engineWhite
+    || engineValue('black') !== ui.engineBlack
+    || $('vary-openings').checked !== ui.varyOpenings
+    || $('show-evals').checked !== ui.showEvalBars) return true;
+  for (const slot of ['ai', 'white', 'black']) {
+    if (clampInt($(`custom-depth-${slot}`).value, 0, 40, 8) !== ui.custom[slot].depth
+      || clampInt($(`custom-ms-${slot}`).value, 0, 60000, 6000) !== ui.custom[slot].ms) return true;
+  }
+  return false;
 }
+function resyncRestoredControls() {
+  if (!controlsOutOfSync()) return; // user-made changes keep ui in sync via the handlers
+  const prevMode = ui.mode;
+  syncControlsFromDom();
+  applyModeVisibility();
+  if (ui.mode !== prevMode) enterStartupMode();
+}
+for (const ms of [200, 600, 1500, 3000]) setTimeout(resyncRestoredControls, ms);
 
 // A `#code=…` in the URL means "join this game". The hash can arrive two ways:
 // at load (a shared link opened cold) or later, when someone pastes a new share
