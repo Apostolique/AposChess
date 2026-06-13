@@ -13,8 +13,14 @@
 //                 opponent, then the solver's next move for as long as it stays
 //                 unique (each solver ply re-passes the uniqueness test, so the
 //                 player is never asked to guess between two equally good moves).
-//                 Mate lines run to checkmate; winning lines end when the win is
-//                 converted (several good moves exist).
+//                 Mate lines run to checkmate — including lines that only BECOME
+//                 a forced mate mid-walk, which are exempt from the solver-move
+//                 cap so the puzzle ends with the mate on the board. Winning
+//                 lines end when the win is converted (several good moves exist).
+//                 The walk searches deeper than the root verification did, so it
+//                 doubles as a soundness check: a line that runs into the solver
+//                 being mated/stalemated, or a defense save the walk shows to be
+//                 lost anyway, rejects the puzzle instead of trimming the line.
 //   3. Themes   — tag what makes the line interesting, with the variant's
 //                 surprises first-class: jump / jump-capture (the move carries
 //                 the generator's jump flag), jump-block (a king/queen move whose
@@ -36,7 +42,10 @@
 //     exactly one move holds (best ≥ saveFloor) while every alternative loses
 //     (runner-up ≤ -win) — tagged 'mate-threat' when the alternatives lose to
 //     forced mate. If the pre-blunder best move turns out to WIN, it's mined as
-//     a missed-win puzzle through the normal win path instead.
+//     a missed-win puzzle through the normal win path instead. Because the app's
+//     play-it-out engine searches deeper than the mining depth, the end-of-line
+//     position is re-searched two plies deeper before accepting — a "save" that
+//     a deeper look shows lost anyway is rejected, not shipped.
 //
 // The TT is reset per mined position so verification is independent of whatever
 // was searched before; within one position the ladder/uniqueness/line searches
@@ -210,15 +219,21 @@ function mineWin(fen, leadFen, id, seed) {
       kind = 'mate';
       break;
     }
-    if (!isMate && (line.length + 1) / 2 > maxSolverMoves) break;
 
     const reply = best(cur, rand);
     const afterReply = applyMove(cur, reply.move);
     st = gameStatus(afterReply);
-    if (st.over) break; // opponent's best self-mates/stalemates — end before it
+    // After the reply the SOLVER is the side to move, so st.over means the walk
+    // found the "win" running into a swindle — the solver mated or stalemated. The
+    // claim the first move was verified on is false; drop the puzzle.
+    if (st.over) return { reject: st.result === 'checkmate' ? 'unsound' : 'bogus-end' };
 
     const next = best(afterReply, rand);
     if (isMate && next.score < MATE_THRESH) return { reject: 'unsound' }; // search disagrees with itself
+    // The solver-move cap only applies while the continuation is NOT a forced mate:
+    // a line that walks into a mate runs to checkmate regardless, so "win the queen,
+    // then mate in two" doesn't stop one move short of the finish.
+    if (next.score < MATE_THRESH && (line.length + 1) / 2 > maxSolverMoves) break;
     // Continuation rule: unlike the FIRST move (which must be the only good one —
     // that's the puzzle's premise), a follow-up only has to be CLEARLY BEST, beating
     // the runner-up by lineGap. Otherwise the line stops the moment a second move
@@ -303,8 +318,7 @@ function mineDefense(item) {
 
   for (;;) {
     let st = gameStatus(cur);
-    if (st.over) break; // a draw end (e.g. stalemate trick) is the save succeeding
-    if ((line.length + 1) / 2 > maxSolverMoves) break;
+    if (st.over) break; // an over here is the save succeeding: draw trick, or the opponent mated
 
     const reply = best(cur, rand);
     const afterReply = applyMove(cur, reply.move);
@@ -315,10 +329,25 @@ function mineDefense(item) {
     }
 
     const next = best(afterReply, rand);
-    if (next.score < saveFloor || next.score >= win) break; // line over: collapsed (noise) or flipped to winning
-    if (st.legal.length > 1) {
-      const alt2 = secondBest(afterReply, rand, next.move);
-      if (alt2.score > -win) break; // danger passed: more than one move holds now
+    // The walk effectively searches deeper than the root verification did. If it
+    // now sees the position is lost ANYWAY after the save, the puzzle's promise
+    // ("this move holds") was a horizon mirage — reject, don't ship a doomed save.
+    if (next.score <= -win) return { reject: 'unsound' };
+    if (next.score >= MATE_THRESH) {
+      // The save flipped all the way into a forced mate FOR the solver: run it to
+      // checkmate like a mate line (cap-exempt, unique-mate rule), so the puzzle
+      // ends with the mate on the board instead of stopping just before it.
+      if (st.legal.length > 1) {
+        const alt2 = secondBest(afterReply, rand, next.move);
+        if (alt2.score >= next.score) break; // an equally-fast second mate — can't script
+      }
+    } else {
+      if (next.score < saveFloor || next.score >= win) break; // line over: collapsed (noise) or flipped to winning
+      if ((line.length + 1) / 2 > maxSolverMoves) break;
+      if (st.legal.length > 1) {
+        const alt2 = secondBest(afterReply, rand, next.move);
+        if (alt2.score > -win) break; // danger passed: more than one move holds now
+      }
     }
 
     matDelta -= capValue(cur, reply.move);
@@ -329,6 +358,16 @@ function mineDefense(item) {
     cur = applyMove(afterReply, next.move);
   }
   if (minDelta <= -250) themes.add('sacrifice');
+
+  // Final soundness check: the root claim ("the save holds") was made at `depth`,
+  // but the app's play-it-out engine searches deeper than that, so an unsound save
+  // gets refuted on the board a few moves later. Re-search the end-of-line position
+  // two plies deeper (opponent to move): if they're decisively winning after all,
+  // the save was a mirage.
+  {
+    const st = gameStatus(cur);
+    if (!st.over && best(cur, rand, depth + 2).score >= win) return { reject: 'unsound' };
+  }
 
   const puzzle = {
     id: item.id + 'd',

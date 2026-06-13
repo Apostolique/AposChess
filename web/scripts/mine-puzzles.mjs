@@ -47,7 +47,8 @@
 //     [--max-candidates=6000]  cap on candidates verified (seeded sample)
 //     [--limit=400]            stop after this many accepted puzzles
 //     [--min-difficulty=1]     drop puzzles solved at a shallower depth
-//     [--max-solver-moves=4]   non-mate solution length cap
+//     [--max-solver-moves=4]   solution length cap (forced-mate finishes exempt:
+//                      a line that walks into a mate runs to checkmate)
 // Defaults: jobs = CPU cores, eval = nn with weights = ./src/nn-weights.json
 // (handcrafted if the weights don't load), in = ../training/data/selfplay.jsonl,
 // out = public/puzzles.json.
