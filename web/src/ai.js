@@ -34,6 +34,11 @@ import { evaluate as nnEvaluate } from './nn.js';
 // least-squares fit puts it at ~520cp. Adopted after a head-to-head SPRT vs the old
 // 300 table (+61 Elo ± 37). Every other piece already matched outcomes, so unchanged.
 const VALUE = { p: 100, n: 500, b: 330, r: 500, q: 900, k: 0 };
+// Handcrafted-eval version, stamped into training-data `v` provenance (scripts/vtag.mjs)
+// so a v computed by an older eval is distinguishable later. BUMP whenever the
+// handcrafted eval changes (VALUE, PST, MOB, evalStm). v1 = the pre-2026-06-13 table
+// (knight=300, untagged in old data); v2 = knight=500.
+export const HC_VERSION = 2;
 const MATE = 1_000_000;
 const MATE_THRESH = MATE - 1000; // scores beyond this magnitude encode a forced mate
 const MAX_PLY = 64;

@@ -22,10 +22,12 @@
 // which records get refreshed is reproducible from --seed.
 //
 // Usage (run from web/):
-//   node scripts/refresh-v.mjs [--refresh] [--frac=P] [--depth=D] [--jobs=N]
+//   node scripts/refresh-v.mjs [--refresh] [--frac=P] [--depth=D] [--jobs=N] [--eval=E]
 //                              [--weights=FILE] [--in=FILE] [--out=FILE] [--seed=S]
-// Defaults: depth 6, jobs = CPU cores, weights = ./src/nn-weights.json (the champion),
-//           in/out = ../training/data/selfplay.jsonl (atomic replace), seed 1.
+// Defaults: depth 6, jobs = CPU cores, eval 'nn' (weights = ./src/nn-weights.json, the
+//           champion), in/out = ../training/data/selfplay.jsonl (atomic replace), seed 1.
+//   --eval=handcrafted recomputes v with the handcrafted eval (no weights) — e.g. to
+//   relabel the bootstrap target with its outcome-grounded values.
 
 import { Worker } from 'node:worker_threads';
 import { createReadStream, createWriteStream, existsSync, rmSync, renameSync, readFileSync, statSync } from 'node:fs';
@@ -35,6 +37,7 @@ import { fileURLToPath } from 'node:url';
 import { cpus } from 'node:os';
 
 import { fmtDur, fmtNum, fmtMB, liveStatus, everyMs } from './fmt.mjs';
+import { vtag as computeVtag } from './vtag.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const args = Object.fromEntries(process.argv.slice(2).map((a) => {
@@ -45,8 +48,15 @@ const frac = args.frac !== undefined ? Number(args.frac) : 1.0;
 const depth = args.depth !== undefined ? Number(args.depth) : 6;
 const jobs = Math.max(1, args.jobs !== undefined ? Number(args.jobs) : cpus().length);
 const seed = args.seed !== undefined ? Number(args.seed) : 1;
+// Which eval recomputes v: 'nn' (default, uses --weights) or 'handcrafted' (no weights).
+// Relabeling with the recalibrated handcrafted injects its outcome-grounded values into
+// the bootstrap target where an nn champion's own v may carry the net's biases.
+const evalName = typeof args.eval === 'string' ? args.eval : 'nn';
 const weights = typeof args.weights === 'string'
   ? resolve(process.cwd(), args.weights) : resolve(here, '../src/nn-weights.json');
+// Provenance tag stamped onto every (re)computed v: which eval + depth + version
+// produced it (e.g. 'nn6@a3f2c1', 'hc6@2') — keeps the dataset auditable as v drifts.
+const vtag = computeVtag(evalName, depth, weights);
 const inFile = typeof args.in === 'string'
   ? resolve(process.cwd(), args.in) : resolve(here, '../../training/data/selfplay.jsonl');
 const outFile = typeof args.out === 'string'
@@ -60,7 +70,7 @@ const t0 = Date.now();
 const status = liveStatus();
 const tick = everyMs(1000);
 console.log(`refresh-v: ${inFile} (${fmtMB(statSync(inFile).size)}) | depth ${depth} | jobs ${jobs} | `
-  + `weights ${weights.replace(/^.*[\\/]/, '')} | seed ${seed}`);
+  + `eval ${evalName}${evalName === 'nn' ? ` (${weights.replace(/^.*[\\/]/, '')})` : ''} | seed ${seed}`);
 console.log(`  mode: ${refresh ? `refresh ${(frac * 100).toFixed(0)}% of existing v + fill missing` : 'fill missing v only'} -> ${outFile}`);
 
 function mulberry32(a) {
@@ -121,7 +131,7 @@ rl.on('line', (line) => {
 rl.on('close', () => { inputEnded = true; enqueueBatch(); maybeFinalize(); });
 
 for (let i = 0; i < jobs; i++) {
-  const w = new Worker(new URL('./refreshWorker.mjs', import.meta.url), { workerData: { weights, depth } });
+  const w = new Worker(new URL('./refreshWorker.mjs', import.meta.url), { workerData: { weights, depth, evalName } });
   pool.push(w);
   w.on('message', (msg) => {
     // A worker turning ready can complete the "all idle" condition, so re-check
@@ -132,6 +142,7 @@ for (let i = 0; i < jobs; i++) {
     for (const { idx, v } of msg.vs) {
       const rec = pendingRec.get(idx); pendingRec.delete(idx);
       rec.v = v;
+      rec.vs = vtag; // who computed this v (eval+depth)
       ready.set(idx, JSON.stringify(rec) + '\n');
     }
     computed += msg.vs.length;

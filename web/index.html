@@ -99,6 +99,17 @@
         </fieldset>
       </section>
 
+      <!-- Mobile-only section tabs: on narrow screens the move list, settings, and
+           rules would stack into a long scroll, so a tab bar (hidden on desktop, where
+           each has its own column) switches between them. The mode picker + action
+           buttons stay pinned above. body[data-mobile-tab] (set in main.js) drives the
+           CSS; the Settings tab hides itself for modes that have no settings. -->
+      <nav class="mobile-tabs" aria-label="Sections">
+        <button type="button" class="mobile-tab" data-mobile-tab="moves" aria-selected="true">Moves</button>
+        <button type="button" class="mobile-tab" id="tab-settings" data-mobile-tab="settings" aria-selected="false">Settings</button>
+        <button type="button" class="mobile-tab" data-mobile-tab="rules" aria-selected="false">Rules</button>
+      </nav>
+
       <section class="controls">
         <fieldset class="ai-group" id="row-ai" hidden>
           <legend>Opponent</legend>

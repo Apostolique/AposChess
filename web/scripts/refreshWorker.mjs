@@ -12,14 +12,15 @@ import { parseFen } from '../src/board.js';
 import { chooseMoveDetailed } from '../src/ai.js';
 import { loadWeights } from '../src/nn.js';
 
-const { weights, depth } = workerData;
-try { loadWeights(JSON.parse(readFileSync(weights, 'utf8'))); } catch { /* material fallback */ }
+const { weights, depth, evalName = 'nn' } = workerData;
+// The handcrafted eval needs no weights; only load a net for the 'nn' eval.
+if (evalName === 'nn') { try { loadWeights(JSON.parse(readFileSync(weights, 'utf8'))); } catch { /* material fallback */ } }
 
 parentPort.on('message', (msg) => {
   if (msg.type !== 'batch') return;
   const vs = msg.items.map(({ idx, fen }) => ({
     idx,
-    v: Math.round(chooseMoveDetailed(parseFen(fen), depth, Math.random, Infinity, true, [], 'nn').score),
+    v: Math.round(chooseMoveDetailed(parseFen(fen), depth, Math.random, Infinity, true, [], evalName).score),
   }));
   parentPort.postMessage({ type: 'done', vs });
 });

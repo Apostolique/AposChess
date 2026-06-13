@@ -70,6 +70,7 @@ import { Worker } from 'node:worker_threads';
 import { cpus } from 'node:os';
 import { resolve, dirname } from 'node:path';
 import { writeFileSync, appendFileSync, mkdirSync } from 'node:fs';
+import { vtag as computeVtag } from './vtag.mjs';
 
 import { fmtDur, fmtNum, liveStatus } from './fmt.mjs';
 
@@ -275,13 +276,19 @@ if (cfg.sprt) {
 }
 
 // Harvest (--save-games): append the buffered games as raw training data, in the
-// generator's exact format ({fen, r, g, v?}). `v` survives only on positions where
+// generator's exact format ({fen, r, g, v?, vs?}). `v` survives only on positions where
 // the engine the match proved stronger was to move (final score; tie -> B, the
 // established baseline) — the weaker engine's positions keep just the outcome,
 // which train.py already handles (no-`v` rows fall back to the pure result).
 if (cfg.saveGames && harvested.length) {
   const p = scores.reduce((a, b) => a + b, 0) / scores.length;
   const winner = p > 0.5 ? 'a' : 'b';
+  // Provenance for the kept v: the winning engine's eval + its gate depth + version.
+  const wVtag = computeVtag(
+    winner === 'a' ? cfg.evalA : cfg.evalB,
+    winner === 'a' ? cfg.depth : cfg.depthB,
+    winner === 'a' ? cfg.weightsA : cfg.weightsB,
+  );
   let lines = '';
   let nPos = 0;
   let nKept = 0;
@@ -292,7 +299,7 @@ if (cfg.saveGames && harvested.length) {
       const gid = `m${cfg.seed.toString(36)}-${pair}${gi === 0 ? 'w' : 'b'}`;
       for (const rec of recs[gi]) {
         const o = { fen: rec.fen, r: rec.r, g: gid };
-        if (rec.mover === winner && rec.v != null) { o.v = rec.v; nKept++; }
+        if (rec.mover === winner && rec.v != null) { o.v = rec.v; o.vs = wVtag; nKept++; }
         lines += JSON.stringify(o) + '\n';
         nPos++;
       }

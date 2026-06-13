@@ -1124,6 +1124,23 @@ function setUrlCode(code) {
 }
 const getUrlCode = () => normalizeCode(hashParams().get('code') || '');
 
+// Deep-linkable modes: the chosen mode rides in the same hash (`#mode=…`) so a link
+// can open straight into Puzzles/AI-vs-AI/etc., and switching modes updates the URL
+// (replaceState, so no history spam and no `hashchange` for our own writes). The
+// default two-player mode is left out to keep the bare URL clean; an online share
+// link already carries `code=`, which implies online on its own.
+const MODES = new Set(['human-human', 'human-ai', 'ai-ai', 'online', 'puzzle', 'editor']);
+const getUrlMode = () => { const m = hashParams().get('mode'); return MODES.has(m) ? m : null; };
+function setUrlMode(mode) {
+  const u = new URL(window.location.href);
+  const p = hashParams();
+  if (mode && mode !== 'human-human') p.set('mode', mode);
+  else p.delete('mode');
+  const s = p.toString();
+  u.hash = s ? s : '';
+  window.history.replaceState(null, '', u.href); // window.history — `history` is the local move list
+}
+
 // Tear down the current session (if any) and clear connection state. The caller
 // is responsible for the resulting UI phase.
 function leaveOnline() {
@@ -1432,6 +1449,7 @@ function applyModeVisibility() {
   // The eval bar is phase-dependent (puzzle free-play only); this covers the paths
   // that change mode/phase without a render (e.g. switching into the editor).
   syncEvalBar();
+  syncMobileTabs(); // show/hide the mobile Settings tab to match the mode
 }
 
 function toggleCustom(slot, show) {
@@ -1575,46 +1593,56 @@ function handoffControl() {
   driveAi();
 }
 
-$('mode').addEventListener('change', (e) => {
+// Switch to a new mode — from the dropdown, or routed programmatically (a `#mode=`
+// deep link / hashchange). Keeps the dropdown + URL in sync and, on mobile, surfaces
+// the relevant tab. A no-op if `next` is already the mode, or if leaving the editor
+// with an unplayable position (snaps the dropdown back so edits aren't lost).
+function selectMode(next) {
   const prev = ui.mode;
+  if (next === prev) return;
+
   // Leaving the editor: the edited board becomes a fresh game. Reject an unplayable
   // position (a side with no king) and snap back to the editor so edits aren't lost.
+  let editedBoard = null;
   if (prev === 'editor') {
-    const edited = readEditorState();
-    if (!edited) {
+    editedBoard = readEditorState();
+    if (!editedBoard) {
       alert('Give each side a king before leaving the board editor.');
-      e.target.value = 'editor';
+      $('mode').value = 'editor';
       return;
     }
-    ui.mode = e.target.value;
-    ui.flipped = false; // each mode auto-orients; don't carry a stale flip over
-    if (ui.mode === 'online') { applyModeVisibility(); setOnlinePhase('idle'); newGame(); return; }
-    applyModeVisibility();
-    if (ui.mode === 'puzzle') { enterPuzzleMode(); return; } // a puzzle replaces the edited board
-    loadGame(edited, []); // start a new game from the edited position, then continue
-    return;
   }
 
-  ui.mode = e.target.value;
+  ui.mode = next;
+  $('mode').value = next; // keep the dropdown in sync when routed programmatically
   ui.flipped = false; // each mode auto-orients; don't carry a stale flip over
-  if (prev === 'online' && ui.mode !== 'online') { leaveOnline(); setUrlCode(''); }
+  setUrlMode(next);
+
+  if (prev === 'online' && next !== 'online') { leaveOnline(); setUrlCode(''); }
   // Leaving puzzles keeps the position (so it can be analyzed in another mode), but
   // drops the puzzle itself: no pending reply, no hint arrow, no stale solution.
-  if (prev === 'puzzle' && ui.mode !== 'puzzle') {
+  if (prev === 'puzzle' && next !== 'puzzle') {
     clearTimeout(puzzleTimer);
     puzzle = null;
     puzzlePhase = 'idle';
     cg.setAutoShapes([]);
     renderPuzzleMeta();
   }
+
   applyModeVisibility();
-  if (ui.mode === 'editor') { enterEditor(); return; }
-  // Online needs a clean handshake, so it still starts a fresh game; every other
-  // mode change continues the current position (there's a New game button per mode).
-  if (ui.mode === 'online') { setOnlinePhase('idle'); newGame(); return; }
-  if (ui.mode === 'puzzle') { enterPuzzleMode(); return; }
+  // On mobile, jump to the Settings tab for modes whose primary controls live there
+  // (online's host/join panel, the board editor) so the panel shows without a tap.
+  if (next === 'online' || next === 'editor') setMobileTab('settings');
+
+  if (next === 'editor') { enterEditor(); return; }
+  // Online needs a clean handshake, so it starts a fresh game; every other mode
+  // change continues the current position (there's a New game button per mode).
+  if (next === 'online') { setOnlinePhase('idle'); newGame(); return; }
+  if (next === 'puzzle') { enterPuzzleMode(); return; } // a puzzle replaces the edited board
+  if (editedBoard) { loadGame(editedBoard, []); return; } // continue from the edited position
   handoffControl();
-});
+}
+$('mode').addEventListener('change', (e) => selectMode(e.target.value));
 $('side').addEventListener('change', (e) => {
   ui.humanColor = e.target.value;
   handoffControl(); // swap which side you play without losing the game
@@ -1870,7 +1898,43 @@ function enterStartupMode() {
   }
 }
 
+// --- mobile section tabs ---
+// On narrow screens the below-board content (move list, settings, rules) is split
+// into tabs so you don't scroll past one to reach another; the mode picker + action
+// buttons stay pinned under the board. body[data-mobile-tab] drives the CSS — it does
+// nothing on desktop, where the media-query rules don't apply and every section shows.
+const MOBILE_TABS = ['moves', 'settings', 'rules'];
+function setMobileTab(tab) {
+  if (!MOBILE_TABS.includes(tab)) tab = 'moves';
+  document.body.dataset.mobileTab = tab;
+  for (const b of document.querySelectorAll('.mobile-tab')) {
+    b.setAttribute('aria-selected', String(b.dataset.mobileTab === tab));
+  }
+}
+// Modes whose settings live in the .controls section (the Settings tab). The rest
+// either have no settings or keep them pinned in the actions bar (puzzle's panel),
+// so the Settings tab would be empty — hide it, and fall back to Moves if it's open.
+const SETTINGS_MODES = new Set(['human-ai', 'ai-ai', 'online', 'editor']);
+function syncMobileTabs() {
+  const hasSettings = SETTINGS_MODES.has(ui.mode);
+  $('tab-settings').hidden = !hasSettings;
+  if (!hasSettings && document.body.dataset.mobileTab === 'settings') setMobileTab('moves');
+}
+for (const b of document.querySelectorAll('.mobile-tab')) {
+  b.addEventListener('click', () => setMobileTab(b.dataset.mobileTab));
+}
+setMobileTab('moves');
+
 syncControlsFromDom();
+// A `#mode=…` deep link opens straight into that mode (unless a `#code=` is also
+// present — that means "join this game", handled by joinFromUrlCode below, which
+// forces online regardless).
+const urlMode = getUrlMode();
+if (urlMode && getUrlCode().length < CODE_LENGTH) {
+  ui.mode = urlMode;
+  $('mode').value = urlMode;
+  if (urlMode === 'online' || urlMode === 'editor') setMobileTab('settings');
+}
 loadNetCatalog(); // async: fills the per-slot net pickers from public/nn/manifest.json
 applyModeVisibility();
 enterStartupMode();
@@ -1930,5 +1994,13 @@ function joinFromUrlCode() {
   $('online-code').value = code;
   startJoin();
 }
-window.addEventListener('hashchange', joinFromUrlCode);
+// A hash change is either a shared `#code=` (join) or a `#mode=` route (switch mode).
+// A code wins — it implies online. Our own writes use replaceState and fire no
+// hashchange, so this only runs for genuine navigation (a pasted/edited URL).
+function onHashChange() {
+  if (getUrlCode().length >= CODE_LENGTH) { joinFromUrlCode(); return; }
+  const m = getUrlMode();
+  if (m && m !== ui.mode) selectMode(m);
+}
+window.addEventListener('hashchange', onHashChange);
 joinFromUrlCode(); // opened via a shared link (cold load)

@@ -64,6 +64,9 @@ h1 { margin: 0; font-size: 1.7rem; letter-spacing: 0.5px; }
 .controls { grid-area: controls; }
 .board-col { grid-area: board; }
 .side-col { grid-area: side; }
+/* The mobile section tabs only exist on narrow screens; on desktop each section has
+   its own column, so the bar is hidden and all the tabbed content shows at once. */
+.mobile-tabs { display: none; }
 .board-col { width: var(--board); }
 .side-col {
   height: var(--board);
@@ -519,10 +522,41 @@ button:disabled:hover { background: var(--panel); } /* no hover lift when locked
   :root { --board: min(94vw, 78vh); }
   .layout {
     grid-template-columns: var(--board);
-    grid-template-areas: "board" "actions" "side" "controls";
+    grid-template-areas: "board" "actions" "tabs" "side" "controls";
     gap: 10px 0;
   }
   .controls, .actions, .side-col { width: var(--board); height: auto; }
+
+  /* Section tabs: split the below-board content so the move list, settings, and rules
+     each get the full width instead of stacking into a long scroll. The mode picker +
+     action buttons stay pinned above (their own grid area). The active tab is chosen by
+     body[data-mobile-tab] (set in main.js); only that tab's section is shown. */
+  .mobile-tabs {
+    display: flex;
+    grid-area: tabs;
+    gap: 4px;
+    background: var(--panel);
+    border-radius: 8px;
+    padding: 4px;
+  }
+  .mobile-tab {
+    flex: 1;
+    padding: 10px 8px;
+    background: transparent;
+    border: none;
+    color: var(--muted);
+    font-weight: 600;
+    border-radius: 6px;
+  }
+  .mobile-tab[aria-selected="true"] { background: var(--accent); color: #15110d; }
+  .mobile-tab[hidden] { display: none; }
+  /* Show only the active tab's content. Rules lives inside .controls (so it sits in
+     the left column on desktop); the Rules tab shows just it, the Settings tab hides it. */
+  body[data-mobile-tab="moves"] .controls { display: none; }
+  body[data-mobile-tab="settings"] .side-col { display: none; }
+  body[data-mobile-tab="settings"] .controls .rules { display: none; }
+  body[data-mobile-tab="rules"] .side-col { display: none; }
+  body[data-mobile-tab="rules"] .controls > :not(.rules) { display: none; }
   /* Compact header: on a phone every vertical pixel above the board counts. */
   .topbar { margin-bottom: 8px; }
   h1 { font-size: 1.3rem; }

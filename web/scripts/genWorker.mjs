@@ -16,15 +16,20 @@ import { newGameState, toFen } from '../src/board.js';
 import { legalMoves, applyMove, gameStatus } from '../src/engine.js';
 import { chooseMoveDetailed, _internal } from '../src/ai.js';
 import { loadWeights } from '../src/nn.js'; // only to set the nn teacher's weights (--eval=nn)
+import { vtag as computeVtag } from './vtag.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const cfg = workerData.cfg;
+const NN_WEIGHTS = resolve(here, '../src/nn-weights.json'); // the champion (--eval=nn)
 
 if (cfg.evalName === 'nn') {
   try {
-    loadWeights(JSON.parse(readFileSync(resolve(here, '../src/nn-weights.json'), 'utf8')));
+    loadWeights(JSON.parse(readFileSync(NN_WEIGHTS, 'utf8')));
   } catch { /* fall back to material eval */ }
 }
+
+// Provenance tag for every v this run writes (eval+depth+version) — see vtag.mjs.
+const vtag = computeVtag(cfg.evalName, cfg.depth, NN_WEIGHTS);
 
 function makeRng(seed) {
   let a = seed >>> 0;
@@ -96,7 +101,7 @@ parentPort.on('message', (msg) => {
     // `v` = the search's value of this position (cp, side-to-move-relative) for TD /
     // bootstrap targets; omitted for random opening plies. With --eval=nn it's the
     // net's own deeper-search value — an unbiased bootstrap signal (train.py --lambda).
-    if (scores[i] != null) rec.v = scores[i];
+    if (scores[i] != null) { rec.v = scores[i]; rec.vs = vtag; }
     lines += JSON.stringify(rec) + '\n';
   }
   parentPort.postMessage({ type: 'result', g, lines, nPositions: positions.length });
