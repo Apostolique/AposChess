@@ -52,6 +52,7 @@ import { Worker } from 'node:worker_threads';
 import { cpus } from 'node:os';
 
 import { fmtDur, fmtNum, fmtMB, liveStatus } from './fmt.mjs';
+import { installStop, printStopHint } from './stop.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const args = Object.fromEntries(
@@ -99,29 +100,28 @@ const fresh = !existsSync(cfg.out);
 const forever = !Number.isFinite(cfg.games);
 console.log(`Generating ${forever ? 'games forever (Ctrl-C to stop)' : `${cfg.games} games`} -> ${cfg.out}${fresh ? '' : ' (appending)'}`);
 console.log(`  ${cfg.depth != null ? `depth ${cfg.depth}` : `${cfg.movetime}ms/move`} | eval ${cfg.evalName} | openings ${cfg.openings} | jobs ${jobs} | seed ${cfg.seed}`);
+printStopHint();
 
 const status = liveStatus();
 const t0 = Date.now();
 let totalPositions = 0;
 let doneGames = 0;
 let nextGame = 0;
-let stopping = false; // set on Ctrl-C in forever mode: stop dispatching, let in-flight games drain
+let stopping = false; // set on key/Ctrl-C: stop dispatching, let in-flight games drain
+
+// A key/Ctrl-C stops new dispatches; workers finish their current game (already
+// flushed on completion) and then retire, so the run ends cleanly with a valid,
+// fully-written dataset — whether the run is finite or --forever.
+const stopper = installStop(() => {
+  stopping = true;
+  status.clear();
+  console.log('  Stopping: draining in-flight games...');
+});
 
 await new Promise((resolve_) => {
   const pool = [];
   let live = jobs;
   const retire = () => { if (--live === 0) resolve_(); };
-
-  // In forever mode, a SIGINT stops new dispatches; workers finish their current
-  // game (already flushed on completion) and then retire, so the run ends cleanly.
-  if (forever) {
-    process.on('SIGINT', () => {
-      if (stopping) return;
-      stopping = true;
-      status.clear();
-      console.log('  Stopping: draining in-flight games...');
-    });
-  }
 
   const dispatch = (w) => {
     if (stopping || nextGame >= cfg.games) { w.terminate(); return; } // exit -> retire
@@ -150,6 +150,7 @@ await new Promise((resolve_) => {
     w.on('exit', retire);
   }
 });
+stopper.dispose();
 status.clear();
 {
   const el = (Date.now() - t0) / 1000;

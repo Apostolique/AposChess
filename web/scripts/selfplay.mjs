@@ -73,6 +73,7 @@ import { writeFileSync, appendFileSync, mkdirSync } from 'node:fs';
 import { vtag as computeVtag } from './vtag.mjs';
 
 import { fmtDur, fmtNum, liveStatus } from './fmt.mjs';
+import { installStop, printStopHint } from './stop.mjs';
 
 // --- args --------------------------------------------------------------------
 const args = Object.fromEntries(
@@ -180,12 +181,14 @@ console.log(
   `openings ${cfg.openings} plies | TT ${cfg.useTT ? 'on' : 'off'} | jobs ${jobs} | seed ${cfg.seed} | ` +
   `${cfg.sprt ? `SPRT[${cfg.elo0},${cfg.elo1}] α=${cfg.alpha} β=${cfg.beta}` : `${cfg.games} games`}`,
 );
+printStopHint();
 
 const scores = [];
 const sprtLower = Math.log(cfg.beta / (1 - cfg.alpha));
 const sprtUpper = Math.log((1 - cfg.beta) / cfg.alpha);
 const t0 = Date.now();
 let decided = null;
+let stopped = false; // key/Ctrl-C: stop dispatching and finalize with the games played so far
 
 // A single in-place status line (carriage-return) refreshed after every game, so a
 // long match never looks frozen between the milestone reports. Lightweight on
@@ -236,15 +239,27 @@ const harvested = [];
 // Worker pool: pull-model dispatch (hand each idle worker the next pair index) so
 // load stays balanced regardless of per-game time, and SPRT can stop promptly.
 let nextPair = 0;
+let stopper = null;
 await new Promise((resolve) => {
   const pool = [];
   let live_ = jobs;
   const retire = () => { if (--live_ === 0) resolve(); };
 
   const dispatch = (w) => {
-    if (decided || nextPair >= totalPairs) { w.terminate(); return; } // exit -> retire
+    if (stopped || decided || nextPair >= totalPairs) { w.terminate(); return; } // exit -> retire
     w.postMessage({ type: 'play', pair: nextPair++ });
   };
+
+  // A key/Ctrl-C stops dispatching and terminates the workers; the run then falls
+  // through to the normal reporting/harvest/result-file with the games already played
+  // (in-flight pairs are dropped, exactly as an SPRT early stop drops them).
+  stopper = installStop(() => {
+    if (stopped) return;
+    stopped = true;
+    status.clear();
+    console.log('\n  Stopping early — finalizing with the games played so far…');
+    pool.forEach((p) => p.terminate());
+  });
 
   for (let i = 0; i < jobs; i++) {
     const w = new Worker(new URL('./matchWorker.mjs', import.meta.url), { workerData: { cfg } });
@@ -262,9 +277,15 @@ await new Promise((resolve) => {
     w.on('exit', retire);
   }
 });
+stopper?.dispose();
 
 status.clear();
+if (!scores.length) {
+  console.log('Stopped before any game finished — nothing to report; no files written.');
+  process.exit(0);
+}
 console.log(report(scores, true));
+if (stopped) console.log('  (stopped early — results cover only the games above)');
 {
   const el = (Date.now() - t0) / 1000;
   console.log(`elapsed ${fmtDur(el)} (${(scores.length / (el / 60)).toFixed(0)} games/min)`);

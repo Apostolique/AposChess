@@ -108,6 +108,7 @@ const genScript = resolve(here, 'gen-selfplay.mjs');
 const featurizeScript = resolve(here, 'featurize.mjs');
 const matchScript = resolve(here, 'selfplay.mjs');
 const refreshScript = resolve(here, 'refresh-v.mjs');
+const rankScript = resolve(here, 'rank-engines.mjs');
 const trainPy = resolve(repoDir, 'training', 'train.py');
 
 const rawFile = join(dataDir, 'selfplay.jsonl');
@@ -131,6 +132,7 @@ function archiveChampion(file) {
   return hash;
 }
 const resultFile = join(loopDir, 'match.json');
+const ledgerFile = join(loopDir, 'engine-elo.json'); // engine-strength ledger (npm run rank)
 const logFile = join(loopDir, 'loop.log');
 const publicNN = resolve(webDir, 'public', 'nn');
 const manifestFile = join(publicNN, 'manifest.json');
@@ -172,6 +174,15 @@ const cfg = {
   // refresh"; only records the current champion already labeled at this depth are no-ops.
   refreshCycle: args['no-refresh'] ? 0 : num(args['refresh-cycle'], 0.01),
   refreshCycleDepth: num(args['refresh-cycle-depth'], num(args.depth, 6)),
+  // Engine ranking for smart weakest-first v refresh. On by default: each promotion adds
+  // the new champion to the Elo ledger (incrementally — one matchup vs the stable hc
+  // anchor), and the refreshes below read the ledger to relabel the WEAKEST engine's `v`
+  // first instead of a blind random fraction. --no-rank reverts to the classic refresh.
+  rank: !args['no-rank'],
+  rankDepth: num(args['rank-depth'], 4),
+  // Default to the gate's game count: the ledger needs enough games to resolve the real
+  // ordering (champions sit only ~elo1 apart), so it matches the gate's match length.
+  rankGames: num(args['rank-games'], num(args['gate-games'], 800)),
 };
 
 function findPython() {
@@ -212,7 +223,10 @@ process.on('SIGINT', () => { stopping = true; console.log('\n  Ctrl-C: stopping 
 function run(label, cmd, argv, cwd = webDir) {
   if (stopping) return false;
   console.log(`\n--- ${label} — ${hms()} ---`);
-  const r = spawnSync(cmd, argv, { stdio: 'inherit', cwd });
+  // APOS_CHILD tells the child tools they're orchestrated: they use a SIGINT-only
+  // graceful stop instead of grabbing the TTY's raw mode, so the loop's own Ctrl-C
+  // (stop after this cycle) keeps working — see scripts/stop.mjs.
+  const r = spawnSync(cmd, argv, { stdio: 'inherit', cwd, env: { ...process.env, APOS_CHILD: '1' } });
   if (r.signal) { stopping = true; return false; }
   // Windows delivers console Ctrl-C to the whole process group; the child then exits
   // with STATUS_CONTROL_C_EXIT (0xC000013A) instead of a signal — an interrupt, not a crash.
@@ -220,6 +234,29 @@ function run(label, cmd, argv, cwd = webDir) {
   if (r.status !== 0) { log(`${label} FAILED (exit ${r.status}); stopping loop.`); return false; }
   return true;
 }
+
+// Update the engine-strength ledger incrementally: only the engines it doesn't yet rank
+// (e.g. a just-promoted champion) play a matchup against the stable hc anchor; the rest
+// are reused. --no-scan keeps it fast (record counts aren't needed to drive the refresh).
+// Maintenance, like the refreshes — a failure logs but doesn't stop the loop.
+function runRank(label) {
+  if (!cfg.rank) return;
+  run(label, process.execPath,
+    [rankScript, '--incremental', '--no-scan', '--no-save-games',
+      `--depth=${cfg.rankDepth}`, `--games=${cfg.rankGames}`, `--out=${ledgerFile}`, ...jobArg]);
+}
+
+// Build refresh-v args. With ranking on AND a ledger present, target the WEAKEST cohort
+// via the ledger (relabeling the worst `v` first) and recompute with the current champion
+// — passed explicitly so a briefly-stale ledger can never pick a weaker engine. Otherwise
+// the classic random-fraction refresh with the champion.
+function refreshArgs(frac, depth) {
+  const a = [refreshScript, `--frac=${frac}`, `--depth=${depth}`, `--seed=${Date.now()}`, ...jobArg];
+  return (cfg.rank && existsSync(ledgerFile))
+    ? [...a, `--ledger=${ledgerFile}`, '--eval=nn', `--weights=${champion}`]
+    : [...a, '--refresh', `--weights=${champion}`];
+}
+const refreshMode = () => (cfg.rank && existsSync(ledgerFile)) ? 'weakest-first' : 'random';
 
 function upsertManifest(arch) {
   let man = { default: 'balanced-64', nets: [] };
@@ -257,9 +294,16 @@ log(`train:loop start — batch ${cfg.batch} @ depth ${cfg.depth} | gate ${cfg.g
   + `${existsSync(lineage) ? ' (resuming lineage)' : ''} | `
   + `refresh/cycle ${cfg.refreshCycle > 0 ? `${(cfg.refreshCycle * 100).toFixed(1)}% @ depth ${cfg.refreshCycleDepth}` : 'off'} | `
   + `refresh on promotion ${cfg.refreshFrac > 0 ? `${(cfg.refreshFrac * 100).toFixed(0)}% @ depth ${cfg.refreshDepth}` : 'off'} | `
+  + `rank ${cfg.rank ? `on (hc anchor, depth ${cfg.rankDepth}, ${cfg.rankGames}g/new engine)` : 'off'} | `
   + `cycles ${cfg.cycles === Infinity ? '∞' : cfg.cycles}`);
 
 const jobArg = cfg.jobs !== undefined ? [`--jobs=${cfg.jobs}`] : [];
+
+// Seed/update the strength ledger before cycling so the very first refresh can already go
+// weakest-first. Incremental, so it's a no-op (no matches) once the ledger ranks every
+// instantiable engine — only the first ever run plays the full (small) gauntlet.
+runRank('Rank engines (seed ledger)');
+
 const loopT0 = Date.now();
 let promotions = 0;
 for (let c = 1; c <= cfg.cycles && !stopping; c++) {
@@ -280,10 +324,8 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
   //     searches, so this upgrades targets even between promotions. The seed varies per
   //     cycle so coverage spreads across the set instead of re-picking the same slice.
   if (cfg.refreshCycle > 0) {
-    if (!run(`Refresh v (${(cfg.refreshCycle * 100).toFixed(1)}% @ depth ${cfg.refreshCycleDepth})`,
-      process.execPath, [refreshScript, '--refresh', `--frac=${cfg.refreshCycle}`,
-        `--weights=${champion}`, `--depth=${cfg.refreshCycleDepth}`, `--seed=${Date.now()}`,
-        ...jobArg])) break;
+    if (!run(`Refresh v (${(cfg.refreshCycle * 100).toFixed(1)}% ${refreshMode()} @ depth ${cfg.refreshCycleDepth})`,
+      process.execPath, refreshArgs(cfg.refreshCycle, cfg.refreshCycleDepth))) break;
   }
 
   // 2. Featurize the raw positions for the current feature set. (After a refresh this
@@ -327,15 +369,18 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
     log(`cycle ${c}: PROMOTED ✓  candidate ${pct}% / Elo +${res.elo.toFixed(0)} over champion `
       + `(${res.games} games, cycle took ${fmtDur((Date.now() - cycleT0) / 1000)}). `
       + `New champion published as 'loop-champion' (archived ${champHash}.json). Total promotions: ${promotions}.`);
+    // Add the new champion to the strength ledger (incremental: one matchup vs the anchor)
+    // so the refresh below — and every later cycle — recognizes it as the new best and
+    // can relabel the now-second-best champion's `v` weakest-first.
+    runRank(`Rank engines (add champion ${champHash})`);
     // The champion (hence the `v` target) just changed: value-iterate by recomputing
     // `v` on a fraction of the dataset with the NEW champion. Optional maintenance —
     // a failure shouldn't kill the loop, so we don't gate on its result (a Ctrl-C
     // still propagates via the `stopping` flag and ends the run after this cycle).
     // Seeded per run so successive refreshes cover different slices of the set.
     if (cfg.refreshFrac > 0) {
-      run(`Refresh v (${(cfg.refreshFrac * 100).toFixed(0)}% @ depth ${cfg.refreshDepth}, new champion)`,
-        process.execPath, [refreshScript, '--refresh', `--frac=${cfg.refreshFrac}`,
-          `--weights=${champion}`, `--depth=${cfg.refreshDepth}`, `--seed=${Date.now()}`, ...jobArg]);
+      run(`Refresh v (${(cfg.refreshFrac * 100).toFixed(0)}% ${refreshMode()} @ depth ${cfg.refreshDepth}, new champion)`,
+        process.execPath, refreshArgs(cfg.refreshFrac, cfg.refreshDepth));
     }
   } else if (!cfg.cold && res.sprt !== 'H0' && res.score >= 0.5) {
     // Inconclusive but not losing: keep the candidate as the lineage so the next

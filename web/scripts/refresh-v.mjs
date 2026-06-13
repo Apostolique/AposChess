@@ -24,10 +24,21 @@
 // Usage (run from web/):
 //   node scripts/refresh-v.mjs [--refresh] [--frac=P] [--depth=D] [--jobs=N] [--eval=E]
 //                              [--weights=FILE] [--in=FILE] [--out=FILE] [--seed=S]
+//                              [--ledger[=FILE]]
 // Defaults: depth 6, jobs = CPU cores, eval 'nn' (weights = ./src/nn-weights.json, the
 //           champion), in/out = ../training/data/selfplay.jsonl (atomic replace), seed 1.
 //   --eval=handcrafted recomputes v with the handcrafted eval (no weights) — e.g. to
 //   relabel the bootstrap target with its outcome-grounded values.
+//
+// Smart weakest-first refresh (--ledger): read the strength ledger written by
+// `npm run rank` (default training/data/loop/engine-elo.json) and let it drive the whole
+// refresh. The recompute engine DEFAULTS to the ledger's STRONGEST engine (so v is always
+// relabeled with the best available eval; explicit --eval/--weights still win), and the
+// refresh replaces ONLY the single WEAKEST cohort of labels still present — the lowest-Elo
+// engine in the data, with records that are missing v / untagged / from an unrecoverable
+// engine all counting as weakest. Stronger labels are left alone, so re-running it walks
+// the dataset upward — weakest engine first — until everything carries the best engine's
+// v. (A pre-scan picks the target each run; --frac can still chunk a very large cohort.)
 
 import { Worker } from 'node:worker_threads';
 import { createReadStream, createWriteStream, existsSync, rmSync, renameSync, readFileSync, statSync } from 'node:fs';
@@ -38,6 +49,7 @@ import { cpus } from 'node:os';
 
 import { fmtDur, fmtNum, fmtMB, liveStatus, everyMs } from './fmt.mjs';
 import { vtag as computeVtag } from './vtag.mjs';
+import { installStop, printStopHint } from './stop.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const args = Object.fromEntries(process.argv.slice(2).map((a) => {
@@ -48,15 +60,63 @@ const frac = args.frac !== undefined ? Number(args.frac) : 1.0;
 const depth = args.depth !== undefined ? Number(args.depth) : 6;
 const jobs = Math.max(1, args.jobs !== undefined ? Number(args.jobs) : cpus().length);
 const seed = args.seed !== undefined ? Number(args.seed) : 1;
-// Which eval recomputes v: 'nn' (default, uses --weights) or 'handcrafted' (no weights).
-// Relabeling with the recalibrated handcrafted injects its outcome-grounded values into
-// the bootstrap target where an nn champion's own v may carry the net's biases.
-const evalName = typeof args.eval === 'string' ? args.eval : 'nn';
-const weights = typeof args.weights === 'string'
-  ? resolve(process.cwd(), args.weights) : resolve(here, '../src/nn-weights.json');
+// --- smart weakest-first refresh (--ledger) --------------------------------------
+// With --ledger, the strength ledger from `npm run rank` (engine-elo.json) drives the
+// refresh end to end: the RECOMPUTE ENGINE defaults to the ledger's STRONGEST engine (so
+// v is always relabeled with the best available eval; explicit --eval/--weights still
+// win), and the refresh TARGETS exactly the single WEAKEST cohort of labels still present
+// — the lowest-Elo engine in the data, with records that are missing v / carry no vs tag
+// / were labeled by an unrecoverable engine all counting as weakest (-Inf). Every
+// stronger label is left untouched, so running it repeatedly replaces the v values one
+// engine at a time, weakest first, until the whole dataset carries the current best
+// engine's labels. Without --ledger nothing here changes the classic behavior.
+const ledgerPath = args.ledger === true
+  ? resolve(here, '../../training/data/loop/engine-elo.json')
+  : (typeof args.ledger === 'string' ? resolve(process.cwd(), args.ledger) : null);
+let eloByVersion = null, best = null;
+if (ledgerPath) {
+  let ledger;
+  try { ledger = JSON.parse(readFileSync(ledgerPath, 'utf8')); }
+  catch (e) { console.error(`Could not read ledger ${ledgerPath}: ${e.message}. Run 'npm run rank' first.`); process.exit(1); }
+  eloByVersion = new Map();
+  // The material fallback ('?') is excluded from refresh decisions entirely — its Elo is
+  // only an internal stat in the ledger (a floor reference for `npm run rank`). So anything
+  // it (or an unrecoverable/untagged source) labeled falls into the -Inf "weakest" bucket
+  // and refreshes first, rather than being scored at the material level.
+  for (const e of ledger.ranking || []) if (e.elo != null && e.version !== '?') eloByVersion.set(e.version, e.elo);
+  // Strongest engine = highest Elo (the anchor sits at 0; a contender may beat it).
+  best = (ledger.ranking || []).filter((e) => e.elo != null && e.version !== '?')
+    .reduce((a, b) => (b.elo > a.elo ? b : a), { elo: -Infinity });
+  if (!Number.isFinite(best.elo)) best = null;
+}
+
+// Which eval recomputes v: explicit --eval/--weights win; otherwise the ledger's best
+// engine (when --ledger), else 'nn' with the shipped champion (the prior default).
+// 'nn' uses --weights; 'handcrafted' needs none. Relabeling with the recalibrated
+// handcrafted injects its outcome-grounded values where an nn champion's own v may carry
+// the net's biases.
+const evalName = typeof args.eval === 'string' ? args.eval
+  : (best ? (best.eng === 'nn' ? 'nn' : 'handcrafted') : 'nn');
+const weights = typeof args.weights === 'string' ? resolve(process.cwd(), args.weights)
+  : (best && best.eng === 'nn' && best.file ? best.file : resolve(here, '../src/nn-weights.json'));
 // Provenance tag stamped onto every (re)computed v: which eval + depth + version
 // produced it (e.g. 'nn6@a3f2c1', 'hc6@2') — keeps the dataset auditable as v drifts.
 const vtag = computeVtag(evalName, depth, weights);
+
+// The recompute engine's identity (eng + version), used to skip records it already
+// labelled at >= this depth (no improvement to redo them).
+const recomputeEng = evalName.startsWith('nn') ? 'nn' : 'hc';
+const recomputeVersion = vtag.slice(vtag.indexOf('@') + 1);
+const parseTag = (tag) => { const m = /^(nn|hc)(\d+|t)@(.+)$/.exec(tag || ''); return m ? { eng: m[1], depth: m[2], version: m[3] } : null; };
+const eloForTag = (tag) => { const t = parseTag(tag); const e = t && eloByVersion.get(t.version); return e == null ? -Infinity : e; };
+const alreadyDone = (tag) => { const t = parseTag(tag); if (!t || t.eng !== recomputeEng || t.version !== recomputeVersion) return false; const d = Number(t.depth); return Number.isFinite(d) && d >= depth; };
+// Human-readable name for a cohort's Elo (for the banner): the version(s) at that Elo, or
+// the catch-all weakest bucket for -Inf (missing v / no tag / material / unrecoverable).
+const cohortName = (elo) => {
+  if (elo === -Infinity) return 'unknown / missing v / material / unrecoverable';
+  const vs = [...eloByVersion.entries()].filter(([, e]) => e === elo).map(([v]) => v);
+  return `${vs.length ? vs.join(', ') : '?'} (Elo ${elo.toFixed(0)})`;
+};
 const inFile = typeof args.in === 'string'
   ? resolve(process.cwd(), args.in) : resolve(here, '../../training/data/selfplay.jsonl');
 const outFile = typeof args.out === 'string'
@@ -69,9 +129,76 @@ const CAP = Math.max(jobs * B * 8, 20000); // max outstanding (un-emitted) lines
 const t0 = Date.now();
 const status = liveStatus();
 const tick = everyMs(1000);
+
+// --- graceful early stop ----------------------------------------------------------
+// On a key/Ctrl-C we DON'T abort (that would lose all the recomputed values and leave
+// a dangling .tmp). Instead we stop scheduling new recomputes, copy every remaining
+// input line through UNCHANGED, let the in-flight searches finish, and then do the
+// normal atomic rename — so the output is a complete, valid dataset that's simply
+// refreshed up to the point we stopped. `rl` is filled in once the main pass starts;
+// a stop during the (read-only) pre-scan just leaves the dataset untouched.
+let stopping = false;
+let rl = null;
+function requestStop() {
+  stopping = true;
+  status.clear();
+  if (rl) {
+    console.log('\n  Stopping early — copying the remaining lines through unchanged and finalizing…');
+    enqueueBatch();   // flush any half-full batch so the in-flight records still resolve
+    // Un-pause if backpressure had paused the reader — but only if it's still open;
+    // the whole file may already be read (just the searches outstanding), in which
+    // case the readline is closed and resume() would throw.
+    if (!inputEnded) { try { rl.resume(); } catch { /* already closed */ } }
+    flush();
+    maybeFinalize();  // in case everything's already drained, complete the rename now
+  } else {
+    console.log('\n  Stopping early during the pre-scan — the dataset is left unchanged.');
+  }
+}
+const stopper = installStop(requestStop);
+
+// --- pre-scan (--ledger): find this run's target = the single weakest cohort still
+// present. One cheap streaming pass (no search): each record's label Elo is its engine's
+// ledger Elo, or -Inf if it's missing v / untagged / from an unrecoverable engine;
+// records the recompute engine already produced at >= depth are not refresh candidates.
+// The minimum over the candidates is the target — only those records get refreshed.
+let targetElo = null;            // null => classic mode (no --ledger)
+if (eloByVersion) {
+  let min = Infinity, scanned = 0;
+  const sTick = everyMs(500);
+  try {
+    const srl = createInterface({ input: createReadStream(inFile), crlfDelay: Infinity });
+    for await (const line of srl) {
+      if (stopping) { srl.close(); break; }
+      if (!line) continue;
+      scanned++;
+      const hasV = line.includes('"v":');
+      const tag = hasV ? ((line.match(/"vs":"([^"]+)"/) || [])[1] || null) : null;
+      if (alreadyDone(tag)) continue;                  // already the best engine at >= depth
+      const elo = hasV ? eloForTag(tag) : -Infinity;   // missing v counts as weakest
+      if (elo < min) min = elo;
+      if (sTick()) status.update(`  scanning for weakest cohort... ${fmtNum(scanned)} lines`);
+    }
+  } catch (e) { console.warn(`\n  pre-scan interrupted (${e.message}); proceeding with what was seen.`); }
+  status.clear();
+  if (stopping) { console.log('Stopped before writing; dataset left unchanged.'); stopper.dispose(); process.exit(0); }
+  if (min === Infinity) {
+    console.log(`Nothing to refresh: every label is already the best engine ${vtag} at depth >= ${depth}.`);
+    process.exit(0);
+  }
+  targetElo = min;
+}
+
 console.log(`refresh-v: ${inFile} (${fmtMB(statSync(inFile).size)}) | depth ${depth} | jobs ${jobs} | `
   + `eval ${evalName}${evalName === 'nn' ? ` (${weights.replace(/^.*[\\/]/, '')})` : ''} | seed ${seed}`);
-console.log(`  mode: ${refresh ? `refresh ${(frac * 100).toFixed(0)}% of existing v + fill missing` : 'fill missing v only'} -> ${outFile}`);
+if (eloByVersion) {
+  console.log(`  ledger: ${ledgerPath.replace(/^.*[\\/]/, '')} | recompute with ${vtag}`
+    + `${best ? ` (best engine, Elo ${best.elo.toFixed(0)})` : ''}`);
+  console.log(`  target: weakest cohort still present = ${cohortName(targetElo)} -> ${outFile}`);
+} else {
+  console.log(`  mode: ${refresh ? `refresh ${(frac * 100).toFixed(0)}% of existing v + fill missing` : 'fill missing v only'} -> ${outFile}`);
+}
+printStopHint();
 
 function mulberry32(a) {
   a >>>= 0;
@@ -100,25 +227,36 @@ function pump() { while (idle.length && queue.length) idle.pop().postMessage({ t
 function maybeFinalize() {
   if (finalized || !inputEnded || batch.length || queue.length || idle.length !== pool.length) return;
   finalized = true;
+  stopper.dispose();
   flush();
   status.clear();
   for (const w of pool) w.terminate();
   out.end(() => {
     if (existsSync(outFile)) rmSync(outFile);
     renameSync(tmp, outFile);
-    console.log(`Done: ${fmtNum(filled)} filled, ${fmtNum(refreshed)} refreshed, ${fmtNum(passed)} unchanged `
+    console.log(`${stopper.requested ? 'Stopped early' : 'Done'}: ${fmtNum(filled)} filled, ${fmtNum(refreshed)} refreshed, ${fmtNum(passed)} unchanged `
       + `(${fmtNum(lineIdx)} total) in ${fmtDur((Date.now() - t0) / 1000)} -> ${outFile} (${fmtMB(statSync(outFile).size)}).`);
     console.log('Re-featurize next:  npm run train:featurize');
   });
 }
 
-const rl = createInterface({ input: createReadStream(inFile), crlfDelay: Infinity });
+rl = createInterface({ input: createReadStream(inFile), crlfDelay: Infinity });
 
 rl.on('line', (line) => {
   if (!line) return;
   const idx = lineIdx++;
+  // After a stop request, every remaining line is copied through verbatim (no
+  // recompute) so the output stays a complete, valid dataset.
+  if (stopping) { ready.set(idx, line + '\n'); passed++; flush(); return; }
   const hasV = line.includes('"v":');
-  const recompute = !hasV || (refresh && rng() < frac);
+  let recompute;
+  if (targetElo === null) {                     // classic mode (no --ledger)
+    recompute = !hasV || (refresh && rng() < frac);
+  } else {                                       // --ledger: only the weakest cohort
+    const tag = hasV ? ((line.match(/"vs":"([^"]+)"/) || [])[1] || null) : null;
+    const elo = hasV ? eloForTag(tag) : -Infinity;
+    recompute = !alreadyDone(tag) && elo === targetElo && rng() < frac;
+  }
   if (!recompute) { ready.set(idx, line + '\n'); passed++; flush(); return; }
   const rec = JSON.parse(line);
   if (typeof rec.fen !== 'string') { ready.set(idx, line + '\n'); passed++; flush(); return; }

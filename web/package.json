@@ -10,6 +10,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "match": "node scripts/selfplay.mjs",
+    "rank": "node scripts/rank-engines.mjs",
     "train": "node scripts/train-pipeline.mjs",
     "train:gen": "node scripts/gen-selfplay.mjs",
     "train:fit": "node scripts/train-fit.mjs",
