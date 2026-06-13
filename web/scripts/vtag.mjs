@@ -16,15 +16,22 @@ import { readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { HC_VERSION } from '../src/ai.js';
 
-const hashCache = new Map(); // weightsPath -> short hash (a file doesn't change mid-run)
+// Short content hash of a weights file = its nn version. Uncached/pure: the loop's
+// champion file keeps ONE path but its content changes across promotions, so the loop
+// archives by calling this fresh each time. '?' = missing (material fallback).
+export function weightsHash(weightsPath) {
+  if (!weightsPath) return '?';
+  try { return createHash('sha1').update(readFileSync(weightsPath)).digest('hex').slice(0, 6); }
+  catch { return '?'; }
+}
+
+// Cached wrapper for the per-position tagging hot path (short-lived gen/refresh
+// workers, where a given weights file is constant for the run).
+const hashCache = new Map(); // weightsPath -> short hash
 function nnVersion(weightsPath) {
   if (!weightsPath) return '?';
   let h = hashCache.get(weightsPath);
-  if (h === undefined) {
-    try { h = createHash('sha1').update(readFileSync(weightsPath)).digest('hex').slice(0, 6); }
-    catch { h = '?'; }
-    hashCache.set(weightsPath, h);
-  }
+  if (h === undefined) { h = weightsHash(weightsPath); hashCache.set(weightsPath, h); }
   return h;
 }
 

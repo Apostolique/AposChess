@@ -95,6 +95,7 @@ import { dirname, resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { fmtDur, fmtMB } from './fmt.mjs';
+import { weightsHash } from './vtag.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const webDir = resolve(here, '..');
@@ -115,6 +116,20 @@ const champion = resolve(webDir, 'src', 'nn-weights.json');
 const candidate = join(loopDir, 'candidate.json');
 const lineage = join(loopDir, 'lineage.json'); // rejected-but-positive candidate, warm-start source
 const prevChampion = join(loopDir, 'champion-prev.json');
+// Archive of every champion that has labelled data, keyed by its content hash (= the
+// nn `vs` version stamped onto that data). Lets historical v-contributors be
+// re-instantiated for the strength-ranking that drives smart weakest-first v refresh
+// (see scripts/vtag.mjs). git-ignored (under training/data).
+const championsDir = join(loopDir, 'champions');
+// Copy `file` (a champion) into the archive under its hash; returns the hash.
+function archiveChampion(file) {
+  const hash = weightsHash(file);
+  if (hash === '?') return hash;
+  mkdirSync(championsDir, { recursive: true });
+  const dest = join(championsDir, `${hash}.json`);
+  if (!existsSync(dest)) copyFileSync(file, dest);
+  return hash;
+}
 const resultFile = join(loopDir, 'match.json');
 const logFile = join(loopDir, 'loop.log');
 const publicNN = resolve(webDir, 'public', 'nn');
@@ -219,6 +234,9 @@ if (!existsSync(champion)) {
   console.error(`No champion at ${champion}. Train a net first (e.g. npm run train:fit).`);
   process.exit(1);
 }
+// Archive the starting champion too — it labels the data generated before the first
+// promotion, so its v-contributors must stay reconstructable like every later champion.
+archiveChampion(champion);
 if (cfg.fresh && existsSync(rawFile)) { rmSync(rawFile); log('Cleared dataset (--fresh).'); }
 
 const hidden = championHidden();
@@ -302,12 +320,13 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
     const arch = JSON.parse(readFileSync(candidate, 'utf8')).arch;
     copyFileSync(champion, prevChampion);   // backup for safety
     copyFileSync(candidate, champion);      // candidate becomes champion
+    const champHash = archiveChampion(champion); // keep it reconstructable by its vs version
     if (existsSync(lineage)) rmSync(lineage); // lineage cleared the gate; next start = new champion
     upsertManifest(arch); copyFileSync(candidate, loopChampPub); // make it playable
     promotions++;
     log(`cycle ${c}: PROMOTED ✓  candidate ${pct}% / Elo +${res.elo.toFixed(0)} over champion `
       + `(${res.games} games, cycle took ${fmtDur((Date.now() - cycleT0) / 1000)}). `
-      + `New champion published as 'loop-champion'. Total promotions: ${promotions}.`);
+      + `New champion published as 'loop-champion' (archived ${champHash}.json). Total promotions: ${promotions}.`);
     // The champion (hence the `v` target) just changed: value-iterate by recomputing
     // `v` on a fraction of the dataset with the NEW champion. Optional maintenance —
     // a failure shouldn't kill the loop, so we don't gate on its result (a Ctrl-C
