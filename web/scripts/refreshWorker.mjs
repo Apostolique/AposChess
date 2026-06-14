@@ -12,16 +12,20 @@ import { parseFen } from '../src/board.js';
 import { chooseMoveDetailed } from '../src/ai.js';
 import { loadWeights } from '../src/nn.js';
 
-const { weights, depth, evalName = 'nn' } = workerData;
+const { weights, depth, evalName = 'nn', stopFlag = null } = workerData;
 // The handcrafted eval needs no weights; only load a net for the 'nn' eval.
 if (evalName === 'nn') { try { loadWeights(JSON.parse(readFileSync(weights, 'utf8'))); } catch { /* material fallback */ } }
 
 parentPort.on('message', (msg) => {
   if (msg.type !== 'batch') return;
-  const vs = msg.items.map(({ idx, fen }) => ({
-    idx,
-    v: Math.round(chooseMoveDetailed(parseFen(fen), depth, Math.random, Infinity, true, [], evalName).score),
-  }));
-  parentPort.postMessage({ type: 'done', vs });
+  // Check the shared stop flag between positions: once an early stop fires, abandon the
+  // rest of the batch (reported as `skipped`) instead of grinding through every search.
+  // The worst case is one in-flight search per worker — the one already running here.
+  const vs = [], skipped = [];
+  for (const { idx, fen } of msg.items) {
+    if (stopFlag && Atomics.load(stopFlag, 0)) { skipped.push(idx); continue; }
+    vs.push({ idx, v: Math.round(chooseMoveDetailed(parseFen(fen), depth, Math.random, Infinity, true, [], evalName).score) });
+  }
+  parentPort.postMessage({ type: 'done', vs, skipped });
 });
 parentPort.postMessage({ type: 'ready' });

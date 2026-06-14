@@ -299,10 +299,10 @@ log(`train:loop start — batch ${cfg.batch} @ depth ${cfg.depth} | gate ${cfg.g
 
 const jobArg = cfg.jobs !== undefined ? [`--jobs=${cfg.jobs}`] : [];
 
-// Seed/update the strength ledger before cycling so the very first refresh can already go
-// weakest-first. Incremental, so it's a no-op (no matches) once the ledger ranks every
-// instantiable engine — only the first ever run plays the full (small) gauntlet.
-runRank('Rank engines (seed ledger)');
+// No startup ranking: the ledger is built lazily on the first promotion (see runRank in
+// the promote branch). Until a champion is crowned there's nothing new to rank, so the
+// early cycles simply refresh with the classic random fraction; weakest-first kicks in
+// once the first promotion has seeded the ledger.
 
 const loopT0 = Date.now();
 let promotions = 0;
@@ -369,9 +369,10 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
     log(`cycle ${c}: PROMOTED ✓  candidate ${pct}% / Elo +${res.elo.toFixed(0)} over champion `
       + `(${res.games} games, cycle took ${fmtDur((Date.now() - cycleT0) / 1000)}). `
       + `New champion published as 'loop-champion' (archived ${champHash}.json). Total promotions: ${promotions}.`);
-    // Add the new champion to the strength ledger (incremental: one matchup vs the anchor)
-    // so the refresh below — and every later cycle — recognizes it as the new best and
-    // can relabel the now-second-best champion's `v` weakest-first.
+    // Add the new champion to the strength ledger so the refresh below — and every later
+    // cycle — recognizes it as the new best and can relabel the now-second-best champion's
+    // `v` weakest-first. Incremental: normally just one matchup vs the anchor; the FIRST
+    // promotion (no ledger yet) plays the full small gauntlet to seed it.
     runRank(`Rank engines (add champion ${champHash})`);
     // The champion (hence the `v` target) just changed: value-iterate by recomputing
     // `v` on a fraction of the dataset with the NEW champion. Optional maintenance —
