@@ -282,7 +282,7 @@ stopper?.dispose();
 status.clear();
 if (!scores.length) {
   console.log('Stopped before any game finished — nothing to report; no files written.');
-  process.exit(0);
+  process.exit(); // inherit STOP_EXIT_CODE when an orchestrator interrupted us
 }
 console.log(report(scores, true));
 if (stopped) console.log('  (stopped early — results cover only the games above)');

@@ -219,7 +219,7 @@ if (eloByVersion) {
     }
   } catch (e) { console.warn(`\n  pre-scan interrupted (${e.message}); proceeding with what was seen.`); }
   status.clear();
-  if (stopping) { console.log('Stopped before writing; dataset left unchanged.'); stopper.dispose(); process.exit(0); }
+  if (stopping) { console.log('Stopped before writing; dataset left unchanged.'); stopper.dispose(); process.exit(); }
   if (missingCount === 0 && min === Infinity) {
     console.log(`Nothing to refresh: every label is already the best engine ${vtag} at depth >= ${depth}.`);
     process.exit(0);

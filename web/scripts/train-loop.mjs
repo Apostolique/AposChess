@@ -96,6 +96,7 @@ import { fileURLToPath } from 'node:url';
 
 import { fmtDur, fmtMB } from './fmt.mjs';
 import { weightsHash } from './vtag.mjs';
+import { STOP_EXIT_CODE } from './stop.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const webDir = resolve(here, '..');
@@ -228,6 +229,10 @@ function run(label, cmd, argv, cwd = webDir) {
   // (stop after this cycle) keeps working — see scripts/stop.mjs.
   const r = spawnSync(cmd, argv, { stdio: 'inherit', cwd, env: { ...process.env, APOS_CHILD: '1' } });
   if (r.signal) { stopping = true; return false; }
+  // A child that caught Ctrl-C, drained its in-flight work cleanly, and exited reports
+  // STOP_EXIT_CODE — a clean early finish, not a crash. Without this it looked like a
+  // success (when the child exited 0) and the loop rolled into the next cycle. End here.
+  if (r.status === STOP_EXIT_CODE) { stopping = true; log(`${label} stopped early (Ctrl-C); ending loop after a clean drain.`); return false; }
   // Windows delivers console Ctrl-C to the whole process group; the child then exits
   // with STATUS_CONTROL_C_EXIT (0xC000013A) instead of a signal — an interrupt, not a crash.
   if (r.status === 0xC000013A) { stopping = true; log(`${label} interrupted (Ctrl-C); stopping loop.`); return false; }

@@ -34,6 +34,15 @@ export function printStopHint() {
   if (keysAvailable) console.log('  Press q (or Ctrl-C) to stop early — output is finalized cleanly.');
 }
 
+// Exit code an orchestrated child uses to tell its parent "I stopped because of a
+// Ctrl-C, after draining cleanly" — distinct from 0 (finished normally) and from a
+// real non-zero failure, so the parent (train:loop) can end the loop instead of
+// either ignoring the stop or logging a phantom crash. 130 is the conventional
+// SIGINT exit code. Set as process.exitCode (not process.exit) so the tool's normal
+// finalize still runs and its output stays valid; tools that exit explicitly on the
+// stop path use `process.exit()` (no arg) so they inherit it.
+export const STOP_EXIT_CODE = 130;
+
 export function installStop(onStop, { keys = true } = {}) {
   let requested = false;
   let disposed = false;
@@ -42,8 +51,12 @@ export function installStop(onStop, { keys = true } = {}) {
   const useKeys = keys && keysAvailable;
 
   function fire(force) {
-    if (requested) { if (force) process.exit(130); return; } // second Ctrl-C: force quit
+    if (requested) { if (force) process.exit(STOP_EXIT_CODE); return; } // second Ctrl-C: force quit
     requested = true;
+    // Orchestrated child: flag the eventual clean exit as "stopped by interrupt" so the
+    // parent can distinguish a Ctrl-C drain from a normal finish. Top-level interactive
+    // runs keep exiting 0 — no spurious "exit code 130" from npm when the user presses q.
+    if (process.env.APOS_CHILD) process.exitCode = STOP_EXIT_CODE;
     onStop();
   }
 
