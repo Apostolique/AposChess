@@ -67,7 +67,13 @@ h1 { margin: 0; font-size: 1.7rem; letter-spacing: 0.5px; }
 /* The mobile section tabs only exist on narrow screens; on desktop each section has
    its own column, so the bar is hidden and all the tabbed content shows at once. */
 .mobile-tabs { display: none; }
-.board-col { width: var(--board); }
+/* position:relative so the mobile layout can overlay the material trays on the
+   board's edges without them taking layout space (see the media query). */
+.board-col { width: var(--board); position: relative; }
+/* The White/Black AI fieldsets are wrapped in .ai-pair only so mobile can lay them
+   out side by side; display:contents makes the wrapper inert on desktop, where the
+   fieldsets stack as plain children of the narrow left column. */
+.ai-pair { display: contents; }
 .side-col {
   height: var(--board);
   display: flex;
@@ -553,19 +559,30 @@ button:disabled:hover { background: var(--panel); } /* no hover lift when locked
   /* Show only the active tab's content. Rules lives inside .controls (so it sits in
      the left column on desktop); the Rules tab shows just it, the Settings tab hides it. */
   body[data-mobile-tab="moves"] .controls { display: none; }
-  body[data-mobile-tab="settings"] .side-col { display: none; }
+  /* The status line ("White to move", "…is thinking", result) stays visible on every
+     tab — only the rest of the sidebar (move list, nav, PGN) is tab-gated. */
+  body[data-mobile-tab="settings"] .side-col > :not(.status) { display: none; }
   body[data-mobile-tab="settings"] .controls .rules { display: none; }
-  body[data-mobile-tab="rules"] .side-col { display: none; }
+  body[data-mobile-tab="rules"] .side-col > :not(.status) { display: none; }
   body[data-mobile-tab="rules"] .controls > :not(.rules) { display: none; }
+  /* The Rules tab shows only the rules, so the disclosure toggle is redundant —
+     drop the summary and keep the list always expanded. */
+  .controls .rules { margin-top: 0; }
+  .controls .rules summary { display: none; }
   /* Compact header: on a phone every vertical pixel above the board counts. */
   .topbar { margin-bottom: 8px; }
   h1 { font-size: 1.3rem; }
-  /* Thumb-sized primary actions: selects and buttons share rows in halves (a
-     control alone on its row stretches full width). */
+  /* Thumb-sized primary actions. */
   .actions .control-row { gap: 8px; }
-  .actions label { flex: 1 1 45%; }
   .actions select { width: 100%; max-width: none; }
   .actions button { flex: 1 1 45%; padding: 10px 12px; }
+  /* Keep the mode row (Mode + You play + New game + Start) on a single line to save
+     a row; min-width:0 lets the long mode <select> shrink. This targets only the
+     mode row (a direct child of .actions) — the nested puzzle-action buttons keep
+     wrapping in halves. */
+  .actions > .control-row { flex-wrap: nowrap; }
+  .actions > .control-row label,
+  .actions > .control-row button { flex: 1 1 0; min-width: 0; }
   .moves { max-height: 36vh; }
   /* Put the move controls above the list so they don't require scrolling the
      list down and back up. status (order 0) stays on top. */
@@ -587,6 +604,36 @@ button:disabled:hover { background: var(--panel); } /* no hover lift when locked
     text-align: left;
   }
   .cg-wrap coords.files coord { padding-left: 2px; }
+
+  /* Material trays overlay the board's edges instead of reserving a strip above and
+     below it: absolutely positioned (so the board never shifts whether or not pieces
+     have been captured) and rendered as compact pills only when there's a surplus
+     (:empty spans vanish, so an even game shows nothing at all). Top player's pill
+     hugs the top-left; the bottom player's the bottom-right, clear of the file
+     coordinates in the bottom-left corner. */
+  .tray {
+    position: absolute;
+    left: 0; right: 0;
+    margin: 0;
+    min-height: 0;
+    padding: 0 6px;
+    pointer-events: none;
+    z-index: 3;
+  }
+  #tray-top { top: 2px; }
+  #tray-bottom { bottom: 2px; justify-content: flex-end; }
+  .tray .caps:empty, .tray .adv:empty { display: none; }
+  .tray .caps, .tray .adv {
+    background: rgba(0, 0, 0, 0.55);
+    border-radius: 6px;
+    padding: 2px 6px;
+  }
+  .tray .cap { width: 20px; height: 20px; }
+
+  /* White/Black AI settings side by side to save vertical space. */
+  .ai-pair { display: flex; gap: 8px; align-items: start; }
+  .ai-pair > fieldset { flex: 1 1 0; min-width: 0; padding: 4px 8px 10px; }
+  .ai-pair .seg label { padding: 6px 8px; font-size: 0.72rem; }
 }
 
 .footer { margin-top: 24px; color: var(--muted); font-size: 0.8rem; }
