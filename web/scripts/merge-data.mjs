@@ -70,11 +70,13 @@ const mb = (bytes) => (bytes / 1e6).toFixed(1) + ' MB';
 
 // --- provenance ranking (the "best v" rule) --------------------------------------
 // A `vs` tag is "<engine><depth>@<version>" (see vtag.mjs): e.g. "nn6@a3f2c1", "hc6@2".
-// We score a record's value by (engine Elo of its version, search depth); a record with
-// no `v` scores lowest of all. The Elo comes from the strength ledger written by
-// `npm run rank`; an untagged / unknown-version label counts as weakest (-Inf), exactly
-// like refresh-v's weakest-first cohort logic. Without a ledger every Elo is -Inf, so the
-// rule degrades to "has-v, then deeper search wins" — still strictly better than a coin flip.
+// We score a record's value by (engine Elo, search depth); a record with no `v` scores
+// lowest of all. The Elo comes from the strength ledger written by `npm run rank`, which
+// holds one entry PER engine×depth — so we look the record's exact tag up first (its true
+// strength at that depth) and fall back to the engine's BEST per-version Elo for a depth
+// that was never ranked (a deeper-than-ranked search is at least as strong). An untagged /
+// unknown label counts as weakest (-Inf), like refresh-v's weakest-first cohort logic.
+// Without a ledger every Elo is -Inf, so the rule degrades to "has-v, then deeper wins".
 const parseTag = (tag) => {
   const m = /^(nn|hc)(\d+|t)@(.+)$/.exec(tag || '');
   return m ? { eng: m[1], depth: m[2], version: m[3] } : null;
@@ -86,7 +88,8 @@ const ledgerPath = args.ledger === true || args.ledger === undefined
 const ledgerExplicit = args.ledger === true || typeof args.ledger === 'string';
 const useLedger = !args['no-ledger'];
 
-let eloByVersion = new Map();
+let eloByTag = new Map();      // exact "<eng><depth>@<version>" tag -> Elo (the precise strength)
+let eloByVersion = new Map();  // version -> best (max) Elo across its ranked depths (fallback)
 if (useLedger && ledgerPath) {
   if (existsSync(ledgerPath)) {
     try {
@@ -94,10 +97,15 @@ if (useLedger && ledgerPath) {
       // The material fallback ('?') is excluded — its Elo is only an internal ledger stat,
       // so anything it (or an unrecoverable/untagged source) labeled is treated as weakest.
       for (const e of ledger.ranking || []) {
-        if (e.elo != null && e.version !== '?') eloByVersion.set(e.version, e.elo);
+        if (e.elo == null || e.version === '?') continue;
+        if (e.tag) eloByTag.set(e.tag, e.elo);
+        // Per-version fallback for an unranked depth: the engine's BEST measured Elo, since a
+        // deeper-than-ranked search is at least as strong as its deepest ranked one.
+        const prev = eloByVersion.has(e.version) ? eloByVersion.get(e.version) : -Infinity;
+        eloByVersion.set(e.version, Math.max(prev, e.elo));
       }
       console.log(`Ranking v by ledger ${ledgerPath.slice(dataDir.length + 1) || ledgerPath} `
-        + `(${eloByVersion.size} engine version(s)).`);
+        + `(${eloByTag.size} engine×depth entr${eloByTag.size === 1 ? 'y' : 'ies'}, ${eloByVersion.size} version(s)).`);
     } catch (e) {
       console.error(`Could not read ledger ${ledgerPath}: ${e.message}`);
       process.exit(1);
@@ -117,8 +125,12 @@ const NONE = { elo: -Infinity, depth: -Infinity };
 function vQuality(rec) {
   if (rec.v === undefined || rec.v === null) return NONE;
   const t = parseTag(rec.vs);
-  const elo = t ? (eloByVersion.has(t.version) ? eloByVersion.get(t.version) : -Infinity) : -Infinity;
-  const depth = t ? (t.depth === 't' ? 0 : Number(t.depth)) : -Infinity;
+  if (!t) return NONE;
+  // Exact engine×depth Elo if that depth was ranked; otherwise the engine's best per-version
+  // Elo (unranked depth). Unknown engine -> -Inf (weakest), same as a missing value.
+  const elo = eloByTag.has(rec.vs) ? eloByTag.get(rec.vs)
+    : (eloByVersion.has(t.version) ? eloByVersion.get(t.version) : -Infinity);
+  const depth = t.depth === 't' ? 0 : Number(t.depth);
   return { elo, depth };
 }
 // Strictly better => replace; equal or worse => keep the incumbent (so the first file in

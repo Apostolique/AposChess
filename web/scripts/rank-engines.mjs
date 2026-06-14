@@ -71,27 +71,29 @@
 //   --maxmoves=N    draw adjudication ply cap (default 200).
 //   --seed=S        base seed (default 1).
 //   --incremental   reuse Elos already in the output ledger and only play engines it
-//                   doesn't yet rank (engine strength vs a fixed anchor doesn't drift).
-//                   A promotion then costs one matchup. Falls back to a full gauntlet if
-//                   no ledger exists or its anchor/depth differs from this run's.
+//                   doesn't yet rank AT THIS DEPTH (engine strength vs a fixed anchor
+//                   doesn't drift). A promotion then costs one matchup. A different --depth
+//                   just ADDS that depth's entries beside the existing ones. Falls back to a
+//                   full gauntlet only if no ledger exists or its ANCHOR differs from this
+//                   run's (a different anchor makes the old Elos incomparable).
 //   --only=SPEC[,…] (re)rank ONLY these contenders against the anchor at this run's
-//                   --depth, splice their fresh Elo into the existing ledger, and reuse
-//                   every other engine's Elo unchanged. Unlike --incremental it does NOT
-//                   require the ledger's contender depth to match — the point is to
-//                   re-measure an engine whose Elo was taken at a shallower depth (so it
-//                   unfairly loses to the deeper anchor) at the anchor's depth, without
-//                   re-running the whole gauntlet. Each Elo is still relative to the SAME
-//                   fixed anchor, so per-engine depths can differ in one ledger; consumers
-//                   (merge-data, refresh-v) key Elo by version and read depth from the
-//                   per-record `vs` tag. SPEC = a content hash / prefix (e.g. a14d52), a
-//                   champion filename, 'hc', or 'champion'. Requires an existing ledger
-//                   built against the same anchor. Re-running --only at the SAME depth
-//                   ACCUMULATES: it plays fresh games (auto-advanced seed) and POOLS them
-//                   with the prior result for a tighter Elo, instead of discarding it — so
-//                   run it again to refine. (At a different depth it's a new measurement,
-//                   so it replaces.) Use --fresh to discard the prior games and re-measure.
-//   --fresh         with --only, do NOT pool with the prior ledger games — re-measure from
-//                   scratch at the original seed (reproduces the original games).
+//                   --depth, splice the result into the existing ledger, and reuse every
+//                   other engine's entries unchanged — measure one engine without re-running
+//                   the whole gauntlet. Each engine×depth is its OWN ledger entry, so
+//                   running --only at a NEW depth ADDS an entry (e.g. nn6@a14d52) beside the
+//                   engine's existing one (nn4@a14d52) rather than replacing it — a deeper
+//                   search is a stronger player and earns its own, higher, Elo. Every Elo is
+//                   relative to the SAME anchor, so the depths stay comparable; consumers
+//                   (merge-data, refresh-v) look the exact engine×depth tag up first and
+//                   fall back to the engine's per-version Elo for a depth never ranked. SPEC
+//                   = a content hash / prefix (e.g. a14d52), a champion filename, 'hc', or
+//                   'champion'. Requires an existing ledger built against the same anchor.
+//                   Re-running --only at the SAME depth ACCUMULATES: it plays fresh games
+//                   (auto-advanced seed) and POOLS them with that entry for a tighter Elo,
+//                   instead of discarding it — so run it again to refine. Use --fresh to
+//                   discard the prior games and re-measure that entry from scratch.
+//   --fresh         with --only, do NOT pool with the prior entry's games — re-measure it
+//                   from scratch at the original seed (reproduces the original games).
 //   --no-scan       skip the dataset cross-reference (record counts / unrecoverable tags).
 //   --data=FILE     dataset to scan (default ../training/data/selfplay.jsonl).
 //   --out=FILE      ledger output (default ../training/data/loop/engine-elo.json).
@@ -307,56 +309,54 @@ const stopper = installStop(() => {
   stopped = true;
   console.log('\n  Stopping early — writing the ledger with the engines ranked so far…');
 });
-let priorByVersion = new Map();
+let priorByTag = new Map();
 try {
   if (existsSync(cfg.out)) {
     const prev = JSON.parse(readFileSync(cfg.out, 'utf8')).ranking || [];
-    priorByVersion = new Map(prev.filter((e) => e.elo != null && !e.anchor).map((e) => [e.version, e]));
+    priorByTag = new Map(prev.filter((e) => e.elo != null && !e.anchor).map((e) => [e.tag, e]));
   }
 } catch { /* no usable prior ledger */ }
 
 // --- play each contender against the anchor (the gauntlet) ---------------------
 mkdirSync(loopDir, { recursive: true });
 const t0 = Date.now();
-// version -> { score, elo, margin, games } relative to the anchor.
-const results = new Map([[anchor.version, { score: 0.5, elo: 0, margin: 0, games: 0, anchor: true }]]);
+// tag (eng+depth+version) -> { score, elo, margin, games } relative to the anchor. Keyed by
+// the FULL tag, not the version, so ONE engine can hold several entries — one per search
+// depth it was measured at (a deeper search is a stronger player, so it earns its own,
+// usually higher, Elo). The consumers (merge-data, refresh-v) look an exact tag up first
+// and fall back to the engine's per-version Elo for a depth that was never ranked.
+const results = new Map([[anchor.tag, { score: 0.5, elo: 0, margin: 0, games: 0, anchor: true }]]);
 
-// --incremental: seed `results` from the existing ledger so we only replay engines it
-// doesn't yet rank. Only valid if it was built against the SAME anchor and depth (Elos
-// are relative to those); otherwise the old numbers aren't comparable, so fall back to a
-// full re-rank. Kept for carrying over the dataset cross-reference when --no-scan.
-// --only targets' prior ledger entries, so a same-depth re-run can POOL its new games with
-// them (version -> prior entry). Populated below; consumed in the play loop.
-const poolPrior = new Map();
+// Reuse the existing ledger (--incremental / --only). Every Elo is relative to the anchor,
+// so the ONLY thing that must match is the anchor tag (its depth included); a different
+// contender --depth doesn't invalidate anything — it just ADDS new per-depth entries beside
+// the ones already there. A mismatched anchor makes the old numbers incomparable:
+// --incremental re-ranks from scratch; --only refuses (it splices into the existing ledger).
+// --only also remembers each target's PRIOR entry AT THIS RUN'S DEPTH, so a same-depth
+// re-run POOLS its fresh games with it for a tighter Elo (other depths are left untouched).
+const poolPrior = new Map(); // this-depth tag -> prior entry, for --only pooling
 let prevLedger = null;
 if ((cfg.incremental || cfg.only) && existsSync(cfg.out)) {
   try { prevLedger = JSON.parse(readFileSync(cfg.out, 'utf8')); } catch (e) { console.warn(`(could not read existing ledger: ${e.message})`); }
   if (prevLedger) {
-    // --only re-measures its targets at a DIFFERENT depth than the rest, so it only needs
-    // the ANCHOR to match (every Elo is relative to it); --incremental reuses each
-    // contender's depth-specific Elo as-is, so it needs the whole setup identical.
-    const anchorSame = prevLedger.anchor === anchor.tag;
-    const sameSetup = anchorSame && prevLedger.depth === cfg.depth && prevLedger.movetime === cfg.movetime
-      && prevLedger.anchorDepth === cfg.anchorDepth && prevLedger.anchorMovetime === cfg.anchorMovetime;
-    if (cfg.only ? !anchorSame : !sameSetup) {
+    if (prevLedger.anchor !== anchor.tag) {
       if (cfg.only) {
         console.error(`--only needs the existing ledger to share this run's anchor: ledger anchor ${prevLedger.anchor}, ` +
           `this run ${anchor.tag}. Re-run with a matching --anchor/--anchor-depth, or do a full re-rank.`);
         process.exit(1);
       }
-      console.warn(`(existing ledger used anchor ${prevLedger.anchor} (depth ${prevLedger.anchorDepth}/${prevLedger.anchorMovetime}ms), ` +
-        `contenders depth ${prevLedger.depth}/${prevLedger.movetime}ms; this run is ${anchor.tag} ` +
-        `(depth ${cfg.anchorDepth}/${cfg.anchorMovetime}ms), contenders depth ${cfg.depth}/${cfg.movetime}ms — re-ranking everything.)`);
+      console.warn(`(existing ledger is anchored on ${prevLedger.anchor}, this run on ${anchor.tag} — the Elos aren't ` +
+        `comparable, so re-ranking everything from scratch.)`);
       prevLedger = null;
     } else {
+      const thisDepthTag = (e) => `${e.eng}${depthMark}@${e.version}`;
       for (const e of prevLedger.ranking || []) {
         if (e.anchor || e.elo == null) continue;
-        if (cfg.only && onlyVersions.has(e.version)) { poolPrior.set(e.version, e); continue; } // force-replay; remember for pooling
-        if (players.has(`${e.eng}@${e.version}`)) {
-          // Carry the prior `tag` too: it encodes the depth this Elo was measured at, which
-          // --only may differ from this run's --depth — reused engines keep their own depth.
-          results.set(e.version, { score: e.score, elo: e.elo, margin: e.margin, games: e.games, reused: true, tag: e.tag });
-        }
+        if (!players.has(`${e.eng}@${e.version}`)) continue; // no longer instantiable -> drop (becomes unrecoverable)
+        // --only: the target's entry at THIS run's depth is the one we replay (and pool with);
+        // keep the target's OTHER-depth entries, and every non-target entry, as reused.
+        if (cfg.only && onlyVersions.has(e.version) && e.tag === thisDepthTag(e)) { poolPrior.set(e.tag, e); continue; }
+        results.set(e.tag, { score: e.score, elo: e.elo, margin: e.margin, games: e.games, reused: true, tag: e.tag });
       }
     }
   } else if (cfg.only) {
@@ -406,35 +406,38 @@ function runMatch(p, idx, seedOffset = 0) {
   } catch (e) { console.error(`  could not read result for ${p.tag}: ${e.message}`); return null; }
 }
 
-const toPlay = contenders.filter((p) => !results.has(p.version));
+// --only plays only its targets; otherwise play every contender whose entry AT THIS DEPTH
+// (p.tag) isn't already reused from the ledger.
+const toPlay = contenders.filter((p) => (cfg.only ? onlyVersions.has(p.version) : !results.has(p.tag)));
 if (cfg.incremental || cfg.only) {
-  console.log(`  ${cfg.only ? 'only (--only)' : 'incremental'}: reuse ${contenders.length - toPlay.length} from ledger, ` +
+  const reused = [...results.values()].filter((r) => r.reused).length;
+  console.log(`  ${cfg.only ? 'only (--only)' : 'incremental'}: reuse ${reused} ledger entr${reused === 1 ? 'y' : 'ies'}, ` +
     `play ${toPlay.length}${toPlay.length ? ` (${toPlay.map((p) => p.tag).join(', ')})` : ''}`);
 }
 
 contenders.forEach((p, idx) => {
   if (stopped) return; // early stop: leave the rest unplayed (prior Elo preserved below)
-  if (results.has(p.version)) { // reused from the ledger (or it's a re-listed anchor); don't replay
-    const r = results.get(p.version);
+  if (cfg.only && !onlyVersions.has(p.version)) return; // --only: non-targets stay reused
+  if (results.has(p.tag)) { // already have this engine AT THIS DEPTH (reused); don't replay
+    const r = results.get(p.tag);
     if (r.reused) console.log(`= ${p.tag}: reusing ledger Elo ${r.elo >= 0 ? '+' : ''}${r.elo.toFixed(0)} (${idx + 1}/${contenders.length})`);
     return;
   }
-  // Pool with the prior result on an --only re-run at the SAME depth: more games -> a
-  // tighter Elo. The prior must be at this run's depth (a different depth is a different
-  // measurement, so it's replaced, not pooled). --fresh forces a clean re-measure.
-  const prior = poolPrior.get(p.version);
-  const priorDepth = prior ? (/^(?:nn|hc)(\d+|t)@/.exec(prior.tag || '')?.[1]) : null;
-  const pool = prior && !cfg.fresh && priorDepth === String(depthMark) && prior.games > 0;
+  // --only same-depth re-run: pool fresh games with the prior entry at this exact tag (more
+  // games -> tighter Elo). A different depth isn't a pool — it's a different tag, so it
+  // simply becomes its own new entry. --fresh discards the prior games and re-measures.
+  const prior = cfg.fresh ? null : poolPrior.get(p.tag);
+  const pool = !!prior && prior.games > 0;
   // Advance the seed past the prior games so this run's games don't repeat them.
   const res = runMatch(p, idx, pool ? prior.games : 0);
-  if (!res) { results.set(p.version, { score: null, elo: null, margin: null, games: 0 }); return; }
+  if (!res) { results.set(p.tag, { score: null, elo: null, margin: null, games: 0 }); return; }
   let score = res.score, games = res.games;
   if (pool) {
     games = prior.games + res.games;
     score = (prior.score * prior.games + res.score * res.games) / games;
     console.log(`  + pooled with ${prior.games} prior game(s): ${prior.games}+${res.games} = ${games} total`);
   }
-  results.set(p.version, {
+  results.set(p.tag, {
     score, elo: eloFromScore(score), margin: eloMargin(score, games), games,
   });
 });
@@ -496,27 +499,38 @@ if (cfg.scan) {
   for (const e of prevLedger.ranking || []) recordsByVersion.set(`${e.eng}@${e.version}`, e.records || 0);
 }
 
-const ranking = [...players.values()].map((p) => {
-  let r = results.get(p.version);
-  // Early stop: carry over a known engine's prior Elo rather than emitting null.
-  if (!r && stopped && priorByVersion.has(p.version)) {
-    const prev = priorByVersion.get(p.version);
-    r = { elo: prev.elo, score: prev.score, margin: prev.margin, games: prev.games, reused: true, tag: prev.tag };
+// Early stop: preserve every prior entry we didn't get to replay, so an interrupted run
+// never drops or downgrades a known engine×depth (refresh-v reads a missing Elo as weakest).
+if (stopped) {
+  for (const [tag, e] of priorByTag) {
+    if (results.has(tag)) continue;
+    const t = parseTag(tag);
+    if (t && players.has(`${t.eng}@${t.version}`)) {
+      results.set(tag, { score: e.score, elo: e.elo, margin: e.margin, games: e.games, reused: true, tag });
+    }
   }
-  // A reused engine keeps the tag it was ranked under (it encodes that Elo's depth, which
-  // --only lets differ from this run's --depth); a freshly played one gets this run's tag.
+}
+
+// One ranking entry per engine×depth (every tag in `results`), not per engine — that's what
+// lets a single engine carry several depth-specific Elos. `records` is per-version, so an
+// engine's depth entries share its dataset record count.
+const ranking = [...results.entries()].map(([tag, r]) => {
+  const t = parseTag(tag) || {};
+  const key = `${t.eng}@${t.version}`;
+  const p = players.get(key);
   return {
-    tag: (r && r.reused && r.tag) ? r.tag : p.tag,
-    eng: p.eng,
-    version: p.version,
-    anchor: p.key === anchor.key,
-    elo: r ? r.elo : null,
-    score: r ? r.score : null,
-    margin: r ? r.margin : null,
-    games: r ? r.games : 0,
-    records: recordsByVersion.get(p.key) || 0,
+    tag,
+    eng: t.eng,
+    version: t.version,
+    depth: t.depth,
+    anchor: tag === anchor.tag,
+    elo: r.elo,
+    score: r.score,
+    margin: r.margin,
+    games: r.games,
+    records: recordsByVersion.get(key) || 0,
     recoverable: true,
-    file: p.weights || null,
+    file: p ? p.weights : null,
   };
 }).sort((a, b) => {
   // Weakest first; an unrankable engine (no Elo) sorts to the very bottom (= weakest).
@@ -550,18 +564,16 @@ if (cfg.scan) {
 }
 
 // --- write the ledger ----------------------------------------------------------
-// --only leaves a ledger of MIXED contender depths (the targets at this run's --depth, the
-// rest at whatever they were), so the global depth fields can't describe it as one number.
-// Keep the prior baseline so the next --incremental run still guards against the majority
-// depth (each engine's actual depth lives in its own tag); a full run records its own depth.
-const baseline = cfg.only && prevLedger ? prevLedger : cfg;
+// The ledger now holds one entry per engine×depth, so a single global depth can't describe
+// it. These fields just record THIS run's contender/anchor search budget (each entry's real
+// depth lives in its own tag) — they're informational; reuse keys off the anchor tag alone.
 const ledger = {
   generated: new Date().toISOString(),
   anchor: anchor.tag,
-  depth: baseline.depth,
-  movetime: baseline.movetime,
-  anchorDepth: baseline.anchorDepth,
-  anchorMovetime: baseline.anchorMovetime,
+  depth: cfg.depth,
+  movetime: cfg.movetime,
+  anchorDepth: cfg.anchorDepth,
+  anchorMovetime: cfg.anchorMovetime,
   games: cfg.games,
   seed: cfg.seed,
   dataset: cfg.scan ? { file: cfg.data, totalLines, withV: totalLines - noV, legacyNoTag } : (prevLedger ? prevLedger.dataset : null),

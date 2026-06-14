@@ -85,17 +85,24 @@ const minutes = args.minutes !== undefined ? Number(args.minutes) : 10;
 const ledgerPath = args.ledger === true
   ? resolve(here, '../../training/data/loop/engine-elo.json')
   : (typeof args.ledger === 'string' ? resolve(process.cwd(), args.ledger) : null);
-let eloByVersion = null, best = null;
+let eloByVersion = null, eloByTag = null, best = null;
 if (ledgerPath) {
   let ledger;
   try { ledger = JSON.parse(readFileSync(ledgerPath, 'utf8')); }
   catch (e) { console.error(`Could not read ledger ${ledgerPath}: ${e.message}. Run 'npm run rank' first.`); process.exit(1); }
-  eloByVersion = new Map();
+  eloByVersion = new Map(); eloByTag = new Map();
   // The material fallback ('?') is excluded from refresh decisions entirely — its Elo is
   // only an internal stat in the ledger (a floor reference for `npm run rank`). So anything
   // it (or an unrecoverable/untagged source) labeled falls into the -Inf "weakest" bucket
   // and refreshes first, rather than being scored at the material level.
-  for (const e of ledger.ranking || []) if (e.elo != null && e.version !== '?') eloByVersion.set(e.version, e.elo);
+  // The ledger holds one entry per engine×depth: eloByTag is the exact strength at a depth;
+  // eloByVersion is the engine's BEST measured Elo, the fallback for a depth never ranked.
+  for (const e of ledger.ranking || []) {
+    if (e.elo == null || e.version === '?') continue;
+    if (e.tag) eloByTag.set(e.tag, e.elo);
+    const prev = eloByVersion.has(e.version) ? eloByVersion.get(e.version) : -Infinity;
+    eloByVersion.set(e.version, Math.max(prev, e.elo));
+  }
   // Strongest engine = highest Elo (the anchor sits at 0; a contender may beat it).
   best = (ledger.ranking || []).filter((e) => e.elo != null && e.version !== '?')
     .reduce((a, b) => (b.elo > a.elo ? b : a), { elo: -Infinity });
@@ -120,13 +127,25 @@ const vtag = computeVtag(evalName, depth, weights);
 const recomputeEng = evalName.startsWith('nn') ? 'nn' : 'hc';
 const recomputeVersion = vtag.slice(vtag.indexOf('@') + 1);
 const parseTag = (tag) => { const m = /^(nn|hc)(\d+|t)@(.+)$/.exec(tag || ''); return m ? { eng: m[1], depth: m[2], version: m[3] } : null; };
-const eloForTag = (tag) => { const t = parseTag(tag); const e = t && eloByVersion.get(t.version); return e == null ? -Infinity : e; };
+// Exact engine×depth Elo if that depth was ranked, else the engine's best per-version Elo
+// (a depth never ranked); unknown engine / no tag -> -Inf (weakest, refreshed first).
+const eloForTag = (tag) => {
+  const t = parseTag(tag);
+  if (!t) return -Infinity;
+  if (eloByTag && eloByTag.has(tag)) return eloByTag.get(tag);
+  const e = eloByVersion && eloByVersion.get(t.version);
+  return e == null ? -Infinity : e;
+};
 const alreadyDone = (tag) => { const t = parseTag(tag); if (!t || t.eng !== recomputeEng || t.version !== recomputeVersion) return false; const d = Number(t.depth); return Number.isFinite(d) && d >= depth; };
 // Human-readable name for a cohort's Elo (for the banner): the version(s) at that Elo, or
 // the catch-all weakest bucket for -Inf (no vs tag / material / unrecoverable). Records
 // missing v entirely aren't a cohort here — they're filled first, separately.
 const cohortName = (elo) => {
   if (elo === -Infinity) return 'untagged / material / unrecoverable';
+  // Prefer the exact engine×depth tag(s) at this Elo; fall back to version(s) for an Elo that
+  // only the per-version fallback produced (a dataset depth that wasn't itself ranked).
+  const tags = [...eloByTag.entries()].filter(([, e]) => e === elo).map(([t]) => t);
+  if (tags.length) return `${tags.join(', ')} (Elo ${elo.toFixed(0)})`;
   const vs = [...eloByVersion.entries()].filter(([, e]) => e === elo).map(([v]) => v);
   return `${vs.length ? vs.join(', ') : '?'} (Elo ${elo.toFixed(0)})`;
 };
