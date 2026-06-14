@@ -74,6 +74,18 @@
 //                   doesn't yet rank (engine strength vs a fixed anchor doesn't drift).
 //                   A promotion then costs one matchup. Falls back to a full gauntlet if
 //                   no ledger exists or its anchor/depth differs from this run's.
+//   --only=SPEC[,…] (re)rank ONLY these contenders against the anchor at this run's
+//                   --depth, splice their fresh Elo into the existing ledger, and reuse
+//                   every other engine's Elo unchanged. Unlike --incremental it does NOT
+//                   require the ledger's contender depth to match — the point is to
+//                   re-measure an engine whose Elo was taken at a shallower depth (so it
+//                   unfairly loses to the deeper anchor) at the anchor's depth, without
+//                   re-running the whole gauntlet. Each Elo is still relative to the SAME
+//                   fixed anchor, so per-engine depths can differ in one ledger; consumers
+//                   (merge-data, refresh-v) key Elo by version and read depth from the
+//                   per-record `vs` tag. SPEC = a content hash / prefix (e.g. a14d52), a
+//                   champion filename, 'hc', or 'champion'. Requires an existing ledger
+//                   built against the same anchor.
 //   --no-scan       skip the dataset cross-reference (record counts / unrecoverable tags).
 //   --data=FILE     dataset to scan (default ../training/data/selfplay.jsonl).
 //   --out=FILE      ledger output (default ../training/data/loop/engine-elo.json).
@@ -139,6 +151,9 @@ const cfg = {
   // anchor doesn't drift), and only play engines the ledger doesn't yet rank — so a
   // champion promotion costs one matchup (new champion vs anchor), not the whole gauntlet.
   incremental: !!args.incremental,
+  // --only=SPEC[,SPEC]: force-(re)rank just these contenders at this run's depth, reusing
+  // every other engine's Elo from the existing ledger (see header). null = rank everyone.
+  only: typeof args.only === 'string' ? args.only.split(',').map((s) => s.trim()).filter(Boolean) : null,
   data: typeof args.data === 'string' ? resolve(process.cwd(), args.data) : join(dataDir, 'selfplay.jsonl'),
   out: typeof args.out === 'string' ? resolve(process.cwd(), args.out) : join(loopDir, 'engine-elo.json'),
   // Harvest the ranking games into a side file (NOT the live dataset — see header) that
@@ -222,7 +237,48 @@ if (!contenders.length) {
   process.exit(1);
 }
 
-console.log(`Ranking ${players.size} engine(s) vs anchor ${anchor.tag}`);
+// --only=SPEC[,…]: resolve each spec to exactly one contender to (re)play; every other
+// engine's Elo is reused from the existing ledger. Versions to force-replay go in onlyVersions.
+let onlyVersions = null;
+if (cfg.only) {
+  if (!existsSync(cfg.out)) {
+    console.error(`--only updates an existing ledger, but none at ${cfg.out}. Run a full 'npm run rank' first.`);
+    process.exit(1);
+  }
+  const resolveSpec = (spec) => {
+    if (spec === 'hc' || spec === 'handcrafted') { const p = players.get(`hc@${HC_VERSION}`); return p ? [p] : []; }
+    if (spec === 'champion') { const h = existsSync(champion) ? weightsHash(champion) : null; const p = h && players.get(`nn@${h}`); return p ? [p] : []; }
+    if (players.has(`nn@${spec}`)) return [players.get(`nn@${spec}`)];
+    if (players.has(`hc@${spec}`)) return [players.get(`hc@${spec}`)];
+    const base = spec.replace(/\.json$/i, '');
+    return [...players.values()].filter((p) => {
+      if (p.version === base || p.version.startsWith(base)) return true;
+      const wb = p.weights ? p.weights.split(/[\\/]/).pop().replace(/\.json$/i, '') : null;
+      return !!wb && (wb === base || wb.startsWith(base));
+    });
+  };
+  onlyVersions = new Set();
+  for (const spec of cfg.only) {
+    const hits = resolveSpec(spec);
+    if (hits.length === 0) {
+      console.error(`--only '${spec}' matched no instantiable engine. Available: ${[...players.keys()].join(', ')}`);
+      process.exit(1);
+    }
+    if (hits.length > 1) {
+      console.error(`--only '${spec}' is ambiguous: ${hits.map((p) => p.key).join(', ')}. Use a longer prefix.`);
+      process.exit(1);
+    }
+    if (hits[0].key === anchor.key) {
+      console.error(`--only '${spec}' is the anchor (${anchor.tag}); its Elo is fixed at 0. Pick a contender, or change --anchor.`);
+      process.exit(1);
+    }
+    onlyVersions.add(hits[0].version);
+  }
+}
+
+console.log(cfg.only
+  ? `Re-ranking ${cfg.only.length} engine(s) (--only ${cfg.only.join(', ')}) vs anchor ${anchor.tag}, reusing the rest of ${cfg.out}`
+  : `Ranking ${players.size} engine(s) vs anchor ${anchor.tag}`);
 console.log(`  contenders ${cfg.depth != null ? `depth ${cfg.depth}` : `${cfg.movetime}ms/move`} | ` +
   `anchor ${cfg.anchorDepth != null ? `depth ${cfg.anchorDepth}` : `${cfg.anchorMovetime}ms/move`} | ` +
   `${cfg.games} games/matchup | jobs ${cfg.jobs} | openings ${cfg.openings} | seed ${cfg.seed}`);
@@ -260,12 +316,21 @@ const results = new Map([[anchor.version, { score: 0.5, elo: 0, margin: 0, games
 // are relative to those); otherwise the old numbers aren't comparable, so fall back to a
 // full re-rank. Kept for carrying over the dataset cross-reference when --no-scan.
 let prevLedger = null;
-if (cfg.incremental && existsSync(cfg.out)) {
+if ((cfg.incremental || cfg.only) && existsSync(cfg.out)) {
   try { prevLedger = JSON.parse(readFileSync(cfg.out, 'utf8')); } catch (e) { console.warn(`(could not read existing ledger: ${e.message})`); }
   if (prevLedger) {
-    const sameSetup = prevLedger.anchor === anchor.tag && prevLedger.depth === cfg.depth && prevLedger.movetime === cfg.movetime
+    // --only re-measures its targets at a DIFFERENT depth than the rest, so it only needs
+    // the ANCHOR to match (every Elo is relative to it); --incremental reuses each
+    // contender's depth-specific Elo as-is, so it needs the whole setup identical.
+    const anchorSame = prevLedger.anchor === anchor.tag;
+    const sameSetup = anchorSame && prevLedger.depth === cfg.depth && prevLedger.movetime === cfg.movetime
       && prevLedger.anchorDepth === cfg.anchorDepth && prevLedger.anchorMovetime === cfg.anchorMovetime;
-    if (!sameSetup) {
+    if (cfg.only ? !anchorSame : !sameSetup) {
+      if (cfg.only) {
+        console.error(`--only needs the existing ledger to share this run's anchor: ledger anchor ${prevLedger.anchor}, ` +
+          `this run ${anchor.tag}. Re-run with a matching --anchor/--anchor-depth, or do a full re-rank.`);
+        process.exit(1);
+      }
       console.warn(`(existing ledger used anchor ${prevLedger.anchor} (depth ${prevLedger.anchorDepth}/${prevLedger.anchorMovetime}ms), ` +
         `contenders depth ${prevLedger.depth}/${prevLedger.movetime}ms; this run is ${anchor.tag} ` +
         `(depth ${cfg.anchorDepth}/${cfg.anchorMovetime}ms), contenders depth ${cfg.depth}/${cfg.movetime}ms — re-ranking everything.)`);
@@ -273,11 +338,17 @@ if (cfg.incremental && existsSync(cfg.out)) {
     } else {
       for (const e of prevLedger.ranking || []) {
         if (e.anchor || e.elo == null) continue;
+        if (cfg.only && onlyVersions.has(e.version)) continue; // force-replay the targets
         if (players.has(`${e.eng}@${e.version}`)) {
-          results.set(e.version, { score: e.score, elo: e.elo, margin: e.margin, games: e.games, reused: true });
+          // Carry the prior `tag` too: it encodes the depth this Elo was measured at, which
+          // --only may differ from this run's --depth — reused engines keep their own depth.
+          results.set(e.version, { score: e.score, elo: e.elo, margin: e.margin, games: e.games, reused: true, tag: e.tag });
         }
       }
     }
+  } else if (cfg.only) {
+    console.error(`--only updates an existing ledger at ${cfg.out}, but it couldn't be read. Run a full 'npm run rank' first.`);
+    process.exit(1);
   }
 }
 
@@ -321,7 +392,10 @@ function runMatch(p, idx) {
 }
 
 const toPlay = contenders.filter((p) => !results.has(p.version));
-if (cfg.incremental) console.log(`  incremental: reuse ${contenders.length - toPlay.length} from ledger, play ${toPlay.length}`);
+if (cfg.incremental || cfg.only) {
+  console.log(`  ${cfg.only ? 'only (--only)' : 'incremental'}: reuse ${contenders.length - toPlay.length} from ledger, ` +
+    `play ${toPlay.length}${toPlay.length ? ` (${toPlay.map((p) => p.tag).join(', ')})` : ''}`);
+}
 
 contenders.forEach((p, idx) => {
   if (stopped) return; // early stop: leave the rest unplayed (prior Elo preserved below)
@@ -399,10 +473,12 @@ const ranking = [...players.values()].map((p) => {
   // Early stop: carry over a known engine's prior Elo rather than emitting null.
   if (!r && stopped && priorByVersion.has(p.version)) {
     const prev = priorByVersion.get(p.version);
-    r = { elo: prev.elo, score: prev.score, margin: prev.margin, games: prev.games };
+    r = { elo: prev.elo, score: prev.score, margin: prev.margin, games: prev.games, reused: true, tag: prev.tag };
   }
+  // A reused engine keeps the tag it was ranked under (it encodes that Elo's depth, which
+  // --only lets differ from this run's --depth); a freshly played one gets this run's tag.
   return {
-    tag: p.tag,
+    tag: (r && r.reused && r.tag) ? r.tag : p.tag,
     eng: p.eng,
     version: p.version,
     anchor: p.key === anchor.key,
@@ -446,13 +522,18 @@ if (cfg.scan) {
 }
 
 // --- write the ledger ----------------------------------------------------------
+// --only leaves a ledger of MIXED contender depths (the targets at this run's --depth, the
+// rest at whatever they were), so the global depth fields can't describe it as one number.
+// Keep the prior baseline so the next --incremental run still guards against the majority
+// depth (each engine's actual depth lives in its own tag); a full run records its own depth.
+const baseline = cfg.only && prevLedger ? prevLedger : cfg;
 const ledger = {
   generated: new Date().toISOString(),
   anchor: anchor.tag,
-  depth: cfg.depth,
-  movetime: cfg.movetime,
-  anchorDepth: cfg.anchorDepth,
-  anchorMovetime: cfg.anchorMovetime,
+  depth: baseline.depth,
+  movetime: baseline.movetime,
+  anchorDepth: baseline.anchorDepth,
+  anchorMovetime: baseline.anchorMovetime,
   games: cfg.games,
   seed: cfg.seed,
   dataset: cfg.scan ? { file: cfg.data, totalLines, withV: totalLines - noV, legacyNoTag } : (prevLedger ? prevLedger.dataset : null),
