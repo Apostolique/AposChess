@@ -193,8 +193,14 @@ const stopper = installStop(requestStop);
 // always filled all missing v and only fractioned the rest.)
 let targetElo = null;            // weakest cohort (with v) to refresh; null => none such
 let missingCount = 0;            // records lacking v entirely (always filled)
+// Estimated count of records this run will (re)compute, for the live ETA. Known only when
+// the pre-scan runs (ledger mode); null otherwise, in which case the ETA falls back to the
+// time budget. The cohort term is an expectation: ~frac of the weakest cohort passes the
+// random gate, so the real count varies a little run to run.
+let toCompute = null;
 if (eloByVersion) {
   let min = Infinity, scanned = 0;
+  const cohortCounts = new Map();   // elo -> # of candidate records with a v at that elo
   const sTick = everyMs(500);
   try {
     const srl = createInterface({ input: createReadStream(inFile), crlfDelay: Infinity });
@@ -208,6 +214,7 @@ if (eloByVersion) {
       if (alreadyDone(tag)) continue;                   // already the best engine at >= depth
       const elo = eloForTag(tag);                       // untagged / unrecoverable -> -Inf
       if (elo < min) min = elo;
+      cohortCounts.set(elo, (cohortCounts.get(elo) || 0) + 1);
       if (sTick()) status.update(`  planning refresh... ${fmtNum(scanned)} lines`);
     }
   } catch (e) { console.warn(`\n  pre-scan interrupted (${e.message}); proceeding with what was seen.`); }
@@ -218,6 +225,8 @@ if (eloByVersion) {
     process.exit(0);
   }
   targetElo = min === Infinity ? null : min;
+  const cohort = targetElo === null ? 0 : (cohortCounts.get(targetElo) || 0);
+  toCompute = missingCount + Math.round(frac * cohort);  // fills (all) + expected cohort relabels
 }
 
 const budgeted = minutes > 0 && Number.isFinite(minutes);
@@ -356,8 +365,15 @@ for (let i = 0; i < jobs; i++) {
     flush();
     if (tick()) {
       const el = (Date.now() - t0) / 1000;
-      status.update(`  ${fmtNum(computed)} values computed | ${(computed / Math.max(el, 0.001)).toFixed(0)}/s | `
-        + `${fmtDur(el)} elapsed | ${fmtNum(lineIdx)} lines read`);
+      const rate = computed / Math.max(el, 0.001);
+      // ETA = whichever comes first: finishing the work (known count / current rate) or the
+      // wall-clock budget running out. Either may be unknown (classic mode has no count; an
+      // unbudgeted run has no deadline) — show it only once at least one is finite.
+      const etaWork = (toCompute != null && rate > 0) ? Math.max(0, (toCompute - computed) / rate) : Infinity;
+      const etaBudget = budgeted ? Math.max(0, minutes * 60 - el) : Infinity;
+      const eta = Math.min(etaWork, etaBudget);
+      status.update(`  ${fmtNum(computed)}${toCompute != null ? `/${fmtNum(toCompute)}` : ''} computed | ${rate.toFixed(0)}/s | `
+        + `${fmtDur(el)} elapsed${Number.isFinite(eta) ? ` | ETA ${fmtDur(eta)}` : ''} | ${fmtNum(lineIdx)} lines read`);
     }
     idle.push(w);
     if (!inputEnded && lineIdx - nextEmit <= CAP) rl.resume();
