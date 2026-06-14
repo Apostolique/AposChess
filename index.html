@@ -21,8 +21,8 @@
 
     gtag('config', 'G-TYM1QSCNLT');
   </script>
-  <script type="module" crossorigin src="./assets/index-BuDSpBYu.js"></script>
-  <link rel="stylesheet" crossorigin href="./assets/index-B1d1jRqB.css">
+  <script type="module" crossorigin src="./assets/index-d5zj98C5.js"></script>
+  <link rel="stylesheet" crossorigin href="./assets/index-mlrws15A.css">
 </head>
 <body>
   <main class="app">
@@ -339,7 +339,7 @@
       </section>
 
       <div class="board-col">
-        <div id="tray-top" class="tray"><span class="caps"></span><span class="adv"></span></div>
+        <div id="tray-top" class="tray"><span class="caps"></span><span class="adv"></span><p id="status" class="status" role="status" aria-live="polite"></p></div>
         <!-- Eval bars: Lichess-style vertical gauges; the white fill grows toward
              whichever side is winning. Puzzle play-it-out uses the left one (a
              dedicated worker evaluates the viewed position); the AI-vs-AI "Eval
@@ -355,10 +355,14 @@
           </div>
         </div>
         <div id="tray-bottom" class="tray"><span class="caps"></span><span class="adv"></span></div>
+        <!-- Below-board status line: puzzle prompts ("Black to move — find the best
+             move") and game-over/draw/connection banners land here, centred. The live
+             turn/thinking indicator instead moves into the to-move player's tray (see
+             placeStatus in main.js), so #status is relocated between these spots. -->
+        <div id="status-below" class="status-below"></div>
       </div>
 
       <aside class="side-col">
-        <p id="status" class="status" role="status" aria-live="polite"></p>
         <div id="moves" class="moves"></div>
         <div class="nav">
           <button id="nav-first" type="button" title="Start (Home)">⏮</button>
