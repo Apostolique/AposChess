@@ -21,8 +21,8 @@
 
     gtag('config', 'G-TYM1QSCNLT');
   </script>
-  <script type="module" crossorigin src="./assets/index-DtDFW7j5.js"></script>
-  <link rel="stylesheet" crossorigin href="./assets/index-Bf01kOaR.css">
+  <script type="module" crossorigin src="./assets/index-BuDSpBYu.js"></script>
+  <link rel="stylesheet" crossorigin href="./assets/index-B1d1jRqB.css">
 </head>
 <body>
   <main class="app">
@@ -157,6 +157,10 @@
           </div>
         </fieldset>
 
+        <!-- White + Black AI slots: wrapped so the mobile layout can place them side
+             by side (saving vertical space); display:contents on desktop keeps them
+             behaving as plain siblings in the narrow left column. -->
+        <div class="ai-pair">
         <fieldset class="ai-group" id="row-white" hidden>
           <legend>White</legend>
           <div class="control-row">
@@ -240,6 +244,7 @@
             </div>
           </div>
         </fieldset>
+        </div>
         <div class="control-row" id="row-ai-swap" hidden>
           <button id="ai-swap" type="button" title="Swap the White and Black AI settings">⇄ Swap</button>
           <label class="check-field" title="Avoid replaying a recent opening: White's first move differs from its last few games, so each game opens differently.">

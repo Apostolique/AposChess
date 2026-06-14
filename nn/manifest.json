@@ -1,5 +1,5 @@
 {
-  "default": "balanced-64",
+  "default": "loop-champion",
   "nets": [
     {
       "name": "balanced-64",
