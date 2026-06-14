@@ -85,7 +85,13 @@
 //                   (merge-data, refresh-v) key Elo by version and read depth from the
 //                   per-record `vs` tag. SPEC = a content hash / prefix (e.g. a14d52), a
 //                   champion filename, 'hc', or 'champion'. Requires an existing ledger
-//                   built against the same anchor.
+//                   built against the same anchor. Re-running --only at the SAME depth
+//                   ACCUMULATES: it plays fresh games (auto-advanced seed) and POOLS them
+//                   with the prior result for a tighter Elo, instead of discarding it — so
+//                   run it again to refine. (At a different depth it's a new measurement,
+//                   so it replaces.) Use --fresh to discard the prior games and re-measure.
+//   --fresh         with --only, do NOT pool with the prior ledger games — re-measure from
+//                   scratch at the original seed (reproduces the original games).
 //   --no-scan       skip the dataset cross-reference (record counts / unrecoverable tags).
 //   --data=FILE     dataset to scan (default ../training/data/selfplay.jsonl).
 //   --out=FILE      ledger output (default ../training/data/loop/engine-elo.json).
@@ -154,6 +160,10 @@ const cfg = {
   // --only=SPEC[,SPEC]: force-(re)rank just these contenders at this run's depth, reusing
   // every other engine's Elo from the existing ledger (see header). null = rank everyone.
   only: typeof args.only === 'string' ? args.only.split(',').map((s) => s.trim()).filter(Boolean) : null,
+  // By default an --only re-run at the SAME depth POOLS its new games with the prior result
+  // (more games -> tighter Elo) and advances the seed so they're fresh. --fresh discards the
+  // prior games and re-measures from scratch (the original seed -> the original games).
+  fresh: !!args.fresh,
   data: typeof args.data === 'string' ? resolve(process.cwd(), args.data) : join(dataDir, 'selfplay.jsonl'),
   out: typeof args.out === 'string' ? resolve(process.cwd(), args.out) : join(loopDir, 'engine-elo.json'),
   // Harvest the ranking games into a side file (NOT the live dataset — see header) that
@@ -315,6 +325,9 @@ const results = new Map([[anchor.version, { score: 0.5, elo: 0, margin: 0, games
 // doesn't yet rank. Only valid if it was built against the SAME anchor and depth (Elos
 // are relative to those); otherwise the old numbers aren't comparable, so fall back to a
 // full re-rank. Kept for carrying over the dataset cross-reference when --no-scan.
+// --only targets' prior ledger entries, so a same-depth re-run can POOL its new games with
+// them (version -> prior entry). Populated below; consumed in the play loop.
+const poolPrior = new Map();
 let prevLedger = null;
 if ((cfg.incremental || cfg.only) && existsSync(cfg.out)) {
   try { prevLedger = JSON.parse(readFileSync(cfg.out, 'utf8')); } catch (e) { console.warn(`(could not read existing ledger: ${e.message})`); }
@@ -338,7 +351,7 @@ if ((cfg.incremental || cfg.only) && existsSync(cfg.out)) {
     } else {
       for (const e of prevLedger.ranking || []) {
         if (e.anchor || e.elo == null) continue;
-        if (cfg.only && onlyVersions.has(e.version)) continue; // force-replay the targets
+        if (cfg.only && onlyVersions.has(e.version)) { poolPrior.set(e.version, e); continue; } // force-replay; remember for pooling
         if (players.has(`${e.eng}@${e.version}`)) {
           // Carry the prior `tag` too: it encodes the depth this Elo was measured at, which
           // --only may differ from this run's --depth — reused engines keep their own depth.
@@ -352,7 +365,7 @@ if ((cfg.incremental || cfg.only) && existsSync(cfg.out)) {
   }
 }
 
-function runMatch(p, idx) {
+function runMatch(p, idx, seedOffset = 0) {
   // Index-keyed temp name: the version can contain filesystem-unsafe chars (e.g. the
   // material fallback's '?'), and matchups run sequentially anyway.
   const tmp = join(loopDir, `rank-match-${idx}.json`);
@@ -363,7 +376,9 @@ function runMatch(p, idx) {
     `--openings=${cfg.openings}`,
     `--maxmoves=${cfg.maxmoves}`,
     // Decorrelate matchups so they aren't all the same openings, yet stay reproducible.
-    `--seed=${cfg.seed + idx}`,
+    // seedOffset advances the seed for a pooled --only re-run so its games are FRESH (the
+    // match seeds every opening from the base seed, so the same seed = the same games).
+    `--seed=${cfg.seed + idx + seedOffset}`,
     `--eval-a=${p.evalName}`,
     `--eval-b=${anchor.evalName}`,
     `--result-file=${tmp}`,
@@ -404,10 +419,23 @@ contenders.forEach((p, idx) => {
     if (r.reused) console.log(`= ${p.tag}: reusing ledger Elo ${r.elo >= 0 ? '+' : ''}${r.elo.toFixed(0)} (${idx + 1}/${contenders.length})`);
     return;
   }
-  const res = runMatch(p, idx);
+  // Pool with the prior result on an --only re-run at the SAME depth: more games -> a
+  // tighter Elo. The prior must be at this run's depth (a different depth is a different
+  // measurement, so it's replaced, not pooled). --fresh forces a clean re-measure.
+  const prior = poolPrior.get(p.version);
+  const priorDepth = prior ? (/^(?:nn|hc)(\d+|t)@/.exec(prior.tag || '')?.[1]) : null;
+  const pool = prior && !cfg.fresh && priorDepth === String(depthMark) && prior.games > 0;
+  // Advance the seed past the prior games so this run's games don't repeat them.
+  const res = runMatch(p, idx, pool ? prior.games : 0);
   if (!res) { results.set(p.version, { score: null, elo: null, margin: null, games: 0 }); return; }
+  let score = res.score, games = res.games;
+  if (pool) {
+    games = prior.games + res.games;
+    score = (prior.score * prior.games + res.score * res.games) / games;
+    console.log(`  + pooled with ${prior.games} prior game(s): ${prior.games}+${res.games} = ${games} total`);
+  }
   results.set(p.version, {
-    score: res.score, elo: res.elo, margin: eloMargin(res.score, res.games), games: res.games,
+    score, elo: eloFromScore(score), margin: eloMargin(score, games), games,
   });
 });
 
