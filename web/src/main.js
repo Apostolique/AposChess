@@ -240,6 +240,7 @@ const cg = Chessground(boardEl, {
   movable: { free: false, showDests: true, events: { after: onUserMove } },
   highlight: { lastMove: true, check: true },
   animation: { enabled: true, duration: 200 },
+  events: { change: onBoardChange },
 });
 
 // Which colour the human may move right now (undefined = board locked).
@@ -364,6 +365,16 @@ function renderTrays(entry) {
   const bottom = viewColor();
   renderTray($('tray-bottom'), bottom, entry.state.board);
   renderTray($('tray-top'), opponent(bottom), entry.state.board);
+}
+
+// chessground fires this on any board mutation. In the editor (palette drops,
+// drag-off deletions, Clear/Start) the board changes outside game state, and
+// render() skips the editor entirely — so refresh the material trays from the
+// edited placement here. Other modes drive the trays through render().
+function onBoardChange() {
+  if (ui.mode !== 'editor') return;
+  const board = parseFen(`${cg.getFen()} w - - 0 1`).board;
+  renderTrays({ state: { board } });
 }
 
 // Relocate the single #status element to where its message belongs: a concise live
