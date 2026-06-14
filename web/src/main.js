@@ -366,11 +366,24 @@ function renderTrays(entry) {
   renderTray($('tray-top'), opponent(bottom), entry.state.board);
 }
 
+// Relocate the single #status element to where its message belongs: a concise live
+// turn/thinking indicator sits in the to-move player's own tray (right of their
+// material diff, on their side of the board), while everything else — puzzle prompts,
+// game-over/draw banners, the editor and connection notices — goes below the board.
+// `where` is 'below' or a colour; a colour maps to the matching tray via orientation.
+function placeStatus(el, where) {
+  const parent = where === 'below' ? $('status-below')
+    : where === viewColor() ? $('tray-bottom') : $('tray-top');
+  if (el.parentElement !== parent) parent.appendChild(el);
+  el.classList.toggle('status-side', where !== 'below');
+}
+
 function updateStatusText() {
   const el = $('status');
   if (ui.mode === 'editor') {
     el.classList.remove('over');
     el.textContent = `Editing — ${editorTurn === 'white' ? 'White' : 'Black'} to move. Switch Mode to play.`;
+    placeStatus(el, 'below');
     return;
   }
   if (ui.mode === 'puzzle') renderPuzzleMeta();
@@ -378,6 +391,7 @@ function updateStatusText() {
   // it falls through to the regular status text below.
   if (ui.mode === 'puzzle' && puzzlePhase !== 'freeplay') {
     el.classList.toggle('over', puzzlePhase === 'solved' || puzzlePhase === 'revealed');
+    placeStatus(el, 'below');
     if (!puzzle) {
       el.textContent = puzzleCatalog === null ? 'Loading puzzles…'
         : puzzleCatalog.length === 0 ? 'No puzzles available.'
@@ -394,6 +408,8 @@ function updateStatusText() {
     return;
   }
   el.classList.toggle('over', status.over);
+  // Live turn/thinking → the to-move player's tray; banners/results → below the board.
+  let placement = 'below';
   if (status.result === 'checkmate') {
     el.textContent = `Checkmate — ${status.winner === 'white' ? 'White' : 'Black'} wins.`;
   } else if (status.result === 'stalemate') {
@@ -409,10 +425,13 @@ function updateStatusText() {
   } else if (aiThinking) {
     const side = state.turn === 'white' ? 'White' : 'Black';
     el.textContent = `${side} is thinking…`;
+    placement = state.turn;
   } else {
     const side = state.turn === 'white' ? 'White' : 'Black';
     el.textContent = `${side} to move${status.check ? ' — check!' : ''}`;
+    placement = state.turn;
   }
+  placeStatus(el, placement);
 }
 
 // Apply one move to the live game and record it (state, status, history snapshot,
