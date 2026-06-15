@@ -754,9 +754,13 @@ let puzzleStep = 0;        // index into puzzle.moves of the next expected move
 let puzzleTimer = null;    // pending scripted reply / solution playback step
 let puzzleAiPending = false; // a free-play "AI move" request is in flight
 
-// The play-it-out engine: a fixed strong default (the Opponent row isn't shown in
+// The analysis engine: a fixed strong default (the Opponent row isn't shown in
 // puzzle mode — analysis wants one good answer, not a sparring partner's level).
-const PUZZLE_AI = { depth: 7, engine: 'handcrafted' };
+// The loop-champion net at depth 7, our strongest eval; net resolved at request
+// time (the catalog has loaded by the time you reach analysis), falling back to
+// material if the catalog is unavailable. This drives the on-demand "AI move", the
+// analysis eval bar, AND the best-move arrow (see EVAL_BAR), so all three agree.
+const PUZZLE_AI = { depth: 7, engine: 'nn', net: 'loop-champion' };
 
 const puzzleUci = (m) => squareName(m.from) + squareName(m.to) + (m.promotion || '');
 
@@ -926,9 +930,13 @@ function puzzleHint() {
 // themes only once the puzzle is over (they'd spoil the answer).
 function renderPuzzleMeta() {
   const el = $('puzzle-meta');
+  // "Next puzzle" stays locked until the current one is solved/revealed (or you're
+  // already analyzing it) — no skipping ahead without an answer.
+  const solvedish = puzzlePhase === 'solved' || puzzlePhase === 'revealed' || puzzlePhase === 'freeplay';
+  $('puzzle-next').disabled = !solvedish;
   if (ui.mode !== 'puzzle' || !puzzle) { el.textContent = ''; return; }
   let s = `Puzzle ${puzzleIdx + 1} / ${puzzleList.length}`;
-  if (puzzlePhase === 'solved' || puzzlePhase === 'revealed' || puzzlePhase === 'freeplay') {
+  if (solvedish) {
     s += puzzle.kind === 'mate' ? ` · mate in ${puzzle.mateIn}`
       : puzzle.kind === 'defense' ? ' · defensive save' : ' · winning tactic';
     s += ` · difficulty ${puzzle.difficulty}`;
@@ -959,11 +967,19 @@ function renderPuzzleMeta() {
 //     after each search depth (onSearchProgress), and the idle engine refreshes its
 //     bar on each ponder burst (onPonderResult), so neither bar sits frozen between
 //     moves. The final per-ply value (onSearchResult) is what review replays.
-const EVAL_BAR = { depth: 6, maxMs: 1500, engine: 'handcrafted' };
+// The analysis eval bar (and the best-move arrow that shares its reply) runs the same
+// engine as "AI move" — loop-champion at depth 7 — so the bar, the arrow, and the move
+// AI move would play all agree. It lives in its own worker, so the heavier nn search
+// never blocks the UI; it just updates a touch more deliberately as you navigate.
+const EVAL_BAR = { depth: PUZZLE_AI.depth, maxMs: ui.maxMs, engine: PUZZLE_AI.engine, net: PUZZLE_AI.net };
 // Scores beyond this magnitude encode a forced mate (ai.js MATE = 1,000,000; no
 // real centipawn eval comes anywhere near) — pin the bar to the winner's end.
 const EVAL_BAR_MATE = 500_000;
 const evalBar = { worker: null, seq: 0, pending: false, dirty: false, fen: null, turn: 'white' };
+// Analysis "best-move arrow": reuse the eval-bar worker's reply (it already searches
+// the viewed position) to draw an arrow to its best move, refreshed as you navigate
+// or fork — no extra worker, no need to actually play the move.
+let showBestArrow = false;
 
 const puzzleBarVisible = () => ui.mode === 'puzzle' && puzzlePhase === 'freeplay' && !!puzzle;
 const duelBarsVisible = () => ui.mode === 'ai-ai' && ui.showEvalBars;
@@ -974,9 +990,10 @@ function createEvalBarWorker() {
     if (data.type !== 'search' || data.seq !== evalBar.seq) return;
     evalBar.pending = false;
     if (evalBar.dirty) { evalBar.dirty = false; evalBar.fen = null; requestEvalBar(); return; }
-    if (!puzzleBarVisible() || typeof data.score !== 'number') return;
+    if (!puzzleBarVisible()) return;
     // The search score is side-to-move-relative; the bar wants White's view.
-    paintEvalBar(evalBar.turn === 'white' ? data.score : -data.score);
+    if (typeof data.score === 'number') paintEvalBar(evalBar.turn === 'white' ? data.score : -data.score);
+    drawBestArrow(data.move);
   };
   w.onerror = (e) => console.error('Eval-bar worker error:', e.message);
   return w;
@@ -1004,6 +1021,15 @@ function paintEvalBarEl(el, whiteCp, who) {
 
 // The puzzle bar (left, dedicated worker).
 function paintEvalBar(whiteCp) { paintEvalBarEl($('eval-bar-left'), whiteCp, 'Eval'); }
+
+// Draw (or clear) the analysis best-move arrow from an eval-bar search reply.
+// Off, out of analysis, or a terminal position (no move) all clear it.
+function drawBestArrow(move) {
+  if (!showBestArrow || !puzzleBarVisible()) return;
+  cg.setAutoShapes(move && move.from != null
+    ? [{ orig: squareName(move.from), dest: squareName(move.to), brush: 'paleBlue' }]
+    : []);
+}
 
 // The AI-vs-AI duel bars: each engine's own score at the VIEWED ply (recorded
 // per history entry by onSearchResult in White's view), so stepping back shows
@@ -1062,14 +1088,16 @@ function requestEvalBar() {
   const here = viewIndex === history.length - 1 ? status : gameStatus(st);
   if (here.over) {
     paintEvalBar(here.result === 'checkmate' ? (here.winner === 'white' ? EVAL_BAR_MATE : -EVAL_BAR_MATE) : 0);
+    drawBestArrow(null); // no move in a finished position
     return;
   }
+  drawBestArrow(null); // clear the arrow for the old position until the new search lands
   if (!evalBar.worker) evalBar.worker = createEvalBarWorker();
   evalBar.pending = true;
   evalBar.turn = st.turn;
   evalBar.worker.postMessage({
     type: 'search', seq: ++evalBar.seq, state: st,
-    depth: EVAL_BAR.depth, maxMs: EVAL_BAR.maxMs, engine: EVAL_BAR.engine,
+    depth: EVAL_BAR.depth, maxMs: EVAL_BAR.maxMs, engine: EVAL_BAR.engine, net: netUrl(EVAL_BAR.net),
     // The repetition window up to the VIEWED ply (same trimming as repWindow).
     posHistory: repFens.slice(0, viewIndex + 1).slice(-(st.halfmove + 1)),
   });
@@ -1457,12 +1485,20 @@ function applyModeVisibility() {
   const m = ui.mode;
   $('side-control').hidden = m !== 'human-ai';
   $('ai-toggle').hidden = m !== 'ai-ai';
-  // Puzzles have their own Retry/Next buttons; "New game" would be ambiguous there.
+  // Puzzles have their own Retry/Next buttons (in the mode row); "New game" would be
+  // ambiguous there. Next is enabled/disabled by phase in renderPuzzleMeta.
   $('new-game').hidden = m === 'puzzle';
+  $('puzzle-retry').hidden = m !== 'puzzle';
+  $('puzzle-next').hidden = m !== 'puzzle';
   $('row-puzzle').hidden = m !== 'puzzle';
   // The puzzle panel swaps Play it out for the on-demand AI move button in free-play.
-  $('puzzle-continue').hidden = m === 'puzzle' && puzzlePhase === 'freeplay';
-  $('puzzle-ai-move').hidden = !(m === 'puzzle' && puzzlePhase === 'freeplay');
+  const freeplay = m === 'puzzle' && puzzlePhase === 'freeplay';
+  $('puzzle-continue').hidden = freeplay;
+  $('puzzle-ai-move').hidden = !freeplay;
+  // The best-move-arrow toggle lives with the analysis controls; leaving analysis
+  // turns it off (the arrow itself is cleared by loadPuzzle / mode-switch).
+  $('puzzle-arrows-field').hidden = !freeplay;
+  if (!freeplay && showBestArrow) { showBestArrow = false; $('puzzle-arrows').checked = false; }
   $('row-ai-swap').hidden = m !== 'ai-ai';
   $('row-online').hidden = m !== 'online';
   // human-ai: one colour-agnostic AI row. ai-ai: separate White/Black rows.
@@ -1506,7 +1542,7 @@ function applyAiLock() {
 function aiParams(turn) {
   // Puzzle free-play "AI move" requests use the fixed analysis default — the
   // Opponent row isn't shown (or consulted) in puzzle mode.
-  if (ui.mode === 'puzzle') return { depth: PUZZLE_AI.depth, maxMs: ui.maxMs, engine: PUZZLE_AI.engine, net: undefined };
+  if (ui.mode === 'puzzle') return { depth: PUZZLE_AI.depth, maxMs: ui.maxMs, engine: PUZZLE_AI.engine, net: netUrl(PUZZLE_AI.net) };
   const slot = ui.mode === 'ai-ai' ? turn : 'ai';
   const engine = engineOf(slot);
   const net = engine === 'nn' ? netUrl(netOf(slot)) : undefined; // weights URL for the worker
@@ -1746,7 +1782,7 @@ $('puzzle-retry').addEventListener('click', () => { if (puzzle) loadPuzzle(puzzl
 $('puzzle-hint').addEventListener('click', puzzleHint);
 $('puzzle-solution').addEventListener('click', revealPuzzleSolution);
 $('puzzle-next').addEventListener('click', nextPuzzle);
-// "Play it out": stay in puzzle mode and analyze freely — it's often not obvious
+// "Analysis": stay in puzzle mode and analyze freely — it's often not obvious
 // how the game unfolds after the tactic lands. Both sides are hand-movable,
 // reviewing becomes forkable (rewind and play a different move — see
 // onUserMove/truncateToView), and the AI move button asks the engine for the next
@@ -1769,6 +1805,14 @@ $('puzzle-ai-move').addEventListener('click', () => {
   puzzleAiPending = true;
   startSearch(ai[state.turn]); // commits via the normal onSearchResult path
   updateStatusText();          // "… is thinking"
+});
+// Best-move arrow: on, force a fresh eval-bar search so its reply carries the move
+// to draw; off, clear the arrow immediately.
+$('puzzle-arrows').addEventListener('change', (e) => {
+  showBestArrow = e.target.checked;
+  if (!showBestArrow) { cg.setAutoShapes([]); return; }
+  evalBar.fen = null; // bypass the "same position" short-circuit so the move comes back
+  requestEvalBar();
 });
 for (const id of ['puzzle-difficulty', 'puzzle-theme']) {
   $(id).addEventListener('change', () => {
