@@ -176,9 +176,10 @@ const cfg = {
   refreshCycle: args['no-refresh'] ? 0 : num(args['refresh-cycle'], 0.01),
   refreshCycleDepth: num(args['refresh-cycle-depth'], num(args.depth, 6)),
   // Engine ranking for smart weakest-first v refresh. On by default: each promotion adds
-  // the new champion to the Elo ledger (incrementally — one matchup vs the stable hc
-  // anchor), and the refreshes below read the ledger to relabel the WEAKEST engine's `v`
-  // first instead of a blind random fraction. --no-rank reverts to the classic refresh.
+  // ONLY the new champion to the Elo ledger (rank --only; every other engine's Elo is
+  // reused), ranked at both the gate depth (--rank-depth) and the generation depth so its
+  // nn4@/nn6@ labels each get a precise Elo. The refreshes below read the ledger to relabel
+  // the WEAKEST engine's `v` first instead of a blind random fraction. --no-rank reverts.
   rank: !args['no-rank'],
   rankDepth: num(args['rank-depth'], 4),
   // Default to the gate's game count: the ledger needs enough games to resolve the real
@@ -240,15 +241,36 @@ function run(label, cmd, argv, cwd = webDir) {
   return true;
 }
 
-// Update the engine-strength ledger incrementally: only the engines it doesn't yet rank
-// (e.g. a just-promoted champion) play a matchup against the stable hc anchor; the rest
-// are reused. --no-scan keeps it fast (record counts aren't needed to drive the refresh).
+// Add a just-promoted champion to the engine-strength ledger — ONLY that champion plays,
+// every other engine's Elo is reused unchanged (via rank's --only), so a promotion never
+// re-ranks engines that didn't change. The champion is ranked at BOTH the gate depth
+// (cfg.rankDepth, its harvested nn4@ labels) and the generation depth (cfg.depth, its
+// nn6@ labels), so each of its engine×depth labels gets a precise Elo (the consumers look
+// an exact engine×depth tag up first). The first promotion has no ledger yet, so it seeds
+// one with a full incremental gauntlet at the gate depth before adding the champion's deep
+// entry. --no-scan keeps it fast (record counts aren't needed to drive the refresh).
 // Maintenance, like the refreshes — a failure logs but doesn't stop the loop.
-function runRank(label) {
+function runRank(label, champHash) {
   if (!cfg.rank) return;
-  run(label, process.execPath,
-    [rankScript, '--incremental', '--no-scan', '--no-save-games',
-      `--depth=${cfg.rankDepth}`, `--games=${cfg.rankGames}`, `--out=${ledgerFile}`, ...jobArg]);
+  // No ledger yet (first promotion): seed it with a full gauntlet at the gate depth —
+  // every instantiable engine plays the stable hc anchor once (--incremental falls back to
+  // a full rank when no ledger exists). Later promotions skip this: the ledger already
+  // ranks every prior engine, and --only adds just the new champion.
+  const seeding = !existsSync(ledgerFile);
+  if (seeding) {
+    run(`${label} (seed ledger @ depth ${cfg.rankDepth})`, process.execPath,
+      [rankScript, '--incremental', '--no-scan', '--no-save-games',
+        `--depth=${cfg.rankDepth}`, `--games=${cfg.rankGames}`, `--out=${ledgerFile}`, ...jobArg]);
+  }
+  if (champHash === '?') return; // unhashable champion — can't target it with --only
+  // Rank ONLY the new champion at both the gate depth and the generation depth (deduped;
+  // skip the gate depth the seed gauntlet just covered for this champion).
+  const depths = [...new Set([cfg.rankDepth, cfg.depth])].filter((d) => !(seeding && d === cfg.rankDepth));
+  for (const d of depths) {
+    run(`${label} @ depth ${d}`, process.execPath,
+      [rankScript, `--only=${champHash}`, '--no-scan', '--no-save-games',
+        `--depth=${d}`, `--games=${cfg.rankGames}`, `--out=${ledgerFile}`, ...jobArg]);
+  }
 }
 
 // Build refresh-v args. With ranking on AND a ledger present, target the WEAKEST cohort
@@ -299,7 +321,7 @@ log(`train:loop start — batch ${cfg.batch} @ depth ${cfg.depth} | gate ${cfg.g
   + `${existsSync(lineage) ? ' (resuming lineage)' : ''} | `
   + `refresh/cycle ${cfg.refreshCycle > 0 ? `${(cfg.refreshCycle * 100).toFixed(1)}% @ depth ${cfg.refreshCycleDepth}` : 'off'} | `
   + `refresh on promotion ${cfg.refreshFrac > 0 ? `${(cfg.refreshFrac * 100).toFixed(0)}% @ depth ${cfg.refreshDepth}` : 'off'} | `
-  + `rank ${cfg.rank ? `on (hc anchor, depth ${cfg.rankDepth}, ${cfg.rankGames}g/new engine)` : 'off'} | `
+  + `rank ${cfg.rank ? `on (hc anchor, new champion @ depths ${[...new Set([cfg.rankDepth, cfg.depth])].join('+')}, ${cfg.rankGames}g/matchup)` : 'off'} | `
   + `cycles ${cfg.cycles === Infinity ? '∞' : cfg.cycles}`);
 
 const jobArg = cfg.jobs !== undefined ? [`--jobs=${cfg.jobs}`] : [];
@@ -376,9 +398,9 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
       + `New champion published as 'loop-champion' (archived ${champHash}.json). Total promotions: ${promotions}.`);
     // Add the new champion to the strength ledger so the refresh below — and every later
     // cycle — recognizes it as the new best and can relabel the now-second-best champion's
-    // `v` weakest-first. Incremental: normally just one matchup vs the anchor; the FIRST
-    // promotion (no ledger yet) plays the full small gauntlet to seed it.
-    runRank(`Rank engines (add champion ${champHash})`);
+    // `v` weakest-first. Only the new champion plays (--only), at both the gate and
+    // generation depths; the FIRST promotion (no ledger yet) seeds the gauntlet first.
+    runRank(`Rank engines (add champion ${champHash})`, champHash);
     // The champion (hence the `v` target) just changed: value-iterate by recomputing
     // `v` on a fraction of the dataset with the NEW champion. Optional maintenance —
     // a failure shouldn't kill the loop, so we don't gate on its result (a Ctrl-C
