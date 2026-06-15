@@ -21,7 +21,7 @@
 
     gtag('config', 'G-TYM1QSCNLT');
   </script>
-  <script type="module" crossorigin src="./assets/index-eL0yrgx5.js"></script>
+  <script type="module" crossorigin src="./assets/index-BNy9sv7G.js"></script>
   <link rel="stylesheet" crossorigin href="./assets/index-DrZdGO58.css">
 </head>
 <body>
@@ -46,6 +46,7 @@
               <option value="ai-ai">AI vs AI</option>
               <option value="online">Online: play a friend</option>
               <option value="puzzle">Puzzles</option>
+              <option value="analysis">Analysis</option>
               <option value="editor">Board editor</option>
             </select>
           </label>
@@ -74,11 +75,7 @@
           <div class="control-row puzzle-actions">
             <button id="puzzle-hint" type="button" title="Highlight the piece that moves next">Hint</button>
             <button id="puzzle-solution" type="button" title="Play out the solution">Solution</button>
-            <button id="puzzle-continue" type="button" title="Explore from here — move either side freely and rewind to try different moves; the engine's best move shows as an arrow">Analysis</button>
-            <label id="puzzle-arrows-field" class="check-field" hidden title="Continuously draw an arrow to the engine's best move for the side to move — no need to play it">
-              <input type="checkbox" id="puzzle-arrows" />
-              Best-move arrow
-            </label>
+            <button id="puzzle-continue" type="button" title="Analyze this position freely — move either side, rewind to try different lines, and see the engine's best move; you can return to the puzzle afterward">Analysis</button>
           </div>
           <!-- Filters at the bottom: you set the difficulty/theme once, then mostly
                work through puzzles without touching them again. -->
@@ -105,6 +102,23 @@
                 <option value="sacrifice">Sacrifice</option>
                 <option value="promotion">Promotion</option>
               </select>
+            </label>
+          </div>
+        </fieldset>
+
+        <!-- Analysis panel (its own mode). Lives in .actions — alongside the puzzle
+             panel — so it stays pinned under the board and visible on mobile, where the
+             .controls column is hidden during analysis. "Back to puzzle" resumes the
+             puzzle session you came from (shown only when analysis was entered from a
+             puzzle). -->
+        <fieldset class="ai-group" id="row-analysis" hidden>
+          <legend>Analysis</legend>
+          <p class="puzzle-meta">Free analysis — move either side, rewind to fork a line; the engine never plays, it just shows its best move as an arrow.</p>
+          <div class="control-row puzzle-actions">
+            <button id="analysis-back" type="button" hidden title="Return to the puzzle you were solving and pick up where you left off">Back to puzzle</button>
+            <label class="check-field" title="Continuously draw an arrow to the engine's best move for the side to move — no need to play it">
+              <input type="checkbox" id="analysis-arrows" />
+              Best-move arrow
             </label>
           </div>
         </fieldset>
