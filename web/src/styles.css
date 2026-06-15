@@ -574,11 +574,11 @@ button:disabled:hover { background: var(--panel); } /* no hover lift when locked
   .controls .rules { margin-top: 0; }
   .controls .rules summary { display: none; }
 
-  /* Puzzle Analysis (free-play): you live in the move list, scrubbing/forking the
-     line, so lift it + the nav controls directly under the board (above the puzzle
-     panel). The tab bar is dropped — analysis only cares about the moves — and the
-     move list is forced visible regardless of which tab was last active. These rules
-     follow the tab rules above so they win on equal specificity. */
+  /* Analysis mode: you live in the move list, scrubbing/forking the line, so lift it +
+     the nav controls directly under the board (above the analysis panel). The tab bar
+     is dropped — analysis only cares about the moves — and the move list is forced
+     visible regardless of which tab was last active. These rules follow the tab rules
+     above so they win on equal specificity. */
   body[data-analysis="1"] .layout {
     grid-template-areas: "board" "side" "actions";
   }

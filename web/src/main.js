@@ -18,7 +18,7 @@ const boardEl = document.getElementById('board');
 const $ = (id) => document.getElementById(id);
 
 const ui = {
-  mode: 'human-human', // 'human-human' | 'human-ai' | 'ai-ai' | 'online' | 'puzzle' | 'editor'
+  mode: 'human-human', // 'human-human' | 'human-ai' | 'ai-ai' | 'online' | 'puzzle' | 'analysis' | 'editor'
   humanColor: 'white', // which side the human controls in 'human-ai'
   // AI strength per slot: a preset depth string '1'..'7', or 'custom'.
   strengthAi: '2',     // opponent strength in 'human-ai'
@@ -249,13 +249,14 @@ function controllableColor() {
   if (ui.mode === 'human-ai' && state.turn === ui.humanColor) return state.turn;
   if (ui.mode === 'online' && onlineConnected && state.turn === onlineColor) return state.turn;
   // Puzzle: the solver's side while the puzzle is live (not solved/revealed and not
-  // waiting on the scripted reply). The play-it-out free-play is analysis: BOTH
-  // sides are hand-movable; the engine never moves, it only suggests the best move
-  // via the eval-bar arrow.
+  // waiting on the scripted reply).
   if (ui.mode === 'puzzle' && puzzle) {
-    if (puzzlePhase === 'freeplay') return state.turn;
     if ((puzzlePhase === 'playing' || puzzlePhase === 'wrong') && state.turn === puzzleColor) return state.turn;
   }
+  // Analysis: free play — the side to move is hand-movable (the other side becomes
+  // movable once you navigate/fork to a ply where it's on move; see render()). The
+  // engine never moves, it only suggests the best move via the eval-bar arrow.
+  if (ui.mode === 'analysis') return state.turn;
   return undefined;
 }
 
@@ -275,6 +276,7 @@ function viewColor() {
   if (ui.mode === 'human-ai') c = ui.humanColor;
   else if (ui.mode === 'online') c = onlineColor || 'white';
   else if (ui.mode === 'puzzle') c = puzzleColor;
+  else if (ui.mode === 'analysis') c = analysisOrient; // carried from the mode we entered from
   return ui.flipped ? opponent(c) : c;
 }
 
@@ -286,11 +288,11 @@ function render() {
   const atLive = viewIndex === history.length - 1;
   let color = atLive ? controllableColor() : undefined;
   let dests = (atLive && color) ? destsMap(status.legal) : new Map();
-  // Puzzle play-it-out: reviewing isn't read-only — EITHER side can move from any
-  // viewed position, which FORKS the game there (the continuation after it is
-  // discarded by onUserMove), so "what if" is one rewind away for both colours.
-  // Everywhere else an off-live view stays locked.
-  if (!atLive && ui.mode === 'puzzle' && puzzlePhase === 'freeplay') {
+  // Analysis: reviewing isn't read-only — EITHER side can move from any viewed
+  // position, which FORKS the game there (the continuation after it is discarded by
+  // onUserMove), so "what if" is one rewind away for both colours. Everywhere else an
+  // off-live view stays locked.
+  if (!atLive && ui.mode === 'analysis') {
     color = entry.state.turn;
     dests = destsMap(legalMoves(entry.state));
   }
@@ -396,10 +398,8 @@ function updateStatusText() {
     placeStatus(el, 'below');
     return;
   }
-  if (ui.mode === 'puzzle') renderPuzzleMeta();
-  // The play-it-out free-play reads like a normal game (thinking/check/result), so
-  // it falls through to the regular status text below.
-  if (ui.mode === 'puzzle' && puzzlePhase !== 'freeplay') {
+  if (ui.mode === 'puzzle') {
+    renderPuzzleMeta();
     el.classList.toggle('over', puzzlePhase === 'solved' || puzzlePhase === 'revealed');
     placeStatus(el, 'below');
     if (!puzzle) {
@@ -436,7 +436,7 @@ function updateStatusText() {
     const side = state.turn === 'white' ? 'White' : 'Black';
     el.textContent = `${side} is thinking…`;
     placement = state.turn;
-  } else if (ui.mode === 'puzzle' && puzzlePhase === 'freeplay' && evalBar.pending) {
+  } else if (ui.mode === 'analysis' && evalBar.pending) {
     // Analysis: the eval-bar/best-move-arrow search is running. Show the same
     // "thinking…" line as the play modes, for the side being analysed (the viewed
     // position's turn, which the eval-bar worker is searching).
@@ -557,7 +557,7 @@ function goTo(index) {
 
 // Make the viewed ply the live end of the game: drop everything after it and
 // rebuild the live bookkeeping (state, status, repetition counts) from the
-// snapshot. Backs the rewind-and-fork in puzzle play-it-out.
+// snapshot. Backs the rewind-and-fork in analysis mode.
 function truncateToView() {
   history.length = viewIndex + 1;
   repFens.length = viewIndex + 1;
@@ -576,11 +576,11 @@ function truncateToView() {
 // asking for a promotion piece when several moves share that destination.
 function onUserMove(orig, dest) {
   if (ui.mode === 'editor') return; // free placement: chessground keeps the move, no game logic
-  // A move played while reviewing (only enabled in puzzle play-it-out — everywhere
-  // else an off-live board is view-only) forks the game at the viewed ply: the
-  // moves after it are discarded and this move becomes the new continuation.
+  // A move played while reviewing (only enabled in analysis — everywhere else an
+  // off-live board is view-only) forks the game at the viewed ply: the moves after it
+  // are discarded and this move becomes the new continuation.
   if (viewIndex !== history.length - 1) {
-    if (!(ui.mode === 'puzzle' && puzzlePhase === 'freeplay')) { render(); return; }
+    if (ui.mode !== 'analysis') { render(); return; }
     truncateToView();
   }
   const from = parseSquare(orig), to = parseSquare(dest);
@@ -599,7 +599,7 @@ function onUserMove(orig, dest) {
 // as a minimal {from,to,promotion} so the other client reconstructs the identical
 // engine move from its own legalMoves (no chance of the two games diverging).
 function playLocalMove(move) {
-  if (ui.mode === 'puzzle' && puzzlePhase !== 'freeplay') { playPuzzleMove(move); return; }
+  if (ui.mode === 'puzzle') { playPuzzleMove(move); return; }
   commit(move);
   if (ui.mode === 'online' && online && onlineConnected) {
     online.send({ t: 'move', from: move.from, to: move.to, promotion: move.promotion || null });
@@ -758,6 +758,19 @@ let puzzlePhase = 'idle';  // 'playing' | 'wrong' | 'solved' | 'revealed' | 'idl
 let puzzleStep = 0;        // index into puzzle.moves of the next expected move
 let puzzleTimer = null;    // pending scripted reply / solution playback step
 
+// --- analysis mode ---
+// Board orientation while in analysis (carried from whatever mode we entered from,
+// then togglable via Flip board). See viewColor().
+let analysisOrient = 'white';
+// A snapshot of the puzzle session we entered analysis from (null = analysis was not
+// reached from a puzzle). It drives the "Back to puzzle" button and is the data the
+// button restores, so leaving analysis resumes the puzzle exactly where it was rather
+// than re-dealing it. See snapshotPuzzleSession/resumePuzzleSession.
+let puzzleSession = null;
+// One-shot hand-off: set just before switching to puzzle mode so enterPuzzleMode
+// resumes this saved session instead of dealing a fresh puzzle.
+let puzzleResume = null;
+
 // The analysis engine: a fixed strong default (the Opponent row isn't shown in
 // puzzle mode — analysis wants one good answer, not a sparring partner's level).
 // The loop-champion net at depth 7, our strongest eval; net resolved at request
@@ -788,6 +801,10 @@ const PUZZLE_THEME = {
 
 async function enterPuzzleMode() {
   clearTimeout(puzzleTimer);
+  // Returning from analysis (the "Back to puzzle" button): resume the saved session
+  // instead of dealing a new puzzle. The catalog is already loaded (we were puzzling
+  // before), so no fetch is needed.
+  if (puzzleResume) { const s = puzzleResume; puzzleResume = null; resumePuzzleSession(s); return; }
   render(); // lock the board while the catalog loads
   if (!puzzleCatalog) {
     try {
@@ -799,6 +816,44 @@ async function enterPuzzleMode() {
   }
   refilterPuzzles();
   nextPuzzle();
+}
+
+// Capture everything needed to resume the current puzzle session after a detour
+// through analysis: the live game (state/status/history/repFens/viewIndex/counts) and
+// the puzzle tracking (which puzzle, whose move, phase, progress). The arrays are
+// copied so analysis's forking/truncation can't mutate the saved session; the catalog
+// and filtered play order (puzzleList) are left shared — analysis can't change them.
+function snapshotPuzzleSession() {
+  return {
+    state, status,
+    history: history.slice(),
+    repFens: repFens.slice(),
+    viewIndex,
+    posCounts: new Map(posCounts),
+    puzzle, puzzleColor, puzzlePhase, puzzleStep, puzzleIdx,
+  };
+}
+
+// Restore a session captured by snapshotPuzzleSession — the inverse: drop any analysis
+// work in progress and re-establish the puzzle exactly where it was left.
+function resumePuzzleSession(s) {
+  clearTimeout(puzzleTimer);
+  cancelAi();
+  state = s.state;
+  status = s.status;
+  history = s.history;
+  repFens = s.repFens;
+  viewIndex = s.viewIndex;
+  posCounts = s.posCounts;
+  puzzle = s.puzzle;
+  puzzleColor = s.puzzleColor;
+  puzzlePhase = s.puzzlePhase;
+  puzzleStep = s.puzzleStep;
+  puzzleIdx = s.puzzleIdx;
+  lastCommitAt = performance.now();
+  cg.setAutoShapes([]);
+  applyModeVisibility();
+  render();
 }
 
 // Rebuild the play order from the current filter selects: filter, then shuffle so
@@ -859,7 +914,7 @@ function loadPuzzle(p) {
   puzzlePhase = 'playing';
   puzzleStep = 0;
   cg.setAutoShapes([]);
-  applyModeVisibility(); // re-hide the Opponent row if we're leaving a play-it-out
+  applyModeVisibility(); // keep the puzzle panel/buttons in sync with the new puzzle
   render();
   // Let the starting position paint, then play the blunder (commit animates it and
   // sounds it like any move); the board unlocks for the solver when it lands.
@@ -934,9 +989,9 @@ function puzzleHint() {
 // themes only once the puzzle is over (they'd spoil the answer).
 function renderPuzzleMeta() {
   const el = $('puzzle-meta');
-  // "Next puzzle" stays locked until the current one is solved/revealed (or you're
-  // already analyzing it) — no skipping ahead without an answer.
-  const solvedish = puzzlePhase === 'solved' || puzzlePhase === 'revealed' || puzzlePhase === 'freeplay';
+  // "Next puzzle" stays locked until the current one is solved/revealed — no skipping
+  // ahead without an answer.
+  const solvedish = puzzlePhase === 'solved' || puzzlePhase === 'revealed';
   $('puzzle-next').disabled = !solvedish;
   if (ui.mode !== 'puzzle' || !puzzle) { el.textContent = ''; return; }
   let s = `Puzzle ${puzzleIdx + 1} / ${puzzleList.length}`;
@@ -945,7 +1000,6 @@ function renderPuzzleMeta() {
       : puzzle.kind === 'defense' ? ' · defensive save' : ' · winning tactic';
     s += ` · difficulty ${puzzle.difficulty}`;
     if (puzzle.themes.length) s += ` · ${puzzle.themes.join(', ')}`;
-    if (puzzlePhase === 'freeplay') s += ' · free play — move either side, rewind to fork, AI move on demand';
   }
   el.textContent = s;
 }
@@ -954,11 +1008,10 @@ function renderPuzzleMeta() {
 // Lichess-style vertical gauges beside the board; the white fill's height is
 // White's winning chances and the CSS height transition animates each update.
 // Two users, mutually exclusive by mode:
-//   - Puzzle play-it-out (left bar only; shown while solving it would spoil the
-//     puzzle): a dedicated THIRD worker evaluates the VIEWED position (so review
-//     navigation and forking refresh the bar) and never competes with the
-//     per-colour play workers; it's terminated whenever the bar hides, since its
-//     idle transposition table holds ~20 MB. Requests are throttled to one in
+//   - Analysis mode (left bar only): a dedicated THIRD worker evaluates the VIEWED
+//     position (so review navigation and forking refresh the bar) and never competes
+//     with the per-colour play workers; it's terminated whenever the bar hides, since
+//     its idle transposition table holds ~20 MB. Requests are throttled to one in
 //     flight: a position change while one is out marks it dirty and re-requests
 //     on the reply, so mashing the review arrows queues at most one extra search.
 //   - AI-vs-AI "Eval bars" option (both bars): each engine's OWN root score —
@@ -985,7 +1038,7 @@ const evalBar = { worker: null, seq: 0, pending: false, dirty: false, fen: null,
 // or fork — no extra worker, no need to actually play the move.
 let showBestArrow = false;
 
-const puzzleBarVisible = () => ui.mode === 'puzzle' && puzzlePhase === 'freeplay' && !!puzzle;
+const analysisBarVisible = () => ui.mode === 'analysis';
 const duelBarsVisible = () => ui.mode === 'ai-ai' && ui.showEvalBars;
 
 function createEvalBarWorker() {
@@ -996,7 +1049,7 @@ function createEvalBarWorker() {
     // A queued re-search picks up where this left off; it sets pending again and
     // refreshes the status, so don't clear the "thinking…" line here.
     if (evalBar.dirty) { evalBar.dirty = false; evalBar.fen = null; requestEvalBar(); return; }
-    if (!puzzleBarVisible()) return;
+    if (!analysisBarVisible()) return;
     // The search score is side-to-move-relative; the bar wants White's view.
     if (typeof data.score === 'number') paintEvalBar(evalBar.turn === 'white' ? data.score : -data.score);
     drawBestArrow(data.move);
@@ -1032,7 +1085,7 @@ function paintEvalBar(whiteCp) { paintEvalBarEl($('eval-bar-left'), whiteCp, 'Ev
 // Draw (or clear) the analysis best-move arrow from an eval-bar search reply.
 // Off, out of analysis, or a terminal position (no move) all clear it.
 function drawBestArrow(move) {
-  if (!showBestArrow || !puzzleBarVisible()) return;
+  if (!showBestArrow || !analysisBarVisible()) return;
   cg.setAutoShapes(move && move.from != null
     ? [{ orig: squareName(move.from), dest: squareName(move.to), brush: 'paleBlue' }]
     : []);
@@ -1053,31 +1106,31 @@ function paintDuelBars() {
 
 // Show/hide the bars for the current mode+phase and keep their values current.
 // Called from render() and applyModeVisibility(), so every path that changes
-// the position, the view, the phase, or the option lands here; the puzzle-bar
+// the position, the view, the phase, or the option lands here; the analysis-bar
 // fen check makes repeat calls free.
 function syncEvalBar() {
   const left = $('eval-bar-left'), right = $('eval-bar-right');
-  const puzzleBar = puzzleBarVisible();
-  const duel = !puzzleBar && duelBarsVisible();
+  const analysisBar = analysisBarVisible();
+  const duel = !analysisBar && duelBarsVisible();
   // The board cedes 26px per visible bar (see styles.css); resizing it means
   // chessground must re-measure, so redraw only on a real layout change.
   const row = left.parentElement;
   const prevLayout = row.className;
-  row.classList.toggle('bars-1', puzzleBar);
+  row.classList.toggle('bars-1', analysisBar);
   row.classList.toggle('bars-2', duel);
-  if (puzzleBar && left.hidden) paintEvalBarEl(left, null, 'Eval'); // neutral until the first eval lands
-  left.hidden = !(puzzleBar || duel);
+  if (analysisBar && left.hidden) paintEvalBarEl(left, null, 'Eval'); // neutral until the first eval lands
+  left.hidden = !(analysisBar || duel);
   right.hidden = !duel;
   if (row.className !== prevLayout) cg.redrawAll();
-  if (!puzzleBar) {
-    // The dedicated worker only serves the puzzle bar; drop it (and any
+  if (!analysisBar) {
+    // The dedicated worker only serves the analysis bar; drop it (and any
     // in-flight reply) whenever that bar isn't showing.
     if (evalBar.worker) { evalBar.worker.terminate(); evalBar.worker = null; }
     evalBar.seq++;
     evalBar.pending = evalBar.dirty = false;
     evalBar.fen = null;
   }
-  if (!puzzleBar && !duel) return;
+  if (!analysisBar && !duel) return;
   const flip = viewColor() === 'black'; // white fill sits at White's end
   left.classList.toggle('flipped', flip);
   right.classList.toggle('flipped', flip);
@@ -1196,7 +1249,7 @@ const getUrlCode = () => normalizeCode(hashParams().get('code') || '');
 // (replaceState, so no history spam and no `hashchange` for our own writes). The
 // default two-player mode is left out to keep the bare URL clean; an online share
 // link already carries `code=`, which implies online on its own.
-const MODES = new Set(['human-human', 'human-ai', 'ai-ai', 'online', 'puzzle', 'editor']);
+const MODES = new Set(['human-human', 'human-ai', 'ai-ai', 'online', 'puzzle', 'analysis', 'editor']);
 const getUrlMode = () => { const m = hashParams().get('mode'); return MODES.has(m) ? m : null; };
 function setUrlMode(mode) {
   const u = new URL(window.location.href);
@@ -1500,16 +1553,18 @@ function applyModeVisibility() {
   $('puzzle-retry').hidden = m !== 'puzzle';
   $('puzzle-next').hidden = m !== 'puzzle';
   $('row-puzzle').hidden = m !== 'puzzle';
-  // The Analysis (puzzle-continue) button hides once you're already in free-play.
-  const freeplay = m === 'puzzle' && puzzlePhase === 'freeplay';
-  $('puzzle-continue').hidden = freeplay;
-  // The best-move-arrow toggle lives with the analysis controls; leaving analysis
-  // turns it off (the arrow itself is cleared by loadPuzzle / mode-switch).
-  $('puzzle-arrows-field').hidden = !freeplay;
-  if (!freeplay && showBestArrow) { showBestArrow = false; $('puzzle-arrows').checked = false; }
+  // Analysis is its own mode. Its panel lives in the actions area (so it stays
+  // reachable on mobile, where the .controls column is hidden during analysis); the
+  // "Back to puzzle" button shows only when analysis was reached from a puzzle.
+  const analysis = m === 'analysis';
+  $('row-analysis').hidden = !analysis;
+  $('analysis-back').hidden = !(analysis && puzzleSession);
+  // Leaving analysis turns the best-move arrow off (the arrow itself is cleared on the
+  // mode switch); entering turns it on (see enterAnalysis).
+  if (!analysis && showBestArrow) { showBestArrow = false; $('analysis-arrows').checked = false; }
   // Mobile analysis layout: lift the move list + nav directly under the board (see
   // styles.css); inert on desktop where the media-query rules don't apply.
-  document.body.dataset.analysis = freeplay ? '1' : '';
+  document.body.dataset.analysis = analysis ? '1' : '';
   $('row-ai-swap').hidden = m !== 'ai-ai';
   $('row-online').hidden = m !== 'online';
   // human-ai: one colour-agnostic AI row. ai-ai: separate White/Black rows.
@@ -1523,8 +1578,8 @@ function applyModeVisibility() {
   toggleCustom('black', m === 'ai-ai' && ui.strengthBlack === 'custom');
   // The net picker appears only when a slot's engine is the neural net.
   for (const slot of ['ai', 'white', 'black']) $(`net-field-${slot}`).hidden = engineOf(slot) !== 'nn';
-  // The eval bar is phase-dependent (puzzle free-play only); this covers the paths
-  // that change mode/phase without a render (e.g. switching into the editor).
+  // The eval bar is mode-dependent (analysis only); this covers the paths that change
+  // mode without a render (e.g. switching into the editor).
   syncEvalBar();
   syncMobileTabs(); // show/hide the mobile Settings tab to match the mode
 }
@@ -1674,6 +1729,7 @@ function handoffControl() {
 function selectMode(next) {
   const prev = ui.mode;
   if (next === prev) return;
+  const prevView = viewColor(); // the orientation showing now, to carry into analysis
 
   // Leaving the editor: the edited board becomes a fresh game. Reject an unplayable
   // position (a side with no king) and snap back to the editor so edits aren't lost.
@@ -1690,12 +1746,17 @@ function selectMode(next) {
   ui.mode = next;
   $('mode').value = next; // keep the dropdown in sync when routed programmatically
   ui.flipped = false; // each mode auto-orients; don't carry a stale flip over
+  if (next === 'analysis') analysisOrient = prevView; // keep the board pointing the same way
   setUrlMode(next);
+  if (prev === 'analysis') puzzleSession = null; // the saved session is consumed/abandoned on leaving
 
   if (prev === 'online' && next !== 'online') { leaveOnline(); setUrlCode(''); }
   // Leaving puzzles keeps the position (so it can be analyzed in another mode), but
   // drops the puzzle itself: no pending reply, no hint arrow, no stale solution.
+  // Heading into analysis is the exception: snapshot the live session first so
+  // "Back to puzzle" can resume it exactly where it stands.
   if (prev === 'puzzle' && next !== 'puzzle') {
+    if (next === 'analysis' && puzzle) puzzleSession = snapshotPuzzleSession();
     clearTimeout(puzzleTimer);
     puzzle = null;
     puzzlePhase = 'idle';
@@ -1713,8 +1774,26 @@ function selectMode(next) {
   // change continues the current position (there's a New game button per mode).
   if (next === 'online') { setOnlinePhase('idle'); newGame(); return; }
   if (next === 'puzzle') { enterPuzzleMode(); return; } // a puzzle replaces the edited board
-  if (editedBoard) { loadGame(editedBoard, []); return; } // continue from the edited position
+  // From the editor, adopt the edited board first; analysis then sets up over it.
+  if (editedBoard) loadGame(editedBoard, []);
+  if (next === 'analysis') { enterAnalysis(); return; }
+  if (editedBoard) return; // already loaded above for a non-analysis target
   handoffControl();
+}
+
+// Set up analysis over the current position: stop any AI, turn the best-move arrow on
+// by default, and render (which shows the eval bar and kicks off its search — the reply
+// draws the arrow). The position is whatever the previous mode left (handoff semantics).
+function enterAnalysis() {
+  cancelAi();
+  ui.running = false;
+  ui.started = false;
+  syncToggleLabel();
+  showBestArrow = true;
+  $('analysis-arrows').checked = true;
+  cg.setAutoShapes([]); // drop any leftover hint/arrow from the prior mode
+  applyModeVisibility();
+  render();
 }
 $('mode').addEventListener('change', (e) => selectMode(e.target.value));
 $('side').addEventListener('change', (e) => {
@@ -1790,26 +1869,26 @@ $('puzzle-retry').addEventListener('click', () => { if (puzzle) loadPuzzle(puzzl
 $('puzzle-hint').addEventListener('click', puzzleHint);
 $('puzzle-solution').addEventListener('click', revealPuzzleSolution);
 $('puzzle-next').addEventListener('click', nextPuzzle);
-// "Analysis": stay in puzzle mode and analyze freely — it's often not obvious
-// how the game unfolds after the tactic lands. Both sides are hand-movable and
-// reviewing becomes forkable (rewind and play a different move — see
-// onUserMove/truncateToView); the engine never plays, it just shows its best move
-// as the eval-bar arrow, which we turn on by default so the suggestion is there
-// the moment you enter analysis (no manual toggle needed).
+// "Analysis": leave for the standalone analysis mode to explore freely — it's often
+// not obvious how the game unfolds after the tactic lands. selectMode snapshots the
+// puzzle session on the way out so "Back to puzzle" can resume it.
 $('puzzle-continue').addEventListener('click', () => {
-  if (!puzzle || puzzlePhase === 'freeplay') return;
-  clearTimeout(puzzleTimer);
-  puzzlePhase = 'freeplay';
-  cg.setAutoShapes([]);
-  showBestArrow = true;
-  $('puzzle-arrows').checked = true;
-  applyModeVisibility(); // reveal the analysis controls (arrow toggle, etc.)
-  render();              // syncEvalBar kicks off the search; its reply draws the arrow
+  if (ui.mode !== 'puzzle') return;
+  selectMode('analysis');
+});
+
+// Analysis panel controls.
+// "Back to puzzle": resume the puzzle session we entered analysis from, exactly where
+// it stood. selectMode('puzzle') consumes puzzleResume in enterPuzzleMode.
+$('analysis-back').addEventListener('click', () => {
+  if (!puzzleSession) return;
+  puzzleResume = puzzleSession; // enterPuzzleMode restores this instead of dealing anew
+  selectMode('puzzle');
 });
 
 // Best-move arrow: on, force a fresh eval-bar search so its reply carries the move
 // to draw; off, clear the arrow immediately.
-$('puzzle-arrows').addEventListener('change', (e) => {
+$('analysis-arrows').addEventListener('change', (e) => {
   showBestArrow = e.target.checked;
   if (!showBestArrow) { cg.setAutoShapes([]); return; }
   evalBar.fen = null; // bypass the "same position" short-circuit so the move comes back
@@ -1967,6 +2046,8 @@ function enterStartupMode() {
     enterEditor(); // a restored editor mode needs the editable board set up
   } else if (ui.mode === 'puzzle') {
     enterPuzzleMode(); // a restored puzzle mode fetches the catalog and deals a puzzle
+  } else if (ui.mode === 'analysis') {
+    enterAnalysis(); // a restored/deep-linked analysis mode (no puzzle to return to)
   } else {
     render();
     driveAi(); // if a restored mode has the AI to move first
