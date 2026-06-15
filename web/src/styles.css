@@ -573,6 +573,18 @@ button:disabled:hover { background: var(--panel); } /* no hover lift when locked
      drop the summary and keep the list always expanded. */
   .controls .rules { margin-top: 0; }
   .controls .rules summary { display: none; }
+
+  /* Puzzle Analysis (free-play): you live in the move list, scrubbing/forking the
+     line, so lift it + the nav controls directly under the board (above the puzzle
+     panel). The tab bar is dropped — analysis only cares about the moves — and the
+     move list is forced visible regardless of which tab was last active. These rules
+     follow the tab rules above so they win on equal specificity. */
+  body[data-analysis="1"] .layout {
+    grid-template-areas: "board" "side" "actions";
+  }
+  body[data-analysis="1"] .mobile-tabs { display: none; }
+  body[data-analysis="1"] .side-col { display: flex; }
+  body[data-analysis="1"] .controls { display: none; }
   /* Compact header: on a phone every vertical pixel above the board counts. */
   .topbar { margin-bottom: 8px; }
   h1 { font-size: 1.3rem; }
@@ -589,8 +601,11 @@ button:disabled:hover { background: var(--panel); } /* no hover lift when locked
   .actions > .control-row button { flex: 1 1 0; min-width: 0; }
   /* On a phone the latest move is the one you care about, so flip the list to put it
      at the top (column-reverse renders the last DOM row first). renderMoveList's
-     autoscroll keeps the current ply in view regardless of direction. */
-  .moves { max-height: 36vh; display: flex; flex-direction: column-reverse; }
+     autoscroll keeps the current ply in view regardless of direction. justify-content
+     flex-end anchors the rows to the TOP (column-reverse's main-end): the first few
+     moves start at the top and each new move pushes the older ones down, instead of
+     the whole cluster sitting pinned to the bottom of the box. */
+  .moves { max-height: 36vh; display: flex; flex-direction: column-reverse; justify-content: flex-end; }
   /* Put the move controls above the list so they don't require scrolling the
      list down and back up. status (order 0) stays on top. */
   .side-col .nav { order: 1; }

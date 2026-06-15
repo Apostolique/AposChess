@@ -205,7 +205,6 @@ function supersedeAi() {
 function cancelAi() {
   clearTimeout(aiTimer);
   aiThinking = false;
-  puzzleAiPending = false;
   spawnAiWorkers();
   updateWakeLock();
 }
@@ -251,7 +250,8 @@ function controllableColor() {
   if (ui.mode === 'online' && onlineConnected && state.turn === onlineColor) return state.turn;
   // Puzzle: the solver's side while the puzzle is live (not solved/revealed and not
   // waiting on the scripted reply). The play-it-out free-play is analysis: BOTH
-  // sides are hand-movable, with the engine only moving on request (AI move button).
+  // sides are hand-movable; the engine never moves, it only suggests the best move
+  // via the eval-bar arrow.
   if (ui.mode === 'puzzle' && puzzle) {
     if (puzzlePhase === 'freeplay') return state.turn;
     if ((puzzlePhase === 'playing' || puzzlePhase === 'wrong') && state.turn === puzzleColor) return state.turn;
@@ -263,8 +263,7 @@ function aiToMove() {
   if (status.over) return false;
   if (ui.mode === 'human-ai') return state.turn !== ui.humanColor;
   if (ui.mode === 'ai-ai') return ui.running;
-  // Puzzle free-play: only while a requested "AI move" is in flight.
-  if (ui.mode === 'puzzle') return puzzlePhase === 'freeplay' && puzzleAiPending;
+  // Puzzle mode never moves the engine automatically (analysis only suggests).
   return false;
 }
 
@@ -437,6 +436,13 @@ function updateStatusText() {
     const side = state.turn === 'white' ? 'White' : 'Black';
     el.textContent = `${side} is thinking…`;
     placement = state.turn;
+  } else if (ui.mode === 'puzzle' && puzzlePhase === 'freeplay' && evalBar.pending) {
+    // Analysis: the eval-bar/best-move-arrow search is running. Show the same
+    // "thinking…" line as the play modes, for the side being analysed (the viewed
+    // position's turn, which the eval-bar worker is searching).
+    const side = evalBar.turn === 'white' ? 'White' : 'Black';
+    el.textContent = `${side} is thinking…`;
+    placement = evalBar.turn;
   } else {
     const side = state.turn === 'white' ? 'White' : 'Black';
     el.textContent = `${side} to move${status.check ? ' — check!' : ''}`;
@@ -608,7 +614,6 @@ function driveAi() {
   clearTimeout(aiTimer);
   updateWakeLock();
   aiThinking = false;
-  puzzleAiPending = false; // any position change consumes/cancels a pending AI-move request
   if (!status.over) {
     const movers = aiColors();
     for (const c of ['white', 'black']) {
@@ -626,8 +631,8 @@ function aiColors() {
   if (status.over) return [];
   if (ui.mode === 'human-ai') return [opponent(ui.humanColor)];
   if (ui.mode === 'ai-ai') return ui.running ? ['white', 'black'] : [];
-  // Puzzle mode never drives the AI automatically — free-play engine moves are
-  // requested one at a time via the AI move button (requestPuzzleAiMove).
+  // Puzzle mode never drives the AI automatically — analysis only shows the
+  // engine's suggestion (the eval-bar best-move arrow), it never plays a move.
   return [];
 }
 
@@ -752,14 +757,13 @@ let puzzleColor = 'white'; // the solver's side (the side to move in the puzzle 
 let puzzlePhase = 'idle';  // 'playing' | 'wrong' | 'solved' | 'revealed' | 'idle'
 let puzzleStep = 0;        // index into puzzle.moves of the next expected move
 let puzzleTimer = null;    // pending scripted reply / solution playback step
-let puzzleAiPending = false; // a free-play "AI move" request is in flight
 
 // The analysis engine: a fixed strong default (the Opponent row isn't shown in
 // puzzle mode — analysis wants one good answer, not a sparring partner's level).
 // The loop-champion net at depth 7, our strongest eval; net resolved at request
 // time (the catalog has loaded by the time you reach analysis), falling back to
-// material if the catalog is unavailable. This drives the on-demand "AI move", the
-// analysis eval bar, AND the best-move arrow (see EVAL_BAR), so all three agree.
+// material if the catalog is unavailable. This drives the analysis eval bar AND
+// the best-move arrow that shares its reply (see EVAL_BAR), so the two agree.
 const PUZZLE_AI = { depth: 7, engine: 'nn', net: 'loop-champion' };
 
 const puzzleUci = (m) => squareName(m.from) + squareName(m.to) + (m.promotion || '');
@@ -989,11 +993,14 @@ function createEvalBarWorker() {
   w.onmessage = ({ data }) => {
     if (data.type !== 'search' || data.seq !== evalBar.seq) return;
     evalBar.pending = false;
+    // A queued re-search picks up where this left off; it sets pending again and
+    // refreshes the status, so don't clear the "thinking…" line here.
     if (evalBar.dirty) { evalBar.dirty = false; evalBar.fen = null; requestEvalBar(); return; }
     if (!puzzleBarVisible()) return;
     // The search score is side-to-move-relative; the bar wants White's view.
     if (typeof data.score === 'number') paintEvalBar(evalBar.turn === 'white' ? data.score : -data.score);
     drawBestArrow(data.move);
+    updateStatusText(); // the search settled — drop the "thinking…" line
   };
   w.onerror = (e) => console.error('Eval-bar worker error:', e.message);
   return w;
@@ -1089,6 +1096,7 @@ function requestEvalBar() {
   if (here.over) {
     paintEvalBar(here.result === 'checkmate' ? (here.winner === 'white' ? EVAL_BAR_MATE : -EVAL_BAR_MATE) : 0);
     drawBestArrow(null); // no move in a finished position
+    updateStatusText();  // nothing to search here — no "thinking…" line
     return;
   }
   drawBestArrow(null); // clear the arrow for the old position until the new search lands
@@ -1101,6 +1109,7 @@ function requestEvalBar() {
     // The repetition window up to the VIEWED ply (same trimming as repWindow).
     posHistory: repFens.slice(0, viewIndex + 1).slice(-(st.halfmove + 1)),
   });
+  updateStatusText(); // a search is now in flight — show the "thinking…" line
 }
 
 // --- promotion picker ---
@@ -1491,14 +1500,16 @@ function applyModeVisibility() {
   $('puzzle-retry').hidden = m !== 'puzzle';
   $('puzzle-next').hidden = m !== 'puzzle';
   $('row-puzzle').hidden = m !== 'puzzle';
-  // The puzzle panel swaps Play it out for the on-demand AI move button in free-play.
+  // The Analysis (puzzle-continue) button hides once you're already in free-play.
   const freeplay = m === 'puzzle' && puzzlePhase === 'freeplay';
   $('puzzle-continue').hidden = freeplay;
-  $('puzzle-ai-move').hidden = !freeplay;
   // The best-move-arrow toggle lives with the analysis controls; leaving analysis
   // turns it off (the arrow itself is cleared by loadPuzzle / mode-switch).
   $('puzzle-arrows-field').hidden = !freeplay;
   if (!freeplay && showBestArrow) { showBestArrow = false; $('puzzle-arrows').checked = false; }
+  // Mobile analysis layout: lift the move list + nav directly under the board (see
+  // styles.css); inert on desktop where the media-query rules don't apply.
+  document.body.dataset.analysis = freeplay ? '1' : '';
   $('row-ai-swap').hidden = m !== 'ai-ai';
   $('row-online').hidden = m !== 'online';
   // human-ai: one colour-agnostic AI row. ai-ai: separate White/Black rows.
@@ -1540,9 +1551,6 @@ function applyAiLock() {
 // Search params for the AI playing `turn`: a preset depth + the default cap, or
 // that slot's custom depth + timeout when its strength is set to "Custom".
 function aiParams(turn) {
-  // Puzzle free-play "AI move" requests use the fixed analysis default — the
-  // Opponent row isn't shown (or consulted) in puzzle mode.
-  if (ui.mode === 'puzzle') return { depth: PUZZLE_AI.depth, maxMs: ui.maxMs, engine: PUZZLE_AI.engine, net: netUrl(PUZZLE_AI.net) };
   const slot = ui.mode === 'ai-ai' ? turn : 'ai';
   const engine = engineOf(slot);
   const net = engine === 'nn' ? netUrl(netOf(slot)) : undefined; // weights URL for the worker
@@ -1783,29 +1791,22 @@ $('puzzle-hint').addEventListener('click', puzzleHint);
 $('puzzle-solution').addEventListener('click', revealPuzzleSolution);
 $('puzzle-next').addEventListener('click', nextPuzzle);
 // "Analysis": stay in puzzle mode and analyze freely — it's often not obvious
-// how the game unfolds after the tactic lands. Both sides are hand-movable,
+// how the game unfolds after the tactic lands. Both sides are hand-movable and
 // reviewing becomes forkable (rewind and play a different move — see
-// onUserMove/truncateToView), and the AI move button asks the engine for the next
-// move of whichever side is to move.
+// onUserMove/truncateToView); the engine never plays, it just shows its best move
+// as the eval-bar arrow, which we turn on by default so the suggestion is there
+// the moment you enter analysis (no manual toggle needed).
 $('puzzle-continue').addEventListener('click', () => {
   if (!puzzle || puzzlePhase === 'freeplay') return;
   clearTimeout(puzzleTimer);
   puzzlePhase = 'freeplay';
   cg.setAutoShapes([]);
-  applyModeVisibility(); // swap the panel's Play it out button for AI move
-  render();
+  showBestArrow = true;
+  $('puzzle-arrows').checked = true;
+  applyModeVisibility(); // reveal the analysis controls (arrow toggle, etc.)
+  render();              // syncEvalBar kicks off the search; its reply draws the arrow
 });
 
-// One engine move on demand, for the side to move at the VIEWED position (asking
-// from a rewound ply forks the game there first, like playing a move would).
-$('puzzle-ai-move').addEventListener('click', () => {
-  if (ui.mode !== 'puzzle' || puzzlePhase !== 'freeplay' || puzzleAiPending) return;
-  if (viewIndex !== history.length - 1) truncateToView();
-  if (status.over) { render(); return; }
-  puzzleAiPending = true;
-  startSearch(ai[state.turn]); // commits via the normal onSearchResult path
-  updateStatusText();          // "… is thinking"
-});
 // Best-move arrow: on, force a fresh eval-bar search so its reply carries the move
 // to draw; off, clear the arrow immediately.
 $('puzzle-arrows').addEventListener('change', (e) => {
