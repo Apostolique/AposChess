@@ -21,8 +21,8 @@
 
     gtag('config', 'G-TYM1QSCNLT');
   </script>
-  <script type="module" crossorigin src="./assets/index-BNy9sv7G.js"></script>
-  <link rel="stylesheet" crossorigin href="./assets/index-DrZdGO58.css">
+  <script type="module" crossorigin src="./assets/index-z0q92j14.js"></script>
+  <link rel="stylesheet" crossorigin href="./assets/index-42NVCIZd.css">
 </head>
 <body>
   <main class="app">
@@ -386,6 +386,10 @@
       </div>
 
       <aside class="side-col">
+        <!-- Desktop home for game-over/draw banners and prompts: above the move list,
+             which has its own column here. On mobile this column drops below the board,
+             so placeStatus (main.js) routes those to #status-below instead. -->
+        <div id="status-above" class="status-below"></div>
         <div id="moves" class="moves"></div>
         <div class="nav">
           <button id="nav-first" type="button" title="Start (Home)">⏮</button>
