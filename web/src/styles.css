@@ -53,9 +53,17 @@ h1 { margin: 0; font-size: 1.7rem; letter-spacing: 0.5px; }
 .layout {
   display: grid;
   grid-template-columns: var(--side) var(--board) var(--side);
+  /* Two content rows (actions, controls) plus a flexible slack row. The board and
+     side columns span all three rows; when they're taller than the stacked left
+     controls, the surplus height pools in the empty slack row at the bottom instead
+     of being split between the actions/controls rows. That keeps the left column
+     pinned to the top, so toggling a section (e.g. the rules disclosure, or the AI
+     White/Black settings) no longer nudges the other controls up or down. */
+  grid-template-rows: auto auto 1fr;
   grid-template-areas:
     "actions  board side"
-    "controls board side";
+    "controls board side"
+    ".        board side";
   gap: 10px var(--gap); /* 10px row gap = the old spacing between control rows */
   justify-content: center;
   align-items: start;
@@ -475,6 +483,9 @@ button:disabled:hover { background: var(--panel); } /* no hover lift when locked
 .tray .status.status-side { margin-left: auto; text-align: right; min-height: 0; }
 .status-below { text-align: center; }
 .status-below .status { min-height: 1.4em; }
+/* The two banner slots are empty whenever the status lives in a tray; collapse the
+   idle one so it doesn't contribute a flex gap above the move list (side-col gap). */
+.status-below:empty { display: none; }
 
 /* Move list & review navigation (Lichess-style), in the right sidebar. */
 .moves {

@@ -383,8 +383,14 @@ function onBoardChange() {
 // material diff, on their side of the board), while everything else — puzzle prompts,
 // game-over/draw banners, the editor and connection notices — goes below the board.
 // `where` is 'below' or a colour; a colour maps to the matching tray via orientation.
+// The 'below' banner resolves to whichever slot is showing: above the move list on
+// desktop (the list has its own column there), or below the board on mobile (where
+// that column drops underneath). Re-run placement when crossing the breakpoint.
+const desktopMql = window.matchMedia('(min-width: 981px)');
+desktopMql.addEventListener('change', updateStatusText);
 function placeStatus(el, where) {
-  const parent = where === 'below' ? $('status-below')
+  const belowSlot = desktopMql.matches ? $('status-above') : $('status-below');
+  const parent = where === 'below' ? belowSlot
     : where === viewColor() ? $('tray-bottom') : $('tray-top');
   if (el.parentElement !== parent) parent.appendChild(el);
   el.classList.toggle('status-side', where !== 'below');

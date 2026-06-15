@@ -384,6 +384,10 @@
       </div>
 
       <aside class="side-col">
+        <!-- Desktop home for game-over/draw banners and prompts: above the move list,
+             which has its own column here. On mobile this column drops below the board,
+             so placeStatus (main.js) routes those to #status-below instead. -->
+        <div id="status-above" class="status-below"></div>
         <div id="moves" class="moves"></div>
         <div class="nav">
           <button id="nav-first" type="button" title="Start (Home)">⏮</button>
