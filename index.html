@@ -21,8 +21,8 @@
 
     gtag('config', 'G-TYM1QSCNLT');
   </script>
-  <script type="module" crossorigin src="./assets/index-bVqL_iUq.js"></script>
-  <link rel="stylesheet" crossorigin href="./assets/index-mlrws15A.css">
+  <script type="module" crossorigin src="./assets/index-DQGkjfmf.js"></script>
+  <link rel="stylesheet" crossorigin href="./assets/index-BNHF_7lT.css">
 </head>
 <body>
   <main class="app">
@@ -60,11 +60,30 @@
 
           <button id="new-game" type="button">New game</button>
           <button id="ai-toggle" type="button" hidden>Start</button>
+          <!-- Puzzle navigation lives in the mode row (the mode <select> otherwise
+               takes the whole width): Retry replays the current puzzle, Next deals a
+               new one but stays disabled until the current puzzle is solved/revealed. -->
+          <button id="puzzle-retry" type="button" hidden title="Restart this puzzle from the beginning">Retry</button>
+          <button id="puzzle-next" type="button" hidden title="Jump to another puzzle (unlocks once you solve this one)">Next puzzle</button>
         </div>
 
         <fieldset class="ai-group" id="row-puzzle" hidden>
           <legend>Puzzle</legend>
-          <div class="control-row">
+          <!-- Puzzle info first (progress, and — once solved — kind/difficulty/themes). -->
+          <p id="puzzle-meta" class="puzzle-meta"></p>
+          <div class="control-row puzzle-actions">
+            <button id="puzzle-hint" type="button" title="Highlight the piece that moves next">Hint</button>
+            <button id="puzzle-solution" type="button" title="Play out the solution">Solution</button>
+            <button id="puzzle-continue" type="button" title="Explore from here — move either side freely, rewind to try different moves, and ask the engine for a move when you want one">Analysis</button>
+            <button id="puzzle-ai-move" type="button" hidden title="Let the engine (loop-champion net, depth 7) play the next move for whichever side is to move">AI move</button>
+            <label id="puzzle-arrows-field" class="check-field" hidden title="Continuously draw an arrow to the engine's best move for the side to move — no need to play it">
+              <input type="checkbox" id="puzzle-arrows" />
+              Best-move arrow
+            </label>
+          </div>
+          <!-- Filters at the bottom: you set the difficulty/theme once, then mostly
+               work through puzzles without touching them again. -->
+          <div class="control-row puzzle-filters">
             <label>
               Difficulty
               <select id="puzzle-difficulty">
@@ -89,15 +108,6 @@
               </select>
             </label>
           </div>
-          <div class="control-row puzzle-actions">
-            <button id="puzzle-retry" type="button" title="Restart this puzzle from the beginning">Retry</button>
-            <button id="puzzle-hint" type="button" title="Highlight the piece that moves next">Hint</button>
-            <button id="puzzle-solution" type="button" title="Play out the solution">Solution</button>
-            <button id="puzzle-next" type="button" title="Jump to another puzzle">Next puzzle</button>
-            <button id="puzzle-continue" type="button" title="Explore from here — move either side freely, rewind to try different moves, and ask the engine for a move when you want one">Play it out</button>
-            <button id="puzzle-ai-move" type="button" hidden title="Let the engine (handcrafted, depth 7) play the next move for whichever side is to move">AI move</button>
-          </div>
-          <p id="puzzle-meta" class="puzzle-meta"></p>
         </fieldset>
       </section>
 
