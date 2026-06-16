@@ -357,7 +357,13 @@ rl.on('line', (line) => {
   pendingLine.set(idx, line);
   batch.push({ idx, fen: rec.fen });
   if (batch.length >= B) enqueueBatch();
-  if (!inputEnded && lineIdx - nextEmit > CAP) rl.pause(); // backpressure
+  // Backpressure — but NEVER pause while still holding an undispatched partial batch
+  // that nextEmit is blocked on. When recompute candidates are sparse near the front of
+  // the file, the batch can't reach B before the reader runs CAP lines ahead; pausing
+  // here would deadlock (partial batch never sent -> its values never computed -> nextEmit
+  // never advances -> reader never resumes). Flush whatever's accumulated first, so the
+  // workers always have the blocking records and can unstick the reorder buffer.
+  if (!inputEnded && lineIdx - nextEmit > CAP) { enqueueBatch(); rl.pause(); }
 });
 rl.on('close', () => { inputEnded = true; enqueueBatch(); maybeFinalize(); });
 
