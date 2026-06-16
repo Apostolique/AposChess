@@ -1089,12 +1089,18 @@ function paintEvalBarEl(el, whiteCp, who) {
 function paintEvalBar(whiteCp) { paintEvalBarEl($('eval-bar-left'), whiteCp, 'Eval'); }
 
 // Draw (or clear) the analysis best-move arrow from an eval-bar search reply.
-// Off, out of analysis, or a terminal position (no move) all clear it.
+// Off, out of analysis, or a terminal position (no move) all clear it. When the
+// best move is a promotion, drop a ghost piece (Lichess-style) on the landing
+// square so it's clear which piece the pawn should become.
 function drawBestArrow(move) {
   if (!showBestArrow || !analysisBarVisible()) return;
-  cg.setAutoShapes(move && move.from != null
-    ? [{ orig: squareName(move.from), dest: squareName(move.to), brush: 'paleBlue' }]
-    : []);
+  if (!move || move.from == null) { cg.setAutoShapes([]); return; }
+  const dest = squareName(move.to);
+  const shapes = [{ orig: squareName(move.from), dest, brush: 'paleBlue' }];
+  if (move.promotion) {
+    shapes.push({ orig: dest, piece: { role: CG_ROLE[move.promotion], color: evalBar.turn, scale: 0.6 } });
+  }
+  cg.setAutoShapes(shapes);
 }
 
 // The AI-vs-AI duel bars: each engine's own score at the VIEWED ply (recorded
