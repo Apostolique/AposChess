@@ -29,6 +29,7 @@
       "arch": [
         768,
         64,
+        16,
         1
       ],
       "note": "Latest gated train:loop champion."
