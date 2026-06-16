@@ -243,8 +243,13 @@ function mineWin(fen, leadFen, id, seed) {
     // can only script one. Mate lines instead stop on an equally-fast second mate.
     if (st.legal.length > 1) {
       const alt = secondBest(afterReply, rand, next.move);
+      // A mate continuation normally ends the line when a twin equally-fast mate
+      // exists (we can't say which the solver "should" pick). But if THIS move
+      // checkmates on the spot, play it anyway so the puzzle finishes ON the mate
+      // instead of one move short — the app accepts any mating move at the final
+      // step, so a twin mate-in-1 still solves.
       const ok = next.score >= MATE_THRESH
-        ? alt.score < next.score
+        ? alt.score < next.score || gameStatus(applyMove(afterReply, next.move)).result === 'checkmate'
         : next.score >= win && next.score - alt.score >= lineGap;
       if (!ok) break; // converted: several moves are fine from here — stop
     }
@@ -259,6 +264,13 @@ function mineWin(fen, leadFen, id, seed) {
     cur = applyMove(afterReply, next.move);
   }
   if (minDelta <= -250) themes.add('sacrifice'); // down a minor piece or more mid-line
+
+  // A forced-mate position whose line didn't actually reach checkmate bailed on an
+  // INTERMEDIATE twin mate (two equally-fast continuations that aren't mate-in-1, so
+  // neither can be scripted — mate-in-1 twins were already played through above).
+  // Don't ship a mate that stops a move short: a puzzle should have one solution that
+  // runs to its end, so drop it rather than truncate.
+  if (isMate && kind !== 'mate') return { reject: 'mate-twin' };
 
   const solverMoves = Math.ceil(line.length / 2);
   const puzzle = {
@@ -339,7 +351,11 @@ function mineDefense(item) {
       // ends with the mate on the board instead of stopping just before it.
       if (st.legal.length > 1) {
         const alt2 = secondBest(afterReply, rand, next.move);
-        if (alt2.score >= next.score) break; // an equally-fast second mate — can't script
+        // Twin equally-fast mate ends the line, unless this move mates on the spot —
+        // then play it so the puzzle finishes ON checkmate (the app accepts any final
+        // mating move) instead of stopping one move short.
+        if (alt2.score >= next.score
+            && gameStatus(applyMove(afterReply, next.move)).result !== 'checkmate') break;
       }
     } else {
       if (next.score < saveFloor || next.score >= win) break; // line over: collapsed (noise) or flipped to winning

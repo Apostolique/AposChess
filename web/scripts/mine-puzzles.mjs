@@ -45,7 +45,9 @@
 //                      and a DEFENSE (only-move) puzzle from the position before it,
 //                      where the game's own engine fell off the tightrope
 //     [--max-candidates=6000]  cap on candidates verified (seeded sample)
-//     [--limit=400]            stop after this many accepted puzzles
+//     [--limit=N]              stop after this many accepted puzzles (default: none —
+//                      accept every candidate that verifies; --max-candidates still
+//                      bounds how many are checked)
 //     [--min-difficulty=1]     drop puzzles solved at a shallower depth
 //     [--max-solver-moves=4]   solution length cap (forced-mate finishes exempt:
 //                      a line that walks into a mate runs to checkmate)
@@ -79,7 +81,7 @@ const saveFloor = num('save-floor', -150);
 const win = num('win', 500);
 const second = num('second', 150);
 const maxCandidates = num('max-candidates', 6000);
-const limit = num('limit', 400);
+const limit = num('limit', Infinity); // no accept cap by default; --max-candidates bounds the work
 const minDifficulty = num('min-difficulty', 1);
 const maxSolverMoves = num('max-solver-moves', 4);
 const evalName = typeof args.eval === 'string' ? args.eval : 'nn';
@@ -102,7 +104,7 @@ const t0 = Date.now();
 const status = liveStatus();
 const tick = everyMs(1000);
 console.log(`mine-puzzles: ${inFile} (${fmtMB(statSync(inFile).size)}) | depth ${depth} | jobs ${jobs} | seed ${seed}`);
-console.log(`  gates: swing>=${swing} | pre>=${preFloor} | move>=${minMove} | win>=${win} | second<=${second} | line-gap>=${lineGap} | difficulty>=${minDifficulty} | limit ${limit} of <=${fmtNum(maxCandidates)} candidates`);
+console.log(`  gates: swing>=${swing} | pre>=${preFloor} | move>=${minMove} | win>=${win} | second<=${second} | line-gap>=${lineGap} | difficulty>=${minDifficulty} | limit ${Number.isFinite(limit) ? limit : 'none'} of <=${fmtNum(maxCandidates)} candidates`);
 
 // --- phase 1: scan the dataset for blunder-punish candidates ----------------------
 // The position key ignores the move counters (board + turn + castling) so the same
