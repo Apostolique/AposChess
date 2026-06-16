@@ -21,7 +21,7 @@
 
     gtag('config', 'G-TYM1QSCNLT');
   </script>
-  <script type="module" crossorigin src="./assets/index-Bt72Rqlu.js"></script>
+  <script type="module" crossorigin src="./assets/index-BLBoufqt.js"></script>
   <link rel="stylesheet" crossorigin href="./assets/index-42NVCIZd.css">
 </head>
 <body>
@@ -62,8 +62,10 @@
           <button id="new-game" type="button">New game</button>
           <button id="ai-toggle" type="button" hidden>Start</button>
           <!-- Puzzle navigation lives in the mode row (the mode <select> otherwise
-               takes the whole width): Retry replays the current puzzle, Next deals a
-               new one but stays disabled until the current puzzle is solved/revealed. -->
+               takes the whole width): Previous re-deals an earlier puzzle in this
+               session's walk, Retry replays the current puzzle, Next deals the next
+               one but stays disabled until the current puzzle is solved/revealed. -->
+          <button id="puzzle-prev" type="button" hidden title="Go back to the previous puzzle">Previous puzzle</button>
           <button id="puzzle-retry" type="button" hidden title="Restart this puzzle from the beginning">Retry</button>
           <button id="puzzle-next" type="button" hidden title="Jump to another puzzle (unlocks once you solve this one)">Next puzzle</button>
         </div>
