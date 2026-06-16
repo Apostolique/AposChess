@@ -249,8 +249,10 @@ function controllableColor() {
   if (ui.mode === 'human-ai' && state.turn === ui.humanColor) return state.turn;
   if (ui.mode === 'online' && onlineConnected && state.turn === onlineColor) return state.turn;
   // Puzzle: the solver's side while the puzzle is live (not solved/revealed and not
-  // waiting on the scripted reply).
+  // waiting on the scripted reply); once it's done, the board opens up for free play,
+  // so the side to move is hand-movable like analysis.
   if (ui.mode === 'puzzle' && puzzle) {
+    if (puzzleDone()) return state.turn;
     if ((puzzlePhase === 'playing' || puzzlePhase === 'wrong') && state.turn === puzzleColor) return state.turn;
   }
   // Analysis: free play — the side to move is hand-movable (the other side becomes
@@ -288,11 +290,11 @@ function render() {
   const atLive = viewIndex === history.length - 1;
   let color = atLive ? controllableColor() : undefined;
   let dests = (atLive && color) ? destsMap(status.legal) : new Map();
-  // Analysis: reviewing isn't read-only — EITHER side can move from any viewed
-  // position, which FORKS the game there (the continuation after it is discarded by
-  // onUserMove), so "what if" is one rewind away for both colours. Everywhere else an
-  // off-live view stays locked.
-  if (!atLive && ui.mode === 'analysis') {
+  // Analysis (and a finished puzzle): reviewing isn't read-only — EITHER side can move
+  // from any viewed position, which FORKS the game there (the continuation after it is
+  // discarded by onUserMove), so "what if" is one rewind away for both colours.
+  // Everywhere else an off-live view stays locked.
+  if (!atLive && (ui.mode === 'analysis' || (ui.mode === 'puzzle' && puzzleDone()))) {
     color = entry.state.turn;
     dests = destsMap(legalMoves(entry.state));
   }
@@ -321,6 +323,9 @@ function render() {
   updateStatusText();
   applyAiLock();
   syncEvalBar();
+  // Puzzle mode owns its auto-shapes (syncEvalBar left them alone above): keep the
+  // solved ✓ in sync with the viewed ply. Other modes manage shapes themselves.
+  if (ui.mode === 'puzzle') paintPuzzleGlyph();
 }
 
 // --- material difference / advantage trays (Lichess-style) ---
@@ -582,11 +587,11 @@ function truncateToView() {
 // asking for a promotion piece when several moves share that destination.
 function onUserMove(orig, dest) {
   if (ui.mode === 'editor') return; // free placement: chessground keeps the move, no game logic
-  // A move played while reviewing (only enabled in analysis — everywhere else an
-  // off-live board is view-only) forks the game at the viewed ply: the moves after it
-  // are discarded and this move becomes the new continuation.
+  // A move played while reviewing (enabled in analysis and in a finished puzzle —
+  // everywhere else an off-live board is view-only) forks the game at the viewed ply:
+  // the moves after it are discarded and this move becomes the new continuation.
   if (viewIndex !== history.length - 1) {
-    if (ui.mode !== 'analysis') { render(); return; }
+    if (ui.mode !== 'analysis' && !(ui.mode === 'puzzle' && puzzleDone())) { render(); return; }
     truncateToView();
   }
   const from = parseSquare(orig), to = parseSquare(dest);
@@ -605,7 +610,10 @@ function onUserMove(orig, dest) {
 // as a minimal {from,to,promotion} so the other client reconstructs the identical
 // engine move from its own legalMoves (no chance of the two games diverging).
 function playLocalMove(move) {
-  if (ui.mode === 'puzzle') { playPuzzleMove(move); return; }
+  // A live puzzle routes through the solution-checker; a finished one is free play,
+  // so its moves just commit like any other mode.
+  if (ui.mode === 'puzzle' && !puzzleDone()) { playPuzzleMove(move); return; }
+  if (ui.mode === 'puzzle') { commit(move); return; }
   commit(move);
   if (ui.mode === 'online' && online && onlineConnected) {
     online.send({ t: 'move', from: move.from, to: move.to, promotion: move.promotion || null });
@@ -763,6 +771,12 @@ let puzzleColor = 'white'; // the solver's side (the side to move in the puzzle 
 let puzzlePhase = 'idle';  // 'playing' | 'wrong' | 'solved' | 'revealed' | 'idle'
 let puzzleStep = 0;        // index into puzzle.moves of the next expected move
 let puzzleTimer = null;    // pending scripted reply / solution playback step
+let puzzleSolvedPly = -1;  // history index of the solving move (-1 until solved); the ✓ pins to it
+
+// A finished puzzle (solved or solution shown). The board then opens up for free
+// exploration — either side hand-movable, rewind-and-fork like analysis — instead of
+// staying locked, so you can try other continuations right where you are.
+const puzzleDone = () => puzzlePhase === 'solved' || puzzlePhase === 'revealed';
 
 // --- analysis mode ---
 // Board orientation while in analysis (carried from whatever mode we entered from,
@@ -836,7 +850,7 @@ function snapshotPuzzleSession() {
     repFens: repFens.slice(),
     viewIndex,
     posCounts: new Map(posCounts),
-    puzzle, puzzleColor, puzzlePhase, puzzleStep, puzzleIdx,
+    puzzle, puzzleColor, puzzlePhase, puzzleStep, puzzleIdx, puzzleSolvedPly,
   };
 }
 
@@ -856,6 +870,7 @@ function resumePuzzleSession(s) {
   puzzlePhase = s.puzzlePhase;
   puzzleStep = s.puzzleStep;
   puzzleIdx = s.puzzleIdx;
+  puzzleSolvedPly = s.puzzleSolvedPly ?? -1;
   lastCommitAt = performance.now();
   cg.setAutoShapes([]);
   applyModeVisibility();
@@ -889,6 +904,15 @@ function nextPuzzle() {
   loadPuzzle(puzzleList[puzzleIdx]);
 }
 
+// Step back to the puzzle before this one in the session's walk. No wraparound: at
+// the start of the list there's nothing earlier to revisit (the button is disabled
+// there), so going back only ever re-deals puzzles already seen this session.
+function prevPuzzle() {
+  if (puzzleList.length === 0 || puzzleIdx <= 0) return;
+  puzzleIdx--;
+  loadPuzzle(puzzleList[puzzleIdx]);
+}
+
 // Reset the live game to the puzzle's position (the same bookkeeping as loadGame,
 // minus the replay) and arm the solution tracking. When the catalog carries the
 // lead-in (`prefen` + `opening`, the blunder that created the puzzle), start one
@@ -919,6 +943,7 @@ function loadPuzzle(p) {
   puzzleColor = lead ? opponent(state.turn) : state.turn; // the solver = the side to move in p.fen
   puzzlePhase = 'playing';
   puzzleStep = 0;
+  puzzleSolvedPly = -1;
   cg.setAutoShapes([]);
   applyModeVisibility(); // keep the puzzle panel/buttons in sync with the new puzzle
   render();
@@ -927,31 +952,62 @@ function loadPuzzle(p) {
   if (lead) puzzleTimer = setTimeout(() => commit(lead), 650);
 }
 
+// Lichess-style feedback glyphs, drawn into a square's top-right corner (the
+// customSvg cell is the 100×100 viewBox of the whole square). The green ✓ marks
+// the move that solved the puzzle; the red ✗ flashes on a wrong try.
+const GLYPH_SOLVED = '<g transform="translate(54,2)"><circle cx="22" cy="22" r="22" fill="#629924" stroke="#fff" stroke-width="2"/><path d="M11 23l7 7 13-15" fill="none" stroke="#fff" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/></g>';
+const GLYPH_WRONG = '<g transform="translate(54,2)"><circle cx="22" cy="22" r="22" fill="#c0392b" stroke="#fff" stroke-width="2"/><path d="M13 13l18 18M31 13l-18 18" stroke="#fff" stroke-width="5" stroke-linecap="round"/></g>';
+
+// The puzzle-mode auto-shapes, recomputed from the viewed position on every render
+// (in puzzle mode syncEvalBar leaves shapes untouched, so this owns them). The green
+// ✓ pins to the solving ply (puzzleSolvedPly), so it shows only while that exact move
+// is in view: it vanishes when you play on or rewind, and returns when you step back
+// to it. A transient wrong-move ✗ is drawn directly by playPuzzleMove, outside this
+// path.
+function paintPuzzleGlyph() {
+  const entry = history[viewIndex];
+  cg.setAutoShapes(
+    puzzlePhase === 'solved' && viewIndex === puzzleSolvedPly && entry && entry.lastMove
+      ? [{ orig: squareName(entry.lastMove.to), customSvg: { html: GLYPH_SOLVED } }]
+      : [],
+  );
+}
+
 // A solver move from the board. The expected move is accepted and committed; any
 // other move that mates on the spot also solves the puzzle; everything else snaps
 // back for another try.
 function playPuzzleMove(move) {
   if (!puzzle || (puzzlePhase !== 'playing' && puzzlePhase !== 'wrong')) { render(); return; }
+  clearTimeout(puzzleTimer); // cancel a pending wrong-move snap-back if the solver retries fast
   cg.setAutoShapes([]);
   if (puzzleUci(move) === puzzle.moves[puzzleStep]) {
     puzzleStep++;
     puzzlePhase = 'playing';
     const done = puzzleStep >= puzzle.moves.length;
-    if (done) puzzlePhase = 'solved';
+    if (done) { puzzlePhase = 'solved'; puzzleSolvedPly = history.length; } // the move commit is about to append
     commit(move);
     if (done) playConnectSound();
     else schedulePuzzleReply();
     return;
   }
-  if (gameStatus(applyMove(state, move)).result === 'checkmate') {
+  const after = gameStatus(applyMove(state, move));
+  if (after.result === 'checkmate') {
     puzzleStep = puzzle.moves.length;
     puzzlePhase = 'solved';
+    puzzleSolvedPly = history.length; // the mating move commit is about to append
     commit(move);
     playConnectSound();
     return;
   }
+  // Wrong: chessground has optimistically placed the piece on its target. Sound the
+  // move (it visibly moved), flash a red ✗ there and leave the piece for a beat, then
+  // render() snaps it back to its origin and clears the glyph (puzzlePhase 'wrong' →
+  // paintPuzzleGlyph draws nothing).
   puzzlePhase = 'wrong';
-  render(); // chessground already moved the piece; redraw from the unchanged state
+  playMoveSound(move.capture, after.check);
+  cg.setAutoShapes([{ orig: squareName(move.to), customSvg: { html: GLYPH_WRONG } }]);
+  updateStatusText(); // "Not the move — try again." while the ✗ shows
+  puzzleTimer = setTimeout(render, 600);
 }
 
 // Play the scripted opponent reply after the watch delay, then hand back to the
@@ -999,6 +1055,9 @@ function renderPuzzleMeta() {
   // ahead without an answer.
   const solvedish = puzzlePhase === 'solved' || puzzlePhase === 'revealed';
   $('puzzle-next').disabled = !solvedish;
+  // Previous is free (those puzzles were already seen) — only the start of the walk
+  // disables it.
+  $('puzzle-prev').disabled = puzzleIdx <= 0;
   if (ui.mode !== 'puzzle' || !puzzle) { el.textContent = ''; return; }
   let s = `Puzzle ${puzzleIdx + 1} / ${puzzleList.length}`;
   if (solvedish) {
@@ -1562,6 +1621,7 @@ function applyModeVisibility() {
   // Puzzles have their own Retry/Next buttons (in the mode row); "New game" would be
   // ambiguous there. Next is enabled/disabled by phase in renderPuzzleMeta.
   $('new-game').hidden = m === 'puzzle';
+  $('puzzle-prev').hidden = m !== 'puzzle';
   $('puzzle-retry').hidden = m !== 'puzzle';
   $('puzzle-next').hidden = m !== 'puzzle';
   $('row-puzzle').hidden = m !== 'puzzle';
@@ -1877,6 +1937,7 @@ $('ai-swap').addEventListener('click', () => {
 });
 
 // Puzzle panel controls. A filter change redeals from the newly-filtered list.
+$('puzzle-prev').addEventListener('click', prevPuzzle);
 $('puzzle-retry').addEventListener('click', () => { if (puzzle) loadPuzzle(puzzle); });
 $('puzzle-hint').addEventListener('click', puzzleHint);
 $('puzzle-solution').addEventListener('click', revealPuzzleSolution);
