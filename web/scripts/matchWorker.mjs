@@ -61,6 +61,13 @@ function makePlayer(mod, { depth, movetime, evalName }) {
     // this, so plain matches behave identically.
     move: (state, rng, prevHashes) =>
       mod.chooseMoveDetailed(state, depth ?? 99, rng, depth != null ? Infinity : movetime, cfg.useTT, prevHashes, evalName),
+    // Score a position this engine is NOT to move on, WITHOUT touching its transposition
+    // table (useTT=false) — used once per game to give the winner its own value of the
+    // opening ply it didn't search (the index-0-loser case in --save-games). TT-free and
+    // with a throwaway rng so this probe can't perturb the engine's real moves or the
+    // game's seed-reproducibility (the fixed-depth score is rng/TT-independent anyway).
+    evalNoTT: (state, rng, prevHashes) =>
+      mod.chooseMoveDetailed(state, depth ?? 99, rng, depth != null ? Infinity : movetime, false, prevHashes, evalName),
     hashOf: mod._internal.hashOf,
     resetTT: () => mod._internal.resetTT(),
   };
@@ -74,7 +81,10 @@ const B = makePlayer(modB, { depth: cfg.depthB, movetime: cfg.movetimeB, evalNam
 // per searched position: { fen, r, v, mover } — the position, the game result from
 // the SIDE-TO-MOVE's view, the mover's search value (cp, stm-relative; the same
 // semantics the data generator records), and which engine ('a'/'b') was to move,
-// so the harvester can keep `v` only from the engine the match proves stronger.
+// so the harvester can keep the value from whichever engine the match proves stronger.
+// The first record also carries { vOther, moverOther } — the OTHER engine's score of
+// that opening position — so the winner's value of the one ply it didn't move on is
+// available too (the rest of its off-turn plies are derived from the previous ply).
 function playGame(openingState, whiteIsA, rng, collect) {
   A.resetTT();
   B.resetTT();
@@ -94,7 +104,18 @@ function playGame(openingState, whiteIsA, rng, collect) {
     const window = seen.slice(-(st.halfmove + 1));
     const r = player.move(st, rng, window.map(player.hashOf));
     if (!r.move) break; // safety: scored as a draw
-    if (recs) recs.push({ fen: toFen(st), turn: st.turn, v: r.score, mover: aToMove ? 'a' : 'b' });
+    if (recs) {
+      const rec = { fen: toFen(st), turn: st.turn, v: r.score, mover: aToMove ? 'a' : 'b' };
+      // First recorded ply: the side NOT to move never searches this position during the
+      // game, so harvesting can't derive its value from a previous ply. Score it once here
+      // with that engine, so the harvester can keep it whichever engine ends up the winner.
+      if (ply === 0) {
+        const other = aToMove ? B : A;
+        rec.vOther = other.evalNoTT(st, makeRng(0), []).score;
+        rec.moverOther = aToMove ? 'b' : 'a';
+      }
+      recs.push(rec);
+    }
     st = applyMove(st, r.move);
   }
   if (recs) {

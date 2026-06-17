@@ -241,14 +241,21 @@ function run(label, cmd, argv, cwd = webDir) {
   return true;
 }
 
+// Depths the champion is ranked at. The gate depth (cfg.rankDepth) and generation depth
+// (cfg.depth) carry its direct nnD@ harvest labels, and ONE BELOW EACH (d-1) carries the
+// depth-(d-1) labels option-(b) harvesting writes on the loser's plies (nn3 from the depth-4
+// gate, nn5 from a depth-6 rank/match harvest). Every such engine×depth tag needs its own
+// Elo or weakest-first refresh would misrank the shallow labels as strong (see eloForTag).
+const rankDepths = [...new Set([cfg.rankDepth, cfg.rankDepth - 1, cfg.depth, cfg.depth - 1])]
+  .filter((d) => d >= 1);
+
 // Add a just-promoted champion to the engine-strength ledger — ONLY that champion plays,
 // every other engine's Elo is reused unchanged (via rank's --only), so a promotion never
-// re-ranks engines that didn't change. The champion is ranked at BOTH the gate depth
-// (cfg.rankDepth, its harvested nn4@ labels) and the generation depth (cfg.depth, its
-// nn6@ labels), so each of its engine×depth labels gets a precise Elo (the consumers look
-// an exact engine×depth tag up first). The first promotion has no ledger yet, so it seeds
-// one with a full incremental gauntlet at the gate depth before adding the champion's deep
-// entry. --no-scan keeps it fast (record counts aren't needed to drive the refresh).
+// re-ranks engines that didn't change. The champion is ranked at each of `rankDepths`, so
+// each of its engine×depth labels gets a precise Elo (the consumers look an exact engine×
+// depth tag up first). The first promotion has no ledger yet, so it seeds one with a full
+// incremental gauntlet at the gate depth before adding the champion's other entries.
+// --no-scan keeps it fast (record counts aren't needed to drive the refresh).
 // Maintenance, like the refreshes — a failure logs but doesn't stop the loop.
 function runRank(label, champHash) {
   if (!cfg.rank) return;
@@ -263,9 +270,9 @@ function runRank(label, champHash) {
         `--depth=${cfg.rankDepth}`, `--games=${cfg.rankGames}`, `--out=${ledgerFile}`, ...jobArg]);
   }
   if (champHash === '?') return; // unhashable champion — can't target it with --only
-  // Rank ONLY the new champion at both the gate depth and the generation depth (deduped;
-  // skip the gate depth the seed gauntlet just covered for this champion).
-  const depths = [...new Set([cfg.rankDepth, cfg.depth])].filter((d) => !(seeding && d === cfg.rankDepth));
+  // Rank ONLY the new champion at each label depth (skip the gate depth the seed gauntlet
+  // just covered for this champion).
+  const depths = rankDepths.filter((d) => !(seeding && d === cfg.rankDepth));
   for (const d of depths) {
     run(`${label} @ depth ${d}`, process.execPath,
       [rankScript, `--only=${champHash}`, '--no-scan', '--no-save-games',
@@ -321,7 +328,7 @@ log(`train:loop start — batch ${cfg.batch} @ depth ${cfg.depth} | gate ${cfg.g
   + `${existsSync(lineage) ? ' (resuming lineage)' : ''} | `
   + `refresh/cycle ${cfg.refreshCycle > 0 ? `${(cfg.refreshCycle * 100).toFixed(1)}% @ depth ${cfg.refreshCycleDepth}` : 'off'} | `
   + `refresh on promotion ${cfg.refreshFrac > 0 ? `${(cfg.refreshFrac * 100).toFixed(0)}% @ depth ${cfg.refreshDepth}` : 'off'} | `
-  + `rank ${cfg.rank ? `on (hc anchor, new champion @ depths ${[...new Set([cfg.rankDepth, cfg.depth])].join('+')}, ${cfg.rankGames}g/matchup)` : 'off'} | `
+  + `rank ${cfg.rank ? `on (hc anchor, new champion @ depths ${rankDepths.join('+')}, ${cfg.rankGames}g/matchup)` : 'off'} | `
   + `cycles ${cfg.cycles === Infinity ? '∞' : cfg.cycles}`);
 
 const jobArg = cfg.jobs !== undefined ? [`--jobs=${cfg.jobs}`] : [];
@@ -372,8 +379,9 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
 
   // 4. Gate: candidate (A) vs champion (B), SPRT(0, elo1). Unless --no-harvest,
   //    the gate's games are appended to the dataset (they're already paid for;
-  //    `v` survives only from the side the gate proves stronger) and the next
-  //    cycle's incremental featurize folds them in.
+  //    every position gets the stronger side's value — its direct depth-d search
+  //    where it moved, the free depth-(d-1) value from the previous ply where the
+  //    weaker side moved) and the next cycle's incremental featurize folds them in.
   if (existsSync(resultFile)) rmSync(resultFile);
   if (!run('Gate: candidate vs champion', process.execPath,
     [matchScript, '--eval-a=nn', `--weights-a=${candidate}`, '--eval-b=nn', `--weights-b=${champion}`,

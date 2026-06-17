@@ -42,12 +42,16 @@
 //                     sprt} at the end (for orchestration, e.g. the gated train:loop)
 //   --save-games=F    harvest the match's games as training data: append one JSONL
 //                     line per searched position ({fen, r, g, v?} — the generator's
-//                     raw format) to F when the match ends. The search value `v` is
-//                     kept only on positions where the engine the match proved
-//                     STRONGER (by final score; tie -> B, the baseline) was to
-//                     move — the weaker engine's opinion is a worse target, so its
-//                     positions carry just the outcome. Games are buffered until
-//                     the verdict, since the winner isn't known until the end.
+//                     raw format) to F when the match ends. Every position gets the
+//                     value of the engine the match proved STRONGER (by final score;
+//                     tie -> B, the baseline) — its own search on the plies it moved
+//                     (depth d, tagged nnD@), and on the OPPONENT's plies its free
+//                     depth-(d-1) value taken from the previous ply: the winner's best
+//                     move leads to exactly that position, so its value is -(winner's
+//                     score one ply earlier), tagged nn(D-1)@ — an honest, weaker
+//                     label that weakest-first refresh upgrades later. Games are
+//                     buffered until the verdict, since the winner isn't known until
+//                     the end. (The loser's own opinion is discarded entirely.)
 //   --eval-b=NAME     evaluation for engine B (default 'handcrafted'). Lets you pit
 //                     the neural-net eval against the handcrafted one in one file.
 //   --no-tt           disable the transposition table for both engines
@@ -297,30 +301,49 @@ if (cfg.sprt) {
 }
 
 // Harvest (--save-games): append the buffered games as raw training data, in the
-// generator's exact format ({fen, r, g, v?, vs?}). `v` survives only on positions where
-// the engine the match proved stronger was to move (final score; tie -> B, the
-// established baseline) — the weaker engine's positions keep just the outcome,
-// which train.py already handles (no-`v` rows fall back to the pure result).
+// generator's exact format ({fen, r, g, v?, vs?}). Every position carries the WINNING
+// engine's value (the one the match proved stronger; final score, tie -> B, the
+// established baseline): its direct depth-d search on the plies it moved, and the free
+// depth-(d-1) value from the previous ply on the plies the loser moved. The loser's own
+// opinion is dropped. (train.py still handles any no-`v` row by falling back to the result.)
 if (cfg.saveGames && harvested.length) {
   const p = scores.reduce((a, b) => a + b, 0) / scores.length;
   const winner = p > 0.5 ? 'a' : 'b';
-  // Provenance for the kept v: the winning engine's eval + its gate depth + version.
-  const wVtag = computeVtag(
-    winner === 'a' ? cfg.evalA : cfg.evalB,
-    winner === 'a' ? cfg.depth : cfg.depthB,
-    winner === 'a' ? cfg.weightsA : cfg.weightsB,
-  );
+  const winEval = winner === 'a' ? cfg.evalA : cfg.evalB;
+  const winDepth = winner === 'a' ? cfg.depth : cfg.depthB;
+  const winWeights = winner === 'a' ? cfg.weightsA : cfg.weightsB;
+  // Provenance for the winner's direct value (its eval + search depth + version).
+  const wVtag = computeVtag(winEval, winDepth, winWeights);
+  // Provenance for the DERIVED value on the loser's plies: one ply shallower. The winner
+  // always plays its best move, so the position the loser then faces IS the PV child of the
+  // winner's previous search, whose negamax value is exactly -(winner's score one ply back)
+  // at depth d-1. Tagging it nn(d-1)@ keeps the label honest (a weaker value, never claimed
+  // as depth d) so weakest-first refresh upgrades it later. Needs a fixed depth >= 2; a
+  // time-based search has no clean d-1, so we leave those loser plies unlabeled (filled later).
+  const wVtagPrev = (winDepth != null && winDepth >= 2)
+    ? computeVtag(winEval, winDepth - 1, winWeights) : null;
   let lines = '';
-  let nPos = 0;
-  let nKept = 0;
+  let nPos = 0, nKept = 0, nDerived = 0;
   for (const { pair, recs } of harvested) {
     for (let gi = 0; gi < recs.length; gi++) {
       // Unique per run + pair + color, same role as the generator's game id ("g"
       // groups a game for the trainer's by-game train/val split).
       const gid = `m${cfg.seed.toString(36)}-${pair}${gi === 0 ? 'w' : 'b'}`;
-      for (const rec of recs[gi]) {
+      const game = recs[gi];
+      for (let i = 0; i < game.length; i++) {
+        const rec = game[i];
         const o = { fen: rec.fen, r: rec.r, g: gid };
-        if (rec.mover === winner && rec.v != null) { o.v = rec.v; o.vs = wVtag; nKept++; }
+        if (rec.mover === winner) {
+          if (rec.v != null) { o.v = rec.v; o.vs = wVtag; nKept++; }
+        } else if (i === 0 && rec.moverOther === winner && rec.vOther != null) {
+          // The one ply the winner moved second on: no previous ply to derive from, so use
+          // the winner's own off-turn search of the opening position — a real depth-d value.
+          o.v = rec.vOther; o.vs = wVtag; nKept++;
+        } else if (wVtagPrev && i > 0 && game[i - 1].mover === winner && game[i - 1].v != null) {
+          // Loser to move: the winner's depth-(d-1) value of this position is -its prior score
+          // (stm-relative on both sides, so the negamax sign flip is a plain negation).
+          o.v = -game[i - 1].v; o.vs = wVtagPrev; nDerived++;
+        }
         lines += JSON.stringify(o) + '\n';
         nPos++;
       }
@@ -329,7 +352,8 @@ if (cfg.saveGames && harvested.length) {
   mkdirSync(dirname(cfg.saveGames), { recursive: true });
   appendFileSync(cfg.saveGames, lines);
   console.log(`Saved ${fmtNum(nPos)} positions from ${harvested.length * 2} games to ${cfg.saveGames} `
-    + `(v kept from the stronger engine ${winner.toUpperCase()} on ${fmtNum(nKept)}).`);
+    + `(winner ${winner.toUpperCase()}: ${fmtNum(nKept)} direct ${wVtag}`
+    + `${wVtagPrev ? `, ${fmtNum(nDerived)} derived ${wVtagPrev}` : ''}).`);
 }
 
 // Machine-readable summary for orchestration (train:loop reads this to gate).
