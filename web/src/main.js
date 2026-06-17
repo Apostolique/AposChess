@@ -766,6 +766,8 @@ function onPonderResult(slot, data) {
 let puzzleCatalog = null;  // null until fetched; [] if the fetch failed or was empty
 let puzzleList = [];       // current filtered, shuffled play order
 let puzzleIdx = -1;        // position in puzzleList
+let puzzleBeaten = new Set(); // puzzleList indices solved/revealed this session — they
+                              // stay navigable (re-dealing one doesn't re-lock "Next")
 let puzzle = null;         // the active catalog entry
 let puzzleColor = 'white'; // the solver's side (the side to move in the puzzle FEN)
 let puzzlePhase = 'idle';  // 'playing' | 'wrong' | 'solved' | 'revealed' | 'idle'
@@ -888,6 +890,7 @@ function refilterPuzzles() {
     [puzzleList[i], puzzleList[j]] = [puzzleList[j], puzzleList[i]];
   }
   puzzleIdx = -1;
+  puzzleBeaten.clear();
 }
 
 function nextPuzzle() {
@@ -1054,7 +1057,10 @@ function renderPuzzleMeta() {
   // "Next puzzle" stays locked until the current one is solved/revealed — no skipping
   // ahead without an answer.
   const solvedish = puzzlePhase === 'solved' || puzzlePhase === 'revealed';
-  $('puzzle-next').disabled = !solvedish;
+  if (solvedish && puzzleIdx >= 0) puzzleBeaten.add(puzzleIdx);
+  // "Next" unlocks once the current puzzle is solved — or was already beaten earlier
+  // this session, so stepping back to a finished puzzle keeps navigation free.
+  $('puzzle-next').disabled = !solvedish && !puzzleBeaten.has(puzzleIdx);
   // Previous is free (those puzzles were already seen) — only the start of the walk
   // disables it.
   $('puzzle-prev').disabled = puzzleIdx <= 0;
