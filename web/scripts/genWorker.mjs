@@ -71,9 +71,31 @@ function playGame(rng) {
     // can ever recur, so that window is all the repetition detection needs — and
     // each position is hashed once per game, not once per remaining ply.
     const prev = seenHashes.slice(-(state.halfmove + 1));
-    const r = chooseMoveDetailed(state, cfg.depth ?? 99, rng,
-      cfg.depth != null ? Infinity : cfg.movetime, true, prev, cfg.evalName);
-    const move = ply < cfg.openings ? pick(status.legal) : r.move;
+    const maxMs = cfg.depth != null ? Infinity : cfg.movetime;
+    const r = chooseMoveDetailed(state, cfg.depth ?? 99, rng, maxMs, true, prev, cfg.evalName);
+    // Opening move: uniform-random over all legal moves (default), or — with
+    // --opening-topk=N — uniform over the engine's N best, so the opening varies but
+    // stays sound. The N best come from N searches that exclude the moves already
+    // chosen (excludeKeys is keyed from*64+to), the same idiom the puzzle miner uses.
+    // `r` (the unexcluded best) is reused as the first candidate AND as this position's
+    // recorded `v`, so the value still labels the position, not the move played.
+    let move;
+    if (ply >= cfg.openings) {
+      move = r.move; // normal play: the engine's best
+    } else if (cfg.openingTopk > 0 && r.move) {
+      const cands = [r.move];
+      const exclude = new Set([r.move.from * 64 + r.move.to]);
+      while (cands.length < cfg.openingTopk) {
+        const nx = chooseMoveDetailed(state, cfg.depth ?? 99, rng, maxMs, true, prev, cfg.evalName, exclude);
+        const key = nx.move && nx.move.from * 64 + nx.move.to;
+        if (!nx.move || exclude.has(key)) break; // no fresh move left (all excluded)
+        cands.push(nx.move);
+        exclude.add(key);
+      }
+      move = cands[Math.floor(rng() * cands.length)];
+    } else {
+      move = pick(status.legal); // --opening-topk=0: original uniform-random opening
+    }
     scores.push(r.score);
     seenHashes.push(_internal.hashOf(state));
     state = applyMove(state, move);

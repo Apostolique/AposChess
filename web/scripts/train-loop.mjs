@@ -23,6 +23,10 @@
 // Options:
 //   --batch=N       games generated per cycle (default 200)
 //   --depth=D       search depth while generating (default 6 — deeper = better labels)
+//   --openings=K    forwarded to gen: starting plies to vary (default: gen's 8)
+//   --opening-topk=N  forwarded to gen: 0 (default) = uniform-random openings; N>=1
+//                   samples among the engine's N best opening moves (sound but varied).
+//                   Off by default, so the loop's data is unchanged unless you set it.
 //   --cycles=N      stop after N cycles (default: run forever until Ctrl-C)
 //   --gate-games=N  max games in the candidate-vs-champion match (default 800 — mature
 //                   gains are small, and small edges need more games to clear the SPRT)
@@ -149,6 +153,8 @@ const num = (v, d) => (v === undefined ? d : Number(v));
 const cfg = {
   batch: num(args.batch, 200),
   depth: num(args.depth, 6),
+  openings: args.openings !== undefined ? Number(args.openings) : null, // null = gen default (8)
+  openingTopk: num(args['opening-topk'], 0), // 0 = uniform-random opening (gen default)
   cycles: args.cycles !== undefined ? Number(args.cycles) : Infinity,
   gateGames: num(args['gate-games'], 800),
   gateDepth: num(args['gate-depth'], 4),
@@ -351,7 +357,10 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
   if (c === 1 && cfg.skipGen) {
     log('Skipping generation (--skip-gen): gating the existing dataset.');
   } else if (!run('Generate (champion self-play)', process.execPath,
-    [genScript, `--games=${cfg.batch}`, `--depth=${cfg.depth}`, '--eval=nn', ...jobArg])) break;
+    [genScript, `--games=${cfg.batch}`, `--depth=${cfg.depth}`, '--eval=nn',
+      ...(cfg.openings !== null ? [`--openings=${cfg.openings}`] : []),
+      ...(cfg.openingTopk > 0 ? [`--opening-topk=${cfg.openingTopk}`] : []),
+      ...jobArg])) break;
 
   // 1b. Per-cycle value refresh: re-label a small random slice of the dataset with the
   //     current champion. Most records carry `v` from older champions or shallower

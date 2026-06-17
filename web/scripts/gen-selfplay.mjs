@@ -39,7 +39,13 @@
 //   --jobs=N        parallel worker threads (default: CPU core count)
 //   --depth=D       fixed-depth search per move (default 4)
 //   --movetime=MS   use a time budget per move instead of fixed depth
-//   --openings=K    random plies to start each game, for variety (default 8)
+//   --openings=K    plies to vary at the start of each game, for variety (default 8)
+//   --opening-topk=N  how those opening plies pick a move (default 0 = uniform random,
+//                   the original behavior). N>=1 instead samples uniformly among the
+//                   engine's N best moves (found by N excluded searches, the puzzle
+//                   miner's idiom), so openings stay realistic ("deviate among GOOD
+//                   moves") while still branching: ~N^openings distinct lines, all
+//                   sound. Costs up to N searches per opening ply, so keep N small.
 //   --eval=NAME     engine evaluation to play with: 'handcrafted' (default) | 'nn'
 //   --maxmoves=N    adjudicate a draw after N plies (default 200)
 //   --out=FILE      output path (default ../training/data/selfplay.jsonl); appends
@@ -75,6 +81,7 @@ const cfg = {
   depth: args.depth !== undefined ? Number(args.depth) : (args.movetime !== undefined ? null : 4),
   movetime: num(args.movetime, 50),
   openings: num(args.openings, 8),
+  openingTopk: Math.max(0, num(args['opening-topk'], 0)),
   evalName: typeof args.eval === 'string' ? args.eval : 'handcrafted',
   maxmoves: num(args.maxmoves, 200),
   // Default lands in the repo-root training/data/ (where train.py reads); a custom
@@ -99,7 +106,7 @@ mkdirSync(dirname(cfg.out), { recursive: true });
 const fresh = !existsSync(cfg.out);
 const forever = !Number.isFinite(cfg.games);
 console.log(`Generating ${forever ? 'games forever (Ctrl-C to stop)' : `${cfg.games} games`} -> ${cfg.out}${fresh ? '' : ' (appending)'}`);
-console.log(`  ${cfg.depth != null ? `depth ${cfg.depth}` : `${cfg.movetime}ms/move`} | eval ${cfg.evalName} | openings ${cfg.openings} | jobs ${jobs} | seed ${cfg.seed}`);
+console.log(`  ${cfg.depth != null ? `depth ${cfg.depth}` : `${cfg.movetime}ms/move`} | eval ${cfg.evalName} | openings ${cfg.openings}${cfg.openingTopk ? ` (top-${cfg.openingTopk})` : ' (random)'} | jobs ${jobs} | seed ${cfg.seed}`);
 printStopHint();
 
 const status = liveStatus();

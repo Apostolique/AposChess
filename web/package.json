@@ -17,7 +17,8 @@
     "train:featurize": "node scripts/featurize.mjs",
     "train:loop": "node scripts/train-loop.mjs",
     "train:merge": "node --max-old-space-size=8192 scripts/merge-data.mjs",
-    "puzzles:mine": "node scripts/mine-puzzles.mjs"
+    "puzzles:mine": "node scripts/mine-puzzles.mjs",
+    "openings:mine": "node --max-old-space-size=8192 scripts/mine-openings.mjs"
   },
   "dependencies": {
     "@lichess-org/chessground": "^10.1.1",
