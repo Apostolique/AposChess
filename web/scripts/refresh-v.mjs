@@ -338,7 +338,16 @@ rl.on('line', (line) => {
   const idx = lineIdx++;
   // After a stop request, every remaining line is copied through verbatim (no
   // recompute) so the output stays a complete, valid dataset.
-  if (stopping) { ready.set(idx, line + '\n'); passed++; flush(); return; }
+  if (stopping) {
+    ready.set(idx, line + '\n'); passed++; flush();
+    // Same backpressure as the normal path below: a few depth-N searches still in
+    // flight at the front leave a gap at nextEmit that blocks flush, so without this
+    // the reader floods the whole rest of the file into `ready` and blows V8's Map
+    // size cap on a large dataset. The worker 'done' handler resumes us as the gap
+    // drains; once nothing is pending, every line flushes at once and we stream to EOF.
+    if (!inputEnded && lineIdx - nextEmit > CAP) rl.pause();
+    return;
+  }
   const hasV = line.includes('"v":');
   let recompute;
   if (!eloByVersion) {                           // classic mode (no --ledger)

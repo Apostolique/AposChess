@@ -126,7 +126,7 @@ parentPort.on('message', (msg) => {
     if (scores[i] != null) { rec.v = scores[i]; rec.vs = vtag; }
     lines += JSON.stringify(rec) + '\n';
   }
-  parentPort.postMessage({ type: 'result', g, lines, nPositions: positions.length });
+  parentPort.postMessage({ type: 'result', g, lines, nPositions: positions.length, result });
 });
 
 parentPort.postMessage({ type: 'ready' });

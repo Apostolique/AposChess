@@ -113,6 +113,9 @@ const status = liveStatus();
 const t0 = Date.now();
 let totalPositions = 0;
 let doneGames = 0;
+const wins = { white: 0, black: 0, draw: 0 }; // game outcomes, to gauge balance
+// White's score as a percentage (draws count half); 50% = perfectly balanced.
+const pctW = () => (doneGames ? (((wins.white + wins.draw / 2) / doneGames) * 100).toFixed(1) : '0.0');
 let nextGame = 0;
 let stopping = false; // set on key/Ctrl-C: stop dispatching, let in-flight games drain
 
@@ -144,11 +147,13 @@ await new Promise((resolve_) => {
         if (msg.lines) appendFileSync(cfg.out, msg.lines); // single writer: no interleave
         totalPositions += msg.nPositions;
         doneGames++;
+        wins[msg.result > 0 ? 'white' : msg.result < 0 ? 'black' : 'draw']++;
         const elapsed = (Date.now() - t0) / 1000;
         const head = forever ? `${doneGames} games` : `${doneGames}/${cfg.games} games`;
         const eta = !forever && doneGames < cfg.games
           ? ` | ETA ${fmtDur((elapsed / doneGames) * (cfg.games - doneGames))}` : '';
-        status.update(`  ${head} | ${fmtNum(totalPositions)} positions | `
+        status.update(`  ${head} | W ${wins.white} B ${wins.black} D ${wins.draw} (${pctW()}% W) | `
+          + `${fmtNum(totalPositions)} positions | `
           + `${(doneGames / (elapsed / 60)).toFixed(1)} games/min | ${fmtDur(elapsed)} elapsed${eta}`);
         dispatch(w);
       }
@@ -164,4 +169,5 @@ status.clear();
   const size = existsSync(cfg.out) ? ` Dataset now ${fmtMB(statSync(cfg.out).size)}.` : '';
   console.log(`Done: ${doneGames} games, ${fmtNum(totalPositions)} positions in ${fmtDur(el)} `
     + `(${(doneGames / (el / 60)).toFixed(1)} games/min).${size}`);
+  console.log(`  Results: White ${wins.white} | Black ${wins.black} | Draw ${wins.draw} (White scores ${pctW()}%).`);
 }
