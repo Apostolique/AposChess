@@ -95,7 +95,7 @@ import { spawnSync } from 'node:child_process';
 import {
   existsSync, rmSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, appendFileSync, statSync,
 } from 'node:fs';
-import { dirname, resolve, join } from 'node:path';
+import { dirname, resolve, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { fmtDur, fmtMB } from './fmt.mjs';
@@ -115,6 +115,60 @@ const matchScript = resolve(here, 'selfplay.mjs');
 const refreshScript = resolve(here, 'refresh-v.mjs');
 const rankScript = resolve(here, 'rank-engines.mjs');
 const trainPy = resolve(repoDir, 'training', 'train.py');
+
+// Each loop step shells out to a standalone script that also has its own npm entry
+// point — so anyone watching the loop can reproduce/resume a single step by hand.
+// Map the script we spawn back to the command you'd type to run it yourself.
+const scriptCmd = new Map([
+  [genScript, 'npm run train:gen'],
+  [featurizeScript, 'npm run train:featurize'],
+  [matchScript, 'npm run match'],
+  [rankScript, 'npm run rank'],
+  [refreshScript, 'node scripts/refresh-v.mjs'], // no npm alias
+  [trainPy, 'npm run train:fit'],                // train:fit forwards args to train.py
+]);
+// Each spawned script's own per-flag defaults, keyed by the command above. A flag the
+// loop passes that just restates the script's default is dropped from the echoed command
+// (it'd behave identically if omitted), so what's shown is only what actually differs.
+// Values are compared as strings (argv flags are strings). Keep in sync with the
+// referenced scripts' arg parsing. Flags absent here are always shown; `--seed` is
+// dropped unconditionally below (the loop always seeds it from the clock).
+const scriptDefaults = {
+  'npm run train:gen': { games: '200', depth: '4', eval: 'handcrafted', openings: '8', 'opening-topk': '0', maxmoves: '200' },
+  'npm run match': { games: '100', movetime: '50', 'eval-a': 'handcrafted', 'eval-b': 'handcrafted', openings: '6', maxmoves: '200', elo0: '0', elo1: '15', alpha: '0.05', beta: '0.05' },
+  'npm run rank': { depth: '4', games: '200', anchor: 'hc', openings: '6', maxmoves: '200' },
+  'node scripts/refresh-v.mjs': { frac: '1', depth: '6', minutes: '10' },
+  'npm run train:fit': { hidden: '128', lambda: '1' }, // train:fit forwards to train.py
+};
+// Rewrite an absolute-path argument (e.g. --out=C:\…\candidate.json) to a path relative
+// to web/, where these commands are meant to run — shorter and still copy-pasteable.
+function relArg(tok) {
+  const eq = tok.indexOf('=');
+  if (eq < 0) return tok;
+  const key = tok.slice(0, eq), val = tok.slice(eq + 1);
+  if (!/^([A-Za-z]:[\\/]|[\\/])/.test(val)) return tok; // not an absolute path
+  return `${key}=${relative(webDir, val).replace(/\\/g, '/')}`;
+}
+// The hand-runnable form of a spawned step: `npm run … -- <flags>` (npm needs the `--`
+// to forward flags), with redundant defaults and the clock-based seed stripped so only
+// the meaningful overrides show. Returns null for anything not in the map.
+function friendlyCmd(argv) {
+  const base = scriptCmd.get(argv[0]);
+  if (!base) return null;
+  const def = scriptDefaults[base] || {};
+  const flags = [];
+  for (const tok of argv.slice(1)) {
+    const eq = tok.indexOf('=');
+    const key = (eq < 0 ? tok : tok.slice(0, eq)).replace(/^--/, '');
+    const val = eq < 0 ? null : tok.slice(eq + 1);
+    if (key === 'seed') continue;            // clock-seeded each run, never reproducible
+    if (val !== null && def[key] === val) continue; // restates the script's own default
+    flags.push(relArg(tok));
+  }
+  if (!flags.length) return base;
+  const sep = base.startsWith('npm run') ? ' --' : '';
+  return `${base}${sep} ${flags.join(' ')}`;
+}
 
 const rawFile = join(dataDir, 'selfplay.jsonl');
 const featFile = join(dataDir, 'selfplay.features.jsonl');
@@ -231,6 +285,10 @@ process.on('SIGINT', () => { stopping = true; console.log('\n  Ctrl-C: stopping 
 function run(label, cmd, argv, cwd = webDir) {
   if (stopping) return false;
   console.log(`\n--- ${label} — ${hms()} ---`);
+  // Echo the equivalent stand-alone command so the step can be reproduced/resumed by
+  // hand (run from web/). Logged too, so the persisted log records exactly what ran.
+  const friendly = friendlyCmd(argv);
+  if (friendly) log(`  $ ${friendly}`);
   // APOS_CHILD tells the child tools they're orchestrated: they use a SIGINT-only
   // graceful stop instead of grabbing the TTY's raw mode, so the loop's own Ctrl-C
   // (stop after this cycle) keeps working — see scripts/stop.mjs.
