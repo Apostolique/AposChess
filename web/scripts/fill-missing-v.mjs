@@ -12,14 +12,12 @@
 //
 // Usage (run from web/):  node scripts/fill-missing-v.mjs [--depth=D] [--in=FILE] [--weights=FILE]
 
-import { createReadStream, createWriteStream, existsSync, rmSync, renameSync, readFileSync, statSync } from 'node:fs';
+import { createReadStream, createWriteStream, existsSync, rmSync, renameSync, statSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { parseFen } from '../src/board.js';
-import { chooseMoveDetailed } from '../src/ai.js';
-import { loadWeights } from '../src/nn.js';
+import { makeEngine } from './wasmEngine.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const args = Object.fromEntries(process.argv.slice(2).map((a) => {
@@ -32,7 +30,8 @@ const weights = typeof args.weights === 'string'
   ? resolve(process.cwd(), args.weights) : resolve(here, '../src/nn-weights.json');
 
 if (!existsSync(dataFile)) { console.error(`No dataset at ${dataFile}`); process.exit(1); }
-try { loadWeights(JSON.parse(readFileSync(weights, 'utf8'))); } catch { /* material fallback */ }
+// Score via the native Zig engine (wasm) — consistent with the generator/gate.
+const eng = makeEngine('nn', weights);
 
 console.log(`fill-missing-v: ${dataFile} | depth ${depth} | weights ${weights.replace(/^.*[\\/]/, '')}`);
 
@@ -50,8 +49,7 @@ for await (const line of rl) {
   if (line.includes('"v":')) { await write(line + '\n'); continue; } // already has v
   const rec = JSON.parse(line);
   if (typeof rec.fen === 'string') {
-    const v = Math.round(chooseMoveDetailed(parseFen(rec.fen), depth, Math.random, Infinity, true, [], 'nn').score);
-    rec.v = v; filled++;
+    rec.v = eng.score(rec.fen, depth); filled++;
     await write(JSON.stringify(rec) + '\n');
     if (filled % 200 === 0) process.stdout.write(`\r  filled ${filled} | ${total} scanned`);
   } else {

@@ -68,6 +68,13 @@ speed up the offline self-play tools and the in-browser bot. The JS engine in
       `gen-selfplay.mjs`, `genWorker.mjs`) are deleted. The JS *engine* (`src/*.js`) stays —
       it's still the browser bot (until the wasm worker lands) and the engine for the JS glue
       tools (featurize, refresh-v, puzzles, openings, the parity oracle).
+- [x] **offline scorers via wasm**: the remaining search-heavy JS tools — `refresh-v`,
+      the puzzle miner (`mine-puzzles`), `backfill-v`, `fill-missing-v` — run their per-
+      position searches in `apos.wasm` through a shared Node helper (`scripts/wasmEngine.mjs`),
+      ~3x faster than `ai.js` in Node and bit-consistent with the native generator/gate.
+      Their orchestration (streaming, atomic rename, ledger selection, puzzle verification)
+      stays JS. No offline tool searches via `ai.js` anymore (only constants — `HC_VERSION`,
+      `MATE_THRESH` — and the parity oracle still import it).
 - [x] app wiring: `apos.wasm` in the Web Worker (`src/aiWorker.js`). Full parity with the
       old `ai.js` search — nn weights written into wasm memory (`loadWeights`), **movetime**
       via a JS-imported clock (`env.aposNowMs`), **live eval-bar** streaming

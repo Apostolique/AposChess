@@ -148,6 +148,12 @@ export fn ponderSearch(
     return out_reached;
 }
 
+/// Invalidate the searcher's transposition table (the puzzle miner resets it between
+/// positions so a prior search can't leak in). No-op before the first search.
+export fn resetTT() void {
+    if (searcher) |*s| s.clearTT();
+}
+
 export fn lastScore() i32 {
     return out_score;
 }

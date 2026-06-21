@@ -25,6 +25,8 @@ import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { cpus } from 'node:os';
 
+import { ensureWasm } from './wasmEngine.mjs';
+
 const here = dirname(fileURLToPath(import.meta.url));
 const args = Object.fromEntries(process.argv.slice(2).map((a) => {
   const m = a.replace(/^--/, '').split('='); return [m[0], m.length > 1 ? m[1] : true];
@@ -122,6 +124,7 @@ rl.on('line', (line) => {
 rl.on('close', () => { inputEnded = true; flushGame(); maybeFinalize(); });
 
 // --- workers --------------------------------------------------------------------
+ensureWasm(); // build the native engine (wasm) once before the workers race for it
 for (let i = 0; i < jobs; i++) {
   const w = new Worker(new URL('./backfillWorker.mjs', import.meta.url), { workerData: { weights, depth } });
   pool.push(w);

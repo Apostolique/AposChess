@@ -62,6 +62,7 @@ import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { cpus } from 'node:os';
 
+import { ensureWasm } from './wasmEngine.mjs';
 import { fmtDur, fmtNum, fmtMB, liveStatus, everyMs } from './fmt.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -190,6 +191,7 @@ await new Promise((done) => {
   }
   if (queue.length === 0) { finished = true; done(); return; }
   let reportedEngine = null;
+  ensureWasm(); // build the native engine (wasm) once before the workers race for it
   for (let i = 0; i < jobs; i++) {
     const w = new Worker(new URL('./puzzleWorker.mjs', import.meta.url), {
       workerData: { weights, depth, win, second, lineGap, saveFloor, maxSolverMoves, eval: evalName },

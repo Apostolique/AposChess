@@ -23,15 +23,14 @@
 // safe: keyed by full hash + eval namespace) for speed.
 
 import { parentPort, workerData } from 'node:worker_threads';
-import { readFileSync } from 'node:fs';
 
 import { newGameState, toFen } from '../src/board.js';
 import { legalMoves, applyMove } from '../src/engine.js';
-import { chooseMoveDetailed } from '../src/ai.js';
-import { loadWeights } from '../src/nn.js';
+import { makeEngine } from './wasmEngine.mjs';
 
 const { weights, depth } = workerData;
-try { loadWeights(JSON.parse(readFileSync(weights, 'utf8'))); } catch { /* material fallback */ }
+// Score via the native Zig engine (wasm); board reconstruction still uses the JS engine.
+const eng = makeEngine('nn', weights);
 
 const ROLES = ['p', 'n', 'b', 'r', 'q', 'k'];
 
@@ -80,9 +79,6 @@ function heuristicCastle(b) {
   return { K: !!(wk && wr(7)), Q: !!(wk && wr(0)), k: !!(bk && br(63)), q: !!(bk && br(56)) };
 }
 
-const valueOf = (state) =>
-  Math.round(chooseMoveDetailed(state, depth, Math.random, Infinity, true, [], 'nn').score);
-
 function processGame(g, recs) {
   const boards = recs.map((r, i) => actualBoard(r.f, i));
   let state = newGameState();
@@ -98,8 +94,9 @@ function processGame(g, recs) {
              castling: heuristicCastle(boards[i]), halfmove: 0, fullmove: (i >> 1) + 1 };
       fallbacks++;
     }
-    const v = valueOf(st);
-    lines += JSON.stringify({ fen: toFen(st), r: recs[i].r, g, v }) + '\n';
+    const fen = toFen(st);
+    const v = eng.score(fen, depth);
+    lines += JSON.stringify({ fen, r: recs[i].r, g, v }) + '\n';
     if (chained && i < recs.length - 1) {
       let found = null;
       for (const m of legalMoves(state)) {

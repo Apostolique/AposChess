@@ -53,6 +53,7 @@ import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { cpus } from 'node:os';
 
+import { ensureWasm } from './wasmEngine.mjs';
 import { fmtDur, fmtNum, fmtMB, liveStatus, everyMs } from './fmt.mjs';
 import { vtag as computeVtag } from './vtag.mjs';
 import { installStop, printStopHint } from './stop.mjs';
@@ -376,6 +377,7 @@ rl.on('line', (line) => {
 });
 rl.on('close', () => { inputEnded = true; enqueueBatch(); maybeFinalize(); });
 
+ensureWasm(); // build the native engine (wasm) once on the main thread before workers race for it
 for (let i = 0; i < jobs; i++) {
   const w = new Worker(new URL('./refreshWorker.mjs', import.meta.url), { workerData: { weights, depth, evalName, stopFlag } });
   pool.push(w);

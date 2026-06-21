@@ -157,6 +157,13 @@ pub const Searcher = struct {
         };
     }
 
+    // Invalidate every TT entry cheaply (no realloc) — used by the puzzle miner between
+    // positions so a prior search's deep values can't leak into the next.
+    pub fn clearTT(self: *Searcher) void {
+        @memset(self.tt_gen, 0);
+        self.cur_gen = 0;
+    }
+
     // Monotonic nanoseconds: the std.Io clock on native, the JS-host clock on wasm.
     fn monoNs(self: *Searcher) i96 {
         if (self.io) |io| return std.Io.Clock.now(.awake, io).nanoseconds;

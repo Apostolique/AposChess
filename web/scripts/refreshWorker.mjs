@@ -6,15 +6,13 @@
 // depth. Position-grained (every record is already a {fen,...}), so no game logic.
 
 import { parentPort, workerData } from 'node:worker_threads';
-import { readFileSync } from 'node:fs';
 
-import { parseFen } from '../src/board.js';
-import { chooseMoveDetailed } from '../src/ai.js';
-import { loadWeights } from '../src/nn.js';
+import { makeEngine } from './wasmEngine.mjs';
 
 const { weights, depth, evalName = 'nn', stopFlag = null } = workerData;
-// The handcrafted eval needs no weights; only load a net for the 'nn' eval.
-if (evalName === 'nn') { try { loadWeights(JSON.parse(readFileSync(weights, 'utf8'))); } catch { /* material fallback */ } }
+// Score via the native Zig engine (wasm) — ~3x faster than ai.js and bit-consistent with
+// the native generator/gate (same Zig eval). The handcrafted eval needs no weights.
+const eng = makeEngine(evalName, evalName === 'nn' ? weights : null);
 
 parentPort.on('message', (msg) => {
   if (msg.type !== 'batch') return;
@@ -24,7 +22,7 @@ parentPort.on('message', (msg) => {
   const vs = [], skipped = [];
   for (const { idx, fen } of msg.items) {
     if (stopFlag && Atomics.load(stopFlag, 0)) { skipped.push(idx); continue; }
-    vs.push({ idx, v: Math.round(chooseMoveDetailed(parseFen(fen), depth, Math.random, Infinity, true, [], evalName).score) });
+    vs.push({ idx, v: eng.score(fen, depth) });
   }
   parentPort.postMessage({ type: 'done', vs, skipped });
 });

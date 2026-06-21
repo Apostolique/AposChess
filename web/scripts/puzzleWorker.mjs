@@ -56,22 +56,21 @@ import { readFileSync } from 'node:fs';
 
 import { parseFen, toFen, squareName, opponent } from '../src/board.js';
 import { legalMoves, applyMove, gameStatus, generatePseudoMoves, safetyZones } from '../src/engine.js';
-import { chooseMoveDetailed, _internal } from '../src/ai.js';
-import { loadWeights, hasWeights } from '../src/nn.js';
+import { _internal } from '../src/ai.js'; // MATE_THRESH constant only (search runs in wasm)
+import { makeEngine } from './wasmEngine.mjs';
 
 const { weights, depth, win, second, lineGap, saveFloor, maxSolverMoves } = workerData;
-const { resetTT, MATE_THRESH } = _internal;
+const { MATE_THRESH } = _internal;
 
-// Same engine-selection policy as the rest of the tools: the champion net when it
-// loads, otherwise the handcrafted eval (NOT nn's material fallback — weak evals
-// make wrong puzzles, where the "solution" doesn't actually win).
+// Same engine-selection policy as the rest of the tools: the champion net when it's a
+// real net, otherwise the handcrafted eval (NOT nn's material fallback — weak evals make
+// wrong puzzles, where the "solution" doesn't actually win). The search runs in the native
+// Zig engine (wasm); `engine` is kept for the labels/logging elsewhere.
 let engine = 'handcrafted';
 if (workerData.eval === 'nn') {
-  try {
-    loadWeights(JSON.parse(readFileSync(weights, 'utf8')));
-    if (hasWeights()) engine = 'nn';
-  } catch { /* fall through to handcrafted */ }
+  try { if (JSON.parse(readFileSync(weights, 'utf8')).arch) engine = 'nn'; } catch { /* handcrafted */ }
 }
+const eng = makeEngine(engine, engine === 'nn' ? weights : null);
 
 function mulberry32(a) {
   a >>>= 0;
@@ -83,9 +82,10 @@ const VALUE = { p: 100, n: 300, b: 330, r: 500, q: 900, k: 0 };
 const uci = (m) => squareName(m.from) + squareName(m.to) + (m.promotion || '');
 
 // Search wrappers: full strength, deterministic per candidate via the seeded rand.
-const best = (state, rand, d = depth) => chooseMoveDetailed(state, d, rand, Infinity, true, [], engine);
-const secondBest = (state, rand, excludeMove) =>
-  chooseMoveDetailed(state, depth, rand, Infinity, true, [], engine, new Set([keyOf(excludeMove)]));
+// `rand` is unused now (the wasm searcher has its own deterministic root variety); kept in
+// the signatures so the call sites are unchanged.
+const best = (state, rand, d = depth) => eng.searchMove(state, d, null);
+const secondBest = (state, rand, excludeMove) => eng.searchMove(state, depth, [keyOf(excludeMove)]);
 
 // Is `m` the only move good enough to BE the puzzle? (The first move's test — line
 // continuations use the looser clearly-best rule in the walk below.) `score` is m's
@@ -173,7 +173,7 @@ function mineWin(fen, leadFen, id, seed) {
   if (status.over) return { reject: 'over' };
   if (status.legal.length < 2) return { reject: 'forced' }; // nothing to find
 
-  resetTT();
+  eng.resetTT();
 
   // Difficulty ladder: best move at each depth 1..D (the TT is shared, so this
   // costs about one full iterative-deepening search). The final rung is the
@@ -302,7 +302,7 @@ function mineDefense(item) {
   if (status.over) return { reject: 'over' };
   if (status.legal.length < 2) return { reject: 'forced' }; // "only move" with no choice isn't a puzzle
 
-  resetTT();
+  eng.resetTT();
   const ladder = [];
   for (let d = 1; d <= depth; d++) ladder.push(best(state, rand, d));
   const top = ladder[depth - 1];
