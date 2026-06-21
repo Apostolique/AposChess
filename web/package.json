@@ -18,6 +18,7 @@
     "train:loop": "node scripts/train-loop.mjs",
     "train:merge": "node --max-old-space-size=8192 scripts/merge-data.mjs",
     "puzzles:mine": "node scripts/mine-puzzles.mjs",
+    "parity": "node scripts/engine-parity.mjs",
     "openings:mine": "node --max-old-space-size=8192 scripts/mine-openings.mjs"
   },
   "dependencies": {

@@ -68,14 +68,20 @@
 //                   ~5 promotions. Re-featurize happens next cycle, so it flows in.
 //   --refresh-depth=D  search depth for the refresh (default 3 — cheap, like the
 //                   backfilled majority; a depth-6 refresh of a big fraction is hours)
-//   --refresh-cycle=P  EVERY cycle (between generation and featurize), recompute `v` on
-//                   a random fraction P of the dataset with the current champion
-//                   (default 0.01; 0 = off). Unlike --refresh-frac this helps between
-//                   promotions too: most records carry `v` from OLDER champions (or
-//                   shallower gate-harvest/backfill searches), so re-labeling them with
-//                   the current champion steadily upgrades the TD target even while the
-//                   champion is unchanged. Rule of thumb: 1% of a ~2.5M-position set at
-//                   depth 6 costs about as much as generating a 200-game batch.
+//   --refresh-cycle=P  EVERY cycle (between generation and featurize), recompute `v` with
+//                   the current champion (default 1 = the whole weakest cohort; 0 = off).
+//                   Unlike --refresh-frac this helps between promotions too: most records
+//                   carry `v` from OLDER champions (or shallower gate-harvest/backfill
+//                   searches), so re-labeling them with the current champion steadily
+//                   upgrades the TD target even while the champion is unchanged. In
+//                   ledger mode (the loop's default once a champion exists) refresh-v
+//                   already restricts itself to the single WEAKEST cohort and is capped
+//                   at a 10-minute wall-clock budget, so P throttles only how much of
+//                   that cohort is eligible — P=1 simply spends the whole budget draining
+//                   the weakest labels first (and, unthrottled, reaches the "nothing to
+//                   refresh" steady state sooner, after which the refresh is a cheap
+//                   read-only scan that no longer forces a full re-featurize). A small P
+//                   wastes budget; only lower it if you want shorter cycles than 10m.
 //   --refresh-cycle-depth=D  search depth for the per-cycle refresh (default: --depth,
 //                   so the re-labels match generation's deep-label quality)
 //   --no-refresh    skip ALL value refreshing (both --refresh-cycle and --refresh-frac),
@@ -233,7 +239,7 @@ const cfg = {
   // every cycle. Helps between promotions too — most `v` in the set came from older
   // champions or shallower searches, so "unchanged champion" does NOT mean "nothing to
   // refresh"; only records the current champion already labeled at this depth are no-ops.
-  refreshCycle: args['no-refresh'] ? 0 : num(args['refresh-cycle'], 0.01),
+  refreshCycle: args['no-refresh'] ? 0 : num(args['refresh-cycle'], 1),
   refreshCycleDepth: num(args['refresh-cycle-depth'], num(args.depth, 6)),
   // Engine ranking for smart weakest-first v refresh. On by default: each promotion adds
   // ONLY the new champion to the Elo ledger (rank --only; every other engine's Elo is
