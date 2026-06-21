@@ -5,7 +5,7 @@
 // drop-in for `npm run train:gen` — same flags, same {fen,r,g,v,vs} JSONL appended to
 // the same default dataset. Runs with cwd = web/ so relative paths (the default
 // ../training/data/selfplay.jsonl, src/nn-weights.json, --out) resolve like the JS tool.
-//   npm run gen:zig -- --games=200 --depth=4 --eval=nn --openings=8 [--opening-topk=N]
+//   npm run gen:zig -- --games=200 --depth=6 --eval=nn --openings=8 [--opening-topk=N]
 
 import { spawnSync } from 'node:child_process';
 import { resolve, dirname } from 'node:path';

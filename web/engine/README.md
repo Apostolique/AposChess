@@ -16,7 +16,7 @@ speed up the offline self-play tools and the in-browser bot. The JS engine in
   zig build parity                       # all engine layers vs the JS oracle
   zig build bench  -Doptimize=ReleaseFast -- --depth=8 [--nn]
   zig build match  -Doptimize=ReleaseFast -- --games=20 --depth=6 [--nn]
-  zig build gen    -Doptimize=ReleaseFast -- --games=200 --depth=4 --eval=nn
+  zig build gen    -Doptimize=ReleaseFast -- --games=200 --depth=6 --eval=nn
   zig build wasm                         # -> zig-out/bin/apos.wasm (browser)
   ```
 

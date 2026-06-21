@@ -21,9 +21,9 @@ const ui = {
   mode: 'human-human', // 'human-human' | 'human-ai' | 'ai-ai' | 'online' | 'puzzle' | 'analysis' | 'editor'
   humanColor: 'white', // which side the human controls in 'human-ai'
   // AI strength per slot: a preset depth string '1'..'7', or 'custom'.
-  strengthAi: '2',     // opponent strength in 'human-ai'
-  strengthWhite: '2',  // per-colour strength in 'ai-ai'
-  strengthBlack: '2',
+  strengthAi: '6',     // opponent strength in 'human-ai'
+  strengthWhite: '6',  // per-colour strength in 'ai-ai'
+  strengthBlack: '6',
   // Which evaluation drives each AI slot: 'handcrafted' or 'nn' (neural net).
   // Orthogonal to strength — the chosen engine still searches to the depth/time above.
   engineAi: 'handcrafted',

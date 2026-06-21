@@ -54,7 +54,7 @@ pub fn build(b: *std.Build) void {
     const match_step = b.step("match", "Play self-play games and report results + nps");
     match_step.dependOn(&run_match.step);
 
-    // Self-play data generator: `zig build gen -- --games=200 --depth=4 --eval=nn`.
+    // Self-play data generator: `zig build gen -- --games=200 --depth=6 --eval=nn`.
     const gen = b.addExecutable(.{
         .name = "apos-gen",
         .root_module = b.createModule(.{

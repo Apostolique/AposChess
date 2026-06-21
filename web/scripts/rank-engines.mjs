@@ -46,7 +46,7 @@
 //   npm run rank -- [options]
 //
 // Options:
-//   --depth=D       fixed search depth for the CONTENDERS in the gauntlet (default 4).
+//   --depth=D       fixed search depth for the CONTENDERS in the gauntlet (default 6).
 //                   The anchor searches separately (--anchor-depth); contenders don't
 //                   need to match it.
 //   --movetime=MS   give the contenders a time budget instead of a fixed depth.
@@ -152,7 +152,7 @@ const num = (v, d) => (v === undefined ? d : Number(v));
 
 const cfg = {
   // Contenders' gauntlet depth/movetime.
-  depth: args.movetime !== undefined ? null : (args.depth !== undefined ? Number(args.depth) : 4),
+  depth: args.movetime !== undefined ? null : (args.depth !== undefined ? Number(args.depth) : 6),
   movetime: args.movetime !== undefined ? Number(args.movetime) : null,
   // The anchor searches at its OWN fixed depth (default 6), independent of the
   // contenders above — it's the deep, stable reference yardstick. --anchor-movetime

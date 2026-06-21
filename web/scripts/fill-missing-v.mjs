@@ -25,7 +25,7 @@ const args = Object.fromEntries(process.argv.slice(2).map((a) => {
 }));
 const dataFile = typeof args.in === 'string'
   ? resolve(process.cwd(), args.in) : resolve(here, '../../training/data/selfplay.jsonl');
-const depth = args.depth !== undefined ? Number(args.depth) : 3;
+const depth = args.depth !== undefined ? Number(args.depth) : 6;
 const weights = typeof args.weights === 'string'
   ? resolve(process.cwd(), args.weights) : resolve(here, '../src/nn-weights.json');
 

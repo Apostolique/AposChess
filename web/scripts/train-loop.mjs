@@ -30,7 +30,7 @@
 //   --cycles=N      stop after N cycles (default: run forever until Ctrl-C)
 //   --gate-games=N  max games in the candidate-vs-champion match (default 800 — mature
 //                   gains are small, and small edges need more games to clear the SPRT)
-//   --gate-depth=D  search depth for the gating match (default 4)
+//   --gate-depth=D  search depth for the gating match (default 6)
 //   --elo1=E        SPRT H1 promotion threshold in Elo (default 20; elo0 is 0). This
 //                   is the SMALLEST gain worth promoting; it must be wide enough that
 //                   the SPRT can actually decide within --gate-games. A too-small band
@@ -56,8 +56,8 @@
 //                   selfplay.jsonl via the match runner's --save-games, with the
 //                   search value `v` kept only from the engine the gate proved
 //                   stronger; the next cycle's (incremental) featurize folds them
-//                   in. Note they're played at --gate-depth, shallower labels than
-//                   generation's --depth.
+//                   in. They're played at --gate-depth, the same depth as generation's
+//                   --depth by default, so the harvested labels match generation quality.
 //   --jobs=N        parallel workers for gen + match
 //   --fresh         clear the dataset before the first cycle (clean deep-search start)
 //   --refresh-frac=P  after each PROMOTION, recompute `v` on a random fraction P of the
@@ -66,8 +66,8 @@
 //                   is unchanged, so a refresh would just recompute identical values.
 //                   Cost scales with P × depth; e.g. P=0.2 touches the whole set every
 //                   ~5 promotions. Re-featurize happens next cycle, so it flows in.
-//   --refresh-depth=D  search depth for the refresh (default 3 — cheap, like the
-//                   backfilled majority; a depth-6 refresh of a big fraction is hours)
+//   --refresh-depth=D  search depth for the refresh (default 6 — matches generation;
+//                   a depth-6 refresh of a big fraction is hours, lower it for speed)
 //   --refresh-cycle=P  EVERY cycle (between generation and featurize), recompute `v` with
 //                   the current champion (default 1 = the whole weakest cohort; 0 = off).
 //                   Unlike --refresh-frac this helps between promotions too: most records
@@ -156,9 +156,9 @@ const scriptCmd = new Map([
 // referenced scripts' arg parsing. Flags absent here are always shown; `--seed` is
 // dropped unconditionally below (the loop always seeds it from the clock).
 const scriptDefaults = {
-  'npm run train:gen': { games: '200', depth: '4', eval: 'handcrafted', openings: '8', 'opening-topk': '0', maxmoves: '200' },
+  'npm run train:gen': { games: '200', depth: '6', eval: 'handcrafted', openings: '8', 'opening-topk': '0', maxmoves: '200' },
   'npm run match': { games: '100', movetime: '50', 'eval-a': 'handcrafted', 'eval-b': 'handcrafted', openings: '6', maxmoves: '200', elo0: '0', elo1: '15', alpha: '0.05', beta: '0.05' },
-  'npm run rank': { depth: '4', games: '200', anchor: 'hc', openings: '6', maxmoves: '200' },
+  'npm run rank': { depth: '6', games: '200', anchor: 'hc', openings: '6', maxmoves: '200' },
   'node scripts/refresh-v.mjs': { frac: '1', depth: '6', minutes: '10' },
   'npm run train:fit': { hidden: '128', lambda: '1' }, // train:fit forwards to train.py
 };
@@ -233,7 +233,7 @@ const cfg = {
   openingTopk: num(args['opening-topk'], 0), // 0 = uniform-random opening (gen default)
   cycles: args.cycles !== undefined ? Number(args.cycles) : Infinity,
   gateGames: num(args['gate-games'], 800),
-  gateDepth: num(args['gate-depth'], 4),
+  gateDepth: num(args['gate-depth'], 6),
   elo1: num(args.elo1, 20), // wide enough that SPRT can decide within --gate-games
   lam: num(args.lambda, 1), // TD target mix passed to train.py (1 = pure result)
   hidden: typeof args.hidden === 'string' ? args.hidden : null,
@@ -248,9 +248,9 @@ const cfg = {
   // promotions. Refresh search depth defaults to the gen depth.
   // --no-refresh zeroes both, overriding any explicit fractions.
   refreshFrac: args['no-refresh'] ? 0 : num(args['refresh-frac'], 0),
-  // Cheap by default (depth 3, like the backfilled majority): a depth-6 refresh of a
-  // big fraction is many hours. Raise it to trade speed for value accuracy.
-  refreshDepth: num(args['refresh-depth'], 3),
+  // Matches the gen/gate depth (6) so promotion refreshes relabel at full value-accuracy.
+  // A depth-6 refresh of a big fraction is many hours — lower it to trade accuracy for speed.
+  refreshDepth: num(args['refresh-depth'], 6),
   // Per-cycle refresh: a small slice of the dataset re-labeled with the current champion
   // every cycle. Helps between promotions too — most `v` in the set came from older
   // champions or shallower searches, so "unchanged champion" does NOT mean "nothing to
@@ -259,11 +259,11 @@ const cfg = {
   refreshCycleDepth: num(args['refresh-cycle-depth'], num(args.depth, 6)),
   // Engine ranking for smart weakest-first v refresh. On by default: each promotion adds
   // ONLY the new champion to the Elo ledger (rank --only; every other engine's Elo is
-  // reused), ranked at both the gate depth (--rank-depth) and the generation depth so its
-  // nn4@/nn6@ labels each get a precise Elo. The refreshes below read the ledger to relabel
+  // reused), ranked at the gen/gate depth (--rank-depth, 6) and one below it so its
+  // nn6@/nn5@ labels each get a precise Elo. The refreshes below read the ledger to relabel
   // the WEAKEST engine's `v` first instead of a blind random fraction. --no-rank reverts.
   rank: !args['no-rank'],
-  rankDepth: num(args['rank-depth'], 4),
+  rankDepth: num(args['rank-depth'], 6),
   // Default to the gate's game count: the ledger needs enough games to resolve the real
   // ordering (champions sit only ~elo1 apart), so it matches the gate's match length.
   rankGames: num(args['rank-games'], num(args['gate-games'], 800)),
@@ -329,8 +329,8 @@ function run(label, cmd, argv, cwd = webDir) {
 
 // Depths the champion is ranked at. The gate depth (cfg.rankDepth) and generation depth
 // (cfg.depth) carry its direct nnD@ harvest labels, and ONE BELOW EACH (d-1) carries the
-// depth-(d-1) labels option-(b) harvesting writes on the loser's plies (nn3 from the depth-4
-// gate, nn5 from a depth-6 rank/match harvest). Every such engine×depth tag needs its own
+// depth-(d-1) labels option-(b) harvesting writes on the loser's plies (with gate and gen
+// both at depth 6: nn6 from the gate/rank harvest, nn5 below). Every such engine×depth tag needs its own
 // Elo or weakest-first refresh would misrank the shallow labels as strong (see eloForTag).
 const rankDepths = [...new Set([cfg.rankDepth, cfg.rankDepth - 1, cfg.depth, cfg.depth - 1])]
   .filter((d) => d >= 1);

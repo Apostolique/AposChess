@@ -7,7 +7,7 @@
 // dataset: the raw {fen, r, g} (net-agnostic — features come later via
 // scripts/featurize.mjs) plus the search value {v, vs} for TD/bootstrap targets.
 //
-//   apos-gen --games=200 --depth=4 --eval=nn --openings=8 [--opening-topk=N] \
+//   apos-gen --games=200 --depth=6 --eval=nn --openings=8 [--opening-topk=N] \
 //     [--movetime=MS] [--maxmoves=200] [--out=../training/data/selfplay.jsonl] \
 //     [--seed=S] [--jobs=N]
 // Paths are relative to the current directory (run from web/). With --eval=nn the
@@ -252,7 +252,7 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
 
     var games: u64 = 200;
-    var depth: u32 = 4;
+    var depth: u32 = 6;
     var movetime: i64 = 50;
     var use_movetime = false;
     var openings: u32 = 8;
