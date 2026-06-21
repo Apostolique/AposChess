@@ -1,12 +1,19 @@
 {
   "meta": {
-    "generatedAt": "2026-06-21T14:24:31.668Z",
+    "generatedAt": "2026-06-21T14:42:40.543Z",
     "seed": 1,
+    "positions": 17,
     "startDepth": 4,
     "probeDepth": 3,
-    "weights": "src/nn-weights.json",
-    "positions": 11,
-    "zobristMovesChecked": 353
+    "zobristMovesChecked": 368,
+    "zobrist": {
+      "rng": "mulberry32 seeded 0x1a2b3c4d (uint32 stream)",
+      "rand64": "(BigInt(rnd()) << 32) | BigInt(rnd()) — first draw is the HIGH 32 bits",
+      "drawOrder": "768 piece keys, then SIDE_KEY, then CASTLE_KEYS in order K, Q, k, q",
+      "pieceKeyIndex": "(ROLE_IDX[role]*2 + (white?0:1))*64 + sq, ROLE_IDX={p:0,n:1,b:2,r:3,q:4,k:5}, sq=rank*8+file",
+      "hash": "XOR piece keys of occupied squares; XOR SIDE_KEY iff black to move; XOR each available castle key",
+      "width": "64-bit, reported as 16-hex-digit lowercase"
+    }
   },
   "positions": [
     {
@@ -14,8 +21,8 @@
       "plies": 0,
       "fen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
       "hash": "3239ef3c043538a4",
-      "evalHc": 0,
-      "evalNn": 104,
+      "status": "ongoing",
+      "check": false,
       "moves": [
         "a1a3",
         "a2a4",
@@ -88,8 +95,8 @@
       "plies": 2,
       "fen": "rnbqkbnr/ppp1pppp/4p3/8/8/4P3/PPPPP1PP/RNBQKBNR w KQkq - 0 2",
       "hash": "04606a76916f1132",
-      "evalHc": -24,
-      "evalNn": 62,
+      "status": "ongoing",
+      "check": false,
       "moves": [
         "a1a3",
         "a2a4",
@@ -155,8 +162,8 @@
       "plies": 4,
       "fen": "rnbqkbnr/2pppppp/2p5/p7/8/1P2P3/PP1PP1PP/RNBQKBNR w KQkq - 0 3",
       "hash": "7e5fa7320b9315aa",
-      "evalHc": -35,
-      "evalNn": -93,
+      "status": "ongoing",
+      "check": false,
       "moves": [
         "a1a3",
         "a2a4",
@@ -218,8 +225,8 @@
       "plies": 6,
       "fen": "1nbqkbnr/1pp1pppp/rp2p3/8/6P1/P6N/P1PPPP1P/RNBQKB1R w KQk - 1 4",
       "hash": "da701e3d696ff854",
-      "evalHc": 18,
-      "evalNn": -35,
+      "status": "ongoing",
+      "check": false,
       "moves": [
         "a2b3",
         "a3b4",
@@ -307,8 +314,8 @@
       "plies": 8,
       "fen": "rn1qkbnr/ppp1pp2/b3pp2/7p/4P3/B3K3/PPPP1PPP/RN1Q1BNR w kq - 0 5",
       "hash": "b40c00aa87dbe6af",
-      "evalHc": -2,
-      "evalNn": -184,
+      "status": "ongoing",
+      "check": false,
       "moves": [
         "a1c1",
         "a2b3",
@@ -358,8 +365,8 @@
       "plies": 10,
       "fen": "rnbqkbnr/1pp1pppp/1p6/1p6/2P5/1PP5/RPP2PPP/1NBQKBNR w K - 1 6",
       "hash": "56454649d1a967b8",
-      "evalHc": 19,
-      "evalNn": 276,
+      "status": "ongoing",
+      "check": false,
       "moves": [
         "a2a1",
         "a2a3",
@@ -417,8 +424,8 @@
       "plies": 13,
       "fen": "rnbqk1nr/1p1pbpp1/1p6/p3Q1pp/8/2P2P1R/PPP2PPP/RNB1KBN1 b kq - 1 7",
       "hash": "ae5361b6b609a3a7",
-      "evalHc": -28,
-      "evalNn": -6,
+      "status": "ongoing",
+      "check": false,
       "moves": [
         "a5b4",
         "a8a4",
@@ -457,8 +464,8 @@
       "plies": 16,
       "fen": "rnbqk1n1/p3ppbp/1p3pBr/1p6/2p2PP1/B1PP1P2/P2P3P/RN1QK1NR w KQq - 2 9",
       "hash": "3c1fa924d227d296",
-      "evalHc": 1,
-      "evalNn": -95,
+      "status": "ongoing",
+      "check": false,
       "moves": [
         "a1c1",
         "a2b3",
@@ -513,8 +520,8 @@
       "plies": 20,
       "fen": "6nr/ppnkqppR/r1pp3b/1Pp5/1Pb1NP2/4P3/4P1PP/R1BQKBN1 w Q - 1 11",
       "hash": "8b949cbe428c269c",
-      "evalHc": 47,
-      "evalNn": 37,
+      "status": "ongoing",
+      "check": false,
       "moves": [
         "a1a2",
         "a1a3",
@@ -570,8 +577,8 @@
       "plies": 26,
       "fen": "rn2k1nr/pp2pp1p/3p4/3Q4/1BB1Pbbp/q1P1PP2/P1P4P/RN2K1NR w KQq - 0 14",
       "hash": "03cf5b7845f8cd96",
-      "evalHc": 6,
-      "evalNn": 285,
+      "status": "ongoing",
+      "check": false,
       "moves": [
         "a1c1",
         "a2a3",
@@ -634,8 +641,8 @@
       "plies": 34,
       "fen": "1n1qk3/p1p5/br2pp1r/1p2nR2/Pbp5/5PP1/PPQ1PP2/RNB1KBN1 w Q - 0 18",
       "hash": "985ae80b1ee1805f",
-      "evalHc": -31,
-      "evalNn": -39,
+      "status": "ongoing",
+      "check": true,
       "moves": [
         "b2c3",
         "c1d2",
@@ -646,6 +653,95 @@
         "1": 4,
         "2": 185,
         "3": 5292
+      }
+    },
+    {
+      "id": "t1",
+      "plies": 219,
+      "fen": "k3N3/8/5RP1/3B1bP1/8/3p4/2N5/2K5 b - - 3 110",
+      "hash": "574146e35920aeb0",
+      "status": "checkmate",
+      "check": true,
+      "moves": [],
+      "perft": {
+        "1": 0
+      }
+    },
+    {
+      "id": "t2",
+      "plies": 68,
+      "fen": "2b1k1n1/6bR/p3pp1N/n3p3/1P1pPP1q/1p1r3P/2N1K2P/4r3 w - - 0 35",
+      "hash": "2890248008d95272",
+      "status": "checkmate",
+      "check": true,
+      "moves": [],
+      "perft": {
+        "1": 0
+      }
+    },
+    {
+      "id": "t3",
+      "plies": 383,
+      "fen": "8/6K1/8/8/8/8/8/2k5 b - - 0 192",
+      "hash": "26d20bd94ffbc703",
+      "status": "insufficient-material",
+      "check": false,
+      "moves": [
+        "c1b1",
+        "c1b2",
+        "c1c2",
+        "c1d1",
+        "c1d2"
+      ],
+      "perft": {
+        "1": 5
+      }
+    },
+    {
+      "id": "t4",
+      "plies": 243,
+      "fen": "Q7/k2P1P2/2Q5/4r1Bp/5RPR/6K1/8/8 b - - 4 122",
+      "hash": "f5a4f65be5cc7a01",
+      "status": "checkmate",
+      "check": true,
+      "moves": [],
+      "perft": {
+        "1": 0
+      }
+    },
+    {
+      "id": "t5",
+      "plies": 268,
+      "fen": "NK6/3k4/n7/4r3/6p1/4b3/8/8 w - - 1 135",
+      "hash": "efeb18a85648df71",
+      "status": "stalemate",
+      "check": false,
+      "moves": [],
+      "perft": {
+        "1": 0
+      }
+    },
+    {
+      "id": "t6",
+      "plies": 395,
+      "fen": "8/8/8/7b/3B1K2/7k/8/8 b - - 100 198",
+      "hash": "3961845187eee6bd",
+      "status": "fifty-move",
+      "check": false,
+      "moves": [
+        "h3g2",
+        "h3h2",
+        "h3h4",
+        "h5d1",
+        "h5e2",
+        "h5e8",
+        "h5f3",
+        "h5f7",
+        "h5g4",
+        "h5g6"
+      ],
+      "perft": {
+        "1": 10
       }
     }
   ]
