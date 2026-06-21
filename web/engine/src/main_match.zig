@@ -260,6 +260,30 @@ fn worker(sh: *Shared) void {
                 sh.stop = true;
             }
         }
+        // Live milestone every 5 pairs (or on an SPRT decision), so a long match never
+        // looks frozen — mirrors the old JS runner's periodic progress line. Printed under
+        // the mutex so the worker threads' output never interleaves.
+        const ng = sh.scores.items.len;
+        if (sh.decided != null or ng % 10 == 0) {
+            var w: usize = 0;
+            var dr: usize = 0;
+            var ls: usize = 0;
+            var ssum: f64 = 0;
+            for (sh.scores.items) |sc| {
+                ssum += sc;
+                if (sc == 1) w += 1 else if (sc == 0.5) dr += 1 else ls += 1;
+            }
+            const pp = ssum / @as(f64, @floatFromInt(ng));
+            if (sh.sprt) {
+                std.debug.print("  after {d} games | A +{d} ={d} -{d} | score {d:.1}% | Elo {d:.1} | LLR {d:.2} [{d:.2}, {d:.2}]\n", .{
+                    ng, w, dr, ls, pp * 100, eloFromScore(pp), llr(sh.scores.items, sh.elo0, sh.elo1), sh.lower, sh.upper,
+                });
+            } else {
+                std.debug.print("  after {d} games | A +{d} ={d} -{d} | score {d:.1}% | Elo {d:.1}\n", .{
+                    ng, w, dr, ls, pp * 100, eloFromScore(pp),
+                });
+            }
+        }
         sh.mutex.unlock(sh.cfg.io);
     }
 }

@@ -113,6 +113,13 @@ async function ensureEvalNet(engine, netUrl) {
 
 // A finite ms budget for the wasm clock; 0 means "depth-only" (no deadline).
 const msBudget = (maxMs) => (Number.isFinite(maxMs) ? Math.max(0, maxMs | 0) : 0);
+// A finite, positive depth for the wasm u32 param. "No depth limit" — the time-only
+// "Custom, depth 0" mode, which main.js sends as Infinity (and which 0 also means, per
+// the native tools' depth==0 sentinel) — maps to the 99-ply cap, NOT 0. Passing Infinity
+// straight to the wasm i32 arg coerces to 0, and a literal 0 is 0 too; either way that
+// makes depth_cap 0 and the search returns its first legal move instantly (the timeout
+// never gets a chance to run). Anything <= 0 or non-finite therefore means "unlimited".
+const depthBudget = (depth) => (Number.isFinite(depth) && depth > 0 ? depth | 0 : 99);
 
 // Reconstruct the full variant move object (castle/jump/promotion flags) from the wasm's
 // from/to/promo by matching the JS engine's own legal moves for this position.
@@ -158,15 +165,16 @@ self.onmessage = async ({ data }) => {
   const prevHashes = posHistory ? posHistory.map((f) => hashOf(parseFen(f))) : [];
   const hashCount = writeHashes(prevHashes);
   const ms = msBudget(maxMs);
+  const d = depthBudget(depth);
 
   if (type === 'ponder') {
-    const reached = x.ponderSearch(scratch.fen, fenLen, depth, ms, scratch.hash, hashCount);
+    const reached = x.ponderSearch(scratch.fen, fenLen, d, ms, scratch.hash, hashCount);
     self.postMessage({ type: 'ponder', seq, reached, score: x.lastScore() });
     return;
   }
 
   const exCount = writeExcl(exclude && exclude.length ? exclude : []);
-  const packed = x.search(scratch.fen, fenLen, depth, ms, scratch.hash, hashCount, scratch.excl, exCount);
+  const packed = x.search(scratch.fen, fenLen, d, ms, scratch.hash, hashCount, scratch.excl, exCount);
   const move = decodeMove(state, packed);
   const pp = x.lastPonder();
   const ponder = pp === 0xffff ? null : { from: (pp >> 8) & 0xff, to: pp & 0xff };
