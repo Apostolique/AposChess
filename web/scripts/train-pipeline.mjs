@@ -37,10 +37,16 @@ import { fmtDur } from './fmt.mjs';
 const here = dirname(fileURLToPath(import.meta.url));
 const webDir = resolve(here, '..');
 const repoDir = resolve(webDir, '..');
-const genScript = resolve(here, 'gen-selfplay.mjs');
 const featurizeScript = resolve(here, 'featurize.mjs');
-const matchScript = resolve(here, 'selfplay.mjs');
 const trainPy = resolve(repoDir, 'training', 'train.py');
+
+// Generation and the strength check run on the native Zig engine (apos-gen / apos-match),
+// built once up front; spawned with cwd = web/ so their relative paths resolve like the
+// JS tools'.
+const engineDir = resolve(webDir, 'engine');
+const isWin = process.platform === 'win32';
+const genBin = resolve(engineDir, 'zig-out', 'bin', isWin ? 'apos-gen.exe' : 'apos-gen');
+const matchBin = resolve(engineDir, 'zig-out', 'bin', isWin ? 'apos-match.exe' : 'apos-match');
 const dataFile = resolve(repoDir, 'training', 'data', 'selfplay.jsonl');
 const weightsFile = resolve(webDir, 'src', 'nn-weights.json');
 const backupFile = resolve(webDir, 'src', 'nn-weights.bak.json');
@@ -71,6 +77,21 @@ function runNode(label, script, scriptArgs, cwd = webDir) {
   const r = spawnSync(process.execPath, [script, ...scriptArgs], { stdio: 'inherit', cwd });
   if (r.status !== 0) fail(label, r.status);
 }
+// Run a native binary directly (shell:false).
+function runBin(label, bin, binArgs, cwd = webDir) {
+  console.log(`\n=== ${label} ===`);
+  const r = spawnSync(bin, binArgs, { stdio: 'inherit', cwd });
+  if (r.status !== 0) fail(label, r.status);
+}
+// Build the native engine (cached — near-instant if unchanged).
+function buildEngine() {
+  console.log('\n=== Build native engine (zig) ===');
+  const r = spawnSync('zig build -Doptimize=ReleaseFast', { stdio: 'inherit', shell: true, cwd: engineDir });
+  if (r.status !== 0) {
+    console.error('zig build failed (is Zig 0.16 on PATH?). The pipeline needs the native engine.');
+    process.exit(1);
+  }
+}
 // Run a shell command (for python / npm). Paths are quoted for spaces.
 function runShell(label, cmd, cwd = repoDir) {
   console.log(`\n=== ${label} ===\n> ${cmd}`);
@@ -93,6 +114,7 @@ function findPython() {
 }
 
 const python = findPython();
+buildEngine();
 console.log(`AposChess training pipeline: ${cfg.generations} generation(s), `
   + `${cfg.games} games/gen at depth ${cfg.depth}, python="${python}".`);
 
@@ -123,7 +145,7 @@ for (let g = 0; g < cfg.generations; g++) {
   //    weights file in src/ directly, so no build is needed between generations.
   const genArgs = [`--games=${cfg.games}`, `--depth=${cfg.depth}`, `--eval=${evalName}`];
   if (cfg.jobs !== undefined) genArgs.push(`--jobs=${cfg.jobs}`);
-  runNode('Generate self-play data', genScript, genArgs);
+  runBin('Generate self-play data', genBin, genArgs);
 
   // 2. Featurize the raw positions into training inputs for the current net
   //    (selfplay.jsonl -> selfplay.features.jsonl) so a feature change is picked up.
@@ -140,7 +162,7 @@ for (let g = 0; g < cfg.generations; g++) {
 if (cfg.match > 0) {
   const matchArgs = [`--games=${cfg.match}`, `--depth=${cfg.depth}`, '--eval-a=nn'];
   if (cfg.jobs !== undefined) matchArgs.push(`--jobs=${cfg.jobs}`);
-  runNode('Measure vs handcrafted', matchScript, matchArgs);
+  runBin('Measure vs handcrafted', matchBin, matchArgs);
 }
 
 // 5. Bundle the new weights into the deployable app.

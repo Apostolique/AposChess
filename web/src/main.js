@@ -658,7 +658,7 @@ function startSearch(slot) {
   slot.ponderSeq++; // a real search supersedes this colour's ponder chain
   aiThinking = true;
   const { depth, maxMs, engine, net } = aiParams(slot.color);
-  slot.worker.postMessage({ type: 'search', seq, state, depth, maxMs, engine, net, posHistory: repWindow(state), exclude: openingExclude() });
+  slot.worker.postMessage({ type: 'search', seq, state, depth, maxMs, engine, net, posHistory: repWindow(state), exclude: openingExclude(), wasmUrl: WASM_URL });
 }
 
 // Move keys to forbid for the game's very first move, so an AI-vs-AI game doesn't
@@ -730,7 +730,7 @@ function startPonder(slot) {
   slot.ponderBest = 0;
   const seq = ++slot.ponderSeq;
   const { depth, engine, net } = aiParams(slot.color);
-  slot.worker.postMessage({ type: 'ponder', seq, state: slot.ponderState, depth, maxMs: PONDER_STEP_MS, engine, net, posHistory: repWindow(slot.ponderState) });
+  slot.worker.postMessage({ type: 'ponder', seq, state: slot.ponderState, depth, maxMs: PONDER_STEP_MS, engine, net, posHistory: repWindow(slot.ponderState), wasmUrl: WASM_URL });
 }
 
 function onPonderResult(slot, data) {
@@ -750,7 +750,7 @@ function onPonderResult(slot, data) {
   // forced line resolved), so we don't spin firing instant bursts.
   if (data.reached >= depth || data.reached <= slot.ponderBest) return;
   slot.ponderBest = data.reached;
-  slot.worker.postMessage({ type: 'ponder', seq: data.seq, state: slot.ponderState, depth, maxMs: PONDER_STEP_MS, engine, net, posHistory: repWindow(slot.ponderState) });
+  slot.worker.postMessage({ type: 'ponder', seq: data.seq, state: slot.ponderState, depth, maxMs: PONDER_STEP_MS, engine, net, posHistory: repWindow(slot.ponderState), wasmUrl: WASM_URL });
 }
 
 // --- puzzle mode ---
@@ -1238,6 +1238,7 @@ function requestEvalBar() {
     depth: EVAL_BAR.depth, maxMs: EVAL_BAR.maxMs, engine: EVAL_BAR.engine, net: netUrl(EVAL_BAR.net),
     // The repetition window up to the VIEWED ply (same trimming as repWindow).
     posHistory: repFens.slice(0, viewIndex + 1).slice(-(st.halfmove + 1)),
+    wasmUrl: WASM_URL,
   });
   updateStatusText(); // a search is now in flight — show the "thinking…" line
 }
@@ -1595,6 +1596,12 @@ function netUrl(name) {
   const entry = netCatalog.find((n) => n.name === name);
   return entry ? new URL(`${import.meta.env.BASE_URL}nn/${entry.file}`, location.href).href : null;
 }
+
+// The wasm search engine (web/engine → public/apos.wasm). Resolved here against the
+// document base and passed to the worker, since a worker's own relative URL would resolve
+// under assets/ (same reason net URLs are resolved on the page). Built by `npm run
+// build:wasm`; if it's missing the worker falls back to the JS search.
+const WASM_URL = new URL(`${import.meta.env.BASE_URL}apos.wasm`, location.href).href;
 
 async function loadNetCatalog() {
   try {

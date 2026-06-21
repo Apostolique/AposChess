@@ -115,20 +115,36 @@ const dataDir = resolve(repoDir, 'training', 'data');
 const loopDir = join(dataDir, 'loop');
 mkdirSync(loopDir, { recursive: true });
 
-const genScript = resolve(here, 'gen-selfplay.mjs');
 const featurizeScript = resolve(here, 'featurize.mjs');
-const matchScript = resolve(here, 'selfplay.mjs');
 const refreshScript = resolve(here, 'refresh-v.mjs');
 const rankScript = resolve(here, 'rank-engines.mjs');
 const trainPy = resolve(repoDir, 'training', 'train.py');
+
+// Generation and the gate run on the native Zig engine (2-3x faster than the JS tools,
+// same flags + output): apos-gen for self-play, apos-match for the candidate-vs-champion
+// gate (with --save-games harvest). Built once at startup from web/engine; the binaries
+// run with cwd = web/ so their relative paths resolve like the JS tools'.
+const engineDir = resolve(webDir, 'engine');
+const isWin = process.platform === 'win32';
+const genBin = resolve(engineDir, 'zig-out', 'bin', isWin ? 'apos-gen.exe' : 'apos-gen');
+const matchBin = resolve(engineDir, 'zig-out', 'bin', isWin ? 'apos-match.exe' : 'apos-match');
+function buildEngine() {
+  // String form (not args-array) with shell:true so Windows resolves `zig` on PATH
+  // without the DEP0190 arg-concatenation warning.
+  const r = spawnSync('zig build -Doptimize=ReleaseFast', { cwd: engineDir, stdio: 'inherit', shell: true });
+  if (r.status !== 0) {
+    console.error('zig build failed (is Zig 0.16 on PATH?). The loop needs the native engine for gen + gate.');
+    process.exit(1);
+  }
+}
 
 // Each loop step shells out to a standalone script that also has its own npm entry
 // point — so anyone watching the loop can reproduce/resume a single step by hand.
 // Map the script we spawn back to the command you'd type to run it yourself.
 const scriptCmd = new Map([
-  [genScript, 'npm run train:gen'],
+  [genBin, 'npm run train:gen'],
   [featurizeScript, 'npm run train:featurize'],
-  [matchScript, 'npm run match'],
+  [matchBin, 'npm run match'],
   [rankScript, 'npm run rank'],
   [refreshScript, 'node scripts/refresh-v.mjs'], // no npm alias
   [trainPy, 'npm run train:fit'],                // train:fit forwards args to train.py
@@ -375,6 +391,9 @@ if (!existsSync(champion)) {
   console.error(`No champion at ${champion}. Train a net first (e.g. npm run train:fit).`);
   process.exit(1);
 }
+// Build the native engine up front (cached — near-instant if unchanged) so the gen and
+// gate steps spawn the fast Zig binaries.
+buildEngine();
 // Archive the starting champion too — it labels the data generated before the first
 // promotion, so its v-contributors must stay reconstructable like every later champion.
 archiveChampion(champion);
@@ -420,11 +439,11 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
   //    run already flushed to the dataset instead of generating a new batch.
   if (c === 1 && cfg.skipGen) {
     log('Skipping generation (--skip-gen): gating the existing dataset.');
-  } else if (!run('Generate (champion self-play)', process.execPath,
-    [genScript, `--games=${cfg.batch}`, `--depth=${cfg.depth}`, '--eval=nn',
+  } else if (!run('Generate (champion self-play)', genBin,
+    [`--games=${cfg.batch}`, `--depth=${cfg.depth}`, '--eval=nn',
       ...(cfg.openings !== null ? [`--openings=${cfg.openings}`] : []),
       ...(cfg.openingTopk > 0 ? [`--opening-topk=${cfg.openingTopk}`] : []),
-      ...jobArg])) break;
+      `--seed=${Date.now()}`, ...jobArg])) break;
 
   // 1b. Per-cycle value refresh: re-label a small random slice of the dataset with the
   //     current champion. Most records carry `v` from older champions or shallower
@@ -456,8 +475,8 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
   //    where it moved, the free depth-(d-1) value from the previous ply where the
   //    weaker side moved) and the next cycle's incremental featurize folds them in.
   if (existsSync(resultFile)) rmSync(resultFile);
-  if (!run('Gate: candidate vs champion', process.execPath,
-    [matchScript, '--eval-a=nn', `--weights-a=${candidate}`, '--eval-b=nn', `--weights-b=${champion}`,
+  if (!run('Gate: candidate vs champion', matchBin,
+    ['--eval-a=nn', `--weights-a=${candidate}`, '--eval-b=nn', `--weights-b=${champion}`,
       `--depth=${cfg.gateDepth}`, '--sprt', '--elo0=0', `--elo1=${cfg.elo1}`,
       `--games=${cfg.gateGames}`, `--result-file=${resultFile}`,
       ...(cfg.harvest ? [`--save-games=${rawFile}`, `--seed=${Date.now()}`] : []), ...jobArg])) break;

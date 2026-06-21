@@ -127,7 +127,23 @@ const dataDir = resolve(repoDir, 'training', 'data');
 const loopDir = join(dataDir, 'loop');
 const championsDir = join(loopDir, 'champions');
 const champion = resolve(webDir, 'src', 'nn-weights.json');
-const matchScript = resolve(here, 'selfplay.mjs');
+
+// Each matchup runs on the native Zig match runner (apos-match), a drop-in for
+// selfplay.mjs (per-side depth via --depth-b, SPRT, --result-file, --save-games harvest)
+// that's 2-3x faster. Built once up front from web/engine; spawned with cwd = web/ so its
+// relative paths resolve like the JS tools'.
+const engineDir = resolve(webDir, 'engine');
+const matchBin = resolve(engineDir, 'zig-out', 'bin',
+  process.platform === 'win32' ? 'apos-match.exe' : 'apos-match');
+function buildEngine() {
+  // String form (not args-array) with shell:true so Windows resolves `zig` on PATH
+  // without the DEP0190 arg-concatenation warning.
+  const r = spawnSync('zig build -Doptimize=ReleaseFast', { cwd: engineDir, stdio: 'inherit', shell: true });
+  if (r.status !== 0) {
+    console.error('zig build failed (is Zig 0.16 on PATH?). rank needs the native match runner.');
+    process.exit(1);
+  }
+}
 
 const args = Object.fromEntries(process.argv.slice(2).map((a) => {
   const m = a.replace(/^--/, '').split('='); return [m[0], m.length > 1 ? m[1] : true];
@@ -295,6 +311,7 @@ console.log(`  contenders ${cfg.depth != null ? `depth ${cfg.depth}` : `${cfg.mo
   `anchor ${cfg.anchorDepth != null ? `depth ${cfg.anchorDepth}` : `${cfg.anchorMovetime}ms/move`} | ` +
   `${cfg.games} games/matchup | jobs ${cfg.jobs} | openings ${cfg.openings} | seed ${cfg.seed}`);
 console.log(`  contenders: ${contenders.map((p) => p.tag).join(', ')}`);
+buildEngine(); // ensure the native match runner is built (cached — near-instant if unchanged)
 printStopHint();
 
 // --- graceful early stop ----------------------------------------------------------
@@ -370,7 +387,6 @@ function runMatch(p, idx, seedOffset = 0) {
   // material fallback's '?'), and matchups run sequentially anyway.
   const tmp = join(loopDir, `rank-match-${idx}.json`);
   const argv = [
-    matchScript,
     `--games=${cfg.games}`,
     `--jobs=${cfg.jobs}`,
     `--openings=${cfg.openings}`,
@@ -397,7 +413,7 @@ function runMatch(p, idx, seedOffset = 0) {
   console.log(`\n=== ${p.tag}  vs  ${anchor.tag}  (${idx + 1}/${contenders.length}) ===`);
   // Mark the match as orchestrated so it doesn't fight us for the TTY's raw mode
   // (it falls back to a SIGINT-only stop — see scripts/stop.mjs).
-  const r = spawnSync(process.execPath, argv, { stdio: 'inherit', cwd: webDir, env: { ...process.env, APOS_CHILD: '1' } });
+  const r = spawnSync(matchBin, argv, { stdio: 'inherit', cwd: webDir, env: { ...process.env, APOS_CHILD: '1' } });
   if (r.status !== 0) { console.error(`  match failed (exit ${r.status}); skipping ${p.tag}.`); return null; }
   try {
     const res = JSON.parse(readFileSync(tmp, 'utf8'));
