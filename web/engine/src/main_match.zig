@@ -18,6 +18,7 @@
 // previous ply on the plies the loser moved); the loser's own opinion is dropped.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const board = @import("board.zig");
 const engine = @import("engine.zig");
 const zobrist = @import("zobrist.zig");
@@ -25,6 +26,16 @@ const ai = @import("ai.zig");
 const nn = @import("nn.zig");
 
 const State = board.State;
+
+// Native programs write raw UTF-8 bytes to the console, but Windows interprets them
+// through the console's *output* code page (often 437/1252, not UTF-8) — so a `±`
+// renders as mojibake. Node never hits this because it uses the wide-char console API.
+// Switching the output code page to 65001 (UTF-8) at startup makes our UTF-8 output
+// render correctly, like the old JS runner's. No-op (and unreferenced) off Windows.
+extern "kernel32" fn SetConsoleOutputCP(wCodePageID: std.os.windows.UINT) callconv(.winapi) std.os.windows.BOOL;
+fn enableUtf8Console() void {
+    if (builtin.os.tag == .windows) _ = SetConsoleOutputCP(65001);
+}
 
 // --- Elo / SPRT (mirrors selfplay.mjs) ---------------------------------------------
 fn scoreFromElo(e: f64) f64 {
@@ -529,6 +540,7 @@ fn writeHarvest(sh: *Shared, gpa: std.mem.Allocator, io: std.Io, path: []const u
 }
 
 pub fn main(init: std.process.Init) !void {
+    enableUtf8Console(); // so `±` and friends render instead of mojibake on Windows
     const gpa = init.arena.allocator();
     const io = init.io;
 
