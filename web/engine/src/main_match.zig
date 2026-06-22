@@ -50,6 +50,36 @@ fn llr(scores: []const f64, elo0: f64, elo1: f64) f64 {
     return ((mu1 - mu0) / variance) * (s - (fn_ * (mu0 + mu1)) / 2.0);
 }
 
+// The reported Elo with its 95% confidence interval (mirrors selfplay.mjs's report()):
+// the ± error bar comes from the standard error of the mean score, mapped through the
+// Elo curve. z = 1.96 is the 95% two-sided multiplier.
+const EloCI = struct { elo: f64, margin: f64, lo: f64, hi: f64 };
+fn eloWithCI(scores: []const f64) EloCI {
+    const n = scores.len;
+    if (n == 0) return .{ .elo = 0, .margin = 0, .lo = 0, .hi = 0 };
+    const fn_: f64 = @floatFromInt(n);
+    var s: f64 = 0;
+    for (scores) |x| s += x;
+    const p = s / fn_;
+    var var_sum: f64 = 0;
+    for (scores) |x| var_sum += (x - p) * (x - p);
+    const se = @sqrt(var_sum / fn_ / fn_); // standard error of the mean score
+    const z = 1.96;
+    const lo = eloFromScore(p - z * se);
+    const hi = eloFromScore(p + z * se);
+    return .{ .elo = eloFromScore(p), .margin = (hi - lo) / 2.0, .lo = lo, .hi = hi };
+}
+
+// "45s", "3m 02s", "1h 04m" — same unit picking as scripts/fmt.mjs's fmtDur, for the
+// live progress line's elapsed/ETA fields.
+fn fmtDur(buf: []u8, secs_f: f64) []const u8 {
+    const secs: u64 = @intFromFloat(@max(0, @round(secs_f)));
+    if (secs < 60) return std.fmt.bufPrint(buf, "{d}s", .{secs}) catch buf[0..0];
+    const m = secs / 60;
+    if (m < 60) return std.fmt.bufPrint(buf, "{d}m {d:0>2}s", .{ m, secs % 60 }) catch buf[0..0];
+    return std.fmt.bufPrint(buf, "{d}h {d:0>2}m", .{ m / 60, m % 60 }) catch buf[0..0];
+}
+
 // --- Game harvesting (--save-games) -------------------------------------------------
 // One searched position: the position, the result from its side-to-move view, the
 // mover's search value, and which engine ('a'/'b') moved. The first ply of a game also
@@ -200,7 +230,45 @@ const Shared = struct {
     upper: f64,
     lower: f64,
     cfg: Cfg,
+    t0_ns: i128 = 0, // match start, for live elapsed/ETA
+    live_len: usize = 0, // chars in the current in-place status line (for repaint padding)
 };
+
+// In-place status line on stderr (carriage-return repaint), mirroring fmt.mjs's
+// liveStatus: write `\r` + text, padding over any longer previous content so stale
+// characters never linger. Called under sh.mutex so the worker threads never interleave.
+fn printLive(sh: *Shared, text: []const u8) void {
+    var buf: [384]u8 = undefined;
+    var n: usize = 0;
+    buf[n] = '\r';
+    n += 1;
+    const t = text[0..@min(text.len, 300)];
+    @memcpy(buf[n .. n + t.len], t);
+    n += t.len;
+    if (t.len < sh.live_len) {
+        const pad = @min(sh.live_len - t.len, buf.len - n);
+        @memset(buf[n .. n + pad], ' ');
+        n += pad;
+    }
+    std.debug.print("{s}", .{buf[0..n]});
+    sh.live_len = t.len;
+}
+
+// Erase the live line so a permanent milestone line can be printed without leftovers.
+fn clearLive(sh: *Shared) void {
+    if (sh.live_len == 0) return;
+    var buf: [384]u8 = undefined;
+    var n: usize = 0;
+    buf[n] = '\r';
+    n += 1;
+    const pad = @min(sh.live_len, buf.len - 2);
+    @memset(buf[n .. n + pad], ' ');
+    n += pad;
+    buf[n] = '\r';
+    n += 1;
+    std.debug.print("{s}", .{buf[0..n]});
+    sh.live_len = 0;
+}
 
 fn worker(sh: *Shared) void {
     const pa = std.heap.page_allocator;
@@ -260,27 +328,59 @@ fn worker(sh: *Shared) void {
                 sh.stop = true;
             }
         }
-        // Live milestone every 5 pairs (or on an SPRT decision), so a long match never
-        // looks frozen — mirrors the old JS runner's periodic progress line. Printed under
-        // the mutex so the worker threads' output never interleaves.
+        // Two-tier progress (mirrors the old JS runner). Printed under the mutex so the
+        // worker threads' output never interleaves.
         const ng = sh.scores.items.len;
+        var w: usize = 0;
+        var dr: usize = 0;
+        var ls: usize = 0;
+        var ssum: f64 = 0;
+        for (sh.scores.items) |sc| {
+            ssum += sc;
+            if (sc == 1) w += 1 else if (sc == 0.5) dr += 1 else ls += 1;
+        }
+        const pp = ssum / @as(f64, @floatFromInt(ng));
+        const total: usize = sh.total_pairs * 2;
+        const now_ns: i128 = @intCast(std.Io.Clock.now(.awake, sh.cfg.io).nanoseconds);
+        const elapsed_s: f64 = @as(f64, @floatFromInt(now_ns - sh.t0_ns)) / 1e9;
+
+        // 1) Live, in-place line refreshed after EVERY finished pair, so a long match
+        //    never looks frozen between milestones. Lightweight: counts + score + elapsed
+        //    (+ ETA, + LLR with --sprt); no Elo/CI — that's the milestone's job.
+        var ebuf: [16]u8 = undefined;
+        var etaseg: []const u8 = "";
+        var etastore: [40]u8 = undefined;
+        if (sh.decided == null and ng < total) {
+            const eta_s = elapsed_s / @as(f64, @floatFromInt(ng)) * @as(f64, @floatFromInt(total - ng));
+            var b2: [16]u8 = undefined;
+            etaseg = std.fmt.bufPrint(&etastore, " | ETA {s}", .{fmtDur(&b2, eta_s)}) catch "";
+        }
+        var llrseg: []const u8 = "";
+        var llrstore: [64]u8 = undefined;
+        if (sh.sprt) {
+            llrseg = std.fmt.bufPrint(&llrstore, " | LLR {d:.2} [{d:.2}, {d:.2}]", .{
+                llr(sh.scores.items, sh.elo0, sh.elo1), sh.lower, sh.upper,
+            }) catch "";
+        }
+        var livebuf: [320]u8 = undefined;
+        const live = std.fmt.bufPrint(&livebuf, "  game {d}/{d} | A +{d} ={d} -{d} | {d:.1}% | {s} elapsed{s}{s}", .{
+            ng, total, w, dr, ls, pp * 100, fmtDur(&ebuf, elapsed_s), etaseg, llrseg,
+        }) catch livebuf[0..0];
+        printLive(sh, live);
+
+        // 2) Committed milestone every 5 pairs (or on an SPRT decision): clear the live
+        //    line and print a permanent snapshot with the full Elo ± 95% CI.
         if (sh.decided != null or ng % 10 == 0) {
-            var w: usize = 0;
-            var dr: usize = 0;
-            var ls: usize = 0;
-            var ssum: f64 = 0;
-            for (sh.scores.items) |sc| {
-                ssum += sc;
-                if (sc == 1) w += 1 else if (sc == 0.5) dr += 1 else ls += 1;
-            }
-            const pp = ssum / @as(f64, @floatFromInt(ng));
+            clearLive(sh);
+            const ci = eloWithCI(sh.scores.items);
+            const sign = if (ci.elo >= 0) "+" else "";
             if (sh.sprt) {
-                std.debug.print("  after {d} games | A +{d} ={d} -{d} | score {d:.1}% | Elo {d:.1} | LLR {d:.2} [{d:.2}, {d:.2}]\n", .{
-                    ng, w, dr, ls, pp * 100, eloFromScore(pp), llr(sh.scores.items, sh.elo0, sh.elo1), sh.lower, sh.upper,
+                std.debug.print("  after {d} games  A: +{d} ={d} -{d}  score {d:.1}%  Elo {s}{d:.0} ± {d:.0}  95% CI [{d:.0}, {d:.0}]  LLR {d:.2} [{d:.2}, {d:.2}]\n", .{
+                    ng, w, dr, ls, pp * 100, sign, ci.elo, ci.margin, ci.lo, ci.hi, llr(sh.scores.items, sh.elo0, sh.elo1), sh.lower, sh.upper,
                 });
             } else {
-                std.debug.print("  after {d} games | A +{d} ={d} -{d} | score {d:.1}% | Elo {d:.1}\n", .{
-                    ng, w, dr, ls, pp * 100, eloFromScore(pp),
+                std.debug.print("  after {d} games  A: +{d} ={d} -{d}  score {d:.1}%  Elo {s}{d:.0} ± {d:.0}  95% CI [{d:.0}, {d:.0}]\n", .{
+                    ng, w, dr, ls, pp * 100, sign, ci.elo, ci.margin, ci.lo, ci.hi,
                 });
             }
         }
@@ -527,6 +627,7 @@ pub fn main(init: std.process.Init) !void {
     };
 
     const t0 = std.Io.Clock.now(.awake, io).nanoseconds;
+    shared.t0_ns = @intCast(t0); // so the live progress line can show elapsed/ETA
     const threads = try gpa.alloc(std.Thread, jobs);
     for (threads) |*t| t.* = try std.Thread.spawn(.{}, worker, .{&shared});
     for (threads) |t| t.join();
@@ -544,9 +645,11 @@ pub fn main(init: std.process.Init) !void {
     }
     const p = if (n > 0) sum / @as(f64, @floatFromInt(n)) else 0;
     const elo = eloFromScore(p);
+    const ci = eloWithCI(scores.items);
+    const sign = if (ci.elo >= 0) "+" else "";
     const verdict = if (sprt) (shared.decided orelse "inconclusive") else "n/a";
-    std.debug.print("A vs B: {d} games | +{d} ={d} -{d} | score {d:.1}% | Elo {d:.1} | SPRT {s} | nodes {d} nps {d}\n", .{
-        n, wins, draws, losses, p * 100, elo, verdict, shared.nodes, shared.nodes * 1000 / ms,
+    std.debug.print("A vs B: {d} games | +{d} ={d} -{d} | score {d:.1}% | Elo {s}{d:.0} ± {d:.0} (95% CI [{d:.0}, {d:.0}]) | SPRT {s} | nodes {d} nps {d}\n", .{
+        n, wins, draws, losses, p * 100, sign, ci.elo, ci.margin, ci.lo, ci.hi, verdict, shared.nodes, shared.nodes * 1000 / ms,
     });
 
     if (save_games) |sg| {
