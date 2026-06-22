@@ -105,7 +105,7 @@ import { dirname, resolve, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { fmtDur, fmtMB } from './fmt.mjs';
-import { weightsHash } from './vtag.mjs';
+import { weightsHash, ephemeralVersion } from './vtag.mjs';
 import { STOP_EXIT_CODE } from './stop.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -212,6 +212,10 @@ function archiveChampion(file) {
   return hash;
 }
 const resultFile = join(loopDir, 'match.json');
+// The gate's --save-games harvest is written HERE (a temp), not straight into the dataset,
+// so the loop can rewrite a non-promoted candidate's provenance before folding it in (see
+// foldGateHarvest). Cleared before each gate and deleted after folding.
+const gateHarvest = join(loopDir, 'gate-harvest.jsonl');
 const ledgerFile = join(loopDir, 'engine-elo.json'); // engine-strength ledger (npm run rank)
 const logFile = join(loopDir, 'loop.log');
 const publicNN = resolve(webDir, 'public', 'nn');
@@ -300,6 +304,77 @@ function log(line) {
 
 let stopping = false;
 process.on('SIGINT', () => { stopping = true; console.log('\n  Ctrl-C: stopping after this cycle…'); });
+
+// Elo from a win rate (same logarithmic curve the match runner / rank ledger use, so the
+// numbers line up with the ledger Elos we add the gate edge to).
+const eloFromScore = (p) => (p <= 0 ? -800 : p >= 1 ? 800 : -400 * Math.log10(1 / p - 1));
+
+// The current champion's Elo (vs the rank ledger's stable hc anchor) per search depth, plus
+// its best across depths. Returns null unless the ledger exists and actually ranks this
+// champion — without it we can't place an ephemeral candidate on the hc scale, so the gate
+// harvest is folded in unchanged (its candidate-hash labels stay −∞ "unrecoverable", as before).
+function championLedgerElo() {
+  if (!existsSync(ledgerFile)) return null;
+  let ledger;
+  try { ledger = JSON.parse(readFileSync(ledgerFile, 'utf8')); } catch { return null; }
+  const champHash = weightsHash(champion);
+  const byDepth = new Map();
+  let best = -Infinity;
+  for (const e of ledger.ranking || []) {
+    if (e.eng !== 'nn' || e.version !== champHash || e.elo == null) continue;
+    byDepth.set(String(e.depth), e.elo);
+    best = Math.max(best, e.elo);
+  }
+  return byDepth.size ? { byDepth, best } : null;
+}
+
+// Fold the gate's harvested games (in the temp file) into the dataset. The match runner
+// stamps every position with the WINNER's vs tag. When the candidate WON the gate by score
+// but WASN'T promoted (the common lineage / sub-threshold case), that tag is the candidate's
+// own content hash — an engine we never archive or rank, so refresh-v/merge would read it as
+// −∞ "unrecoverable" and relabel it on sight. Instead we rewrite those lines' vs to a
+// self-describing ephemeral tag "nn<d>@elo<E>", where E is the candidate's strength vs the hc
+// anchor: the champion's ledger Elo at that depth plus the LOWER bound of the gate's measured
+// edge (so a short or early-stopped gate is treated cautiously — weaker, hence refreshed
+// sooner — rather than over-credited on thin evidence). A promoted candidate (its hash is
+// archived + ranked) or a champion-won gate is already tagged with a ranked engine, so it
+// passes through untouched.
+function foldGateHarvest(promoted, res) {
+  if (!existsSync(gateHarvest)) return;
+  const champElo = (!promoted && res && res.games > 0) ? championLedgerElo() : null;
+  // Lower bound of the candidate-vs-champion Elo edge from this gate's score + game count.
+  let gateEloLo = null;
+  if (champElo) {
+    const p = res.score, se = Math.sqrt(Math.max(p * (1 - p), 0) / res.games);
+    const pLo = Math.min(Math.max(p - 1.96 * se, 1e-9), 1 - 1e-9);
+    gateEloLo = eloFromScore(pLo);
+  }
+  const candHash = weightsHash(candidate);
+  const out = [];
+  let folded = 0, relabeled = 0;
+  for (const line of readFileSync(gateHarvest, 'utf8').split('\n')) {
+    if (!line) continue;
+    folded++;
+    // Cheap pre-check before a JSON.parse: only candidate-hash labels need a rewrite.
+    const m = champElo && line.match(/"vs":"nn(\d+|t)@([0-9a-f]+)"/);
+    if (m && m[2] === candHash) {
+      const depth = m[1];
+      const base = champElo.byDepth.has(depth) ? champElo.byDepth.get(depth) : champElo.best;
+      const rec = JSON.parse(line);
+      rec.vs = `nn${depth}@${ephemeralVersion(base + gateEloLo)}`;
+      out.push(JSON.stringify(rec));
+      relabeled++;
+    } else {
+      out.push(line);
+    }
+  }
+  if (out.length) appendFileSync(rawFile, out.join('\n') + '\n');
+  rmSync(gateHarvest, { force: true });
+  if (relabeled) {
+    log(`  Folded ${folded} harvested position(s); relabeled ${relabeled} non-promoted-candidate `
+      + `label(s) as ephemeral (gate edge lower-bound ${gateEloLo >= 0 ? '+' : ''}${gateEloLo.toFixed(0)} Elo vs champion).`);
+  }
+}
 
 // Run a step; return true on success. A SIGINT to a child shows as a null/ signalled
 // status — treat that as "stop", not a hard failure.
@@ -474,16 +549,36 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
   //    where it moved, the free depth-(d-1) value from the previous ply where the
   //    weaker side moved) and the next cycle's incremental featurize folds them in.
   if (existsSync(resultFile)) rmSync(resultFile);
+  if (cfg.harvest && existsSync(gateHarvest)) rmSync(gateHarvest); // no stale harvest from a prior cycle
   if (!run('Gate: candidate vs champion', matchBin,
     ['--eval-a=nn', `--weights-a=${candidate}`, '--eval-b=nn', `--weights-b=${champion}`,
       `--depth=${cfg.gateDepth}`, '--sprt', '--elo0=0', `--elo1=${cfg.elo1}`,
       `--games=${cfg.gateGames}`, `--result-file=${resultFile}`,
-      ...(cfg.harvest ? [`--save-games=${rawFile}`, `--seed=${Date.now()}`] : []), ...jobArg])) break;
+      ...(cfg.harvest ? [`--save-games=${gateHarvest}`, `--seed=${Date.now()}`] : []), ...jobArg])) {
+    // Ctrl-C / failure mid-gate: the runner still drained its played games to the harvest
+    // temp. Fold them in (relabeling if a partial result is readable, else unchanged) so the
+    // already-played games aren't lost, then end the loop.
+    if (cfg.harvest) {
+      let r = null; try { r = JSON.parse(readFileSync(resultFile, 'utf8')); } catch { /* no usable result */ }
+      foldGateHarvest(r ? r.sprt === 'H1' : false, r);
+    }
+    break;
+  }
 
   // 5. Promote only on a significant win (SPRT accepted H1). Never regress.
   let res;
-  try { res = JSON.parse(readFileSync(resultFile, 'utf8')); } catch { log('No match result; keeping champion.'); continue; }
+  try { res = JSON.parse(readFileSync(resultFile, 'utf8')); }
+  catch {
+    log('No match result; keeping champion.');
+    if (cfg.harvest) foldGateHarvest(false, null); // fold the played games in unchanged (no edge to relabel with)
+    continue;
+  }
   const pct = (res.score * 100).toFixed(1);
+  // Fold the gate's harvested games into the dataset, relabeling a non-promoted gate-winning
+  // candidate's provenance to a self-describing ephemeral Elo first (foldGateHarvest). Done
+  // here, before the promote branch copies the candidate over the champion, so weightsHash
+  // still identifies the candidate that actually played.
+  if (cfg.harvest) foldGateHarvest(res.sprt === 'H1', res);
   if (res.sprt === 'H1') {
     const arch = JSON.parse(readFileSync(candidate, 'utf8')).arch;
     copyFileSync(champion, prevChampion);   // backup for safety

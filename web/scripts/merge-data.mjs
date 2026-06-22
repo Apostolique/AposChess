@@ -81,6 +81,8 @@ const parseTag = (tag) => {
   const m = /^(nn|hc)(\d+|t)@(.+)$/.exec(tag || '');
   return m ? { eng: m[1], depth: m[2], version: m[3] } : null;
 };
+// "elo<N>" version = a self-described non-promoted gate candidate; its Elo is in the tag.
+const ephemeralElo = (version) => { const m = /^elo(-?\d+)$/.exec(version || ''); return m ? Number(m[1]) : null; };
 
 const ledgerPath = args.ledger === true || args.ledger === undefined
   ? resolve(here, '../../training/data/loop/engine-elo.json')
@@ -126,11 +128,14 @@ function vQuality(rec) {
   if (rec.v === undefined || rec.v === null) return NONE;
   const t = parseTag(rec.vs);
   if (!t) return NONE;
+  const depth = t.depth === 't' ? 0 : Number(t.depth);
+  // A self-described ephemeral candidate ("nn6@elo37") carries its strength in the tag.
+  const eph = ephemeralElo(t.version);
+  if (eph !== null) return { elo: eph, depth };
   // Exact engine×depth Elo if that depth was ranked; otherwise the engine's best per-version
   // Elo (unranked depth). Unknown engine -> -Inf (weakest), same as a missing value.
   const elo = eloByTag.has(rec.vs) ? eloByTag.get(rec.vs)
     : (eloByVersion.has(t.version) ? eloByVersion.get(t.version) : -Infinity);
-  const depth = t.depth === 't' ? 0 : Number(t.depth);
   return { elo, depth };
 }
 // Strictly better => replace; equal or worse => keep the incumbent (so the first file in

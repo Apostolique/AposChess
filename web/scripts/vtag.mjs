@@ -40,3 +40,18 @@ export function vtag(evalName, depth, weightsPath) {
   const ver = eng === 'nn' ? nnVersion(weightsPath) : HC_VERSION;
   return `${eng}${depth != null ? depth : 't'}@${ver}`;
 }
+
+// Ephemeral-engine version marker. A non-promoted gate candidate is never archived and
+// can't be re-instantiated, so a content-hash version would be UNRECOVERABLE — refresh-v
+// and merge-data would read it as -Inf "weakest, relabel on sight". Instead its `vs`
+// version encodes the candidate's measured strength directly: "elo<N>", an integer Elo
+// relative to the SAME stable hc anchor the rank ledger uses. Consumers read the strength
+// straight off the tag — no ledger lookup, no archived weights needed. The 'elo' prefix is
+// collision-proof against a real nn version (a sha1 hex hash can't contain 'l' or 'o') and
+// against the integer hc version.
+//   ephemeralVersion(37) -> "elo37"   ephemeralElo("elo37") -> 37   ephemeralElo("a3f2c1") -> null
+export function ephemeralVersion(elo) { return `elo${Math.round(elo)}`; }
+export function ephemeralElo(version) {
+  const m = /^elo(-?\d+)$/.exec(version || '');
+  return m ? Number(m[1]) : null;
+}

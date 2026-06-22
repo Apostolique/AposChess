@@ -27,7 +27,7 @@
 // Usage (run from web/):
 //   node scripts/refresh-v.mjs [--refresh] [--frac=P] [--depth=D] [--jobs=N] [--eval=E]
 //                              [--weights=FILE] [--in=FILE] [--out=FILE] [--seed=S]
-//                              [--ledger[=FILE]] [--minutes=M]
+//                              [--ledger[=FILE]] [--minutes=M] [--band=E]
 // Defaults: depth 6, jobs = CPU cores, eval 'nn' (weights = ./src/nn-weights.json, the
 //           champion), in/out = ../training/data/selfplay.jsonl (atomic replace), seed 1.
 //   --eval=handcrafted recomputes v with the handcrafted eval (no weights) — e.g. to
@@ -40,10 +40,14 @@
 // does two things, in priority order:
 //   1. FILL every record that has no `v` at all — these are useless to the trainer, so
 //      they're always filled in full, never throttled by --frac.
-//   2. REFRESH the single WEAKEST cohort of records that DO have a `v` — the lowest-Elo
-//      engine still present (untagged / unrecoverable count as -Inf), at --frac.
+//   2. REFRESH the WEAKEST BAND of records that DO have a `v` — every label within --band
+//      Elo (default 25) of the lowest-Elo engine still present (untagged / unrecoverable
+//      count as -Inf), at --frac. The band (not a single exact Elo) keeps a quasi-continuous
+//      spread of ephemeral candidate Elos (nn<d>@elo<E>; see vtag.mjs) draining as one weak
+//      cohort per run rather than one exact value at a time. --band=0 restores exact-Elo
+//      cohorts (one engine at a time). The -Inf bucket stays its own cohort (-Inf + band = -Inf).
 // Stronger labels are left alone, so re-running it walks the dataset upward — missing v
-// first, then weakest engine — until everything carries the best engine's v. (A pre-scan
+// first, then the weakest band — until everything carries the best engine's v. (A pre-scan
 // plans the run; --frac throttles only the cohort relabel, never the fills.)
 
 import { Worker } from 'node:worker_threads';
@@ -55,7 +59,7 @@ import { cpus } from 'node:os';
 
 import { ensureWasm } from './wasmEngine.mjs';
 import { fmtDur, fmtNum, fmtMB, liveStatus, everyMs } from './fmt.mjs';
-import { vtag as computeVtag } from './vtag.mjs';
+import { vtag as computeVtag, ephemeralElo } from './vtag.mjs';
 import { installStop, printStopHint } from './stop.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -64,6 +68,13 @@ const args = Object.fromEntries(process.argv.slice(2).map((a) => {
 }));
 const refresh = !!args.refresh;
 const frac = args.frac !== undefined ? Number(args.frac) : 1.0;
+// Weakest-cohort BAND width (Elo, --ledger only). The weakest cohort isn't a single exact
+// Elo but every label within `band` Elo of the weakest still present — so a quasi-continuous
+// spread of ephemeral candidate Elos (nn<d>@elo<E>, see vtag.mjs) drains as one weak band per
+// run instead of one exact value at a time (which would relabel a handful of records yet still
+// force a full re-featurize). The −∞ bucket (untagged / material / unrecoverable) stays its own
+// cohort, since −∞ + band is still −∞. 0 restores exact-Elo cohorts (one engine at a time).
+const band = args.band !== undefined ? Number(args.band) : 25;
 const depth = args.depth !== undefined ? Number(args.depth) : 6;
 const jobs = Math.max(1, args.jobs !== undefined ? Number(args.jobs) : cpus().length);
 const seed = args.seed !== undefined ? Number(args.seed) : 1;
@@ -133,6 +144,10 @@ const parseTag = (tag) => { const m = /^(nn|hc)(\d+|t)@(.+)$/.exec(tag || ''); r
 const eloForTag = (tag) => {
   const t = parseTag(tag);
   if (!t) return -Infinity;
+  // A non-promoted gate candidate carries its strength in the tag itself ("nn6@elo37") —
+  // read it straight off, no ledger needed (it's never archived/ranked).
+  const eph = ephemeralElo(t.version);
+  if (eph !== null) return eph;
   if (eloByTag && eloByTag.has(tag)) return eloByTag.get(tag);
   const e = eloByVersion && eloByVersion.get(t.version);
   return e == null ? -Infinity : e;
@@ -148,7 +163,9 @@ const cohortName = (elo) => {
   const tags = [...eloByTag.entries()].filter(([, e]) => e === elo).map(([t]) => t);
   if (tags.length) return `${tags.join(', ')} (Elo ${elo.toFixed(0)})`;
   const vs = [...eloByVersion.entries()].filter(([, e]) => e === elo).map(([v]) => v);
-  return `${vs.length ? vs.join(', ') : '?'} (Elo ${elo.toFixed(0)})`;
+  // A finite Elo matching no ledger engine comes from an ephemeral candidate tag (nn6@elo<N>),
+  // whose strength lives in the tag rather than the ledger.
+  return `${vs.length ? vs.join(', ') : 'ephemeral candidate(s)'} (Elo ${elo.toFixed(0)})`;
 };
 const inFile = typeof args.in === 'string'
   ? resolve(process.cwd(), args.in) : resolve(here, '../../training/data/selfplay.jsonl');
@@ -245,7 +262,11 @@ if (eloByVersion) {
     process.exit(0);
   }
   targetElo = min === Infinity ? null : min;
-  const cohort = targetElo === null ? 0 : (cohortCounts.get(targetElo) || 0);
+  // The cohort is the whole weakest BAND — every Elo in [min, min + band] (so a continuous
+  // spread of ephemeral Elos drains together, not one exact value per run). −∞ + band is −∞,
+  // so the unrecoverable bucket stays its own cohort until it's drained.
+  const cohort = targetElo === null ? 0
+    : [...cohortCounts].reduce((s, [e, n]) => s + (e <= targetElo + band ? n : 0), 0);
   toCompute = missingCount + Math.round(frac * cohort);  // fills (all) + expected cohort relabels
 }
 
@@ -257,7 +278,10 @@ if (eloByVersion) {
   console.log(`  ledger: ${ledgerPath.replace(/^.*[\\/]/, '')} | recompute with ${vtag}`
     + `${best ? ` (best engine, Elo ${best.elo.toFixed(0)})` : ''}`);
   const fillPart = missingCount > 0 ? `fill ${fmtNum(missingCount)} missing v (all)` : null;
-  const refreshPart = targetElo !== null ? `refresh ${(frac * 100).toFixed(0)}% of weakest cohort: ${cohortName(targetElo)}` : null;
+  const refreshPart = targetElo !== null
+    ? `refresh ${(frac * 100).toFixed(0)}% of weakest band: ${cohortName(targetElo)}`
+      + `${band > 0 && targetElo !== -Infinity ? ` … +${band} Elo` : ''}`
+    : null;
   console.log(`  target: ${[fillPart, refreshPart].filter(Boolean).join(' + ')} -> ${outFile}`);
 } else {
   console.log(`  mode: ${refresh ? `refresh ${(frac * 100).toFixed(0)}% of existing v + fill missing` : 'fill missing v only'} -> ${outFile}`);
@@ -355,9 +379,9 @@ rl.on('line', (line) => {
     recompute = !hasV || (refresh && rng() < frac);
   } else if (!hasV) {                            // --ledger: always fill a missing v first
     recompute = true;
-  } else {                                       // --ledger: refresh the weakest cohort that has a v
+  } else {                                       // --ledger: refresh the weakest BAND that has a v
     const tag = (line.match(/"vs":"([^"]+)"/) || [])[1] || null;
-    recompute = targetElo !== null && !alreadyDone(tag) && eloForTag(tag) === targetElo && rng() < frac;
+    recompute = targetElo !== null && !alreadyDone(tag) && eloForTag(tag) <= targetElo + band && rng() < frac;
   }
   if (!recompute) { ready.set(idx, line + '\n'); passed++; flush(); return; }
   const rec = JSON.parse(line);

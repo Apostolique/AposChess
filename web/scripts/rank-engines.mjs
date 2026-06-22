@@ -562,6 +562,10 @@ if (cfg.scan) {
   for (const [tag, n] of tagCounts) {
     const t = parseTag(tag);
     if (!t) { unrecoverable.push({ tag, records: n, reason: 'malformed tag' }); continue; }
+    // "elo<N>" version = a non-promoted gate candidate that carries its own strength in the
+    // tag (see vtag.mjs). It's not an instantiable engine, but it's NOT unrecoverable either —
+    // refresh-v/merge read its Elo straight off the tag, so don't flag it for relabel-on-sight.
+    if (/^elo-?\d+$/.test(t.version)) continue;
     if (players.has(`${t.eng}@${t.version}`)) continue; // covered by a ranked engine
     let reason;
     if (t.eng === 'hc') reason = `old handcrafted (HC_VERSION now ${HC_VERSION})`;
