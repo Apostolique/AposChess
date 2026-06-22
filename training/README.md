@@ -107,10 +107,10 @@ is discarded automatically on `--cold` or a `--hidden` shape change.
 
 The gate's games are themselves **harvested into the dataset** (`--no-harvest` to
 disable): up to `--gate-games` per cycle — comparable volume to generation, already
-paid for. Their search value `v` is kept only on positions where the engine the gate
-proved **stronger** was to move (the weaker engine's opinion is a worse target — the
-same staleness logic as the `v`-refresh); the other side's positions carry just the
-game outcome, which the trainer already handles. Note gate games are played at
+paid for. Each position keeps the search value `v` from the engine that actually
+searched it (the mover), tagged with that engine×depth provenance — so the dataset's
+own machinery (merge dedup prefers the stronger engine, `v`-refresh relabels the
+weakest cohort first) judges label quality, not who won the game. Note gate games are played at
 `--gate-depth` (shallower labels than generation's `--depth`), which is why
 harvesting supplements generation rather than replacing it — generation stays the
 deep-label anchor and guarantees fixed data volume even when the SPRT stops early.

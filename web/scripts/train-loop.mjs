@@ -329,10 +329,11 @@ function championLedgerElo() {
 }
 
 // Fold the gate's harvested games (in the temp file) into the dataset. The match runner
-// stamps every position with the WINNER's vs tag. When the candidate WON the gate by score
-// but WASN'T promoted (the common lineage / sub-threshold case), that tag is the candidate's
-// own content hash — an engine we never archive or rank, so refresh-v/merge would read it as
-// −∞ "unrecoverable" and relabel it on sight. Instead we rewrite those lines' vs to a
+// stamps every position with the MOVER's vs tag (the engine that searched it). The
+// candidate's own plies thus carry its content hash — an engine we never archive or rank,
+// so refresh-v/merge would read it as −∞ "unrecoverable" and relabel it on sight (the
+// champion's plies already carry a ranked tag and pass through). When the candidate WASN'T
+// promoted (the common lineage / sub-threshold case), we rewrite its lines' vs to a
 // self-describing ephemeral tag "nn<d>@elo<E>", where E is the candidate's strength vs the hc
 // anchor: the champion's ledger Elo at that depth plus the LOWER bound of the gate's measured
 // edge (so a short or early-stopped gate is treated cautiously — weaker, hence refreshed
@@ -402,10 +403,12 @@ function run(label, cmd, argv, cwd = webDir) {
 }
 
 // Depths the champion is ranked at. The gate depth (cfg.rankDepth) and generation depth
-// (cfg.depth) carry its direct nnD@ harvest labels, and ONE BELOW EACH (d-1) carries the
-// depth-(d-1) labels option-(b) harvesting writes on the loser's plies (with gate and gen
-// both at depth 6: nn6 from the gate/rank harvest, nn5 below). Every such engine×depth tag needs its own
-// Elo or weakest-first refresh would misrank the shallow labels as strong (see eloForTag).
+// (cfg.depth) carry its direct nnD@ harvest labels — every position is now tagged with the
+// mover's own engine×depth, so the harvest no longer emits any depth-(d-1) labels. We keep
+// ranking ONE BELOW EACH (d-1) only to value the legacy nn(d-1)@ labels still in the dataset
+// from the old winner-derived harvest, so weakest-first refresh drains them correctly instead
+// of misranking the shallow labels as strong (see eloForTag). Drop the d-1 entries once that
+// legacy data is gone.
 const rankDepths = [...new Set([cfg.rankDepth, cfg.rankDepth - 1, cfg.depth, cfg.depth - 1])]
   .filter((d) => d >= 1);
 
@@ -545,9 +548,9 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
 
   // 4. Gate: candidate (A) vs champion (B), SPRT(0, elo1). Unless --no-harvest,
   //    the gate's games are appended to the dataset (they're already paid for;
-  //    every position gets the stronger side's value — its direct depth-d search
-  //    where it moved, the free depth-(d-1) value from the previous ply where the
-  //    weaker side moved) and the next cycle's incremental featurize folds them in.
+  //    every position gets the value from the engine that searched it — the mover's
+  //    own direct depth-d search, tagged with its engine×depth provenance) and the
+  //    next cycle's incremental featurize folds them in.
   if (existsSync(resultFile)) rmSync(resultFile);
   if (cfg.harvest && existsSync(gateHarvest)) rmSync(gateHarvest); // no stale harvest from a prior cycle
   if (!run('Gate: candidate vs champion', matchBin,

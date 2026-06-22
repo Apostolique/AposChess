@@ -12,9 +12,11 @@
 // Paths are relative to the current directory (run from web/).
 //
 // --save-games harvests the played positions as raw training data ({fen,r,g,v,vs}):
-// every position carries the WINNING engine's value
-// (its direct depth-d search on the plies it moved, the free depth-(d-1) value from the
-// previous ply on the plies the loser moved); the loser's own opinion is dropped.
+// every position carries the value from the engine that actually searched it (the mover),
+// at that engine's own depth, tagged with its provenance (`vs`). The dataset machinery then
+// sorts label quality by provenance — merge-data prefers the stronger engine on dedup and
+// refresh-v relabels the weakest cohort first — so there's no need to second-guess a label
+// by who won the game. The game result is kept separately in `r`.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -92,8 +94,7 @@ fn fmtDur(buf: []u8, secs_f: f64) []const u8 {
 
 // --- Game harvesting (--save-games) -------------------------------------------------
 // One searched position: the position, the result from its side-to-move view, the
-// mover's search value, and which engine ('a'/'b') moved. The first ply of a game also
-// carries the OTHER engine's value of the opening (it never searches that ply itself).
+// mover's search value, and which engine ('a'/'b') moved (its provenance on harvest).
 const PlyRec = struct {
     fen: [128]u8 = undefined,
     fen_len: u8 = 0,
@@ -101,9 +102,6 @@ const PlyRec = struct {
     r_turn_white: bool = false, // side-to-move was White (to set `r` once the game ends)
     v: i32 = 0,
     mover: u8 = 0, // 'a' or 'b'
-    has_other: bool = false,
-    v_other: i32 = 0,
-    mover_other: u8 = 0,
 
     fn fenSlice(self: *const PlyRec) []const u8 {
         return self.fen[0..self.fen_len];
@@ -169,9 +167,7 @@ fn playGame(
 
         const a_to_move = (st.turn == .white) == white_is_a;
         const mover = if (st.turn == .white) white else black;
-        const other = if (st.turn == .white) black else white;
         const mover_b = if (st.turn == .white) bw else bb;
-        const other_b = if (st.turn == .white) bb else bw;
         const res = searchBudget(mover, &st, mover_b, seen.items, false);
         nodes.* += res.nodes;
         const m = res.move orelse break;
@@ -187,14 +183,6 @@ fn playGame(
             rec.fen_len = @intCast(fen.len);
             // r from the side-to-move's view is set once the game's outcome is known.
             rec.r_turn_white = st.turn == .white;
-            if (plies == 0) {
-                // The side NOT to move never searches this position in the game; value it
-                // once now (TT-free so the probe can't perturb that engine's real play) so
-                // the harvester has a real depth-d value whichever engine ends up winning.
-                rec.v_other = searchBudget(other, &st, other_b, &.{}, true).score;
-                rec.mover_other = if (a_to_move) 'b' else 'a';
-                rec.has_other = true;
-            }
             try list.append(alloc, rec);
         }
 
@@ -459,29 +447,22 @@ fn appendInt(out: *std.ArrayList(u8), alloc: std.mem.Allocator, v: i64) !void {
 }
 
 // Append the harvested games as raw training data (the gate harvest train:loop folds in).
-fn writeHarvest(sh: *Shared, gpa: std.mem.Allocator, io: std.Io, path: []const u8, p: f64, depth_a: u32, depth_b: u32, eval_a: ai.EvalKind, eval_b: ai.EvalKind, weights_a: []const u8, weights_b: []const u8) !void {
-    const winner: u8 = if (p > 0.5) 'a' else 'b';
-    const win_kind = if (winner == 'a') eval_a else eval_b;
-    const win_weights = if (winner == 'a') weights_a else weights_b;
-    // The winner's value is tagged with ITS OWN search depth (contenders and the anchor can
-    // differ — e.g. a depth-6 anchor beating depth-4 contenders harvests as nn6@/hc6@).
-    const win_depth = if (winner == 'a') depth_a else depth_b;
-    var vtag_buf: [40]u8 = undefined;
-    const w_vtag = vtagFmt(&vtag_buf, win_kind, win_depth, io, gpa, win_weights);
-    var vtag_prev_buf: [40]u8 = undefined;
-    const w_vtag_prev: ?[]const u8 = if (win_depth >= 2)
-        vtagFmt(&vtag_prev_buf, win_kind, win_depth - 1, io, gpa, win_weights)
-    else
-        null;
+// Every position is labeled with the value from the engine that actually searched it (the
+// mover), at that engine's own depth, tagged with its provenance. No winner-based derivation:
+// a label's trustworthiness is captured by its `vs` tag (and the engine's Elo), so the
+// downstream merge/refresh tooling — not who won this game — decides label quality.
+fn writeHarvest(sh: *Shared, gpa: std.mem.Allocator, io: std.Io, path: []const u8, depth_a: u32, depth_b: u32, eval_a: ai.EvalKind, eval_b: ai.EvalKind, weights_a: []const u8, weights_b: []const u8) !void {
+    var tag_a_buf: [40]u8 = undefined;
+    var tag_b_buf: [40]u8 = undefined;
+    const tag_a = vtagFmt(&tag_a_buf, eval_a, depth_a, io, gpa, weights_a);
+    const tag_b = vtagFmt(&tag_b_buf, eval_b, depth_b, io, gpa, weights_b);
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
     var n_pos: usize = 0;
-    var n_kept: usize = 0;
-    var n_derived: usize = 0;
+    var n_a: usize = 0;
     for (sh.games.items) |g| {
-        const recs = g.recs.items;
-        for (recs, 0..) |rec, i| {
+        for (g.recs.items) |rec| {
             try out.appendSlice(gpa, "{\"fen\":\"");
             try out.appendSlice(gpa, rec.fenSlice());
             try out.appendSlice(gpa, "\",\"r\":");
@@ -492,31 +473,14 @@ fn writeHarvest(sh: *Shared, gpa: std.mem.Allocator, io: std.Io, path: []const u
             try appendInt(&out, gpa, @as(i64, @intCast(g.pair)));
             try out.append(gpa, g.color); // 'w' or 'b'
             try out.append(gpa, '"');
-            // Value: winner's direct (its plies), its off-turn opening probe (ply 0), or
-            // the derived depth-(d-1) value from the previous ply (loser's plies).
-            if (rec.mover == winner) {
-                try out.appendSlice(gpa, ",\"v\":");
-                try appendInt(&out, gpa, rec.v);
-                try out.appendSlice(gpa, ",\"vs\":\"");
-                try out.appendSlice(gpa, w_vtag);
-                try out.append(gpa, '"');
-                n_kept += 1;
-            } else if (i == 0 and rec.has_other and rec.mover_other == winner) {
-                try out.appendSlice(gpa, ",\"v\":");
-                try appendInt(&out, gpa, rec.v_other);
-                try out.appendSlice(gpa, ",\"vs\":\"");
-                try out.appendSlice(gpa, w_vtag);
-                try out.append(gpa, '"');
-                n_kept += 1;
-            } else if (w_vtag_prev != null and i > 0 and recs[i - 1].mover == winner) {
-                try out.appendSlice(gpa, ",\"v\":");
-                try appendInt(&out, gpa, -recs[i - 1].v);
-                try out.appendSlice(gpa, ",\"vs\":\"");
-                try out.appendSlice(gpa, w_vtag_prev.?);
-                try out.append(gpa, '"');
-                n_derived += 1;
-            }
+            // The mover's own search value, tagged with the mover's engine + depth.
+            try out.appendSlice(gpa, ",\"v\":");
+            try appendInt(&out, gpa, rec.v);
+            try out.appendSlice(gpa, ",\"vs\":\"");
+            try out.appendSlice(gpa, if (rec.mover == 'a') tag_a else tag_b);
+            try out.append(gpa, '"');
             try out.appendSlice(gpa, "}\n");
+            if (rec.mover == 'a') n_a += 1;
             n_pos += 1;
         }
     }
@@ -526,15 +490,9 @@ fn writeHarvest(sh: *Shared, gpa: std.mem.Allocator, io: std.Io, path: []const u
     defer file.close(io);
     const offset: u64 = (file.stat(io) catch unreachable).size;
     try file.writePositionalAll(io, out.items, offset);
-    if (w_vtag_prev) |wp| {
-        std.debug.print("Saved {d} positions from {d} games to {s} (winner {c}: {d} direct {s}, {d} derived {s}).\n", .{
-            n_pos, sh.games.items.len, path, std.ascii.toUpper(winner), n_kept, w_vtag, n_derived, wp,
-        });
-    } else {
-        std.debug.print("Saved {d} positions from {d} games to {s} (winner {c}: {d} direct {s}).\n", .{
-            n_pos, sh.games.items.len, path, std.ascii.toUpper(winner), n_kept, w_vtag,
-        });
-    }
+    std.debug.print("Saved {d} positions from {d} games to {s} ({d} A {s}, {d} B {s}).\n", .{
+        n_pos, sh.games.items.len, path, n_a, tag_a, n_pos - n_a, tag_b,
+    });
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -663,7 +621,7 @@ pub fn main(init: std.process.Init) !void {
     });
 
     if (save_games) |sg| {
-        if (shared.games.items.len > 0) try writeHarvest(&shared, gpa, io, sg, p, budget_a.depth, budget_b.depth, eval_a, eval_b, weights_a, weights_b);
+        if (shared.games.items.len > 0) try writeHarvest(&shared, gpa, io, sg, budget_a.depth, budget_b.depth, eval_a, eval_b, weights_a, weights_b);
     }
 
     if (result_file) |rf| {

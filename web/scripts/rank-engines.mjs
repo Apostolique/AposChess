@@ -406,7 +406,8 @@ function runMatch(p, idx, seedOffset = 0) {
   else argv.push(`--movetime-b=${cfg.anchorMovetime}`);
   if (p.evalName === 'nn' && p.weights) argv.push(`--weights-a=${p.weights}`);
   if (anchor.evalName === 'nn' && anchor.weights) argv.push(`--weights-b=${anchor.weights}`);
-  // Harvest these games into the side dataset file (the winner's `v`, vtag-stamped).
+  // Harvest these games into the side dataset file (each position gets the mover's `v`,
+  // tagged with the engine×depth that searched it — contender or anchor).
   if (cfg.saveGames) argv.push(`--save-games=${cfg.saveGames}`);
 
   console.log(`\n=== ${p.tag}  vs  ${anchor.tag}  (${idx + 1}/${contenders.length}) ===`);
