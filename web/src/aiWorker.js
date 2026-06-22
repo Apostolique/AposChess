@@ -2,11 +2,10 @@
 // Copyright (C) 2019-2026 Jean-David Moisan
 //
 // Runs the AI search off the main thread so deeper lookahead never freezes the UI. The
-// search itself runs in the **native Zig engine compiled to wasm** (`web/engine`, exported
-// as `apos.wasm`) — 2-3x faster than the JS search, identical results (the port is parity-
-// verified). The JS engine (`board.js`/`engine.js`) is still used here for the variant
-// move objects and Zobrist hashing; `ai.js` remains only as a fallback if the wasm fails
-// to load. Two request kinds, both tagged with a `seq` so a reply for a superseded
+// search itself runs in the Zig engine compiled to wasm (`web/engine`, exported as
+// `apos.wasm`). The JS engine (`board.js`/`engine.js`) is still used here for the variant
+// move objects and Zobrist hashing; `ai.js` is a fallback if the wasm fails to load.
+// Two request kinds, both tagged with a `seq` so a reply for a superseded
 // position is discarded by the page:
 //   { type:'search', seq, state, depth, maxMs, engine, net, posHistory, exclude, wasmUrl }
 //       → { type:'search', seq, move, ponder, score }  — a real move to play; `ponder` is

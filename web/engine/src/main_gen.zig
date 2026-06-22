@@ -1,17 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2019-2026 Jean-David Moisan
 //
-// Native self-play data generator — the drop-in for `npm run train:gen`
-// (scripts/gen-selfplay.mjs + genWorker.mjs). Plays whole games from seeded random
-// openings in parallel across threads and appends one JSONL line per position to the
-// dataset: the raw {fen, r, g} (net-agnostic — features come later via
+// Native self-play data generator behind `npm run train:gen`. Plays whole games from
+// seeded random openings in parallel across threads and appends one JSONL line per
+// position to the dataset: the raw {fen, r, g} (net-agnostic — features come later via
 // scripts/featurize.mjs) plus the search value {v, vs} for TD/bootstrap targets.
 //
 //   apos-gen --games=200 --depth=6 --eval=nn --openings=8 [--opening-topk=N] \
 //     [--movetime=MS] [--maxmoves=200] [--out=../training/data/selfplay.jsonl] \
 //     [--seed=S] [--jobs=N]
 // Paths are relative to the current directory (run from web/). With --eval=nn the
-// teacher is the champion at src/nn-weights.json (same as the JS generator).
+// teacher is the champion at src/nn-weights.json.
 //
 //   r   game result from the SIDE-TO-MOVE's view (+1 it went on to win / 0 / -1)
 //   g   "<seed-base36>-<index>" game id (groups a game for the train/val split)
@@ -26,7 +25,7 @@ const ai = @import("ai.zig");
 const nn = @import("nn.zig");
 
 const State = board.State;
-const NN_WEIGHTS = "src/nn-weights.json"; // the champion (--eval=nn), matching genWorker.mjs
+const NN_WEIGHTS = "src/nn-weights.json"; // the champion (--eval=nn)
 
 const Cfg = struct {
     games: u64,
@@ -58,7 +57,7 @@ const Shared = struct {
 };
 
 // Per-game seed: decorrelate the base seed with the game index so each game is
-// reproducible regardless of worker / job count (mirrors gen-selfplay.mjs gameSeed).
+// reproducible regardless of worker / job count.
 fn gameSeed(seed: u64, g: u64) u64 {
     return (seed ^ (g +% 1) *% 0x9e3779b1) & 0xffffffff;
 }
@@ -200,7 +199,7 @@ fn worker(sh: *Shared) void {
 
         // Reseed the searcher per game so its root variety is a function of the game
         // index, not thread timing (the persistent TT still makes exact games
-        // order-sensitive, as in the JS generator).
+        // order-sensitive).
         s.reseed(sh.cfg.seed +% g);
         out.clearRetainingCapacity();
         var positions: u64 = 0;

@@ -5,10 +5,10 @@
 // side: feature extraction + a tiny MLP forward pass. The matching trainer lives
 // in ../../training/ (Python/PyTorch) and writes the weights to nn-weights.json.
 //
-// The feature definition is deliberately kept HERE, in one place, and reused by
-// both inference and the self-play data generator (scripts/gen-selfplay.mjs). The
-// generator writes the active feature indices for each position, so the Python
-// trainer never needs any chess logic — it only sees integer vectors and targets.
+// The feature definition is deliberately kept HERE, in one place. Self-play stores raw
+// positions; scripts/featurize.mjs applies this featureIndices to produce the integer
+// vectors the Python trainer reads, so the trainer never needs any chess logic — it only
+// sees integer vectors and targets.
 //
 // Network (v1): a sparse input layer (only a board's worth of features are ever
 // active, so the first layer is a handful of column adds — cheap even recomputed

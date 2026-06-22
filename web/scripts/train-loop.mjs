@@ -120,10 +120,9 @@ const refreshScript = resolve(here, 'refresh-v.mjs');
 const rankScript = resolve(here, 'rank-engines.mjs');
 const trainPy = resolve(repoDir, 'training', 'train.py');
 
-// Generation and the gate run on the native Zig engine (2-3x faster than the JS tools,
-// same flags + output): apos-gen for self-play, apos-match for the candidate-vs-champion
-// gate (with --save-games harvest). Built once at startup from web/engine; the binaries
-// run with cwd = web/ so their relative paths resolve like the JS tools'.
+// Generation and the gate run on the native Zig engine: apos-gen for self-play, apos-match
+// for the candidate-vs-champion gate (with --save-games harvest). Built once at startup
+// from web/engine; the binaries run with cwd = web/ so their relative paths resolve there.
 const engineDir = resolve(webDir, 'engine');
 const isWin = process.platform === 'win32';
 const genBin = resolve(engineDir, 'zig-out', 'bin', isWin ? 'apos-gen.exe' : 'apos-gen');

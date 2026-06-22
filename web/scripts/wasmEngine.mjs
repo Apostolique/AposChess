@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2019-2026 Jean-David Moisan
 //
-// Shared Node helper that runs the search in the native Zig engine compiled to wasm
-// (web/engine → apos.wasm) — ~3x faster than the JS ai.js in Node, and bit-consistent
-// with the native generator/gate (same Zig eval). The offline scoring tools (refresh-v,
-// backfill-v, fill-missing-v) and the puzzle miner use it instead of ai.js, so a position
-// value is computed the same everywhere. Each instance owns its own transposition table,
-// so it's safe to create one per worker thread.
+// Shared Node helper that runs the search in the Zig engine compiled to wasm
+// (web/engine → apos.wasm), bit-consistent with the native generator/gate (same Zig eval).
+// The offline scoring tools (refresh-v, backfill-v, fill-missing-v) and the puzzle miner
+// use it, so a position value is computed the same everywhere. Each instance owns its own
+// transposition table, so it's safe to create one per worker thread.
 //
 // The JS engine (board.js/engine.js) is still used by the callers for board manipulation
 // and to reconstruct the full variant move object (castle/jump/promotion flags) from the

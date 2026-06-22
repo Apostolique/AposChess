@@ -100,7 +100,7 @@
 //   --save-games=F  harvest the ranking games as training data (default
 //                   ../training/data/rank-games.jsonl). --no-save-games to disable.
 //
-// Each matchup reuses the tested match runner (scripts/selfplay.mjs) as a subprocess
+// Each matchup reuses the native match runner (apos-match) as a subprocess
 // with --result-file, so the Elo here is measured exactly as everywhere else. The
 // games aren't wasted: --save-games harvests each matchup's positions as training data
 // (the stronger engine's `v`, tagged with its vtag — exactly the harvesting the gate
@@ -128,10 +128,9 @@ const loopDir = join(dataDir, 'loop');
 const championsDir = join(loopDir, 'champions');
 const champion = resolve(webDir, 'src', 'nn-weights.json');
 
-// Each matchup runs on the native Zig match runner (apos-match), a drop-in for
-// selfplay.mjs (per-side depth via --depth-b, SPRT, --result-file, --save-games harvest)
-// that's 2-3x faster. Built once up front from web/engine; spawned with cwd = web/ so its
-// relative paths resolve like the JS tools'.
+// Each matchup runs on the native Zig match runner (apos-match): per-side depth via
+// --depth-b, SPRT, --result-file, --save-games harvest. Built once up front from
+// web/engine; spawned with cwd = web/ so its relative paths resolve there.
 const engineDir = resolve(webDir, 'engine');
 const matchBin = resolve(engineDir, 'zig-out', 'bin',
   process.platform === 'win32' ? 'apos-match.exe' : 'apos-match');
@@ -197,7 +196,7 @@ const cfg = {
 const depthMark = cfg.depth != null ? cfg.depth : 't';
 const anchorDepthMark = cfg.anchorDepth != null ? cfg.anchorDepth : 't';
 
-// --- Elo helpers (mirror selfplay.mjs, so the numbers line up) -----------------
+// --- Elo helpers (same math as the match runner, so the numbers line up) -------
 const eloFromScore = (p) => (p <= 0 ? -800 : p >= 1 ? 800 : -400 * Math.log10(1 / p - 1));
 function eloMargin(score, n) {
   // 95% CI half-width on the Elo, from the score's standard error — same as the

@@ -555,7 +555,7 @@ pub const Searcher = struct {
 
     // Score a position WITHOUT reading or writing the transposition table, so the probe
     // can't perturb this engine's real games (used once per game by the match harvest to
-    // value the one opening ply the winner didn't search — mirrors matchWorker's evalNoTT).
+    // value the one opening ply the winner didn't search).
     pub fn chooseMoveNoTT(self: *Searcher, state: *const State, max_depth: u32, max_ms: i64, prev_hashes: []const u64) Result {
         self.tt_enabled = false;
         defer self.tt_enabled = true;

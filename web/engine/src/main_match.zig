@@ -1,19 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2019-2026 Jean-David Moisan
 //
-// Native match runner — the drop-in for `npm run match`: plays engine A vs engine
-// B over seeded random openings (color-reversed pairs), in parallel across
-// threads, with optional SPRT early-stopping, and writes the same result-file
-// {games,wins,draws,losses,score,elo,llr,sprt} that train:loop reads. The SPRT /
-// Elo math mirrors scripts/selfplay.mjs exactly.
+// Native match runner behind `npm run match`: plays engine A vs engine B over
+// seeded random openings (color-reversed pairs), in parallel across threads, with
+// optional SPRT early-stopping, and writes the result-file
+// {games,wins,draws,losses,score,elo,llr,sprt} that train:loop reads.
 //
 //   apos-match --games=800 --depth=4 --eval-a=nn --eval-b=nn \
 //     --weights-a=cand.json --weights-b=src/nn-weights.json --sprt --elo1=20 \
 //     --result-file=match.json --save-games=../training/data/selfplay.jsonl --jobs=14
 // Paths are relative to the current directory (run from web/).
 //
-// --save-games harvests the played positions as raw training data ({fen,r,g,v,vs}),
-// exactly like scripts/selfplay.mjs: every position carries the WINNING engine's value
+// --save-games harvests the played positions as raw training data ({fen,r,g,v,vs}):
+// every position carries the WINNING engine's value
 // (its direct depth-d search on the plies it moved, the free depth-(d-1) value from the
 // previous ply on the plies the loser moved); the loser's own opinion is dropped.
 
@@ -31,13 +30,13 @@ const State = board.State;
 // through the console's *output* code page (often 437/1252, not UTF-8) — so a `±`
 // renders as mojibake. Node never hits this because it uses the wide-char console API.
 // Switching the output code page to 65001 (UTF-8) at startup makes our UTF-8 output
-// render correctly, like the old JS runner's. No-op (and unreferenced) off Windows.
+// render correctly. No-op (and unreferenced) off Windows.
 extern "kernel32" fn SetConsoleOutputCP(wCodePageID: std.os.windows.UINT) callconv(.winapi) std.os.windows.BOOL;
 fn enableUtf8Console() void {
     if (builtin.os.tag == .windows) _ = SetConsoleOutputCP(65001);
 }
 
-// --- Elo / SPRT (mirrors selfplay.mjs) ---------------------------------------------
+// --- Elo / SPRT --------------------------------------------------------------------
 fn scoreFromElo(e: f64) f64 {
     return 1.0 / (1.0 + std.math.pow(f64, 10.0, -e / 400.0));
 }
@@ -61,7 +60,7 @@ fn llr(scores: []const f64, elo0: f64, elo1: f64) f64 {
     return ((mu1 - mu0) / variance) * (s - (fn_ * (mu0 + mu1)) / 2.0);
 }
 
-// The reported Elo with its 95% confidence interval (mirrors selfplay.mjs's report()):
+// The reported Elo with its 95% confidence interval:
 // the ± error bar comes from the standard error of the mean score, mapped through the
 // Elo curve. z = 1.96 is the 95% two-sided multiplier.
 const EloCI = struct { elo: f64, margin: f64, lo: f64, hi: f64 };
@@ -142,7 +141,7 @@ fn randomOpening(rng: std.Random, plies: u32) State {
 
 // Play one game. `white_is_a` decides which engine has White. Returns +1 white win /
 // 0 draw / -1 black win. When `recs` is non-null (--save-games) it collects one record
-// per searched position (mirrors matchWorker's playGame collect path).
+// per searched position (the harvest path).
 fn playGame(
     white: *ai.Searcher,
     black: *ai.Searcher,
@@ -307,8 +306,7 @@ fn worker(sh: *Shared) void {
         const pb: ?*std.ArrayList(PlyRec) = if (sh.cfg.save_games) &recs_b else null;
 
         // Reseed per game so openings/variety are a function of the pair index, not
-        // thread timing (the persistent TT still makes exact games order-sensitive,
-        // as in selfplay.mjs).
+        // thread timing (the persistent TT still makes exact games order-sensitive).
         sa.reseed(sh.cfg.seed +% pair *% 4 +% 0);
         sb.reseed(sh.cfg.seed +% pair *% 4 +% 1);
         // A = White: White's budget is A's, Black's is B's.
@@ -339,7 +337,7 @@ fn worker(sh: *Shared) void {
                 sh.stop = true;
             }
         }
-        // Two-tier progress (mirrors the old JS runner). Printed under the mutex so the
+        // Two-tier progress. Printed under the mutex so the
         // worker threads' output never interleaves.
         const ng = sh.scores.items.len;
         var w: usize = 0;
@@ -460,7 +458,7 @@ fn appendInt(out: *std.ArrayList(u8), alloc: std.mem.Allocator, v: i64) !void {
     try out.appendSlice(alloc, std.fmt.bufPrint(&buf, "{d}", .{v}) catch unreachable);
 }
 
-// Append the harvested games as raw training data, exactly like selfplay.mjs's harvest.
+// Append the harvested games as raw training data (the gate harvest train:loop folds in).
 fn writeHarvest(sh: *Shared, gpa: std.mem.Allocator, io: std.Io, path: []const u8, p: f64, depth_a: u32, depth_b: u32, eval_a: ai.EvalKind, eval_b: ai.EvalKind, weights_a: []const u8, weights_b: []const u8) !void {
     const winner: u8 = if (p > 0.5) 'a' else 'b';
     const win_kind = if (winner == 'a') eval_a else eval_b;
@@ -545,7 +543,7 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
 
     var games: u32 = 100;
-    // Per-side search budget (mirrors selfplay.mjs): --depth sets A (and B unless --depth-b);
+    // Per-side search budget: --depth sets A (and B unless --depth-b);
     // --movetime sets A's time budget (and B's unless --movetime-b). depth==0 => use movetime.
     var depth_a: ?u32 = null;
     var depth_b_opt: ?u32 = null;

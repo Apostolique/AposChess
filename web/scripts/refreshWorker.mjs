@@ -10,8 +10,8 @@ import { parentPort, workerData } from 'node:worker_threads';
 import { makeEngine } from './wasmEngine.mjs';
 
 const { weights, depth, evalName = 'nn', stopFlag = null } = workerData;
-// Score via the native Zig engine (wasm) — ~3x faster than ai.js and bit-consistent with
-// the native generator/gate (same Zig eval). The handcrafted eval needs no weights.
+// Score via the Zig engine (wasm), bit-consistent with the native generator/gate (same
+// Zig eval). The handcrafted eval needs no weights.
 const eng = makeEngine(evalName, evalName === 'nn' ? weights : null);
 
 parentPort.on('message', (msg) => {

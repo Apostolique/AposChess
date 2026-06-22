@@ -2,7 +2,7 @@
 // Copyright (C) 2019-2026 Jean-David Moisan
 //
 // Turn the raw self-play dataset (positions + outcomes) into per-net training inputs.
-// The generator (gen-selfplay.mjs) stores only the raw position — net-agnostic:
+// The generator (apos-gen) stores only the raw position — net-agnostic:
 // { fen, r, g }. This reads each position and applies the CURRENT nn.js
 // featureIndices, writing the training-ready { f, r, g } that train.py consumes. So
 // the position is the source of truth and features are a derived, regenerable

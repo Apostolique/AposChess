@@ -1,85 +1,65 @@
 # AposChess engine (Zig)
 
-A native + wasm port of the engine core (`board` → `engine` → `ai` → `nn`), built to
-speed up the offline self-play tools and the in-browser bot. The JS engine in
-`web/src/` stays the reference; this is validated against it, never the other way.
+The production implementation of the engine core (`board` → `engine` → `ai` → `nn`).
+One source tree, two targets:
+
+- **Native CLI binaries** the npm tools spawn — `apos-gen` (self-play generation),
+  `apos-match` (match runner / gate / rank gauntlet), `apos-bench`, `apos-parity`.
+- **`apos.wasm`** — the in-browser search, loaded by the Web Worker (`web/src/aiWorker.js`).
+
+The JS engine in `web/src/` is the readable **reference**: rules and search are
+implemented there too, and Zig is validated against it (see Parity). The dataset,
+featurize, and training glue stay in JS/Python.
 
 - **Toolchain:** Zig **0.16.0** (pinned — pre-1.0, expect churn on upgrades).
-- **Architecture:** one source, two targets — native CLI binaries the npm scripts
-  spawn (gen/match/rank), and a `wasm32` module the browser worker loads. The
-  dataset/featurize/training glue stays in JS.
-- **Safety net:** the JS oracle. Generate it in `web/` with `npm run parity`
-  (writes `web/engine-parity.json` + `web/engine-parity.eval.json`), then check the
-  port against it here:
 
-  ```sh
-  zig build parity                       # all engine layers vs the JS oracle
-  zig build bench  -Doptimize=ReleaseFast -- --depth=8 [--nn]
-  zig build match  -Doptimize=ReleaseFast -- --games=20 --depth=6 [--nn]
-  zig build gen    -Doptimize=ReleaseFast -- --games=200 --depth=6 --eval=nn
-  zig build wasm                         # -> zig-out/bin/apos.wasm (browser)
-  ```
+## Files (`src/`)
 
-  `engine-parity.json` is the **frozen** rules contract (rules never change); only
-  `engine-parity.eval.json` is regenerated when the champion changes.
+| File | Mirrors | Contents |
+|------|---------|----------|
+| `board.zig` | `board.js` | board rep, FEN parse/serialize, `squareName` |
+| `engine.zig` | `engine.js` | move generation, `applyMove` (make/unmake, in-place), safety zones, `gameStatus` |
+| `zobrist.zig` | (key gen in `ai.js`) | Zobrist keys + incremental hashing |
+| `eval.zig` | `evalStm` in `ai.js` | handcrafted PST eval (bit-exact vs JS) |
+| `nn.zig` | `nn.js` | neural-net eval (KING_BUCKETS = 0; ±1 cp vs JS) |
+| `ai.zig` | `ai.js` | search: alpha-beta, PVS, null-move, LMR, qsearch, TT, killers/history, repetition |
+| `wasm.zig` | — | wasm32 entry: exports `searchFen`/`allocBytes`/`memory`; movetime/progress via imported `env` callbacks |
+| `main_gen.zig` / `main_match.zig` / `main_bench.zig` | — | native CLI entry points |
+| `parity.zig` | — | replays the JS oracle and checks every layer |
 
-## Port status
+## Build & verify
 
-- [x] `board.zig` — board rep, FEN parse/serialize, `squareName` (FEN round-trip green)
-- [x] `engine.zig` — move generation, `applyMove`, safety zones, `gameStatus`
-      (legal-move sets + perft + status all green, verified to 45.5M perft nodes)
-- [x] `zobrist.zig` — key-gen replicated; hashes + incremental invariant green
-- [x] `eval.zig` / `nn.zig` — handcrafted (bit-exact) and nn (±1 cp) vs the eval oracle
-- [x] `ai.zig` — search (alpha-beta, PVS, null-move, LMR, qsearch, TT, killers/history,
-      repetition). Plays legal self-play games to completion; `zig build bench`/`match`.
-- [x] `wasm.zig` — wasm32 target (`apos.wasm`, exports `searchFen`/`allocBytes`/`memory`),
-      verified searching from a JS host. The browser half of the two-target architecture.
+Run from `web/engine/`:
 
-### Next phase (engine port itself is complete + verified on both targets)
+```sh
+zig build parity                       # all engine layers vs the JS oracle
+zig build bench  -Doptimize=ReleaseFast -- --depth=8 [--nn]
+zig build match  -Doptimize=ReleaseFast -- --games=20 --depth=6 [--nn]
+zig build gen    -Doptimize=ReleaseFast -- --games=200 --depth=6 --eval=nn
+zig build wasm                         # -> zig-out/bin/apos.wasm
+```
 
-- [x] perf: **make/unmake** (in-place, no per-node board clone; validated by perft).
-      Measured vs JS at equal depth (depth-8 from start): **nn 2.64× faster** (4.8s vs
-      12.7s), hc 1.64× (24.1s vs 39.6s).
-- [ ] perf (deferred, low ROI): incremental nn accumulator. The champion is tiny
-      (`768→64→16→8→1`), so a dual-perspective f64 accumulator is only ~1.2–1.3× more,
-      at notable complexity / float-drift risk. Revisit only with a wider first layer.
-- [ ] perf (bigger lever): bitboard move generation — speeds every node (and perft,
-      gen, gate). Large rewrite; the parity harness makes it safe.
-- [x] npm wiring — **match**: `npm run match:zig` (shim `scripts/match-zig.mjs` → native
-      `apos-match`). Drop-in for `npm run match`: A/B evals+weights, parallel threads,
-      SPRT early-stop, the same `--result-file` JSON `train:loop` reads, AND the
-      `--save-games` harvest (winner-relative `v`: direct depth-d on its plies, derived
-      depth-(d-1) on the loser's — exactly like selfplay.mjs). ~2.4M nps aggregate
-      (8 threads) at depth 4.
-- [x] npm wiring — **gen**: `npm run gen:zig` (shim `scripts/gen-zig.mjs` → native
-      `apos-gen`). Drop-in for `npm run train:gen`: parallel self-play, same
-      `{fen,r,g,v,vs}` JSONL appended to the same dataset, `--opening-topk` supported.
-      ~2.4x faster than the JS generator. The `vs` provenance hash matches `vtag.mjs`
-      bit-for-bit (verified), so refresh-v/rank still recognize the labels.
-- [x] **loop integration**: `train:loop`, `train` (pipeline) and `rank` build the engine at
-      startup and spawn `apos-gen` (generate) + `apos-match` (gate / gauntlet, with harvest)
-      instead of the JS tools. `npm run match` and `npm run train:gen` now run the native
-      binaries via the shims. featurize/train/refresh-v stay JS+Python.
-- [x] **rank**: `rank-engines.mjs` (Elo ledger / weakest-first refresh glue) now spawns
-      `apos-match` per matchup — including its asymmetric `--depth-b` (cheap contenders vs a
-      deep stable anchor), `--movetime`, and `--save-games` harvest. The orchestration glue
-      stays JS; only the heavy matches went native.
-- [x] **JS cleanup**: the replaced tools (`selfplay.mjs`, `matchWorker.mjs`,
-      `gen-selfplay.mjs`, `genWorker.mjs`) are deleted. The JS *engine* (`src/*.js`) stays —
-      it's still the browser bot (until the wasm worker lands) and the engine for the JS glue
-      tools (featurize, refresh-v, puzzles, openings, the parity oracle).
-- [x] **offline scorers via wasm**: the remaining search-heavy JS tools — `refresh-v`,
-      the puzzle miner (`mine-puzzles`), `backfill-v`, `fill-missing-v` — run their per-
-      position searches in `apos.wasm` through a shared Node helper (`scripts/wasmEngine.mjs`),
-      ~3x faster than `ai.js` in Node and bit-consistent with the native generator/gate.
-      Their orchestration (streaming, atomic rename, ledger selection, puzzle verification)
-      stays JS. No offline tool searches via `ai.js` anymore (only constants — `HC_VERSION`,
-      `MATE_THRESH` — and the parity oracle still import it).
-- [x] app wiring: `apos.wasm` in the Web Worker (`src/aiWorker.js`). Full parity with the
-      old `ai.js` search — nn weights written into wasm memory (`loadWeights`), **movetime**
-      via a JS-imported clock (`env.aposNowMs`), **live eval-bar** streaming
-      (`env.aposProgress` after each depth), **ponder**, repetition + opening-exclude passed
-      as byte buffers; the worker reconstructs the full variant move from the wasm's
-      from/to/promo via its own `legalMoves`. `ai.js` stays only as a fallback if the wasm
-      can't load. Build + commit the artifact with `npm run build:wasm` (→ `public/apos.wasm`),
-      so the GitHub Pages deploy needs no Zig. Verified in Node: legal play, exact eval parity.
+From `web/`, `npm run build:wasm` rebuilds + copies `apos.wasm` into `public/` (so the
+GitHub Pages deploy needs no Zig toolchain), and `npm run match` / `npm run train:gen`
+run the native binaries through their shims.
+
+## Parity contract
+
+Any rule or search change goes in **both** `web/src/*.js` and `web/engine/src/*.zig`.
+Verify with the JS oracle:
+
+1. `npm run parity` (from `web/`) writes `web/engine-parity.json` + `web/engine-parity.eval.json`.
+2. `zig build parity` (from `web/engine/`) checks the port reproduces them exactly.
+
+`engine-parity.json` is the **frozen** rules contract — the variant rules never change, so
+move-gen/perft/Zobrist are a permanent invariant. Only `engine-parity.eval.json` is
+regenerated, when the champion net changes.
+
+## Perf notes
+
+- Move gen uses in-place **make/unmake** (no per-node board clone), validated by perft.
+  Depth-8 from the start position: nn ~2.6× faster than JS, hc ~1.6×.
+- **Not done** (low ROI on the current tiny `768→64→16→8→1` net): an incremental nn
+  accumulator (~1.2–1.3× for notable complexity + float-drift risk) and bitboard move
+  generation (a large rewrite; the parity harness would make it safe). Revisit the
+  accumulator only with a wider first layer.

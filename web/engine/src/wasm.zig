@@ -3,7 +3,7 @@
 //
 // wasm32 entry for the browser bot: the SAME engine core (board/engine/ai/nn) the native
 // tools use, exported over linear memory. The app's Web Worker (src/aiWorker.js) drives
-// it — a drop-in for the old ai.js search with full parity:
+// it:
 //   * nn eval — JS writes the weights JSON into wasm memory and calls loadWeights.
 //   * movetime — ai.zig reads the clock from the imported env.aposNowMs (no std.Io here).
 //   * live eval bar — the search calls env.aposProgress(score, depth) after each depth.
