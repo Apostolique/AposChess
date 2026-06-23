@@ -28,8 +28,10 @@
 //                   samples among the engine's N best opening moves (sound but varied).
 //                   Off by default, so the loop's data is unchanged unless you set it.
 //   --cycles=N      stop after N cycles (default: run forever until Ctrl-C)
-//   --gate-games=N  max games in the candidate-vs-champion match (default 800 — mature
-//                   gains are small, and small edges need more games to clear the SPRT)
+//   --gate-games=N  max games in the candidate-vs-champion match (default 2000 — mature
+//                   gains are small, and small edges need many games to clear the SPRT:
+//                   a true +20 candidate clears an 800g gate only ~1/3 of the time but
+//                   ~80% at 2000g, with the false-reject rate pinned at beta throughout)
 //   --gate-depth=D  search depth for the gating match (default 6)
 //   --elo1=E        SPRT H1 promotion threshold in Elo (default 20; elo0 is 0). This
 //                   is the SMALLEST gain worth promoting; it must be wide enough that
@@ -235,7 +237,7 @@ const cfg = {
   openings: args.openings !== undefined ? Number(args.openings) : null, // null = gen default (8)
   openingTopk: num(args['opening-topk'], 0), // 0 = uniform-random opening (gen default)
   cycles: args.cycles !== undefined ? Number(args.cycles) : Infinity,
-  gateGames: num(args['gate-games'], 800),
+  gateGames: num(args['gate-games'], 2000),
   gateDepth: num(args['gate-depth'], 6),
   elo1: num(args.elo1, 20), // wide enough that SPRT can decide within --gate-games
   lam: num(args.lambda, 1), // TD target mix passed to train.py (1 = pure result)
@@ -267,9 +269,12 @@ const cfg = {
   // the WEAKEST engine's `v` first instead of a blind random fraction. --no-rank reverts.
   rank: !args['no-rank'],
   rankDepth: num(args['rank-depth'], 6),
-  // Default to the gate's game count: the ledger needs enough games to resolve the real
-  // ordering (champions sit only ~elo1 apart), so it matches the gate's match length.
-  rankGames: num(args['rank-games'], num(args['gate-games'], 800)),
+  // Default 800, decoupled from the gate. The ledger's main consumer is weakest-first `v`
+  // refresh (which engine's labels to recompute), not a fine promote/reject decision, so it
+  // doesn't need the gate's full length — and the gate is now 2000, which would make every
+  // post-promotion rank gauntlet needlessly long. Raise --rank-games if the ledger ordering
+  // looks noisy (champions sit only ~elo1 apart).
+  rankGames: num(args['rank-games'], 800),
 };
 
 function findPython() {
