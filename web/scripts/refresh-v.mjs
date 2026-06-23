@@ -275,8 +275,14 @@ console.log(`refresh-v: ${inFile} (${fmtMB(statSync(inFile).size)}) | depth ${de
   + `eval ${evalName}${evalName === 'nn' ? ` (${weights.replace(/^.*[\\/]/, '')})` : ''} | seed ${seed}`
   + ` | budget ${budgeted ? `${minutes}m` : 'none'}`);
 if (eloByVersion) {
+  // Report the Elo of the engine actually doing the recompute (vtag, set by --weights/--eval),
+  // not the ledger's strongest — they differ when the loop forces --weights=<current champion>
+  // and that champion ranks below an archived one. Flag that case so a weaker relabel is visible.
+  const recomputeElo = eloForTag(vtag);
+  const isBest = best && best.tag === vtag;
   console.log(`  ledger: ${ledgerPath.replace(/^.*[\\/]/, '')} | recompute with ${vtag}`
-    + `${best ? ` (best engine, Elo ${best.elo.toFixed(0)})` : ''}`);
+    + `${Number.isFinite(recomputeElo) ? ` (Elo ${recomputeElo.toFixed(0)})` : ''}`
+    + `${best && !isBest ? `  [ledger best: ${best.tag}, Elo ${best.elo.toFixed(0)}]` : ''}`);
   const fillPart = missingCount > 0 ? `fill ${fmtNum(missingCount)} missing v (all)` : null;
   const refreshPart = targetElo !== null
     ? `refresh ${(frac * 100).toFixed(0)}% of weakest band: ${cohortName(targetElo)}`
