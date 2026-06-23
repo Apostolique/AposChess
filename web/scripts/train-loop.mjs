@@ -220,6 +220,11 @@ const resultFile = join(loopDir, 'match.json');
 const gateHarvest = join(loopDir, 'gate-harvest.jsonl');
 const ledgerFile = join(loopDir, 'engine-elo.json'); // engine-strength ledger (npm run rank)
 const logFile = join(loopDir, 'loop.log');
+// PID of this loop, so `npm run train:pause`/`train:resume` (scripts/loop-ctl.mjs) can find
+// and freeze/thaw the loop's whole process tree from another terminal — a long run pegs every
+// core, so pausing hands the machine back without losing the in-flight gate/generation.
+const pidFile = join(loopDir, 'loop.pid');
+const pauseFlag = join(loopDir, 'PAUSED'); // marker loop-ctl writes while suspended
 const publicNN = resolve(webDir, 'public', 'nn');
 const manifestFile = join(publicNN, 'manifest.json');
 const loopChampPub = join(publicNN, 'loop-champion.json');
@@ -479,6 +484,11 @@ buildEngine();
 // Archive the starting champion too — it labels the data generated before the first
 // promotion, so its v-contributors must stay reconstructable like every later champion.
 archiveChampion(champion);
+// Publish this loop's PID for the pause/resume control, and drop any stale PAUSED marker
+// from a previous run (a fresh loop starts running). The pidfile is removed on exit.
+writeFileSync(pidFile, `${process.pid}\n`);
+rmSync(pauseFlag, { force: true });
+process.on('exit', () => { try { rmSync(pidFile, { force: true }); } catch { /* best effort */ } });
 if (cfg.fresh && existsSync(rawFile)) { rmSync(rawFile); log('Cleared dataset (--fresh).'); }
 
 const hidden = championHidden();
@@ -501,6 +511,7 @@ log(`train:loop start — batch ${cfg.batch} @ depth ${cfg.depth} | gate ${cfg.g
   + `refresh on promotion ${cfg.refreshFrac > 0 ? `${(cfg.refreshFrac * 100).toFixed(0)}% @ depth ${cfg.refreshDepth}` : 'off'} | `
   + `rank ${cfg.rank ? `on (hc anchor, new champion @ depths ${rankDepths.join('+')}, ${cfg.rankGames}g/matchup)` : 'off'} | `
   + `cycles ${cfg.cycles === Infinity ? '∞' : cfg.cycles}`);
+log('Pause/resume from another terminal: `npm run train:pause` / `npm run train:resume` (frees all CPU, no work lost).');
 
 const jobArg = cfg.jobs !== undefined ? [`--jobs=${cfg.jobs}`] : [];
 
