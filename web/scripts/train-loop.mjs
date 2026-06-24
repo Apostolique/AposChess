@@ -46,8 +46,11 @@
 //                   warm-starting from the champion (warm start fine-tunes in a few
 //                   epochs and starts at champion strength; a cold start occasionally
 //                   explores a different basin but relearns everything). Only the first
-//                   cycle is cold — later cycles warm-start from the lineage/champion so
-//                   the run builds on the cold exploration instead of repeating it.
+//                   cycle is cold — every later cycle warm-starts from the PREVIOUS
+//                   cycle's candidate, so the run bootstraps a fresh net once and then
+//                   keeps refining that same net. This is how a candidate whose --hidden
+//                   shape differs from the champion's evolves: the champion can't seed it
+//                   (wrong architecture), so the chain runs through the candidate itself.
 //   --skip-gen      skip generation on the FIRST cycle and go straight to
 //                   featurize -> train -> gate on the dataset as it stands. Use it
 //                   to resume after interrupting a run mid-generation: completed
@@ -528,9 +531,9 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
   const cycleT0 = Date.now();
   const dataset = existsSync(rawFile) ? ` — dataset ${fmtMB(statSync(rawFile).size)}` : '';
   log(`===== cycle ${c}${cfg.cycles === Infinity ? '' : `/${cfg.cycles}`}${dataset} =====`);
-  // --cold trains from random init on the FIRST cycle only: explore a fresh basin once,
-  // then warm-start every later cycle (from the lineage/champion) so the run builds on
-  // that exploration instead of relearning from scratch every cycle.
+  // --cold trains from random init on the FIRST cycle only: bootstrap a fresh net once,
+  // then keep refining THAT net by warm-starting every later cycle from the previous
+  // cycle's candidate (see the init resolution below) instead of relearning from scratch.
   const cold = cfg.cold && c === 1;
 
   // 1. Generate games with the champion (deeper search than the eval sees).
@@ -557,16 +560,27 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
   //    is a full pass — the in-place rewrite invalidates the incremental prefix.)
   if (!run('Featurize', process.execPath, [featurizeScript])) break;
 
-  // 3. Train a candidate (same shape as the champion) to a side file. --lambda blends
-  //    the champion's search value into the target (TD/bootstrap) when < 1. Unless this
-  //    is the cold first cycle, the candidate warm-starts from the lineage (a previous
-  //    rejected-but-positive candidate) when one exists, else from the champion — so
-  //    sub-threshold gains accumulate instead of being re-derived and discarded every
-  //    cycle (train.py ignores --init gracefully if the shapes don't match).
-  const initFile = !cold && existsSync(lineage) ? lineage : champion;
-  if (!run(`Train candidate${cold ? ' (cold start)' : initFile === lineage ? ' (warm-start from lineage)' : ''}`, python,
+  // 3. Train a candidate to a side file. --lambda blends the champion's search value into
+  //    the target (TD/bootstrap) when < 1. Warm-start source for this cycle's candidate:
+  //      --cold: nothing on cycle 1 (random init), then the PREVIOUS cycle's candidate
+  //              every cycle after — so the run bootstraps a fresh net once and then keeps
+  //              refining THAT net. (candidate.json persists across cycles holding last
+  //              cycle's output; init==out is safe — train.py reads --init fully before it
+  //              writes --out. This is the source that lets a fresh --hidden shape evolve:
+  //              the champion is often a different architecture and so unusable as init.)
+  //      otherwise: the kept lineage (a previous rejected-but-positive candidate) when one
+  //              exists, else the champion — so sub-threshold gains accumulate instead of
+  //              being re-derived every cycle (train.py ignores --init if the shapes differ).
+  const initFile = cfg.cold
+    ? (cold ? null : candidate)
+    : (existsSync(lineage) ? lineage : champion);
+  const warm = !!initFile && existsSync(initFile);
+  const initLabel = !warm ? ' (cold start)'
+    : cfg.cold ? ' (warm-start from previous candidate)'
+    : initFile === lineage ? ' (warm-start from lineage)' : '';
+  if (!run(`Train candidate${initLabel}`, python,
     [trainPy, `--hidden=${hidden}`, `--out=${candidate}`, `--lambda=${cfg.lam}`,
-      ...(cold ? [] : [`--init=${initFile}`])])) break;
+      ...(warm ? [`--init=${initFile}`] : [])])) break;
 
   // 4. Gate: candidate (A) vs champion (B), SPRT(0, elo1). Unless --no-harvest,
   //    the gate's games are appended to the dataset (they're already paid for;
@@ -629,10 +643,12 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
       run(`Refresh v (${(cfg.refreshFrac * 100).toFixed(0)}% ${refreshMode()} @ depth ${cfg.refreshDepth}, new champion)`,
         process.execPath, refreshArgs(cfg.refreshFrac, cfg.refreshDepth));
     }
-  } else if (res.sprt !== 'H0' && res.score >= 0.5) {
+  } else if (!cfg.cold && res.sprt !== 'H0' && res.score >= 0.5) {
     // Inconclusive but not losing: keep the candidate as the lineage so the next
     // cycle builds on its (sub-threshold) gain instead of rederiving it from the
-    // champion. The champion itself is untouched — the gate still protects it.
+    // champion. (Not for --cold runs: those already chain from the previous candidate
+    // unconditionally, so the lineage plays no part.) The champion itself is untouched —
+    // the gate still protects it.
     copyFileSync(candidate, lineage);
     log(`cycle ${c}: kept champion — candidate ${pct}% / Elo ${res.elo.toFixed(0)} `
       + `(SPRT ${res.sprt}, ${res.games} games, cycle took ${fmtDur((Date.now() - cycleT0) / 1000)}). `
