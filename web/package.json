@@ -23,6 +23,7 @@
     "train:progress": "node scripts/loop-progress.mjs",
     "train:merge": "node --max-old-space-size=8192 scripts/merge-data.mjs",
     "puzzles:mine": "node scripts/mine-puzzles.mjs",
+    "winrate": "node scripts/winrate.mjs",
     "parity": "node scripts/engine-parity.mjs",
     "openings:mine": "node --max-old-space-size=8192 scripts/mine-openings.mjs"
   },
