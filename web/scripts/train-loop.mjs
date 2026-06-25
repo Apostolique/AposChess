@@ -317,6 +317,21 @@ function log(line) {
   appendFileSync(logFile, `[${stamp()}] ${line}\n`);
 }
 
+// A loud, multi-line boxed banner for cycle headers so they're trivial to spot when
+// scrolling back through a long run (a lone `===== … =====` line blends in). The console
+// gets bold-cyan; the log file gets the same box in plain text (no escape codes), both
+// preceded by a blank line for extra separation.
+function banner(title) {
+  const w = 54;
+  const t = title.length > w - 2 ? `${title.slice(0, w - 5)}…` : title;
+  const pad = w - t.length, left = pad >> 1;
+  const top = `╔${'═'.repeat(w)}╗`;
+  const mid = `║${' '.repeat(left)}${t}${' '.repeat(pad - left)}║`;
+  const bot = `╚${'═'.repeat(w)}╝`;
+  console.log(`\n\x1b[1;36m[${hms()}] ${top}\n${' '.repeat(11)}${mid}\n${' '.repeat(11)}${bot}\x1b[0m`);
+  appendFileSync(logFile, `\n[${stamp()}] ${top}\n[${stamp()}] ${mid}\n[${stamp()}] ${bot}\n`);
+}
+
 let stopping = false;
 process.on('SIGINT', () => { stopping = true; console.log('\n  Ctrl-C: stopping after this cycle…'); });
 
@@ -530,7 +545,7 @@ let promotions = 0;
 for (let c = 1; c <= cfg.cycles && !stopping; c++) {
   const cycleT0 = Date.now();
   const dataset = existsSync(rawFile) ? ` — dataset ${fmtMB(statSync(rawFile).size)}` : '';
-  log(`===== cycle ${c}${cfg.cycles === Infinity ? '' : `/${cfg.cycles}`}${dataset} =====`);
+  banner(`CYCLE ${c}${cfg.cycles === Infinity ? '' : `/${cfg.cycles}`}${dataset}`);
   // --cold trains from random init on the FIRST cycle only: bootstrap a fresh net once,
   // then keep refining THAT net by warm-starting every later cycle from the previous
   // cycle's candidate (see the init resolution below) instead of relearning from scratch.
