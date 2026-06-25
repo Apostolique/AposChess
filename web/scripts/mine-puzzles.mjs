@@ -49,6 +49,10 @@
 //                      accept every candidate that verifies; --max-candidates still
 //                      bounds how many are checked)
 //     [--min-difficulty=1]     drop puzzles solved at a shallower depth
+//     [--min-win-moves=2]      minimum solver moves for a win/mate puzzle — a
+//                      one-move "win" is just grabbing a hanging piece, not a tactic
+//                      (also drops mate-in-1). Defense (only-move) puzzles are exempt.
+//                      Set to 1 to keep one-move wins.
 //     [--max-solver-moves=4]   solution length cap (forced-mate finishes exempt:
 //                      a line that walks into a mate runs to checkmate)
 // Defaults: jobs = CPU cores, eval = nn with weights = ./src/nn-weights.json
@@ -84,6 +88,7 @@ const second = num('second', 150);
 const maxCandidates = num('max-candidates', 6000);
 const limit = num('limit', Infinity); // no accept cap by default; --max-candidates bounds the work
 const minDifficulty = num('min-difficulty', 1);
+const minWinMoves = num('min-win-moves', 2);
 const maxSolverMoves = num('max-solver-moves', 4);
 const evalName = typeof args.eval === 'string' ? args.eval : 'nn';
 const weights = typeof args.weights === 'string'
@@ -105,7 +110,7 @@ const t0 = Date.now();
 const status = liveStatus();
 const tick = everyMs(1000);
 console.log(`mine-puzzles: ${inFile} (${fmtMB(statSync(inFile).size)}) | depth ${depth} | jobs ${jobs} | seed ${seed}`);
-console.log(`  gates: swing>=${swing} | pre>=${preFloor} | move>=${minMove} | win>=${win} | second<=${second} | line-gap>=${lineGap} | difficulty>=${minDifficulty} | limit ${Number.isFinite(limit) ? limit : 'none'} of <=${fmtNum(maxCandidates)} candidates`);
+console.log(`  gates: swing>=${swing} | pre>=${preFloor} | move>=${minMove} | win>=${win} | second<=${second} | line-gap>=${lineGap} | difficulty>=${minDifficulty} | win-moves>=${minWinMoves} | limit ${Number.isFinite(limit) ? limit : 'none'} of <=${fmtNum(maxCandidates)} candidates`);
 
 // --- phase 1: scan the dataset for blunder-punish candidates ----------------------
 // The position key ignores the move counters (board + turn + castling) so the same
@@ -194,7 +199,7 @@ await new Promise((done) => {
   ensureWasm(); // build the native engine (wasm) once before the workers race for it
   for (let i = 0; i < jobs; i++) {
     const w = new Worker(new URL('./puzzleWorker.mjs', import.meta.url), {
-      workerData: { weights, depth, win, second, lineGap, saveFloor, maxSolverMoves, eval: evalName },
+      workerData: { weights, depth, win, second, lineGap, saveFloor, maxSolverMoves, minWinMoves, eval: evalName },
     });
     pool.push(w);
     w.on('message', (msg) => {

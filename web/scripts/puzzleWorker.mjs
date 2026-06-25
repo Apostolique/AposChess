@@ -59,7 +59,7 @@ import { legalMoves, applyMove, gameStatus, generatePseudoMoves, safetyZones } f
 import { _internal } from '../src/ai.js'; // MATE_THRESH constant only (search runs in wasm)
 import { makeEngine } from './wasmEngine.mjs';
 
-const { weights, depth, win, second, lineGap, saveFloor, maxSolverMoves } = workerData;
+const { weights, depth, win, second, lineGap, saveFloor, maxSolverMoves, minWinMoves } = workerData;
 const { MATE_THRESH } = _internal;
 
 // Same engine-selection policy as the rest of the tools: the champion net when it's a
@@ -273,6 +273,12 @@ function mineWin(fen, leadFen, id, seed) {
   if (isMate && kind !== 'mate') return { reject: 'mate-twin' };
 
   const solverMoves = Math.ceil(line.length / 2);
+  // Trivial-puzzle filter: a one-move "win" is just "take the hanging piece" — there's
+  // no combination to calculate, the line ended because the very first move already
+  // converted. Require a real sequence (default >=2 solver moves), which also drops
+  // mate-in-1s. Defense (only-move-save) puzzles are legitimately single-move and skip
+  // this in mineDefense.
+  if (solverMoves < minWinMoves) return { reject: 'too-short' };
   const puzzle = {
     id,
     fen: toFen(state),
