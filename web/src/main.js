@@ -1961,6 +1961,9 @@ $('puzzle-next').addEventListener('click', nextPuzzle);
 $('puzzle-continue').addEventListener('click', () => {
   if (ui.mode !== 'puzzle') return;
   selectMode('analysis');
+  // Scroll back up so the board is in focus — the puzzle panel may have left the
+  // page scrolled down past it.
+  window.scrollTo({ top: 0, behavior: 'smooth' });
 });
 
 // Analysis panel controls.
