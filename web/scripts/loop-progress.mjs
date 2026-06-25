@@ -151,10 +151,10 @@ const signed = (n) => (n >= 0 ? '+' : '') + n;
 // --- Detailed cycle table for a run. ----------------------------------------------------
 function printCycles(run) {
   if (!run.cycles.length) { console.log('  (no completed cycles)'); return; }
-  console.log(`  ${pad('cyc', 4)}${pad('score', 8)}${pad('Elo', 6)}${pad('SPRT', 14)}${pad('games', 7)}${pad('took', 9)}lineage`);
+  console.log(`  ${pad('cyc', 5)}${pad('score', 8)}${pad('Elo', 6)}${pad('SPRT', 14)}${pad('games', 7)}${pad('took', 9)}lineage`);
   for (const c of run.cycles) {
     const mark = c.promoted ? '✓ ' : '  ';
-    console.log('  ' + mark + pad(c.n, 2)
+    console.log('  ' + mark + pad(c.n, 3)
       + pad(Number.isFinite(c.score) ? c.score.toFixed(1) + '%' : '?', 8)
       + pad(Number.isFinite(c.elo) ? signed(c.elo) : '?', 6)
       + pad(c.sprt, 14)
