@@ -136,6 +136,14 @@ function slope(ys) {
   return sxx ? sxy / sxx : 0;
 }
 const avg = (a) => a.reduce((x, y) => x + y, 0) / a.length;
+// Log timestamps are written in UTC (train-loop's stamp() uses toISOString). Date.parse on a
+// no-offset datetime treats it as LOCAL, which on a machine behind UTC pushes the time into the
+// future (negative "ago") — so parse it explicitly as UTC, then render local for display.
+const parseLogTs = (ts) => new Date(ts.replace(' ', 'T') + 'Z');
+const fmtLocal = (d) => {
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+};
 const pad = (s, w) => String(s).padEnd(w);
 const padL = (s, w) => String(s).padStart(w);
 const signed = (n) => (n >= 0 ? '+' : '') + n;
@@ -163,7 +171,7 @@ if (champHidden) console.log(`Current champion: arch [${champArch.join(',')}]  (
 const latest = runs[runs.length - 1];
 const running = isLatestRunning(latest);
 
-console.log(`\n=== Latest run — started ${latest.start}${running ? '  (RUNNING / not yet stopped)' : `  (stopped: ${latest.stopped} promotion(s))`} ===`);
+console.log(`\n=== Latest run — started ${fmtLocal(parseLogTs(latest.start))}${running ? '  (RUNNING / not yet stopped)' : `  (stopped: ${latest.stopped} promotion(s))`} ===`);
 console.log(`  config: hidden=[${latest.hidden}]  gate ${latest.gateGames}g@d${latest.gateDepth} SPRT(0,${latest.elo1})`
   + `  λ=${latest.lambda ?? '?'}  batch ${latest.batch ?? '?'}  ${latest.start_kind} start`);
 if (latest.lineageDiscarded) console.log(`  note: lineage discarded at start (${latest.lineageDiscarded}) — accumulation restarted from scratch.`);
@@ -182,12 +190,12 @@ if (runs.length > 1) {
     const scores = run.cycles.map((c) => c.score).filter(Number.isFinite);
     const best = scores.length ? Math.max(...scores).toFixed(1) + '%' : '—';
     const tag = run === latest && running ? 'RUN' : (run.stopped ?? '·');
-    console.log(`  ${pad(run.start, 20)} h[${pad(run.hidden, 9)}] ${pad(run.start_kind, 22)} `
+    console.log(`  ${pad(fmtLocal(parseLogTs(run.start)), 20)} h[${pad(run.hidden, 9)}] ${pad(run.start_kind, 22)} `
       + `${padL(run.cycles.length, 2)}cyc  best ${padL(best, 6)}  prom ${run.promotions}  ${tag === 'RUN' ? 'running' : tag + ' prom'}`);
   }
   if (detailAll) {
     for (const run of runs.slice(0, -1)) {
-      console.log(`\n--- run ${run.start} (hidden=[${run.hidden}], ${run.start_kind}) ---`);
+      console.log(`\n--- run ${fmtLocal(parseLogTs(run.start))} (hidden=[${run.hidden}], ${run.start_kind}) ---`);
       printCycles(run);
     }
   }
@@ -204,8 +212,9 @@ for (let i = allCycles.length - 1; i >= 0; i--) {
 console.log('\n=== Overall ===');
 console.log(`  ${allCycles.length} cycle(s) across ${runs.length} run(s);  ${totalProm} promotion(s).`);
 if (lastPromo) {
-  const ago = (Date.now() - Date.parse(lastPromo.ts.replace(' ', 'T'))) / 1000;
-  console.log(`  Last promotion: ${lastPromo.ts} (Elo ${signed(lastPromo.elo)}) — ${fmtDur(ago)} ago, ${sincePromo} cycle(s) since.`);
+  const promoAt = parseLogTs(lastPromo.ts);
+  const ago = (Date.now() - promoAt.getTime()) / 1000;
+  console.log(`  Last promotion: ${fmtLocal(promoAt)} (Elo ${signed(lastPromo.elo)}) — ${fmtDur(ago)} ago, ${sincePromo} cycle(s) since.`);
 } else {
   console.log('  No promotions yet in this log.');
 }
