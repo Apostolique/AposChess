@@ -132,7 +132,11 @@ fieldset.ai-group legend {
    as secondary to the strength dropdown instead of a full-width second select. */
 /* The Custom strength inputs (Max depth + Timeout) stay side by side on one row;
    the labels above each input wrap if the column is narrow rather than stacking. */
-.custom-fields { display: flex; gap: 12px; align-items: end; flex-basis: 100%; }
+.custom-fields { display: flex; flex-wrap: wrap; gap: 12px; align-items: end; flex-basis: 100%; }
+/* Each field keeps its 92px width on desktop but may shrink (and wrap to a second
+   row) on a narrow phone rather than overflowing the panel and forcing the page
+   to scroll horizontally. */
+.custom-fields label { flex: 0 1 92px; min-width: 0; }
 .custom-fields .hint { white-space: nowrap; } /* keep "(0 = ∞)" on one line */
 .engine-field { display: flex; flex-direction: column; gap: 4px; }
 /* The net picker stacks its label over the dropdown like the engine toggle, and the
@@ -239,6 +243,9 @@ button:disabled:hover { background: var(--panel); } /* no hover lift when locked
   -webkit-appearance: none;
   margin: 0;
 }
+/* Fill the (shrinkable) label so the input follows the field as it narrows on a
+   phone instead of keeping its fixed 92px and overflowing. */
+.custom-fields input[type="number"] { width: 100%; }
 
 /* Online (peer-to-peer) panel. */
 .online-panel { display: flex; flex-direction: column; gap: 12px; width: 100%; }
