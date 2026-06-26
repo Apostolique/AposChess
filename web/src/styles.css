@@ -142,8 +142,8 @@ fieldset.ai-group legend {
 /* The net picker stacks its label over the dropdown like the engine toggle, and the
    <select> is width-capped so a long net name can't stretch the controls column
    (which would push the panel below the board). The full name still shows when open. */
-.net-field { display: flex; flex-direction: column; gap: 4px; }
-.net-field select { max-width: 14rem; }
+.net-field, .hc-field { display: flex; flex-direction: column; gap: 4px; }
+.net-field select, .hc-field select { max-width: 14rem; }
 /* A checkbox + text label that reads inline (the checkbox to the left of the
    words), overriding the default column stacking of .controls label. */
 .check-field { flex-direction: row !important; align-items: center; gap: 8px; cursor: pointer; }

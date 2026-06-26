@@ -66,6 +66,11 @@
 //                   in. They're played at --gate-depth, the same depth as generation's
 //                   --depth by default, so the harvested labels match generation quality.
 //   --jobs=N        parallel workers for gen + match
+//   --quiet-only    featurize only QUIET positions (drop side-to-move-in-check and
+//                   positions with a winning capture available). NNUE is a static eval
+//                   called only at quiescence-search leaves, so loud positions mismatch
+//                   that distribution and add label noise. Off by default — gate it
+//                   head-to-head before adopting. Toggling forces a full re-featurize.
 //   --fresh         clear the dataset before the first cycle (clean deep-search start)
 //   --refresh-frac=P  after each PROMOTION, recompute `v` on a random fraction P of the
 //                   dataset with the new champion (value iteration; 0 = off, default).
@@ -251,6 +256,11 @@ const cfg = {
   gateDepth: num(args['gate-depth'], 6),
   elo1: num(args.elo1, 20), // wide enough that SPRT can decide within --gate-games
   lam: num(args.lambda, 1), // TD target mix passed to train.py (1 = pure result)
+  // Drop tactically loud positions (in check / winning capture available) at featurize time
+  // so the static net trains on the quiet-position distribution it's actually queried on at
+  // qsearch leaves. Off by default (gate it head-to-head before adopting). Toggling it forces
+  // the next featurize to be a full pass (the meta sidecar records the filter state).
+  quietOnly: !!args['quiet-only'],
   hidden: typeof args.hidden === 'string' ? args.hidden : null,
   jobs: args.jobs,
   fresh: !!args.fresh,
@@ -613,7 +623,8 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
 
   // 2. Featurize the raw positions for the current feature set. (After a refresh this
   //    is a full pass — the in-place rewrite invalidates the incremental prefix.)
-  if (!run('Featurize', process.execPath, [featurizeScript])) break;
+  if (!run('Featurize', process.execPath,
+    [featurizeScript, ...(cfg.quietOnly ? ['--quiet-only'] : [])])) break;
 
   // 3. Train a candidate to a side file. --lambda blends the champion's search value into
   //    the target (TD/bootstrap) when < 1. Warm-start source for this cycle's candidate:

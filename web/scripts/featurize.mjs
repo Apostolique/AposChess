@@ -34,6 +34,10 @@
 //   --in=FILE    raw dataset to read   (default ../training/data/selfplay.jsonl)
 //   --out=FILE   features to write      (default ../training/data/selfplay.features.jsonl)
 //   --full       force a full rebuild (skip the incremental fast path)
+//   --quiet-only drop tactically loud positions (side to move in check, or a winning
+//                capture available) — NNUE is queried only on quiet positions at qsearch
+//                leaves, so training on loud ones mismatches that distribution + adds noise.
+//                Recorded in the meta sidecar; toggling it forces a full re-featurize.
 
 import {
   createReadStream, createWriteStream, existsSync, rmSync, renameSync, statSync, writeFileSync,
@@ -46,6 +50,7 @@ import { fileURLToPath } from 'node:url';
 
 import { parseFen } from '../src/board.js';
 import { featureIndices, PIECE_SQUARE_FEATURES, NUM_FEATURES } from '../src/nn.js';
+import { generatePseudoMoves, kingAttacked } from '../src/engine.js';
 import { fmtDur, fmtNum, fmtMB, liveStatus, everyMs } from './fmt.mjs';
 
 // Rebuild a canonical board from stored feature indices (the legacy fallback when a
@@ -67,6 +72,29 @@ function boardFromFeatures(f) {
   return { board, turn: 'white' };
 }
 
+// --- Quiet-position filter (--quiet-only) ----------------------------------
+// NNUE is a STATIC eval, called only at the leaves of quiescence search — which
+// resolves captures/checks before evaluating — so at runtime the net is only ever
+// queried on relatively quiet positions. Training on "loud" positions both mismatches
+// that distribution and injects label noise (a still-frame with a hanging piece has a
+// value dominated by tactics the static features can't see). Standard NNUE practice
+// filters them out. With no stored best move (the raw record is just {fen,r,g,v}), we
+// approximate "best move is a capture" statically: a position is LOUD if the side to
+// move is in check, or it has a capture of an enemy piece worth strictly more than the
+// capturer (a pending winning capture / hanging piece — almost always the best move).
+// Variant-calibrated values (knight ≈ rook), kept in lockstep with ai.js / nn.js VALUE.
+const VALUE = { p: 100, n: 500, b: 330, r: 500, q: 900, k: 0 };
+function isQuiet(board, turn) {
+  if (kingAttacked(board, turn)) return false; // side to move in check
+  for (const m of generatePseudoMoves(board, turn)) {
+    const victim = board[m.to];
+    if (victim && victim.color !== turn && VALUE[victim.role] > VALUE[board[m.from].role]) {
+      return false; // a winning capture is available — position is tactically loud
+    }
+  }
+  return true;
+}
+
 const here = dirname(fileURLToPath(import.meta.url));
 const args = Object.fromEntries(
   process.argv.slice(2).map((a) => {
@@ -81,6 +109,7 @@ const inFile = typeof args.in === 'string'
 const outFile = typeof args.out === 'string'
   ? resolve(process.cwd(), args.out)
   : resolve(here, '../../training/data/selfplay.features.jsonl');
+const quietOnly = !!args['quiet-only'];
 
 if (!existsSync(inFile)) {
   console.error(`No dataset at ${inFile}. Generate it first:  npm run train:gen`);
@@ -117,7 +146,9 @@ const rawSize = statSync(inFile).size;
 // with the prefix we already processed, and the output is exactly as we left it.
 let meta = null;
 try { meta = JSON.parse(readFileSync(metaFile, 'utf8')); } catch { /* no sidecar yet */ }
-const inc = !args.full && meta && meta.num_features === NUM_FEATURES && meta.incremental
+const inc = !args.full && meta && meta.num_features === NUM_FEATURES
+  && !!meta.quiet_only === quietOnly // a filter toggle changes output content -> full pass
+  && meta.incremental
   && meta.incremental.rawBytes <= rawSize
   && existsSync(outFile) && statSync(outFile).size === meta.incremental.outBytes
   && tailHash(inFile, meta.incremental.rawBytes) === meta.incremental.rawTailHash;
@@ -151,7 +182,7 @@ const t0 = Date.now();
 const span = rawSize - startAt;
 let bytesDone = 0;
 
-let fromFen = 0, fromFeatures = 0;
+let fromFen = 0, fromFeatures = 0, skippedLoud = 0;
 for await (const line of rl) {
   if (!line) continue;
   bytesDone += line.length + 1;
@@ -165,6 +196,7 @@ for await (const line of rl) {
   const { board, turn } = typeof rec.fen === 'string'
     ? (fromFen++, parseFen(rec.fen))
     : (fromFeatures++, boardFromFeatures(rec.f));
+  if (quietOnly && !isQuiet(board, turn)) { skippedLoud++; continue; } // drop tactically loud positions
   const f = featureIndices(board, turn);
   const o = { f, r: rec.r, g: rec.g };
   if (rec.v != null) o.v = rec.v; // search value, for TD/bootstrap targets (train.py --lambda)
@@ -186,6 +218,7 @@ if (!inc) {
 // state for the next run.
 writeFileSync(metaFile, JSON.stringify({
   num_features: NUM_FEATURES,
+  quiet_only: quietOnly,
   incremental: {
     rawBytes: rawSize,
     rawTailHash: tailHash(inFile, rawSize),
@@ -194,8 +227,13 @@ writeFileSync(metaFile, JSON.stringify({
 }, null, 2) + '\n');
 
 status.clear();
-console.log(`Done: ${fmtNum(fromFen + fromFeatures)} positions featurized${inc ? ' (incremental)' : ''} `
+console.log(`Done: ${fmtNum(fromFen + fromFeatures - skippedLoud)} positions featurized${inc ? ' (incremental)' : ''} `
   + `in ${fmtDur((Date.now() - t0) / 1000)} (${fmtMB(statSync(outFile).size)} total, num_features=${NUM_FEATURES}).`);
+if (quietOnly) {
+  const scanned = fromFen + fromFeatures;
+  console.log(`  --quiet-only: dropped ${fmtNum(skippedLoud)} loud positions `
+    + `(${scanned ? (100 * skippedLoud / scanned).toFixed(1) : '0.0'}% of ${fmtNum(scanned)} scanned).`);
+}
 if (fromFeatures) {
   console.log(`  ${fmtNum(fromFeatures)} legacy records had no fen — rebuilt from stored features.`);
 }

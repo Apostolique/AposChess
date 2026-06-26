@@ -24,11 +24,17 @@ const ui = {
   strengthAi: '6',     // opponent strength in 'human-ai'
   strengthWhite: '6',  // per-colour strength in 'ai-ai'
   strengthBlack: '6',
-  // Which evaluation drives each AI slot: 'handcrafted' or 'nn' (neural net).
+  // Which engine family drives each AI slot: 'handcrafted' or 'nn' (neural net).
   // Orthogonal to strength — the chosen engine still searches to the depth/time above.
   engineAi: 'handcrafted',
   engineWhite: 'handcrafted',
   engineBlack: 'handcrafted',
+  // Handcrafted version per slot ('handcrafted' = v2, 'handcrafted3' = v3, the
+  // NN-distilled material+PSTs). Picked from a dropdown, like netAi for nn; only
+  // consulted when that slot's engine family is 'handcrafted'.
+  hcAi: 'handcrafted',
+  hcWhite: 'handcrafted',
+  hcBlack: 'handcrafted',
   // Selected neural-net name per slot (from the public/nn catalog); filled once the
   // manifest loads. Only consulted when that slot's engine is 'nn'.
   netAi: null,
@@ -1571,19 +1577,24 @@ function syncToggleLabel() {
 
 const strengthOf = (slot) =>
   slot === 'ai' ? ui.strengthAi : slot === 'white' ? ui.strengthWhite : ui.strengthBlack;
-const engineOf = (slot) =>
-  slot === 'ai' ? ui.engineAi : slot === 'white' ? ui.engineWhite : ui.engineBlack;
-
-// The engine picker is a segmented radio toggle (`engine-<slot>-hc|-nn`), not a
-// <select>; these read/write the checked option by slot.
+// The engine *family* is a two-option segmented radio toggle (`engine-<slot>-hc|-nn`);
+// when it's handcrafted, a version <select> (`hc-<slot>`) picks v2/v3, exactly as nn
+// has a net <select>. engineOf resolves the pair into the value the worker wants
+// ('handcrafted' | 'handcrafted3' | 'nn').
 const ENGINE_UI_KEY = { ai: 'engineAi', white: 'engineWhite', black: 'engineBlack' };
+const HC_UI_KEY = { ai: 'hcAi', white: 'hcWhite', black: 'hcBlack' };
+const engineFamilyOf = (slot) =>
+  slot === 'ai' ? ui.engineAi : slot === 'white' ? ui.engineWhite : ui.engineBlack;
+const hcOf = (slot) =>
+  slot === 'ai' ? ui.hcAi : slot === 'white' ? ui.hcWhite : ui.hcBlack;
+const engineOf = (slot) =>
+  engineFamilyOf(slot) === 'nn' ? 'nn' : hcOf(slot);
 function engineValue(slot) {
   const checked = document.querySelector(`input[name="engine-${slot}"]:checked`);
   return checked ? checked.value : 'handcrafted';
 }
 function setEngineValue(slot, v) {
-  const suffix = v === 'nn' ? 'nn' : v === 'handcrafted3' ? 'hc3' : 'hc';
-  const el = $(`engine-${slot}-${suffix}`);
+  const el = $(`engine-${slot}-${v === 'nn' ? 'nn' : 'hc'}`);
   if (el) el.checked = true;
 }
 
@@ -1672,8 +1683,13 @@ function applyModeVisibility() {
   toggleCustom('ai', m === 'human-ai' && ui.strengthAi === 'custom');
   toggleCustom('white', m === 'ai-ai' && ui.strengthWhite === 'custom');
   toggleCustom('black', m === 'ai-ai' && ui.strengthBlack === 'custom');
-  // The net picker appears only when a slot's engine is the neural net.
-  for (const slot of ['ai', 'white', 'black']) $(`net-field-${slot}`).hidden = engineOf(slot) !== 'nn';
+  // Exactly one version picker shows per slot: the net dropdown for nn, the
+  // handcrafted-version dropdown otherwise.
+  for (const slot of ['ai', 'white', 'black']) {
+    const nn = engineFamilyOf(slot) === 'nn';
+    $(`net-field-${slot}`).hidden = !nn;
+    $(`hc-field-${slot}`).hidden = nn;
+  }
   // The eval bar is mode-dependent (analysis only); this covers the paths that change
   // mode without a render (e.g. switching into the editor).
   syncEvalBar();
@@ -1696,6 +1712,7 @@ function applyAiLock() {
   for (const slot of ['white', 'black']) {
     for (const r of document.querySelectorAll(`input[name="engine-${slot}"]`)) r.disabled = locked;
     $(`net-${slot}`).disabled = locked;
+    $(`hc-${slot}`).disabled = locked;
   }
 }
 
@@ -1747,6 +1764,9 @@ function syncControlsFromDom() {
   ui.engineAi = engineValue('ai');
   ui.engineWhite = engineValue('white');
   ui.engineBlack = engineValue('black');
+  ui.hcAi = $('hc-ai').value;
+  ui.hcWhite = $('hc-white').value;
+  ui.hcBlack = $('hc-black').value;
   ui.varyOpenings = $('vary-openings').checked;
   ui.showEvalBars = $('show-evals').checked;
   for (const slot of ['ai', 'white', 'black']) {
@@ -1913,9 +1933,12 @@ for (const slot of ['ai', 'white', 'black']) {
   for (const r of document.querySelectorAll(`input[name="engine-${slot}"]`)) {
     r.addEventListener('change', () => {
       ui[ENGINE_UI_KEY[slot]] = engineValue(slot);
-      $(`net-field-${slot}`).hidden = engineValue(slot) !== 'nn'; // reveal the net picker for nn
+      const nn = engineValue(slot) === 'nn'; // swap in the matching version picker
+      $(`net-field-${slot}`).hidden = !nn;
+      $(`hc-field-${slot}`).hidden = nn;
     });
   }
+  $(`hc-${slot}`).addEventListener('change', (e) => { ui[HC_UI_KEY[slot]] = e.target.value; });
   $(`net-${slot}`).addEventListener('change', (e) => { ui[NET_UI_KEY[slot]] = e.target.value || null; });
 }
 for (const slot of ['ai', 'white', 'black']) {
@@ -1946,12 +1969,15 @@ $('new-game').addEventListener('click', () => {
 $('ai-swap').addEventListener('click', () => {
   [ui.strengthWhite, ui.strengthBlack] = [ui.strengthBlack, ui.strengthWhite];
   [ui.engineWhite, ui.engineBlack] = [ui.engineBlack, ui.engineWhite];
+  [ui.hcWhite, ui.hcBlack] = [ui.hcBlack, ui.hcWhite];
   [ui.netWhite, ui.netBlack] = [ui.netBlack, ui.netWhite];
   [ui.custom.white, ui.custom.black] = [ui.custom.black, ui.custom.white];
   $('depth-white').value = ui.strengthWhite;
   $('depth-black').value = ui.strengthBlack;
   setEngineValue('white', ui.engineWhite);
   setEngineValue('black', ui.engineBlack);
+  $('hc-white').value = ui.hcWhite;
+  $('hc-black').value = ui.hcBlack;
   $('net-white').value = ui.netWhite || '';
   $('net-black').value = ui.netBlack || '';
   $('custom-depth-white').value = ui.custom.white.depth;
@@ -2213,6 +2239,9 @@ function controlsOutOfSync() {
     || engineValue('ai') !== ui.engineAi
     || engineValue('white') !== ui.engineWhite
     || engineValue('black') !== ui.engineBlack
+    || $('hc-ai').value !== ui.hcAi
+    || $('hc-white').value !== ui.hcWhite
+    || $('hc-black').value !== ui.hcBlack
     || $('vary-openings').checked !== ui.varyOpenings
     || $('show-evals').checked !== ui.showEvalBars) return true;
   for (const slot of ['ai', 'white', 'black']) {
