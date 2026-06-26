@@ -1576,7 +1576,8 @@ function engineValue(slot) {
   return checked ? checked.value : 'handcrafted';
 }
 function setEngineValue(slot, v) {
-  const el = $(`engine-${slot}-${v === 'nn' ? 'nn' : 'hc'}`);
+  const suffix = v === 'nn' ? 'nn' : v === 'handcrafted3' ? 'hc3' : 'hc';
+  const el = $(`engine-${slot}-${suffix}`);
   if (el) el.checked = true;
 }
 
@@ -1712,7 +1713,8 @@ function playerName(color) {
   if (!isAi) return 'Human';
   const { depth, maxMs, engine } = aiParams(color);
   const slot = ui.mode === 'ai-ai' ? color : 'ai';
-  const e = engine === 'nn' ? `Neural net (${netOf(slot) || '?'})` : 'Handcrafted';
+  const e = engine === 'nn' ? `Neural net (${netOf(slot) || '?'})`
+    : engine === 'handcrafted3' ? 'Handcrafted v3' : 'Handcrafted';
   const d = depth === Infinity ? 'unlimited' : depth;
   const t = maxMs === Infinity ? 'no time limit' : `${maxMs}ms`;
   return `AI (${e}, depth ${d}, ${t})`;

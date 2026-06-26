@@ -96,7 +96,7 @@ function writeExcl(keys) {
 // the searcher (a fresh TT), so they're called only on an actual change — matching the JS
 // path's reset-TT-on-net-switch and otherwise persistent table.
 async function ensureEvalNet(engine, netUrl) {
-  const kind = engine === 'nn' ? 1 : 0;
+  const kind = engine === 'nn' ? 1 : engine === 'handcrafted3' ? 2 : 0;
   if (kind !== curEvalKind) { wasm.setEval(kind); curEvalKind = kind; curNetUrl = null; }
   if (kind === 1 && netUrl && netUrl !== curNetUrl) {
     let p = netCache.get(netUrl);

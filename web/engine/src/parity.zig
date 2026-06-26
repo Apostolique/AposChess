@@ -139,6 +139,7 @@ pub fn main(init: std.process.Init) !void {
     // --- eval parity: handcrafted + nn vs the champion-tagged eval oracle ------
     // Loaded separately because engine-parity.eval.json regenerates per champion.
     var eval_hc_fail: usize = 0;
+    var eval_hc3_fail: usize = 0;
     var eval_nn_fail: usize = 0;
     var eval_positions: usize = 0;
     {
@@ -162,12 +163,18 @@ pub fn main(init: std.process.Init) !void {
             const id = obj.get("id").?.string;
             const st = board.parseFen(obj.get("fen").?.string);
             const want_hc = obj.get("evalHc").?.integer;
+            const want_hc3 = obj.get("evalHc3").?.integer;
             const want_nn = obj.get("evalNn").?.integer;
             const got_hc: i64 = eval.evalStm(&st.board, st.turn);
+            const got_hc3: i64 = eval.evalStmV3(&st.board, st.turn);
             const got_nn: i64 = nn.evaluate(&net, &st.board, st.turn);
             if (got_hc != want_hc) {
                 eval_hc_fail += 1;
                 std.debug.print("EVAL hc [{s}] want {d} got {d}\n", .{ id, want_hc, got_hc });
+            }
+            if (got_hc3 != want_hc3) {
+                eval_hc3_fail += 1;
+                std.debug.print("EVAL hc3 [{s}] want {d} got {d}\n", .{ id, want_hc3, got_hc3 });
             }
             if (@max(got_nn, want_nn) - @min(got_nn, want_nn) > 1) { // ±1 cp tolerance (libm tanh)
                 eval_nn_fail += 1;
@@ -186,10 +193,11 @@ pub fn main(init: std.process.Init) !void {
         \\  zobrist hash   : {d} fail
         \\  zobrist incr.  : {d} fail
         \\  eval handcraft : {d} fail ({d} positions)
+        \\  eval hc3       : {d} fail
         \\  eval nn (±1cp) : {d} fail
         \\
-    , .{ n, fen_fail, move_fail, perft_fail, status_fail, hash_fail, zinv_fail, eval_hc_fail, eval_positions, eval_nn_fail });
+    , .{ n, fen_fail, move_fail, perft_fail, status_fail, hash_fail, zinv_fail, eval_hc_fail, eval_positions, eval_hc3_fail, eval_nn_fail });
 
-    if (fen_fail + move_fail + perft_fail + status_fail + hash_fail + zinv_fail + eval_hc_fail + eval_nn_fail != 0) std.process.exit(1);
+    if (fen_fail + move_fail + perft_fail + status_fail + hash_fail + zinv_fail + eval_hc_fail + eval_hc3_fail + eval_nn_fail != 0) std.process.exit(1);
     std.debug.print("ALL GREEN\n", .{});
 }

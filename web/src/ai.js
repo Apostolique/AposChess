@@ -281,6 +281,88 @@ function evalStm(board, turn) {
   return turn === 'white' ? s : -s;
 }
 
+// --- handcrafted v3 ----------------------------------------------------------
+// An alternative handcrafted eval whose material values and piece-square tables are
+// DISTILLED FROM THE CHAMPION NEURAL NET: a per-(role,square) ridge regression of the
+// net's white-relative eval over ~200k self-play positions recovered the net's implied
+// value of each piece on each square; that map was split into an occupancy-weighted
+// base value (VALUE3) + positional residual (PST), rescaled so pawn=100 (keeping the
+// search's centipawn scale), and left-right symmetrized. Versus v2 this learns a much
+// steeper pawn-advancement gradient, knight≈rook, and a development-hungry queen.
+// Worth ~+12 Elo over v2 in self-play (4000 games, depth 4).
+// The king PST is left at 0: the net's active-king table cost ~18 Elo without a game-phase
+// taper (see PST_K3). Selected via the engine string 'handcrafted3'; same eval contract
+// (side-to-move centipawns) as evalStm.
+const VALUE3 = { p: 100, n: 477, b: 316, r: 478, q: 816, k: 0 };
+const PST_P3 = [
+     0,   0,   0,   0,   0,   0,   0,   0,
+   -29, -17,   3, -15, -15,   3, -17, -29,
+   -43, -13,   3,  -4,  -4,   3, -13, -43,
+   -37,  -2,  23,  35,  35,  23,  -2, -37,
+   -43,  21,  37,  59,  59,  37,  21, -43,
+    57,  89, 141, 117, 117, 141,  89,  57,
+   157, 353, 310, 313, 313, 310, 353, 157,
+     0,   0,   0,   0,   0,   0,   0,   0,
+];
+const PST_N3 = [
+   -39, -28, -37,  -9,  -9, -37, -28, -39,
+   -23,  16,  43,  41,  41,  43,  16, -23,
+     2,  28,  41,  57,  57,  41,  28,   2,
+    -6,  26,  40,  56,  56,  40,  26,  -6,
+   -15,  28,  31,  59,  59,  31,  28, -15,
+   -66,  52,  32,  58,  58,  32,  52, -66,
+   -12,  34,  58,  70,  70,  58,  34, -12,
+    -4,   1,  55,  79,  79,  55,   1,  -4,
+];
+const PST_B3 = [
+   -45, -93,  -9, -75, -75,  -9, -93, -45,
+   -64,  -2, -49,   4,   4, -49,  -2, -64,
+   -13, -35,   8,  28,  28,   8, -35, -13,
+   -49,  -8,  36,  24,  24,  36,  -8, -49,
+     6,  -7,  19,  51,  51,  19,  -7,   6,
+   -86,  17,  26,  28,  28,  26,  17, -86,
+   -27,  10, -25, -39, -39, -25,  10, -27,
+   -33, -98, -77, -42, -42, -77, -98, -33,
+];
+const PST_R3 = [
+   -21,  13,   4,  20,  20,   4,  13, -21,
+    -7, -21, -18, -36, -36, -18, -21,  -7,
+     7,  11,  -1,  21,  21,  -1,  11,   7,
+   -48,  22,  17,  56,  56,  17,  22, -48,
+    13,  22,  47,  50,  50,  47,  22,  13,
+   -94,  66,  18,  44,  44,  18,  66, -94,
+    26,  80, -20,   0,   0, -20,  80,  26,
+   125,  -2,  33,  27,  27,  33,  -2, 125,
+];
+const PST_Q3 = [
+   -93, -96, -86, -65, -65, -86, -96, -93,
+  -111, -55, -34, -28, -28, -34, -55,-111,
+   -48, -12,  11,  22,  22,  11, -12, -48,
+   -30,   5,  29,  34,  34,  29,   5, -30,
+     6,  33,  64,  73,  73,  64,  33,   6,
+     6,  81,  84, 107, 107,  84,  81,   6,
+    14,  78,  90,  73,  73,  90,  78,  14,
+    40,  43,  86,  39,  39,  86,  43,  40,
+];
+// King PST left at 0 (like v2). The net implies an active/central king, but importing
+// that table cost ~18 Elo in self-play (-6 with it vs +12 without, 4000 games each at
+// depth 4 vs v2): a static king bonus has no game-phase taper and walks the king out in
+// the middlegame. Revisit only with a tapered midgame/endgame eval.
+const PST_K3 = new Array(64).fill(0);
+const PST3 = { p: PST_P3, n: PST_N3, b: PST_B3, r: PST_R3, q: PST_Q3, k: PST_K3 };
+
+function evalStmV3(board, turn) {
+  let s = 0;
+  for (let i = 0; i < 64; i++) {
+    const p = board[i];
+    if (!p) continue;
+    const v = VALUE3[p.role] + PST3[p.role][p.color === 'white' ? i : i ^ 56];
+    s += p.color === 'white' ? v : -v;
+  }
+  s += MOB * (generatePseudoMoves(board, 'white').length - generatePseudoMoves(board, 'black').length);
+  return turn === 'white' ? s : -s;
+}
+
 // --- pluggable evaluation ----------------------------------------------------
 // The search funnels every leaf and stand-pat score through `activeEval`, which
 // chooseMoveDetailed selects per search from its `engine` argument. This lets the
@@ -302,7 +384,7 @@ function evalStm(board, turn) {
 let nnSlot = 'default';
 const evalNN = (board, turn) => nnEvaluate(board, turn, nnSlot);
 
-const EVALS = { handcrafted: evalStm, nn: evalNN };
+const EVALS = { handcrafted: evalStm, handcrafted3: evalStmV3, nn: evalNN };
 let activeEval = evalStm;
 
 // The transposition table persists across searches and — in AI-vs-AI on a single
@@ -314,7 +396,7 @@ let activeEval = evalStm;
 // ttProbe/ttStore) so each eval occupies a disjoint slice of the table. Handcrafted
 // uses 0n, so single-eval behaviour — and the match runner's separate-instance
 // engines — stay byte-for-byte unchanged; only the nn keys move out of the way.
-const EVAL_KEYS = { handcrafted: 0n, nn: 0x9e3779b97f4a7c15n };
+const EVAL_KEYS = { handcrafted: 0n, handcrafted3: 0x2545f4914f6cdd1dn, nn: 0x9e3779b97f4a7c15n };
 let evalKey = 0n;
 
 // Distinct TT namespace per nn slot, so a single instance that switches nets mid-run
@@ -620,4 +702,4 @@ export function chooseMove(state, maxDepth, rand, maxMs, useTT, prevHashes, engi
 
 // Exposed for tests only: Zobrist hash equivalence check + table reset so a
 // benchmark/test can start each game from a cold table despite persistence.
-export const _internal = { hashOf, hashAfter, resetTT: ttReset, evalStm, MATE, MATE_THRESH };
+export const _internal = { hashOf, hashAfter, resetTT: ttReset, evalStm, evalStmV3, MATE, MATE_THRESH };

@@ -420,8 +420,19 @@ fn vtagFmt(buf: []u8, kind: ai.EvalKind, depth: u32, io: std.Io, gpa: std.mem.Al
         if (depth == 0) return std.fmt.bufPrint(buf, "nnt@{s}", .{h}) catch unreachable;
         return std.fmt.bufPrint(buf, "nn{d}@{s}", .{ depth, h }) catch unreachable;
     }
+    if (kind == .handcrafted3) {
+        if (depth == 0) return std.fmt.bufPrint(buf, "hc3t@{d}", .{ai.HC_VERSION}) catch unreachable;
+        return std.fmt.bufPrint(buf, "hc3-{d}@{d}", .{ depth, ai.HC_VERSION }) catch unreachable;
+    }
     if (depth == 0) return std.fmt.bufPrint(buf, "hct@{d}", .{ai.HC_VERSION}) catch unreachable;
     return std.fmt.bufPrint(buf, "hc{d}@{d}", .{ depth, ai.HC_VERSION }) catch unreachable;
+}
+
+// --eval-a/--eval-b parse: "nn" -> nn, "hc3" -> handcrafted3, anything else -> handcrafted.
+fn parseEval(v: []const u8) ai.EvalKind {
+    if (std.mem.eql(u8, v, "nn")) return .nn;
+    if (std.mem.eql(u8, v, "hc3")) return .handcrafted3;
+    return .handcrafted;
 }
 
 fn appendBase36(out: *std.ArrayList(u8), alloc: std.mem.Allocator, value: u64) !void {
@@ -534,8 +545,8 @@ pub fn main(init: std.process.Init) !void {
         if (argStr(arg, "--openings=")) |v| openings = std.fmt.parseInt(u32, v, 10) catch openings;
         if (argStr(arg, "--maxmoves=")) |v| maxmoves = std.fmt.parseInt(u32, v, 10) catch maxmoves;
         if (argStr(arg, "--jobs=")) |v| jobs = std.fmt.parseInt(usize, v, 10) catch jobs;
-        if (argStr(arg, "--eval-a=")) |v| eval_a = if (std.mem.eql(u8, v, "nn")) .nn else .handcrafted;
-        if (argStr(arg, "--eval-b=")) |v| eval_b = if (std.mem.eql(u8, v, "nn")) .nn else .handcrafted;
+        if (argStr(arg, "--eval-a=")) |v| eval_a = parseEval(v);
+        if (argStr(arg, "--eval-b=")) |v| eval_b = parseEval(v);
         if (argStr(arg, "--weights-a=")) |v| weights_a = v;
         if (argStr(arg, "--weights-b=")) |v| weights_b = v;
         if (std.mem.eql(u8, arg, "--sprt")) sprt = true;

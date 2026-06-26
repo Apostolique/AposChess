@@ -65,10 +65,14 @@ export fn allocBytes(n: usize) usize {
     return @intFromPtr(buf.ptr);
 }
 
-/// Select the evaluation: 0 = handcrafted, 1 = nn. Rebuilds the searcher so the TT is
-/// eval-namespaced correctly and the right net is bound.
+/// Select the evaluation: 0 = handcrafted, 1 = nn, 2 = handcrafted3 (NN-distilled PSTs).
+/// Rebuilds the searcher so the TT is eval-namespaced correctly and the right net is bound.
 export fn setEval(kind: u32) void {
-    eval_kind = if (kind == 1) .nn else .handcrafted;
+    eval_kind = switch (kind) {
+        1 => .nn,
+        2 => .handcrafted3,
+        else => .handcrafted,
+    };
     rebuildSearcher();
 }
 
