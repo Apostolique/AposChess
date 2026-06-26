@@ -2,50 +2,6 @@
   "default": "loop-champion",
   "nets": [
     {
-      "name": "balanced-64",
-      "file": "balanced-64.json",
-      "arch": [
-        768,
-        64,
-        1
-      ],
-      "note": "Baseline 64-wide net (~parity with the handcrafted eval)."
-    },
-    {
-      "name": "deep3",
-      "file": "deep3.json",
-      "arch": [
-        768,
-        256,
-        64,
-        16,
-        1
-      ],
-      "note": ""
-    },
-    {
-      "name": "loop-champion",
-      "file": "loop-champion.json",
-      "arch": [
-        768,
-        64,
-        32,
-        16,
-        1
-      ],
-      "note": "Latest gated train:loop champion (current)."
-    },
-    {
-      "name": "random-noise",
-      "file": "random-noise.json",
-      "arch": [
-        768,
-        16,
-        1
-      ],
-      "note": "Random untrained weights, plays badly (UI test net)"
-    },
-    {
       "name": "Ada",
       "file": "ada.json",
       "arch": [
@@ -57,6 +13,16 @@
       "hash": "94c88e",
       "gen": 1,
       "note": "Retired train:loop champion (94c88e, 2026-06-12)."
+    },
+    {
+      "name": "balanced-64",
+      "file": "balanced-64.json",
+      "arch": [
+        768,
+        64,
+        1
+      ],
+      "note": "Baseline 64-wide net (~parity with the handcrafted eval)."
     },
     {
       "name": "Boris",
@@ -83,6 +49,18 @@
       "hash": "932b7c",
       "gen": 3,
       "note": "Retired train:loop champion (932b7c, 2026-06-15)."
+    },
+    {
+      "name": "deep3",
+      "file": "deep3.json",
+      "arch": [
+        768,
+        256,
+        64,
+        16,
+        1
+      ],
+      "note": ""
     },
     {
       "name": "Dexter",
@@ -154,6 +132,43 @@
       "hash": "a6baa2",
       "gen": 8,
       "note": "Retired train:loop champion (a6baa2, 2026-06-23)."
+    },
+    {
+      "name": "Ivy",
+      "file": "ivy.json",
+      "arch": [
+        768,
+        64,
+        32,
+        16,
+        1
+      ],
+      "loopChampion": true,
+      "hash": "3938a0",
+      "gen": 9,
+      "note": "Retired train:loop champion (3938a0, 2026-06-26)."
+    },
+    {
+      "name": "loop-champion",
+      "file": "loop-champion.json",
+      "arch": [
+        768,
+        64,
+        32,
+        16,
+        1
+      ],
+      "note": "Latest gated train:loop champion (current)."
+    },
+    {
+      "name": "random-noise",
+      "file": "random-noise.json",
+      "arch": [
+        768,
+        16,
+        1
+      ],
+      "note": "Random untrained weights, plays badly (UI test net)"
     }
   ]
 }
