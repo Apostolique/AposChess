@@ -1216,6 +1216,12 @@ function syncEvalBar() {
 }
 
 function requestEvalBar() {
+  // The analysis eval runs the nn (loop champion), with the weights resolved from the
+  // catalog at request time. On a deep-link/restore boot the catalog loads asynchronously,
+  // so netUrl is briefly null; firing the search then would run the wasm nn eval with no
+  // weights loaded — a "memory access out of bounds" trap that kills the worker (no bar, no
+  // arrow). Defer until loadNetCatalog resolves and kicks us again with the net in hand.
+  if (EVAL_BAR.engine === 'nn' && !netUrl(EVAL_BAR.net)) return;
   const fen = repFens[viewIndex];
   if (fen === evalBar.fen) return; // already showing (or searching) this position
   if (evalBar.pending) { evalBar.dirty = true; return; }
@@ -1626,6 +1632,10 @@ async function loadNetCatalog() {
     sel.value = netDefault || '';
     ui[NET_UI_KEY[slot]] = sel.value || null;
   }
+  // A deep-linked/restored analysis mode may have deferred its eval-bar search because the
+  // net couldn't be resolved before this loaded (see requestEvalBar). Now that the catalog
+  // is in, kick it so the bar + best-move arrow appear, using the current loop champion.
+  if (analysisBarVisible()) { evalBar.fen = null; requestEvalBar(); }
 }
 
 function applyModeVisibility() {
@@ -1645,9 +1655,9 @@ function applyModeVisibility() {
   const analysis = m === 'analysis';
   $('row-analysis').hidden = !analysis;
   $('analysis-back').hidden = !(analysis && puzzleSession);
-  // Leaving analysis turns the best-move arrow off (the arrow itself is cleared on the
-  // mode switch); entering turns it on (see enterAnalysis).
-  if (!analysis && showBestArrow) { showBestArrow = false; $('analysis-arrows').checked = false; }
+  // Leaving analysis turns the best-move arrow off AND clears it from the board (otherwise
+  // the drawn arrow lingers into the next mode); entering turns it on (see enterAnalysis).
+  if (!analysis && showBestArrow) { showBestArrow = false; $('analysis-arrows').checked = false; cg.setAutoShapes([]); }
   // Mobile analysis layout: lift the move list + nav directly under the board (see
   // styles.css); inert on desktop where the media-query rules don't apply.
   document.body.dataset.analysis = analysis ? '1' : '';
