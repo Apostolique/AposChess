@@ -660,10 +660,15 @@ function aiColors() {
 // is never idle. The result is held until at least `ui.delay` has elapsed since the
 // last move, keeping AI-vs-AI watchable.
 function startSearch(slot) {
+  const { depth, maxMs, engine, net } = aiParams(slot.color);
+  // nn with no resolved net yet (catalog still loading) would run the wasm nn eval with
+  // no weights and crash (index out of bounds). This bites when the AI must move first —
+  // playing as Black, the engine moves at game start before loadNetCatalog resolves. Defer;
+  // loadNetCatalog re-kicks driveAi once the net is in hand (same guard as the eval bar).
+  if (engine === 'nn' && !net) return;
   const seq = ++slot.searchSeq;
   slot.ponderSeq++; // a real search supersedes this colour's ponder chain
   aiThinking = true;
-  const { depth, maxMs, engine, net } = aiParams(slot.color);
   slot.worker.postMessage({ type: 'search', seq, state, depth, maxMs, engine, net, posHistory: repWindow(state), exclude: openingExclude(), wasmUrl: WASM_URL });
 }
 
@@ -1647,6 +1652,9 @@ async function loadNetCatalog() {
   // net couldn't be resolved before this loaded (see requestEvalBar). Now that the catalog
   // is in, kick it so the bar + best-move arrow appear, using the current loop champion.
   if (analysisBarVisible()) { evalBar.fen = null; requestEvalBar(); }
+  // Likewise, an nn AI that had to move first (you-vs-AI as Black, or AI-vs-AI) deferred its
+  // search because its net wasn't resolved yet (see startSearch). Re-kick now that it is.
+  driveAi();
 }
 
 function applyModeVisibility() {
