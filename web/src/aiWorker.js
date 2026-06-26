@@ -102,11 +102,14 @@ async function ensureEvalNet(engine, netUrl) {
     let p = netCache.get(netUrl);
     if (!p) { p = fetch(netUrl).then((r) => r.arrayBuffer()); netCache.set(netUrl, p); }
     let buf;
+    // Don't mask a failed weights fetch with the material fallback — let it surface. Drop the
+    // rejected promise from the cache first so a later request can retry instead of reusing it.
     try { buf = new Uint8Array(await p); }
-    catch { return; } // keep the material fallback if the fetch fails
+    catch (e) { netCache.delete(netUrl); throw e; }
     const ptr = wasm.allocBytes(buf.length);
     new Uint8Array(wasm.memory.buffer, ptr, buf.length).set(buf);
-    if (wasm.loadWeights(ptr, buf.length)) curNetUrl = netUrl;
+    if (!wasm.loadWeights(ptr, buf.length)) throw new Error(`nn weights rejected by wasm: ${netUrl}`);
+    curNetUrl = netUrl;
   }
 }
 
