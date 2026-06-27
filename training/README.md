@@ -129,7 +129,7 @@ deep-label anchor and guarantees fixed data volume even when the SPRT stops earl
   outside the repo, or with a `--batch` large enough to rebuild real volume. The
   normal path **omits it** and lets the dataset accumulate (and be maintained — see
   "Dataset maintenance").
-- Options: `--batch`, `--depth` (generation), `--gate-games` (default 800), `--gate-depth`,
+- Options: `--batch`, `--depth` (generation), `--gate-games` (default 2000), `--gate-depth`,
   `--elo1` (promotion bar, below), `--hidden` (candidate shape; default = champion's),
   `--lambda` (TD target mix, below), `--cold` (random-init candidates instead of
   warm-starting from the lineage/champion), `--skip-gen` (skip the FIRST cycle's
@@ -150,10 +150,11 @@ tiny band needs huge samples. With `[0, 5]` over 400 games a candidate must be *
 Elo** to ever trip H1 — so genuine +40/+60 improvements get rejected and the loop
 **stalls** (it keeps training better candidates and discarding them, the champion never
 moves, generation never improves). The default is therefore **`elo1=20`** with a
-**default cap of 800 games**, which decides a +50-class candidate quickly and gives an
+**default cap of 2000 games** (a true +20 candidate clears an 800-game gate only ~⅓ of
+the time but ~80% at 2000), which decides a +50-class candidate quickly and gives an
 honest +20–30 candidate a realistic shot at reaching the H1 boundary before the cap. As
-gains shrink with maturity, **raise `--gate-games`** further (e.g. 1500) rather than
-lowering `elo1` — more games is the sound way to detect a smaller edge. (Candidates in
+gains shrink with maturity, **raise `--gate-games`** further rather than lowering `elo1`
+— more games is the sound way to detect a smaller edge. (Candidates in
 the +10 range stay genuinely undecidable at sane game counts; the **lineage** mechanism
 above is what stops those gains from being wasted.)
 
@@ -272,7 +273,9 @@ Every idea follows the same shape: **train a candidate, then compare it head-to-
 against the current best with an SPRT**. A net vs *itself* scores ~50% — that's the
 built-in sanity check, and the comparison is far more sensitive than each-vs-handcrafted.
 
-The current best ships as `web/public/nn/balanced-64.json`; use it as the opponent.
+The current best is the live `train:loop` champion (`web/public/nn/loop-champion.json`,
+the manifest `default`); use it as the opponent. (`balanced-64.json` is the older
+~handcrafted-parity baseline, kept as a fixed yardstick.)
 
 ### A. Try a different network shape (width/depth)
 
@@ -281,7 +284,7 @@ Architecture only — features are unchanged, so no re-featurize:
 ```
 npm run train:fit -- --hidden=256,64,16 --name=cand      # each comma value = one hidden layer
 npm run match -- --eval-a=nn --eval-b=nn \
-  --weights-a=public/nn/cand.json --weights-b=public/nn/balanced-64.json --sprt
+  --weights-a=public/nn/cand.json --weights-b=public/nn/loop-champion.json --sprt
 ```
 
 ### B. Add a new input feature
@@ -307,7 +310,7 @@ data) and train + compare:
 npm run train:featurize
 npm run train:fit -- --name=cand
 npm run match -- --eval-a=nn --eval-b=nn \
-  --weights-a=public/nn/cand.json --weights-b=public/nn/balanced-64.json --sprt
+  --weights-a=public/nn/cand.json --weights-b=public/nn/loop-champion.json --sprt
 ```
 
 Notes: only `board` + `turn` are available to `featureIndices` (a castling- or
@@ -345,8 +348,10 @@ entry. Keep at least one (the manifest `default`).
 
 ## Pooling data from several machines or runs
 
-Self-play scales out: generate on multiple computers, then combine. The records
-are independent and order-agnostic, so merging is just concatenation.
+Self-play scales out: generate on multiple computers, then combine. `npm run
+train:merge` is a **smart** merge, not a blind concatenation — it identifies records
+by game+ply, collapses positions shared across machines to one copy, and keeps the
+best-provenance `v` (see `docs/tools.md`).
 
 1. On each machine, run the same code version (same commit) with a **distinct
    `--seed`** (same seed = identical games = wasted effort), and the **same teacher**

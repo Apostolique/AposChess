@@ -59,7 +59,7 @@ regenerated, when the champion net changes.
 
 - Move gen uses in-place **make/unmake** (no per-node board clone), validated by perft.
   Depth-8 from the start position: nn ~2.6× faster than JS, hc ~1.6×.
-- **Not done** (low ROI on the current tiny `768→64→16→8→1` net): an incremental nn
+- **Not done** (low ROI on the current tiny net — a few-hundred-wide `768→…→1` MLP): an incremental nn
   accumulator (~1.2–1.3× for notable complexity + float-drift risk) and bitboard move
   generation (a large rewrite; the parity harness would make it safe). Revisit the
   accumulator only with a wider first layer.
