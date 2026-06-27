@@ -248,7 +248,14 @@ const args = Object.fromEntries(
 const num = (v, d) => (v === undefined ? d : Number(v));
 const cfg = {
   batch: num(args.batch, 200),
-  depth: num(args.depth, 6),
+  // Self-play GENERATION depth — the deep label anchor (each generated position's value
+  // target is its search value at this depth). Raised 6 -> 8 (2026-06-27): deeper labels
+  // are the NN's real lever (first-layer width is a dead end — docs/first-layer-strategy.md),
+  // and the NNUE accumulator (~1.5x) offsets part of the cost. Gen is only `batch` games, so
+  // this ~doubles cycle time (gen ≈ the gate's cost) rather than exploding it; the gate stays
+  // at gateDepth and refresh-v walks the dataset up to this depth over cycles. --depth=6 to
+  // revert, --depth=7 for a gentler cost.
+  depth: num(args.depth, 8),
   openings: args.openings !== undefined ? Number(args.openings) : null, // null = gen default (8)
   openingTopk: num(args['opening-topk'], 0), // 0 = uniform-random opening (gen default)
   cycles: args.cycles !== undefined ? Number(args.cycles) : Infinity,
@@ -273,15 +280,16 @@ const cfg = {
   // promotions. Refresh search depth defaults to the gen depth.
   // --no-refresh zeroes both, overriding any explicit fractions.
   refreshFrac: args['no-refresh'] ? 0 : num(args['refresh-frac'], 0),
-  // Matches the gen/gate depth (6) so promotion refreshes relabel at full value-accuracy.
-  // A depth-6 refresh of a big fraction is many hours — lower it to trade accuracy for speed.
-  refreshDepth: num(args['refresh-depth'], 6),
+  // Matches the gen depth (8) so promotion refreshes relabel at the full value-accuracy of
+  // the deep anchor. A depth-8 refresh of a big fraction is many hours — lower it (or the
+  // fraction) to trade accuracy for speed. Off by default (refreshFrac 0).
+  refreshDepth: num(args['refresh-depth'], 8),
   // Per-cycle refresh: a small slice of the dataset re-labeled with the current champion
   // every cycle. Helps between promotions too — most `v` in the set came from older
   // champions or shallower searches, so "unchanged champion" does NOT mean "nothing to
   // refresh"; only records the current champion already labeled at this depth are no-ops.
   refreshCycle: args['no-refresh'] ? 0 : num(args['refresh-cycle'], 1),
-  refreshCycleDepth: num(args['refresh-cycle-depth'], num(args.depth, 6)),
+  refreshCycleDepth: num(args['refresh-cycle-depth'], num(args.depth, 8)),
   // Engine ranking for smart weakest-first v refresh. On by default: each promotion adds
   // ONLY the new champion to the Elo ledger (rank --only; every other engine's Elo is
   // reused), ranked at the gen/gate depth (--rank-depth, 6) and one below it so its
