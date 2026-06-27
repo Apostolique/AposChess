@@ -76,6 +76,13 @@ def update_manifest(name, file, arch, note, set_default):
 # for data with no sidecar (hand-made / pre-sidecar): the original plain layout.
 DEFAULT_NUM_FEATURES = 12 * 64  # 768
 
+# NNUE integer-quantization scales (used only with --quant). Activations are stored at
+# fixed-point scale QA (a real activation x -> round(x*QA), plain ReLU, not clamped);
+# weights are scaled by QA (accumulator / input layer) or QW (dense layers, biases QW*QA).
+# These are stamped into the weights JSON so nn.js / nn.zig reproduce the exact pipeline.
+QUANT_QA = 1024  # activation fixed-point scale (~1cp rounding vs float; int8-style 127 was too coarse)
+QUANT_QW = 1024  # dense-weight scale
+
 
 def read_num_features(data_path):
     meta = (data_path[:-len(".jsonl")] if data_path.endswith(".jsonl") else data_path) + ".meta.json"
@@ -120,6 +127,13 @@ def parse_args():
                         "first-layer-strategy.md).")
     p.add_argument("--scale", type=float, default=600.0,
                    help="centipawns at tanh saturation (written into the weights)")
+    p.add_argument("--quant", action="store_true",
+                   help="export INTEGER (quantized) weights instead of float: layer-0 "
+                        "weights/bias at fixed-point scale QA, dense weights at QW (biases "
+                        "QW*QA), plain-ReLU activations at scale QA. Bit-exact across JS/Zig "
+                        "and the prerequisite for the incremental accumulator; faithfully "
+                        "reproduces the float net (rounding only). Training is unchanged — "
+                        "an existing float net can also be quantized post-hoc.")
     p.add_argument("--lambda", dest="lam", type=float, default=1.0,
                    help="TD/bootstrap mix: target = lam*result + (1-lam)*tanh(v/scale), "
                         "where v is the recorded per-position search value. 1.0 = pure "
@@ -187,6 +201,16 @@ def warm_start(model, path, arch, np, torch):
         print(f"--init: {os.path.basename(path)} arch {obj.get('arch')} != {arch}; "
               "training from scratch.")
         return None
+    # An integer (quantized) champion stores int weights at scales QA/QW — dequantize
+    # back to float so warm-starting works in either direction (float<->quant), so the
+    # loop keeps fine-tuning even after a quantized net becomes champion.
+    if obj.get("int"):
+        qa = obj["quant"]["qa"]
+        qw = obj["quant"]["qw"]
+        deq = [{"w": [x / qa for x in layers[0]["w"]], "b": [x / qa for x in layers[0]["b"]]}]
+        for L in layers[1:]:
+            deq.append({"w": [x / qw for x in L["w"]], "b": [x / (qw * qa) for x in L["b"]]})
+        layers = deq
     with torch.no_grad():
         h0 = arch[1]
         model.emb.weight[:arch[0]] = torch.tensor(
@@ -373,22 +397,41 @@ def main():
     def rnd(a):
         return [round(float(x), 6) for x in a.reshape(-1).tolist()]
 
-    layers = [{
-        # Drop the padding row (the extra vocab entry) — nn.js indexes 0..NUM_FEATURES-1.
-        "w": rnd(model.emb.weight.detach().numpy()[:num_features]),
-        "b": rnd(model.b0.detach().numpy()),
-    }]
-    for lin in model.lins:
-        layers.append({
-            "w": rnd(lin.weight.detach().numpy().T),  # [out,in] -> [in,out]
-            "b": rnd(lin.bias.detach().numpy()),
-        })
-
-    out = {
-        "arch": [num_features, *hidden, 1],
-        "scale": args.scale,
-        "layers": layers,
-    }
+    # layer 0's w is EmbeddingBag.weight, already [feature, h]; the padding row (the
+    # extra vocab entry) is dropped — nn.js indexes 0..NUM_FEATURES-1. lins are
+    # nn.Linear weights [out,in], transposed to input-major [in,out].
+    emb_w = model.emb.weight.detach().numpy()[:num_features]
+    if args.quant:
+        # Integer NNUE export: layer 0 (accumulator) weights+bias at scale QA; dense
+        # layers (incl. the scalar head) weights at scale QW, biases at QW*QA (they add
+        # to a QW*QA-scaled pre-activation). See nn.js for the matching forward pass.
+        def qi(a, s):
+            return [int(round(float(x) * s)) for x in a.reshape(-1).tolist()]
+        layers = [{"w": qi(emb_w, QUANT_QA), "b": qi(model.b0.detach().numpy(), QUANT_QA)}]
+        for lin in model.lins:
+            layers.append({
+                "w": qi(lin.weight.detach().numpy().T, QUANT_QW),
+                "b": qi(lin.bias.detach().numpy(), QUANT_QW * QUANT_QA),
+            })
+        out = {
+            "arch": [num_features, *hidden, 1],
+            "scale": args.scale,
+            "int": True,
+            "quant": {"qa": QUANT_QA, "qw": QUANT_QW},
+            "layers": layers,
+        }
+    else:
+        layers = [{"w": rnd(emb_w), "b": rnd(model.b0.detach().numpy())}]
+        for lin in model.lins:
+            layers.append({
+                "w": rnd(lin.weight.detach().numpy().T),  # [out,in] -> [in,out]
+                "b": rnd(lin.bias.detach().numpy()),
+            })
+        out = {
+            "arch": [num_features, *hidden, 1],
+            "scale": args.scale,
+            "layers": layers,
+        }
     # --name publishes into the web catalog (web/public/nn/<name>.json) and registers
     # it in the manifest; otherwise write the plain --out file (the Node-tools default).
     out_path = os.path.join(NN_CATALOG, f"{args.name}.json") if args.name else args.out

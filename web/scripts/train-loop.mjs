@@ -644,8 +644,12 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
   const initLabel = !warm ? ' (cold start)'
     : cfg.cold ? ' (warm-start from previous candidate)'
     : initFile === lineage ? ' (warm-start from lineage)' : '';
+  // --quant: export the candidate as a quantized integer net, so every champion keeps the
+  // incremental-accumulator speedup (~1.5× nodes/sec) in the gate, generation, and the app.
+  // Quantization is bit-exact JS/Zig and faithful to the float net (~1cp); warm_start
+  // dequantizes an int --init so the float fine-tune is unaffected.
   if (!run(`Train candidate${initLabel}`, python,
-    [trainPy, `--hidden=${hidden}`, `--out=${candidate}`, `--lambda=${cfg.lam}`,
+    [trainPy, `--hidden=${hidden}`, `--out=${candidate}`, `--lambda=${cfg.lam}`, '--quant',
       ...(warm ? [`--init=${initFile}`] : [])])) break;
 
   // 4. Gate: candidate (A) vs champion (B), SPRT(0, elo1). Unless --no-harvest,

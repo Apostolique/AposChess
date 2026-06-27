@@ -59,7 +59,19 @@ regenerated, when the champion net changes.
 
 - Move gen uses in-place **make/unmake** (no per-node board clone), validated by perft.
   Depth-8 from the start position: nn ~2.6× faster than JS, hc ~1.6×.
-- **Not done** (low ROI on the current tiny net — a few-hundred-wide `768→…→1` MLP): an incremental nn
-  accumulator (~1.2–1.3× for notable complexity + float-drift risk) and bitboard move
-  generation (a large rewrite; the parity harness would make it safe). Revisit the
-  accumulator only with a wider first layer.
+- **Incremental NNUE accumulator** (done for *quantized* nets). The first layer is maintained
+  as two raw (pre-clip) perspective accumulators (`acc_white`/`acc_black` in `ai.zig`), updated
+  by a constant ± piece-column delta in `nnMake`/`nnUnmake` instead of re-summed from scratch
+  at every leaf. The leaf eval reads the side-to-move one (`nn.evalFromAcc`). The float-drift
+  risk that made this dubious before is gone because the arithmetic is now **integer** (exact,
+  order-independent — see Quantization below), so incremental == from-scratch bit-for-bit (the
+  `ACC_DEBUG` switch in `ai.zig` asserts this every node). Measured **~1.5× nodes/sec** at
+  depth 8–9 with the shipped `768→64→32→16→1` net; bigger first layers gain more.
+- **Quantization.** A net with `"int": true` (trained via `train.py --quant`, clipped ReLU)
+  runs an integer forward pass: layer-0 weights/bias at scale `QA`, dense weights at `QW`
+  (biases `QW·QA`); activations are clipped to `[0,QA]`; only the final `tanh` is float, so cp
+  values match JS within ±1 like the float path. `nn.zig` and `nn.js` (`compileInt`) keep this
+  bit-identical — parity asserts it.
+- **Not done**: bitboard move generation (a large rewrite; the parity harness would make it
+  safe), and the representational HalfKP feature set (two-perspective *concat* + king-square
+  indexing) — deferred, since the prior king-feature experiment regressed.

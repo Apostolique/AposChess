@@ -12,10 +12,18 @@
 //
 // Network (v1): a sparse input layer (only a board's worth of features are ever
 // active, so the first layer is a handful of column adds — cheap even recomputed
-// from scratch at every leaf), one ReLU hidden layer, and a scalar output. The
-// raw output is squashed with tanh and scaled to centipawns, already from the
+// from scratch at every leaf), one or more ReLU hidden layers, and a scalar output.
+// The raw output is squashed with tanh and scaled to centipawns, already from the
 // SIDE-TO-MOVE's perspective (the search convention, matching evalStm) — no final
 // flip needed.
+//
+// Two weight encodings share this forward pass: the classic FLOAT net, and a
+// QUANTIZED INTEGER net ({int:true, quant:{qa,qw}}, trained by train.py --quant with
+// clipped ReLU). The integer path (compileInt) does exact integer arithmetic —
+// layer-0 weights/bias at scale QA, dense weights at QW (biases QW·QA), activations
+// clipped to [0,QA], dequantized only before tanh — so it's bit-identical to nn.zig
+// and lets the Zig search maintain the first layer with an incrementally-updated
+// accumulator (the "U" in NNUE). See nn.zig / web/engine/README.md.
 
 // Feature layout (canonical / side-to-move orientation): the board is presented
 // from the mover's point of view, so a position and its colour-mirror collapse to
@@ -122,6 +130,7 @@ const WEIGHTS = new Map();
 // over the original plain-array version; a generic property-walking version of the
 // same code was ~0.85x (slower than the original), hence the per-net closures.
 function compile(W) {
+  if (W.int) return compileInt(W); // quantized integer net (NNUE-style)
   const layers = W.layers.map((L) => ({ w: Float64Array.from(L.w), b: Float64Array.from(L.b) }));
   const scale = W.scale;
   const w0 = layers[0].w, b0 = layers[0].b;
@@ -198,6 +207,87 @@ function compile(W) {
     let out = Lf.b[0];
     for (let i = 0; i < dim; i++) out += act[i] * wf[i];
     return Math.round(Math.tanh(out) * scale);
+  };
+}
+
+// Integer (quantized) forward pass — the NNUE arithmetic. Activations are integers at
+// fixed-point scale QA (a real activation x is stored as x*QA) with a plain ReLU, so the
+// quantized net faithfully reproduces the float net (NOT a clipped/[0,1] net — clamping
+// the activations was found to cripple this small net). Layer-0 weights/bias are at scale
+// QA, dense weights at QW (biases at QW*QA); each dense layer requantizes by ÷QW. Every
+// intermediate is an exact integer (well under 2^53, so float64 represents it exactly and
+// the result is bit-identical to the Zig i64 port). Only the final tanh is floating point,
+// so cp values agree within ±1 like the float net. Mirrors featureIndices and nn.zig's
+// integer evaluate — keep the three in sync.
+function compileInt(W) {
+  const QA = W.quant.qa, QW = W.quant.qw;
+  const scale = W.scale;
+  const layers = W.layers.map((L) => ({ w: Float64Array.from(L.w), b: Float64Array.from(L.b) }));
+  const w0 = layers[0].w, b0 = layers[0].b;
+  const H0 = b0.length;
+  const acc = new Float64Array(H0); // raw accumulator (pre-clip), integer-valued
+
+  // Layer 0: bias + active feature columns (integers), then clipped ReLU into [0,QA].
+  function inputLayer(board, turn) {
+    acc.set(b0);
+    const flip = turn === 'black';
+    const kbase = KING_BUCKETS
+      ? PIECE_SQUARE_FEATURES * (1 + kingBucket(ownKingSquare(board, turn, flip)))
+      : 0;
+    for (let i = 0; i < 64; i++) {
+      const p = board[i];
+      if (!p) continue;
+      const side = p.color === turn ? 0 : 1;
+      const sq = flip ? i ^ 56 : i;
+      const kind = (PIECE_INDEX[p.role] * 2 + side) * 64 + sq;
+      const off = kind * H0;
+      for (let h = 0; h < H0; h++) acc[h] += w0[off + h];
+      if (KING_BUCKETS) {
+        const offk = (kbase + kind) * H0;
+        for (let h = 0; h < H0; h++) acc[h] += w0[offk + h];
+      }
+    }
+    for (let h = 0; h < H0; h++) { const v = acc[h]; if (v < 0) acc[h] = 0; } // ReLU (scale QA)
+    return acc;
+  }
+
+  // Final scalar head from a clipped activation buffer: integer dot product, then
+  // dequantize (÷ QW·QA) and squash. Shared by both shapes.
+  function head(act, dim) {
+    const Lf = layers[layers.length - 1];
+    const wf = Lf.w;
+    let pre = Lf.b[0];
+    for (let i = 0; i < dim; i++) pre += act[i] * wf[i];
+    return Math.round(Math.tanh(pre / (QW * QA)) * scale);
+  }
+
+  if (layers.length === 2) {
+    return (board, turn) => head(inputLayer(board, turn), H0);
+  }
+
+  // Deeper nets: dense layers with requantization (÷ QW) + clipped ReLU between them.
+  let widest = H0;
+  for (const L of layers) widest = Math.max(widest, L.b.length);
+  const bufA = new Float64Array(widest);
+  const bufB = new Float64Array(widest);
+  return (board, turn) => {
+    const a0 = inputLayer(board, turn);
+    let act = bufA; act.set(a0.subarray(0, H0)); let dim = H0;
+    for (let li = 1; li < layers.length - 1; li++) {
+      const L = layers[li];
+      const w = L.w, outDim = L.b.length;
+      const next = act === bufA ? bufB : bufA;
+      next.set(L.b.subarray(0, outDim));
+      for (let i = 0; i < dim; i++) {
+        const a = act[i];
+        if (a === 0) continue;
+        const off = i * outDim;
+        for (let o = 0; o < outDim; o++) next[o] += a * w[off + o];
+      }
+      for (let o = 0; o < outDim; o++) { const v = next[o]; next[o] = v <= 0 ? 0 : Math.floor(v / QW); } // ReLU + requant
+      act = next; dim = outDim;
+    }
+    return head(act, dim);
   };
 }
 

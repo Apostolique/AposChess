@@ -43,6 +43,10 @@ const QDEPTH: i32 = 6;
 const DELTA_MARGIN: i32 = 200;
 const MOB = 3;
 
+// When true, every incremental-accumulator eval is cross-checked against a from-scratch
+// recompute and a mismatch panics — flip on to catch accumulator desync in parity/bench.
+const ACC_DEBUG = false;
+
 const EXACT: u8 = 0;
 const LOWER: u8 = 1;
 const UPPER: u8 = 2;
@@ -106,6 +110,13 @@ pub const Searcher = struct {
     eval_kind: EvalKind,
     eval_key: u64,
     net: ?*const nn.Net,
+    // Incremental NNUE accumulators (raw, pre-clip), maintained through make/unmake when
+    // the selected net is quantized — one per fixed perspective (us = white / us = black).
+    // The leaf eval reads the side-to-move one (see evalNn). Float nets recompute instead.
+    acc_white: [1024]i64 = undefined,
+    acc_black: [1024]i64 = undefined,
+    nn_h0: usize = 0, // first-layer width (accumulator size); 0 when not incremental
+    nn_inc: bool = false, // eval_kind == .nn and the net is quantized
     // Optional so the wasm/freestanding build (no Io) can run fixed-depth searches.
     io: ?std.Io,
     // Time + stats + variety. deadline_ns == maxInt means "no time limit" and the
@@ -135,6 +146,8 @@ pub const Searcher = struct {
                 .handcrafted3 => 0x2545f4914f6cdd1d,
             },
             .net = net,
+            .nn_inc = eval_kind == .nn and net != null and net.?.is_int,
+            .nn_h0 = if (eval_kind == .nn and net != null and net.?.is_int) nn.h0(net.?) else 0,
             .prng = std.Random.DefaultPrng.init(seed),
         };
         @memset(s.tt_gen, 0);
@@ -158,8 +171,57 @@ pub const Searcher = struct {
         return switch (self.eval_kind) {
             .handcrafted => eval.evalStm(b, turn),
             .handcrafted3 => eval.evalStmV3(b, turn),
-            .nn => nn.evaluate(self.net.?, b, turn),
+            .nn => self.evalNn(b, turn),
         };
+    }
+
+    // nn eval at a leaf: a quantized net reads the maintained side-to-move accumulator
+    // (the incremental fast path); a float net recomputes from scratch as before.
+    fn evalNn(self: *Searcher, b: *const [64]?Piece, turn: Color) i32 {
+        const net = self.net.?;
+        if (!self.nn_inc) return nn.evaluate(net, b, turn);
+        const acc = if (turn == .white) self.acc_white[0..self.nn_h0] else self.acc_black[0..self.nn_h0];
+        const v = nn.evalFromAcc(net, acc);
+        if (ACC_DEBUG) {
+            const ref = nn.evaluate(net, b, turn);
+            if (ref != v) std.debug.panic("nn accumulator desync: incremental={d} from-scratch={d}", .{ v, ref });
+        }
+        return v;
+    }
+
+    // make/unmake that also keep the NNUE accumulators in sync (quantized net only).
+    // The deltas are read from the PRE-move board: on make that's the live board before
+    // engine.makeMove; on unmake it's the board engine.unmakeMove just restored.
+    fn nnMake(self: *Searcher, state: *State, m: Move) engine.Undo {
+        if (self.nn_inc) self.accApplyMove(&state.board, m, true);
+        return engine.makeMove(state, m);
+    }
+    fn nnUnmake(self: *Searcher, state: *State, m: Move, u: engine.Undo) void {
+        engine.unmakeMove(state, m, u);
+        if (self.nn_inc) self.accApplyMove(&state.board, m, false);
+    }
+
+    // Apply (add=true) or reverse (add=false) move m's piece deltas to both accumulators.
+    // Mirrors engine.makeMove's board edits exactly: moved piece leaves `from` and (with
+    // promotion) arrives at `to`, any captured piece leaves `to`, and a castle hops the rook.
+    fn accApplyMove(self: *Searcher, b: *const [64]?Piece, m: Move, add: bool) void {
+        const net = self.net.?;
+        const accw = self.acc_white[0..self.nn_h0];
+        const accb = self.acc_black[0..self.nn_h0];
+        const moved = b[m.from].?;
+        const color = moved.color;
+        nn.accAddPiece(net, accw, accb, moved.role, color, m.from, !add); // leaves from
+        const placed_role = m.promotion orelse moved.role;
+        nn.accAddPiece(net, accw, accb, placed_role, color, m.to, add); // arrives at to
+        if (b[m.to]) |cap| nn.accAddPiece(net, accw, accb, cap.role, cap.color, m.to, !add); // captured leaves to
+        if (m.castle != 0) {
+            const home: usize = if (color == .white) 0 else 56;
+            const rf: usize = if (m.castle == 'K') home + 7 else home + 0;
+            const rt: usize = if (m.castle == 'K') home + 5 else home + 3;
+            const rook = b[rf].?;
+            nn.accAddPiece(net, accw, accb, rook.role, rook.color, rf, !add);
+            nn.accAddPiece(net, accw, accb, rook.role, rook.color, rt, add);
+        }
     }
 
     // Invalidate every TT entry cheaply (no realloc) — used by the puzzle miner between
@@ -263,9 +325,9 @@ pub const Searcher = struct {
             if (moves.len == 0) return -MATE;
             self.orderMoves(moves.items[0..moves.len], &state.board, 0, 0);
             for (moves.slice()) |m| {
-                const u = engine.makeMove(state, m);
+                const u = self.nnMake(state, m);
                 const score = -self.qsearch(state, -beta, -alpha, qdepth - 1);
-                engine.unmakeMove(state, m, u);
+                self.nnUnmake(state, m, u);
                 if (score > best) best = score;
                 if (best > alpha) alpha = best;
                 if (alpha >= beta) break;
@@ -289,14 +351,14 @@ pub const Searcher = struct {
                     if (stand_pat + eval.value(victim.role) + DELTA_MARGIN <= alpha) continue;
                 }
             }
-            const u = engine.makeMove(state, m);
+            const u = self.nnMake(state, m);
             if (engine.kingAttacked(&state.board, mover)) { // illegal: mover left in check
-                engine.unmakeMove(state, m, u);
+                self.nnUnmake(state, m, u);
                 continue;
             }
             saw_legal = true;
             const score = -self.qsearch(state, -beta, -alpha, qdepth - 1);
-            engine.unmakeMove(state, m, u);
+            self.nnUnmake(state, m, u);
             if (score > best) best = score;
             if (best > alpha) alpha = best;
             if (alpha >= beta) break;
@@ -392,7 +454,7 @@ pub const Searcher = struct {
             move_count += 1;
             const child_hash = if (self.tt_enabled) zobrist.hashAfter(hash, state, m) else 0;
             const quiet = !m.capture and m.promotion == null and !m.jump;
-            const u = engine.makeMove(state, m);
+            const u = self.nnMake(state, m);
             var score: i32 = undefined;
             var s_tainted: bool = undefined;
             if (move_count == 1) {
@@ -411,7 +473,7 @@ pub const Searcher = struct {
                     s_tainted = self.tainted;
                 }
             }
-            engine.unmakeMove(state, m, u);
+            self.nnUnmake(state, m, u);
             if (score > best) {
                 best = score;
                 best_key = keyOf(m);
@@ -500,6 +562,9 @@ pub const Searcher = struct {
         var completed: u32 = 0;
         var root_score: i32 = 0;
         var work = state.*; // one copy; the search make/unmakes it and restores to root
+        // Seed the NNUE accumulators from the root; the search keeps them in sync through
+        // make/unmake, so they're valid at every leaf (rebuilt fresh per chooseMove call).
+        if (self.nn_inc) nn.accRefresh(self.net.?, self.acc_white[0..self.nn_h0], self.acc_black[0..self.nn_h0], &work.board);
 
         const depth_cap = @min(max_depth, 99);
         var depth: u32 = 1;
@@ -514,7 +579,7 @@ pub const Searcher = struct {
             for (root.slice()) |m| {
                 move_count += 1;
                 const child_hash = zobrist.hashAfter(root_hash, state, m);
-                const u = engine.makeMove(&work, m);
+                const u = self.nnMake(&work, m);
                 var score: i32 = undefined;
                 if (move_count == 1) {
                     score = -self.search(&work, d, -INF, -alpha, 1, true, child_hash);
@@ -522,7 +587,7 @@ pub const Searcher = struct {
                     score = -self.search(&work, d, -alpha - 1, -alpha, 1, true, child_hash);
                     if (score > alpha) score = -self.search(&work, d, -INF, -alpha, 1, true, child_hash);
                 }
-                engine.unmakeMove(&work, m, u);
+                self.nnUnmake(&work, m, u);
                 if (self.timeUp()) {
                     aborted = true;
                     break;
