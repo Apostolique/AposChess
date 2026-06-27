@@ -1,77 +1,75 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2019-2026 Jean-David Moisan
 //
-// Self-relative Elo for an Elo-vs-search-depth curve (Bradley-Terry / BayesElo-style).
+// Self-relative engine ranking — ONE Bradley-Terry / BayesElo rating pool (no modes).
 //
-// The anchor approach (rank-engines.mjs / depth-sweep.mjs) measures every engine against
-// ONE fixed reference. That floors the far end of a wide range: a contender >~400 Elo from
-// the anchor scores ~0%/100%, which carries no information no matter how many games you
-// play. The fix is to stop measuring against a fixed point and instead let competitors
-// play EACH OTHER near their own strength, then recover all ratings with one joint fit.
-// Every node only ever plays near-strength opponents (scores stay in the informative
-// 30-70% band), and the whole range is stitched onto one scale by transitivity. As games
-// accumulate, EVERY rating tightens — not just one matchup. The anchor, if present at all,
-// is just another competitor; with none, the scale is mean-centered.
+// The anchor approach (rank-engines.mjs) measures every engine against ONE fixed reference.
+// That floors the far end of a wide range: a contender >~400 Elo from the anchor scores
+// ~0%/100%, which carries no information no matter how many games you play (and the champions
+// are now far above the hc anchor, so the gauntlet saturates). The fix: stop measuring against
+// a fixed point — let engines play EACH OTHER near their own strength, then recover all ratings
+// with one joint fit. Every node only ever plays near-strength opponents (scores stay in the
+// informative 30-70% band), and the whole range is stitched onto one scale by transitivity. As
+// games accumulate, EVERY rating tightens.
 //
-// Competitors here are the SAME net at several depths (apos-match plays one weights file
-// against itself via --depth/--depth-b), optionally plus stable hc@D references. The store
-// persists pairwise results, so re-running ACCUMULATES games and re-fits everything.
+// A node is an (engine, depth) pair: apos-match plays one weights file against another (or
+// itself) via --depth/--depth-b. hc<anchor-depth> (hc6) is ALWAYS a node and is the pin
+// (Elo := 0), so every pool — all engines, or one net's depth sweep — lands on the SAME stable
+// scale. So there is no separate "depth curve" mode: a curve is just the ledger filtered to one
+// net's nodes. The store persists pairwise results, so re-running ACCUMULATES games.
 //
-// Method: Bradley-Terry, fit by the MM algorithm (Hunter 2004) — monotone, no matrix
-// inversion. Draws score as half a point each side (consistent with the codebase's
-// eloFromScore logistic model). A mild prior (virtual draws vs an even phantom) keeps
-// early/sparse rounds from diverging. Per-node 95% CIs come from the Fisher information.
+// Output is the ledger (engine-elo.*.json), the same schema rank-engines.mjs emits, so
+// refresh-v/merge can read it. The ACTIVE scheduler targets the RANKING objective — each step
+// it plays the matchup whose ORDERING is currently most ambiguous (P(mis-order) from the full
+// Bradley-Terry covariance), with periodic rigidity cross-links. Runs until stopped (q/Ctrl-C),
+// --minutes, or --matchups; persists every matchup (lossless overnight stop/start).
 //
-// Usage (run from web/):
-//   node scripts/depth-ladder.mjs [options]
-//   npm run rank:ladder -- [options]
+// Method: Bradley-Terry, fit by the MM algorithm (Hunter 2004) — monotone, no matrix inversion.
+// Draws score as half a point each side (consistent with the codebase's eloFromScore logistic
+// model). A mild prior (virtual draws vs an even phantom) regularizes sparse pools. 95% CIs +
+// the scheduler's contrast variances come from the full Fisher-information covariance.
 //
-// Two modes:
-//   (default) DEPTH CURVE — one net at several depths -> depth,elo CSV.
-//   --rank    ENGINE RANKING — all instantiable engines (hc + champion + archived
-//             champions [+ material]) at --depths, pinned to hc<anchor-depth>, emitting the
-//             same ledger schema as rank-engines.mjs (engine-elo.json) so refresh-v/merge
-//             can read it. The pool replacement for the anchor gauntlet: champions play
-//             near-strength neighbors instead of a now-saturating single anchor.
+// Usage (run from web/):  node scripts/depth-ladder.mjs [options]  |  npm run rank:pool -- [options]
+// Zero-arg `npm run rank:pool` ranks all engines at depths 6,8, pinned hc6, until you stop it.
 //
 // Options:
-//   --rank          engine-ranking mode (see above). Default off (depth-curve mode).
-//   --net=SPEC      (depth-curve) net to curve: 'champion' (default = src/nn-weights.json),
-//                   a champion content hash, or an archived champion filename/path.
-//   --depths=LIST   depths to rate: range (2-10) or list (2,4,6,8). Default 2-10 (curve), 6,8 (--rank).
-//   --hc=LIST       (depth-curve) also include handcrafted references at these depths.
-//   --anchor-depth=D (--rank) hc depth pinned to Elo 0 (default 6) — must be in --depths.
-//   --no-material   (--rank) skip the nn material fallback node (it's the floor reference).
-//   --pin=ID        fix this competitor at Elo 0 (e.g. hc6). Default: hc<anchor-depth> in
-//                   --rank, else the deepest hc node, else mean-centered.
-//   --rounds=N      scheduling rounds per invocation (re-fit + re-pair between each). Default 1.
-//                   0 = play nothing; just merge/refit the existing store and emit (offline).
-//   --merge=F[,F]   fold pool stores from other machines into this one before fitting (pairwise
-//                   counts are additive). Requires the SAME node set and DISTINCT --seed per
-//                   machine. Combine with --rounds=0 for a pure offline merge+refit.
-//   --games=N       games per matchup per round (even; default 100). Re-running accumulates.
+//   --engines=SPEC  which engines: 'all' (default = hc + champion + archived champions
+//                   [+ material]) or a comma list of specs (content hash/prefix, archived
+//                   filename/path, 'champion', 'hc', 'material'). hc<anchor-depth> is added
+//                   regardless. --net=X is shorthand for --engines=X (one net's depth sweep).
+//   --depths=LIST   depths to rate each engine at: range (1-8) or list (6,8). Default 6,8.
+//   --anchor-depth=D  the hc depth that is the pin / Elo 0 (default 6). Always present as a node.
+//   --no-material   skip the nn material fallback node (otherwise included as the floor).
+//   --minutes=M     play for M minutes, then finalize. Omit to run until you stop it (q/Ctrl-C).
+//   --matchups=N    stop after N matchups (default unlimited).
+//   --rounds=0      play nothing; just merge/refit the existing store and emit (offline).
+//   --merge=F[,F]   fold pool stores from other machines in before fitting (pairwise counts are
+//                   additive). Requires the SAME node set and DISTINCT --seed per machine.
+//   --games=N       games per matchup (even; default 100). Re-running accumulates.
 //   --prior=P       virtual draws vs an even phantom, per node (regularizer). Default 1.
 //   --jobs=N        parallel game workers (default: CPU cores).
 //   --openings=K    random opening plies per game (default 6).
 //   --maxmoves=N    draw adjudication ply cap (default 200).
 //   --seed=S        base seed (default 1). The store advances a seed cursor so accumulated
 //                   re-runs never replay identical games.
-//   --store=FILE    pairwise-results store (default loop/depth-ladder.json | loop/ladder-pool.json).
-//   --ledger=FILE   (--rank) ledger output (default loop/engine-elo.ladder.json — a PARALLEL
-//                   ledger, NOT the live engine-elo.json, so it can be A/B'd safely).
-//   --data=FILE     (--rank) dataset to scan for record counts (default selfplay.jsonl). --no-scan skips.
-//   --csv=FILE      (depth-curve) CSV output (default loop/depth-ladder.csv).
+//   --store=FILE    pairwise-results store (default loop/ladder-pool.json — one shared pool).
+//   --ledger=FILE   ledger output (default loop/engine-elo.ladder.json — a PARALLEL ledger,
+//                   NOT the live engine-elo.json, so it can be A/B'd safely).
+//   --data=FILE     dataset to scan for record counts (default selfplay.jsonl). --no-scan skips.
+//   --csv=FILE      also write a flat engine,version,depth,elo,ci95,games CSV (for plotting a
+//                   depth curve — filter to one version). Off unless given.
 //   --save-games[=F]  harvest the games as training data (default OFF).
 //   --fresh         discard any existing store and start the pool from scratch.
 
 import { spawnSync } from 'node:child_process';
-import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync, readdirSync, createReadStream } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync, readdirSync, createReadStream, statSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { cpus } from 'node:os';
 
 import { weightsHash } from './vtag.mjs';
+import { installStop, printStopHint } from './stop.mjs';
 import { HC_VERSION } from '../src/ai.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -96,106 +94,90 @@ function parseDepths(spec, dflt) {
   return s.split(',').map((x) => Number(x.trim())).filter((x) => Number.isInteger(x) && x > 0);
 }
 
-// Two modes share one pool/fit core:
-//   default (depth-curve): nodes = ONE net at several --depths.
-//   --rank: nodes = ALL instantiable engines (hc + champion + archived champions
-//           [+ material]) at --depths — the ledger-emitting replacement for the anchor
-//           gauntlet (rank-engines.mjs), pinned to hc<anchor-depth> for a stable scale.
-const RANK_MODE = !!args.rank;
+// ONE rating pool — no modes. Nodes are (engine, depth) pairs; hc<anchor-depth> (hc6 by
+// default) is ALWAYS a node and is the pin (Elo := 0), so every pool — all engines, or one
+// net's depth sweep — lands on the same stable scale. Pick the engines with --engines (default
+// 'all') or --net=X (one net); --depths sets the depths. The ledger is the single artifact: a
+// "depth curve" is just the ledger filtered to one net, so there's no separate mode to maintain.
 const cfg = {
-  net: typeof args.net === 'string' ? args.net : 'champion',
-  depths: parseDepths(args.depths, RANK_MODE ? [6, 8] : [2, 3, 4, 5, 6, 7, 8, 9, 10]),
-  hc: parseDepths(args.hc, []),
-  pin: typeof args.pin === 'string' ? args.pin : null,
-  anchorDepth: num(args['anchor-depth'], 6), // hc depth pinned to 0 in --rank mode
-  material: RANK_MODE && !args['no-material'],
+  // 'all' = hc + current champion + every archived champion [+ material]; or a comma list of
+  // specs (a content hash/prefix, an archived filename/path, 'champion', 'hc', 'material').
+  // --net=X is shorthand for --engines=X.
+  engines: typeof args.net === 'string' ? args.net : (typeof args.engines === 'string' ? args.engines : 'all'),
+  depths: parseDepths(args.depths, [6, 8]),
+  anchorDepth: num(args['anchor-depth'], 6), // the hc depth that is the pin (Elo := 0)
+  material: !args['no-material'],
   // Pool stores from other machines to fold in before fitting (pairwise counts are additive).
   // Each MUST come from a distinct --seed (else identical games would be double-counted).
   merge: typeof args.merge === 'string' ? args.merge.split(',').map((s) => resolve(process.cwd(), s.trim())).filter(Boolean) : [],
   rounds: Math.max(0, num(args.rounds, 1)), // 0 = don't play; just merge/refit and emit (offline)
-
+  // ACTIVE scheduler: play until --minutes elapse / --matchups are played / the user stops
+  // (q or Ctrl-C). Defaults run until stopped — built for overnight.
+  minutes: args.minutes !== undefined ? Number(args.minutes) : null,
+  matchups: args.matchups !== undefined ? Number(args.matchups) : Infinity,
   games: Math.max(2, Math.round(num(args.games, 100) / 2) * 2),
   prior: num(args.prior, 1),
   jobs: args.jobs !== undefined ? Number(args.jobs) : cpus().length,
   openings: num(args.openings, 6),
   maxmoves: num(args.maxmoves, 200),
   seed: num(args.seed, 1),
-  scan: RANK_MODE && !args['no-scan'],
+  scan: !args['no-scan'],
   data: typeof args.data === 'string' ? resolve(process.cwd(), args.data) : join(dataDir, 'selfplay.jsonl'),
-  store: typeof args.store === 'string' ? resolve(process.cwd(), args.store)
-    : join(loopDir, RANK_MODE ? 'ladder-pool.json' : 'depth-ladder.json'),
+  store: typeof args.store === 'string' ? resolve(process.cwd(), args.store) : join(loopDir, 'ladder-pool.json'),
   ledger: typeof args.ledger === 'string' ? resolve(process.cwd(), args.ledger) : join(loopDir, 'engine-elo.ladder.json'),
-  csv: typeof args.csv === 'string' ? resolve(process.cwd(), args.csv) : join(loopDir, 'depth-ladder.csv'),
+  csv: typeof args.csv === 'string' ? resolve(process.cwd(), args.csv) : null, // opt-in flat dump for plotting
   saveGames: args['save-games'],
   fresh: !!args.fresh,
 };
 
-// --- resolve the net to a weights file + version hash (depth-curve mode) --------
-function resolveNet(spec) {
+// --- resolve an engine spec to { eng, eval, weights, version } ------------------
+function makeEngine(spec) {
+  if (spec === 'hc' || spec === 'handcrafted') return { eng: 'hc', eval: 'handcrafted', weights: null, version: String(HC_VERSION) };
+  if (spec === 'material') return { eng: 'nn', eval: 'nn', weights: null, version: '?' };
   if (spec === 'champion') {
     if (!existsSync(champion)) { console.error(`No champion at ${champion}.`); process.exit(1); }
-    return { file: champion, version: weightsHash(champion) };
+    return { eng: 'nn', eval: 'nn', weights: champion, version: weightsHash(champion) };
   }
-  const cand = [
-    join(championsDir, spec.endsWith('.json') ? spec : `${spec}.json`),
-    resolve(process.cwd(), spec),
-  ].find(existsSync);
+  const cand = [join(championsDir, spec.endsWith('.json') ? spec : `${spec}.json`), resolve(process.cwd(), spec)].find(existsSync);
   if (!cand) { console.error(`Could not find net '${spec}' (champion archive or path).`); process.exit(1); }
-  return { file: cand, version: weightsHash(cand) };
+  return { eng: 'nn', eval: 'nn', weights: cand, version: weightsHash(cand) };
 }
-
-// --- enumerate the instantiable engines (--rank mode) --------------------------
-// Mirrors rank-engines.mjs: handcrafted, the current champion, every archived champion,
-// and (optionally) the nn material fallback. Deduped by eng@version.
-function instantiableEngines() {
-  const list = [{ eng: 'hc', eval: 'handcrafted', weights: null, version: String(HC_VERSION) }];
-  if (existsSync(champion)) list.push({ eng: 'nn', eval: 'nn', weights: champion, version: weightsHash(champion) });
+function allEngines() {
+  const list = [makeEngine('hc')];
+  if (existsSync(champion)) list.push(makeEngine('champion'));
   else console.warn(`(no champion at ${champion} — skipping it)`);
-  if (existsSync(championsDir)) {
-    for (const f of readdirSync(championsDir).filter((f) => f.endsWith('.json'))) {
-      const file = join(championsDir, f);
-      list.push({ eng: 'nn', eval: 'nn', weights: file, version: weightsHash(file) });
-    }
-  }
-  if (cfg.material) list.push({ eng: 'nn', eval: 'nn', weights: null, version: '?' }); // material fallback (floor)
-  const seen = new Set();
-  return list.filter((e) => { const k = `${e.eng}@${e.version}`; if (seen.has(k)) return false; seen.add(k); return true; });
+  if (existsSync(championsDir)) for (const f of readdirSync(championsDir).filter((f) => f.endsWith('.json'))) list.push(makeEngine(f));
+  if (cfg.material) list.push(makeEngine('material'));
+  return list;
 }
 
-let netFile, version;
-if (!RANK_MODE) ({ file: netFile, version } = resolveNet(cfg.net));
+// Selected engines + the ALWAYS-included handcrafted, deduped by eng@version. hc is a full
+// participant at EVERY --depth (near-strength anchor points connecting every depth band to the
+// scale), and hc<anchor-depth> (hc6) is the pin. So even a single-net sweep is tied to the
+// stable scale at each depth, not just reaching down from hc6.
+let engines = cfg.engines === 'all' ? allEngines()
+  : cfg.engines.split(',').map((s) => s.trim()).filter(Boolean).map(makeEngine);
+if (!engines.some((e) => `${e.eng}@${e.version}` === `hc@${HC_VERSION}`)) engines.push(makeEngine('hc'));
+{ const seen = new Set(); engines = engines.filter((e) => { const k = `${e.eng}@${e.version}`; if (seen.has(k)) return false; seen.add(k); return true; }); }
 
 // --- competitors (nodes of the rating pool) ------------------------------------
 // Each node is an (engine, depth) pair; id is its `vs`-tag (stable across runs, the store
 // key AND the ledger tag): nn<d>@<ver> / hc<d>@<HC_VERSION> / nn<d>@? (material).
+const node = (e, d) => ({ id: `${e.eng}${d}@${e.version}`, eng: e.eng, eval: e.eval, weights: e.weights, version: e.version, depth: d });
 const competitors = [];
-if (RANK_MODE) {
-  for (const e of instantiableEngines())
-    for (const d of cfg.depths) competitors.push({ id: `${e.eng}${d}@${e.version}`, eng: e.eng, eval: e.eval, weights: e.weights, version: e.version, depth: d });
-} else {
-  for (const d of cfg.depths) competitors.push({ id: `nn${d}@${version}`, eng: 'nn', eval: 'nn', weights: netFile, version, depth: d });
-  for (const d of cfg.hc) competitors.push({ id: `hc${d}@${HC_VERSION}`, eng: 'hc', eval: 'handcrafted', weights: null, version: String(HC_VERSION), depth: d });
-}
-if (competitors.length < 2) { console.error('Need at least 2 competitors.'); process.exit(1); }
+for (const e of engines) for (const d of cfg.depths) competitors.push(node(e, d));
+// The pin node hc<anchor-depth> is ALWAYS present, even if anchor-depth ∉ --depths.
+const pinId = `hc${cfg.anchorDepth}@${HC_VERSION}`;
+if (!competitors.some((c) => c.id === pinId)) competitors.push(node(makeEngine('hc'), cfg.anchorDepth));
+if (competitors.length < 2) { console.error('Need at least 2 nodes (engines × depths).'); process.exit(1); }
 const byId = new Map(competitors.map((c) => [c.id, c]));
 
-// pin target (Elo := 0). --rank: hc at --anchor-depth (the stable yardstick, reproducing
-// the gauntlet's hc<anchorDepth>@<HC_VERSION> anchor so the scale stays comparable). Else
-// explicit --pin, else the deepest hc node, else null (mean-centered).
-let pinId = cfg.pin;
-if (pinId && !byId.has(pinId)) { console.error(`--pin '${pinId}' is not a competitor. Have: ${[...byId.keys()].join(', ')}`); process.exit(1); }
-if (!pinId && RANK_MODE) {
-  pinId = `hc${cfg.anchorDepth}@${HC_VERSION}`;
-  if (!byId.has(pinId)) { console.error(`--rank pins ${pinId} but it isn't a node; include depth ${cfg.anchorDepth} in --depths (or set --anchor-depth/--pin).`); process.exit(1); }
-}
-if (!pinId) { const hcNodes = competitors.filter((c) => c.eng === 'hc'); if (hcNodes.length) pinId = hcNodes.sort((a, b) => b.depth - a.depth)[0].id; }
-
 // --- persistent pairwise store -------------------------------------------------
-// pairs: { "idA|idB" (sorted): { games, sumA } } where sumA = points scored by idA.
-// `pool` identifies the node set so a config change doesn't silently mix incompatible
-// pools; in --rank mode the pool spans many engines (keyed 'rank'), not one net.
+// pairs: { "idA|idB" (sorted): { games, sumA } } where sumA = points scored by idA. One shared
+// store ('rank') accumulates ALL pool games — any run fits only its own node subset, so a
+// single-net depth sweep and the full ledger pool feed the same body of knowledge.
 mkdirSync(loopDir, { recursive: true });
-const poolId = RANK_MODE ? 'rank' : version;
+const poolId = 'rank';
 let store = { net: poolId, seedCursor: cfg.seed, pairs: {} };
 if (!cfg.fresh && existsSync(cfg.store)) {
   try {
@@ -263,14 +245,86 @@ function fit() {
   }
   const elo = new Map(ids.map((id) => [id, 400 * Math.log10(gamma.get(id))]));
   if (pinId) { const off = elo.get(pinId); for (const id of ids) elo.set(id, elo.get(id) - off); }
-  // 95% CI from Fisher information in beta = ln(gamma): Var(beta_i) ~ 1/I_i (diagonal approx).
-  const ci = new Map();
-  for (const id of ids) {
-    let I = cfg.prior * 0.25; // phantom contributes p0(1-p0)=0.25 at parity
-    for (const { opp, N } of adj.get(id)) { const p = gamma.get(id) / (gamma.get(id) + gamma.get(opp)); I += N * p * (1 - p); }
-    ci.set(id, I > 0 ? 1.96 * (400 / Math.LN10) / Math.sqrt(I) : null);
+  // Full covariance from the Fisher information matrix H (beta = ln gamma): H_ii = phantom
+  // self-anchor + Σ_j N_ij·p_ij(1−p_ij), H_ij = −N_ij·p_ij(1−p_ij). The prior on the diagonal
+  // makes H positive-definite (invertible) even on a sparse/tree graph, so we can read off the
+  // variance of ANY rating contrast — exactly what the active scheduler needs to find the
+  // least-resolved ordering. (The old diagonal-only approximation ignored correlations.)
+  const n = ids.length;
+  const pos = new Map(ids.map((id, k) => [id, k]));
+  const H = Array.from({ length: n }, () => new Float64Array(n));
+  for (let k = 0; k < n; k++) H[k][k] = cfg.prior * 0.25; // phantom self-anchor (p(1−p)=0.25 at parity)
+  for (const [key, v] of Object.entries(store.pairs)) {
+    const [i, j] = key.split('|');
+    if (!pos.has(i) || !pos.has(j)) continue;
+    const gi = gamma.get(i), gj = gamma.get(j);
+    const w = v.games * (gi * gj) / ((gi + gj) * (gi + gj)); // N·p(1−p)
+    const a = pos.get(i), b = pos.get(j);
+    H[a][a] += w; H[b][b] += w; H[a][b] -= w; H[b][a] -= w;
   }
-  return { elo, ci, gamesOf: (id) => adj.get(id).reduce((s, e) => s + e.N, 0) };
+  const S = invSym(H, n);
+  const C = (400 / Math.LN10) ** 2; // beta-variance -> Elo-variance
+  const cov = (a, b) => S[pos.get(a)][pos.get(b)];
+  // Var of the Elo difference between two nodes (Elo²) — the scheduler's currency.
+  const varDiff = (a, b) => (a === b ? 0 : C * (cov(a, a) + cov(b, b) - 2 * cov(a, b)));
+  const ci = new Map(ids.map((id) => [id, 1.96 * Math.sqrt(Math.max(0, pinId ? varDiff(id, pinId) : C * cov(id, id)))]));
+  return { elo, ci, varDiff, gamesOf: (id) => adj.get(id).reduce((s, e) => s + e.N, 0) };
+}
+
+// Gauss-Jordan inverse of a symmetric positive-definite matrix (n small: ~node count).
+function invSym(A, n) {
+  const M = A.map((r) => Float64Array.from(r));
+  const I = Array.from({ length: n }, (_, k) => { const r = new Float64Array(n); r[k] = 1; return r; });
+  for (let col = 0; col < n; col++) {
+    let piv = col;
+    for (let r = col + 1; r < n; r++) if (Math.abs(M[r][col]) > Math.abs(M[piv][col])) piv = r;
+    if (Math.abs(M[piv][col]) < 1e-12) continue; // ~singular (prior should prevent); skip
+    if (piv !== col) { const t = M[piv]; M[piv] = M[col]; M[col] = t; const u = I[piv]; I[piv] = I[col]; I[col] = u; }
+    const d = M[col][col];
+    for (let c = 0; c < n; c++) { M[col][c] /= d; I[col][c] /= d; }
+    for (let r = 0; r < n; r++) {
+      if (r === col) continue;
+      const f = M[r][col]; if (f === 0) continue;
+      for (let c = 0; c < n; c++) { M[r][c] -= f * M[col][c]; I[r][c] -= f * I[col][c]; }
+    }
+  }
+  return I;
+}
+
+// Standard normal CDF (Abramowitz-Stegun 7.1.26 erf) — P(mis-ordered) for a standardized gap.
+function erf(x) {
+  const s = x < 0 ? -1 : 1; x = Math.abs(x);
+  const t = 1 / (1 + 0.3275911 * x);
+  const y = 1 - (((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t) * Math.exp(-x * x);
+  return s * y;
+}
+const ncdf = (x) => 0.5 * (1 + erf(x / Math.SQRT2));
+
+// Active scheduler for the RANKING objective: pick the matchup that most reduces ordering
+// uncertainty. Score each rank-adjacent pair by P(mis-ordered) = Φ(−|Δ|/σ_Δ); play the worst.
+// Every 6th pick (or once all orderings are sharp) play the least-constrained near-strength
+// contrast instead, to keep the graph rigid and catch transitivity errors.
+function pickMatchup(elo, varDiff, iter) {
+  const sorted = [...competitors].sort((a, b) => elo.get(a.id) - elo.get(b.id));
+  let best = null, bestAmb = -1;
+  for (let k = 0; k < sorted.length - 1; k++) {
+    const a = sorted[k], b = sorted[k + 1];
+    const d = Math.abs(elo.get(a.id) - elo.get(b.id));
+    const sd = Math.sqrt(Math.max(varDiff(a.id, b.id), 1e-9));
+    const amb = ncdf(-d / sd);
+    if (amb > bestAmb) { bestAmb = amb; best = [a, b]; }
+  }
+  if (iter % 6 === 5 || bestAmb < 0.02) {
+    let rb = null, rv = -1;
+    for (let i = 0; i < competitors.length; i++) for (let j = i + 1; j < competitors.length; j++) {
+      const a = competitors[i], b = competitors[j];
+      if (Math.abs(elo.get(a.id) - elo.get(b.id)) > 300) continue; // keep p(1−p) meaningful
+      const v = varDiff(a.id, b.id);
+      if (v > rv) { rv = v; rb = [a, b]; }
+    }
+    if (rb) return { pair: rb, reason: 'rigidity', metric: Math.sqrt(Math.max(0, rv)) };
+  }
+  return { pair: best, reason: 'ordering', metric: bestAmb };
 }
 
 // --- one matchup on apos-match -------------------------------------------------
@@ -299,22 +353,29 @@ function playPair(a, b) {
   catch (e) { console.error(`  could not read result: ${e.message}`); }
 }
 
-// --- round scheduling: pair adjacent-in-current-rating + sparse skip links -----
-function roundPairs(elo) {
-  const sorted = [...competitors].sort((a, b) => (elo.get(a.id) ?? a.depth * 100) - (elo.get(b.id) ?? b.depth * 100));
-  const pairs = [];
-  for (let k = 0; k < sorted.length - 1; k++) pairs.push([sorted[k], sorted[k + 1]]); // near-strength (high info)
-  for (let k = 0; k + 2 < sorted.length; k += 2) pairs.push([sorted[k], sorted[k + 2]]); // rigidity cross-links
-  return pairs;
-}
 
 // --- dataset cross-reference (--rank): record counts + unrecoverable tags ------
 // Same read-only regex scan as rank-engines.mjs, so the emitted ledger carries the same
 // `records` / `unrecoverable` fields the report and downstream tooling expect.
 const tagCounts = new Map();
 let totalLines = 0, noV = 0, legacyNoTag = 0;
+const scanCacheFile = join(loopDir, 'ladder-scan-cache.json');
 async function scanDataset() {
   if (!cfg.scan || !existsSync(cfg.data)) { if (cfg.scan) console.warn(`(no dataset at ${cfg.data} — skipping cross-reference)`); return; }
+  // The dataset doesn't change during a ranking run, so cache the scan by file size+mtime —
+  // a no-arg overnight stop/start then doesn't re-read 1 GB on every restart.
+  const st = statSync(cfg.data);
+  if (existsSync(scanCacheFile)) {
+    try {
+      const c = JSON.parse(readFileSync(scanCacheFile, 'utf8'));
+      if (c.file === cfg.data && c.size === st.size && c.mtimeMs === st.mtimeMs) {
+        for (const [t, n] of Object.entries(c.tagCounts)) tagCounts.set(t, n);
+        ({ totalLines, noV, legacyNoTag } = c);
+        console.log(`Using cached dataset scan (${totalLines} lines, ${tagCounts.size} tags).`);
+        return;
+      }
+    } catch { /* stale/unreadable cache -> rescan */ }
+  }
   console.log(`\nScanning ${cfg.data} for vs tags...`);
   try {
     const rl = createInterface({ input: createReadStream(cfg.data), crlfDelay: Infinity });
@@ -326,44 +387,17 @@ async function scanDataset() {
       if (!m) { legacyNoTag++; continue; }
       tagCounts.set(m[1], (tagCounts.get(m[1]) || 0) + 1);
     }
+    writeFileSync(scanCacheFile, JSON.stringify({ file: cfg.data, size: st.size, mtimeMs: st.mtimeMs, totalLines, noV, legacyNoTag, tagCounts: Object.fromEntries(tagCounts) }));
   } catch (e) { console.warn(`  dataset scan interrupted (${e.message}); cross-reference is partial.`); }
 }
 const parseTag = (tag) => { const m = /^(nn|hc)(\d+|t)@(.+)$/.exec(tag); return m ? { eng: m[1], depth: m[2], version: m[3] } : null; };
 
-console.log(`${RANK_MODE ? 'Engine ranking pool' : `Depth ladder: net nn@${version}`}`);
-console.log(`  ${competitors.length} node(s): ${competitors.map((c) => c.id.split('@')[0] + (RANK_MODE ? `@${c.version.slice(0, 6)}` : '')).join(', ')}`);
-console.log(`  pin ${pinId || '(mean-centered)'} | ${cfg.rounds} round(s) x ${cfg.games} games/matchup | store ${cfg.store}`);
-
-if (cfg.rounds === 0) {
-  // Offline: no matches — just persist the (possibly merged) store, refit, and emit.
-  if (cfg.merge.length) writeFileSync(cfg.store, JSON.stringify(store, null, 2) + '\n');
-  console.log('rounds=0: merge/refit only, no games played.');
-} else {
-  buildEngine();
-  for (let round = 1; round <= cfg.rounds; round++) {
-    const { elo } = fit();
-    const pairs = roundPairs(elo);
-    console.log(`\n----- round ${round}/${cfg.rounds}: ${pairs.length} matchups -----`);
-    for (const [a, b] of pairs) playPair(a, b);
-    writeFileSync(cfg.store, JSON.stringify(store, null, 2) + '\n'); // persist after each round
-  }
-}
-await scanDataset();
-
-// --- final fit + report --------------------------------------------------------
-const { elo, ci, gamesOf } = fit();
-const ranked = [...competitors].sort((a, b) => elo.get(a.id) - elo.get(b.id));
-console.log(`\n===== Elo ladder (${pinId ? `${pinId} := 0` : 'mean-centered'}) — weakest first =====`);
-console.log(`  ${'engine'.padEnd(16)} ${'Elo'.padStart(8)} ${'±95'.padStart(6)} ${'games'.padStart(7)}`);
-for (const c of ranked) {
-  const e = elo.get(c.id), m = ci.get(c.id);
-  const label = RANK_MODE ? c.id : c.id.split('@')[0];
-  console.log(`  ${label.padEnd(16)} ${(`${e >= 0 ? '+' : ''}${e.toFixed(0)}`).padStart(8)} ${(m == null ? '' : m.toFixed(0)).padStart(6)} ${String(gamesOf(c.id)).padStart(7)}${c.id === pinId ? '  (pin)' : ''}`);
-}
-
-if (RANK_MODE) {
-  // --- emit the ledger schema (drop-in for rank-engines.mjs's engine-elo.json) --
-  // recordsByVersion: dataset records attributed to each eng@version (any depth).
+// Build + write the ledger (drop-in for rank-engines.mjs's engine-elo.json). Callable
+// periodically (verbose=false) during a long run and once at the end (verbose=true), so the
+// ledger is always reasonably fresh even if the run is killed hard.
+function writeRankLedger(verbose) {
+  const { elo, ci, gamesOf } = fit();
+  const ranked = [...competitors].sort((a, b) => elo.get(a.id) - elo.get(b.id));
   const recordsByVersion = new Map();
   for (const [tag, n] of tagCounts) { const t = parseTag(tag); if (!t) continue; const k = `${t.eng}@${t.version}`; recordsByVersion.set(k, (recordsByVersion.get(k) || 0) + n); }
   const ranking = ranked.map((c) => ({
@@ -372,7 +406,6 @@ if (RANK_MODE) {
     margin: ci.get(c.id) ?? null, games: gamesOf(c.id),
     records: recordsByVersion.get(`${c.eng}@${c.version}`) || 0, recoverable: true, file: c.weights,
   }));
-  // Dataset `vs` tags whose engine we couldn't instantiate -> unrecoverable (weakest).
   const unrecoverable = [];
   if (cfg.scan) {
     for (const [tag, n] of tagCounts) {
@@ -397,25 +430,68 @@ if (RANK_MODE) {
   };
   mkdirSync(dirname(cfg.ledger), { recursive: true });
   writeFileSync(cfg.ledger, JSON.stringify(ledger, null, 2) + '\n');
+  if (!verbose) return;
+  console.log(`\n===== Elo ladder (${pinId} := 0) — weakest first =====`);
+  console.log(`  ${'engine'.padEnd(16)} ${'Elo'.padStart(8)} ${'±95'.padStart(6)} ${'games'.padStart(7)}`);
+  for (const c of ranked) {
+    console.log(`  ${c.id.padEnd(16)} ${(`${elo.get(c.id) >= 0 ? '+' : ''}${elo.get(c.id).toFixed(0)}`).padStart(8)} ${(ci.get(c.id) == null ? '' : ci.get(c.id).toFixed(0)).padStart(6)} ${String(gamesOf(c.id)).padStart(7)}${c.id === pinId ? '  (pin)' : ''}`);
+  }
   if (unrecoverable.length) {
     console.log(`\n  Unrecoverable contributors (no Elo -> weakest, refresh on sight):`);
     for (const u of unrecoverable.slice(0, 12)) console.log(`    ${u.tag.padEnd(16)} ${String(u.records).padStart(10)} records  — ${u.reason}`);
   }
+  // Optional flat CSV (engine,version,depth,elo,ci95,games) for plotting — a derived view of
+  // the ledger (e.g. filter to one version for that net's depth curve), not a separate artifact.
+  if (cfg.csv) {
+    const rows = ['engine,version,depth,elo,ci95,games'];
+    for (const c of [...competitors].sort((a, b) => a.eng.localeCompare(b.eng) || a.version.localeCompare(b.version) || a.depth - b.depth))
+      rows.push([`${c.eng}${c.depth}`, c.version, c.depth, elo.get(c.id).toFixed(1), (ci.get(c.id) ?? '').toString(), gamesOf(c.id)].join(','));
+    writeFileSync(cfg.csv, rows.join('\n') + '\n');
+    console.log(`\nCSV -> ${cfg.csv}`);
+  }
   console.log(`\nLedger -> ${cfg.ledger}  (store ${cfg.store}; re-run to add games and tighten all ratings)`);
   console.log('This is a parallel ledger — point refresh-v/merge at it with --ledger=engine-elo.ladder.json to A/B it against `npm run rank`.');
-} else {
-  // --- depth-curve CSV + Δ/ply (one net, sorted by depth) ----------------------
-  const nnNodes = competitors.filter((c) => c.eng === 'nn').sort((a, b) => a.depth - b.depth);
-  const rows = ['depth,elo,ci95,games'];
-  for (const c of nnNodes) rows.push([c.depth, elo.get(c.id).toFixed(1), (ci.get(c.id) ?? '').toString(), gamesOf(c.id)].join(','));
-  writeFileSync(cfg.csv, rows.join('\n') + '\n');
-  console.log(`\n  depth -> Elo (Δ/ply):`);
-  let prev = null;
-  for (const c of nnNodes) {
-    const e = elo.get(c.id);
-    const dpp = prev ? `  (${e - prev.e >= 0 ? '+' : ''}${((e - prev.e) / (c.depth - prev.d)).toFixed(0)}/ply)` : '';
-    console.log(`    d${c.depth}: ${e >= 0 ? '+' : ''}${e.toFixed(0)}${dpp}`);
-    prev = { e, d: c.depth };
-  }
-  console.log(`\nCSV -> ${cfg.csv}  (store ${cfg.store}; re-run to add games and tighten all ratings)`);
 }
+
+console.log(`Engine ranking pool (active scheduler)`);
+console.log(`  ${competitors.length} node(s): ${competitors.map((c) => `${c.id.split('@')[0]}@${c.version.slice(0, 6)}`).join(', ')}`);
+console.log(`  pin ${pinId} | ${cfg.games} games/matchup | store ${cfg.store}`);
+if (cfg.rounds !== 0) await scanDataset(); // once up front, so the periodic ledger emit has record counts
+
+if (cfg.rounds === 0) {
+  // Offline: no matches — just persist the (possibly merged) store, refit, and emit.
+  if (cfg.merge.length) writeFileSync(cfg.store, JSON.stringify(store, null, 2) + '\n');
+  await scanDataset();
+  console.log('rounds=0: merge/refit only, no games played.');
+} else {
+  // Active scheduler: refit -> pick the most ordering-ambiguous matchup -> play -> persist ->
+  // repeat, until --minutes / --matchups / the user stops it. The store is written after every
+  // matchup (overnight stop/start is lossless — a restart resumes from it), and the ledger is
+  // re-emitted every few matchups so it's never far behind even on a hard kill.
+  const EMIT_EVERY = 5;
+  buildEngine();
+  printStopHint();
+  let stopped = false;
+  const stopper = installStop(() => { if (!stopped) { stopped = true; console.log('\n  Stopping after the current matchup…'); } });
+  const t0 = Date.now();
+  const deadline = cfg.minutes ? t0 + cfg.minutes * 60000 : Infinity;
+  let played = 0;
+  while (!stopped && Date.now() < deadline && played < cfg.matchups) {
+    const { elo, varDiff } = fit();
+    const { pair, reason, metric } = pickMatchup(elo, varDiff, played);
+    if (!pair) break;
+    const [a, b] = pair;
+    const tag = `[${played + 1}${Number.isFinite(cfg.matchups) ? `/${cfg.matchups}` : ''}]`;
+    const why = reason === 'ordering' ? `ordering: P(mis-order) ${(metric * 100).toFixed(0)}%` : `rigidity: ±${metric.toFixed(0)} Elo`;
+    console.log(`\n${tag} ${why} -> ${a.id} vs ${b.id}`);
+    playPair(a, b);
+    writeFileSync(cfg.store, JSON.stringify(store, null, 2) + '\n');
+    played++;
+    if (played % EMIT_EVERY === 0) writeRankLedger(false);
+  }
+  stopper.dispose();
+  console.log(`\nActive ranking: ${played} matchup(s) in ${((Date.now() - t0) / 60000).toFixed(1)} min` +
+    `${stopped ? ' (stopped)' : cfg.minutes && Date.now() >= deadline ? ' (time budget reached)' : ''}.`);
+}
+
+writeRankLedger(true);
