@@ -22,7 +22,7 @@
 //   npm run train:loop -- [options]
 // Options:
 //   --batch=N       games generated per cycle (default 200)
-//   --depth=D       search depth while generating (default 6 — deeper = better labels)
+//   --depth=D       search depth while generating (default 8 — deeper = better labels)
 //   --openings=K    forwarded to gen: starting plies to vary (default: gen's 8)
 //   --opening-topk=N  forwarded to gen: 0 (default) = uniform-random openings; N>=1
 //                   samples among the engine's N best opening moves (sound but varied).
@@ -63,8 +63,8 @@
 //                   selfplay.jsonl via the match runner's --save-games, with the
 //                   search value `v` kept only from the engine the gate proved
 //                   stronger; the next cycle's (incremental) featurize folds them
-//                   in. They're played at --gate-depth, the same depth as generation's
-//                   --depth by default, so the harvested labels match generation quality.
+//                   in. They're played at --gate-depth (default 6), a notch below the
+//                   generation --depth (8); refresh-v walks these labels up over cycles.
 //   --jobs=N        parallel workers for gen + match
 //   --quiet-only    featurize only QUIET positions (drop side-to-move-in-check and
 //                   positions with a winning capture available). NNUE is a static eval
@@ -78,8 +78,8 @@
 //                   is unchanged, so a refresh would just recompute identical values.
 //                   Cost scales with P × depth; e.g. P=0.2 touches the whole set every
 //                   ~5 promotions. Re-featurize happens next cycle, so it flows in.
-//   --refresh-depth=D  search depth for the refresh (default 6 — matches generation;
-//                   a depth-6 refresh of a big fraction is hours, lower it for speed)
+//   --refresh-depth=D  search depth for the refresh (default 8 — matches generation;
+//                   a depth-8 refresh of a big fraction is hours, lower it for speed)
 //   --refresh-cycle=P  EVERY cycle (between generation and featurize), recompute `v` with
 //                   the current champion (default 1 = the whole weakest cohort; 0 = off).
 //                   Unlike --refresh-frac this helps between promotions too: most records
