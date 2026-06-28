@@ -476,6 +476,18 @@ button:disabled:hover { background: var(--panel); } /* no hover lift when locked
   color: var(--muted);
   font-weight: 600;
 }
+/* Participant label for an imported game (recorded self-play/PGN names). Empty for a
+   live game, so collapse it then to avoid an extra flex gap before the material diff. */
+.tray .who {
+  font-size: 0.85rem;
+  color: var(--muted);
+  font-weight: 600;
+  max-width: 24ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tray .who:empty { display: none; }
 
 .status {
   margin: 0;

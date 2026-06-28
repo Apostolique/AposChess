@@ -101,6 +101,10 @@ function playConnectSound() {
 let history = [startEntry(state)];
 let viewIndex = 0;
 
+// Participant labels for an imported game ({ white, black }), shown in the trays so a
+// recorded self-play/PGN game is identifiable. Null for a live game (no labels shown).
+let importedNames = null;
+
 // FENs of every position in the live line, kept in lock-step with `history` and
 // sent to the AI worker so its search knows the real game's repetitions — without
 // this the engine has no game history and can shuffle a won position into a draw.
@@ -371,6 +375,24 @@ function renderTray(el, color, board) {
     .join('');
   const adv = pointAdvantage(board, color);
   el.querySelector('.adv').textContent = adv > 0 ? `+${adv}` : '';
+  el.querySelector('.who').textContent = trayLabel(color);
+}
+
+// The participant label shown in `color`'s tray: an imported game's recorded name,
+// else the live engine/Human name in the AI-playing modes, else nothing (puzzle,
+// online, analysis and editor don't name sides).
+function trayLabel(color) {
+  if (importedNames) return importedNames[color] || '';
+  if (ui.mode === 'ai-ai' || ui.mode === 'human-ai') return playerLabel(color);
+  return '';
+}
+
+// Refresh just the tray name labels (not the material diff) — for control changes
+// that alter who's playing (engine/version/strength) without advancing the game.
+function refreshTrayNames() {
+  const bottom = viewColor();
+  $('tray-bottom').querySelector('.who').textContent = trayLabel(bottom);
+  $('tray-top').querySelector('.who').textContent = trayLabel(opponent(bottom));
 }
 
 function renderTrays(entry) {
@@ -1531,6 +1553,7 @@ function onOnlineData(msg) {
 // --- controls ---
 function newGame() {
   cancelAi();
+  importedNames = null; // a fresh game has no recorded participants
   ui.running = false;
   ui.started = false;
   syncToggleLabel();
@@ -1703,6 +1726,7 @@ function applyModeVisibility() {
   // mode without a render (e.g. switching into the editor).
   syncEvalBar();
   syncMobileTabs(); // show/hide the mobile Settings tab to match the mode
+  refreshTrayNames(); // strength/mode changes can rename a side
 }
 
 function toggleCustom(slot, show) {
@@ -1755,6 +1779,23 @@ function playerName(color) {
   const d = depth === Infinity ? 'unlimited' : depth;
   const t = maxMs === Infinity ? 'no time limit' : `${maxMs}ms`;
   return `AI (${e}, depth ${d}, ${t})`;
+}
+
+// A compact version of playerName for the cramped tray: the engine's name (the net id
+// for nn, the handcrafted version, or "Human") followed by its strength — the depth cap
+// and/or the time cap, whichever are set ("d7", "6s", "d7 6s"; nothing if both unbounded).
+function playerLabel(color) {
+  const isAi = ui.mode === 'ai-ai' || (ui.mode === 'human-ai' && color !== ui.humanColor);
+  if (!isAi) return 'Human';
+  const { depth, maxMs, engine } = aiParams(color);
+  const slot = ui.mode === 'ai-ai' ? color : 'ai';
+  const name = engine === 'nn' ? (netOf(slot) || 'Neural net')
+    : engine === 'handcrafted3' ? 'Handcrafted v3'
+    : engine === 'material' ? 'Material' : 'Handcrafted';
+  const meta = [];
+  if (depth !== Infinity) meta.push(`d${depth}`);
+  if (maxMs !== Infinity) meta.push(maxMs % 1000 === 0 ? `${maxMs / 1000}s` : `${maxMs}ms`);
+  return meta.length ? `${name} · ${meta.join(' ')}` : name;
 }
 
 function clampInt(value, min, max, fallback) {
@@ -1946,19 +1987,22 @@ for (const slot of ['ai', 'white', 'black']) {
       const nn = engineValue(slot) === 'nn'; // swap in the matching version picker
       $(`net-field-${slot}`).hidden = !nn;
       $(`hc-field-${slot}`).hidden = nn;
+      refreshTrayNames();
     });
   }
-  $(`hc-${slot}`).addEventListener('change', (e) => { ui[HC_UI_KEY[slot]] = e.target.value; });
-  $(`net-${slot}`).addEventListener('change', (e) => { ui[NET_UI_KEY[slot]] = e.target.value || null; });
+  $(`hc-${slot}`).addEventListener('change', (e) => { ui[HC_UI_KEY[slot]] = e.target.value; refreshTrayNames(); });
+  $(`net-${slot}`).addEventListener('change', (e) => { ui[NET_UI_KEY[slot]] = e.target.value || null; refreshTrayNames(); });
 }
 for (const slot of ['ai', 'white', 'black']) {
   $(`custom-depth-${slot}`).addEventListener('change', (e) => {
     ui.custom[slot].depth = clampInt(e.target.value, 0, 40, 8);
     e.target.value = ui.custom[slot].depth; // reflect the clamped value
+    refreshTrayNames();
   });
   $(`custom-ms-${slot}`).addEventListener('change', (e) => {
     ui.custom[slot].ms = clampInt(e.target.value, 0, 60000, 6000);
     e.target.value = ui.custom[slot].ms;
+    refreshTrayNames();
   });
 }
 $('vary-openings').addEventListener('change', (e) => {
@@ -2110,10 +2154,13 @@ $('export-pgn').addEventListener('click', async (e) => {
 });
 function loadPgnText(text) {
   try {
-    const { start, moves } = importPgn(text);
+    const { start, moves, white, black } = importPgn(text);
+    // Surface the recorded participants (PGN White/Black tags, or a self-play line's
+    // engine@depth labels / game id) in the trays. Null when unknown — renderTray hides it.
+    importedNames = (white || black) ? { white, black } : null;
     loadGame(start, moves);
   } catch (err) {
-    alert('Could not import PGN: ' + err.message);
+    alert('Could not import game: ' + err.message);
   }
 }
 $('import-pgn').addEventListener('click', async () => {

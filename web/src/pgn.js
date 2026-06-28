@@ -98,10 +98,54 @@ function matchToken(state, raw) {
   return legal.find((mv) => mv.from === from && mv.to === to && (mv.promotion || null) === promo) || null;
 }
 
-// Parse a PGN string into { start, moves } with `moves` as reconstructed engine
-// move objects (ready to replay with applyMove). Throws on an unparseable/illegal
-// move so the caller can surface a clear error.
+// Decode one compact self-play token ("e2e4", "e7e8q") against `state`'s legal
+// moves — the dataset's move codec (see scripts/gameRecord.mjs encodeMove). Same
+// from/to(+promo) matching as matchToken, minus the PGN piece-letter/separator.
+function matchCompact(state, token) {
+  const m = token.match(/^([a-h][1-8])([a-h][1-8])([qrbn])?$/);
+  if (!m) return null;
+  const from = sqIndex(m[1]), to = sqIndex(m[2]);
+  const promo = m[3] || null;
+  return legalMoves(state).find((mv) => mv.from === from && mv.to === to && (mv.promotion || null) === promo) || null;
+}
+
+// Parse one self-play JSONL record (one GAME per line; see scripts/gameRecord.mjs)
+// into the same { start, moves, white, black } shape as importPgn — so pasting a
+// single dataset line replays/visualizes that recorded game. Participant labels come
+// from `players` (the engine@depth vtag per colour) or fall back to the game id `g`.
+function importGameLine(line) {
+  let rec;
+  try { rec = JSON.parse(line); }
+  catch { throw new Error('Not a valid PGN or self-play game line'); }
+  if (!Array.isArray(rec.moves)) throw new Error('Not a self-play game record (no "moves" array)');
+
+  const start = rec.start ? parseFen(rec.start) : newGameState();
+  let state = start;
+  const moves = [];
+  for (const tok of rec.moves) {
+    const mv = matchCompact(state, tok);
+    if (!mv) throw new Error(`Unparseable or illegal move: "${tok}"`);
+    moves.push(mv);
+    state = applyMove(state, mv);
+  }
+  const players = rec.players || {};
+  const fallback = rec.g ? `Game ${rec.g}` : null;
+  return { start, moves, white: players.w || fallback, black: players.b || fallback };
+}
+
+// Parse a PGN string (or a single self-play JSONL line) into { start, moves, white,
+// black }: `moves` are reconstructed engine move objects (ready to replay with
+// applyMove) and white/black are participant labels (or null). A line that begins
+// with '{' is treated as a self-play record; otherwise it's parsed as PGN. Throws on
+// an unparseable/illegal move so the caller can surface a clear error.
 export function importPgn(text) {
+  const trimmed = text.trim();
+  if (trimmed.startsWith('{')) {
+    // Tolerate a multi-line paste (a chunk of the dataset) by replaying the first record.
+    const first = trimmed.split(/\r?\n/).find((l) => l.trim().startsWith('{'));
+    return importGameLine(first.trim());
+  }
+
   const tags = {};
   const tagRe = /\[(\w+)\s+"([^"]*)"\]/g;
   let t;
@@ -127,5 +171,5 @@ export function importPgn(text) {
     moves.push(mv);
     state = applyMove(state, mv);
   }
-  return { start, moves };
+  return { start, moves, white: tags.White || null, black: tags.Black || null };
 }
