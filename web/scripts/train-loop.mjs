@@ -130,7 +130,7 @@ mkdirSync(loopDir, { recursive: true });
 
 const featurizeScript = resolve(here, 'featurize.mjs');
 const refreshScript = resolve(here, 'refresh-v.mjs');
-const rankScript = resolve(here, 'rank-engines.mjs');
+const rankScript = resolve(here, 'depth-ladder.mjs');
 const trainPy = resolve(repoDir, 'training', 'train.py');
 
 // Generation and the gate run on the native Zig engine: apos-gen for self-play, apos-match
@@ -157,7 +157,7 @@ const scriptCmd = new Map([
   [genBin, 'npm run train:gen'],
   [featurizeScript, 'npm run train:featurize'],
   [matchBin, 'npm run match'],
-  [rankScript, 'npm run rank'],
+  [rankScript, 'npm run rank:pool'],
   [refreshScript, 'node scripts/refresh-v.mjs'], // no npm alias
   [trainPy, 'npm run train:fit'],                // train:fit forwards args to train.py
 ]);
@@ -170,7 +170,7 @@ const scriptCmd = new Map([
 const scriptDefaults = {
   'npm run train:gen': { games: '200', depth: '6', eval: 'handcrafted', openings: '8', 'opening-topk': '0', maxmoves: '200' },
   'npm run match': { games: '100', movetime: '50', 'eval-a': 'handcrafted', 'eval-b': 'handcrafted', openings: '6', maxmoves: '200', elo0: '0', elo1: '15', alpha: '0.05', beta: '0.05' },
-  'npm run rank': { depth: '6', games: '200', anchor: 'hc', openings: '6', maxmoves: '200' },
+  'npm run rank:pool': { depths: '6,8', 'anchor-depth': '6', games: '10', openings: '6', maxmoves: '200', prior: '1' },
   'node scripts/refresh-v.mjs': { frac: '1', depth: '6', minutes: '10' },
   'npm run train:fit': { hidden: '128', lambda: '1' }, // train:fit forwards to train.py
 };
@@ -229,7 +229,10 @@ const resultFile = join(loopDir, 'match.json');
 // so the loop can rewrite a non-promoted candidate's provenance before folding it in (see
 // foldGateHarvest). Cleared before each gate and deleted after folding.
 const gateHarvest = join(loopDir, 'gate-harvest.jsonl');
-const ledgerFile = join(loopDir, 'engine-elo.json'); // engine-strength ledger (npm run rank)
+// Bradley-Terry pool ledger (npm run rank:pool) + its persisted pairwise-results store. The
+// store accumulates games across cycles; the ledger is the fitted Elo the refreshes consume.
+const ledgerFile = join(loopDir, 'engine-elo.ladder.json');
+const ladderStore = join(loopDir, 'ladder-pool.json');
 const logFile = join(loopDir, 'loop.log');
 // PID of this loop, so `npm run train:pause`/`train:resume` (scripts/loop-ctl.mjs) can find
 // and freeze/thaw the loop's whole process tree from another terminal — a long run pegs every
@@ -291,19 +294,25 @@ const cfg = {
   // refresh"; only records the current champion already labeled at this depth are no-ops.
   refreshCycle: args['no-refresh'] ? 0 : num(args['refresh-cycle'], 1),
   refreshCycleDepth: num(args['refresh-cycle-depth'], num(args.depth, 8)),
-  // Engine ranking for smart weakest-first v refresh. On by default: each promotion adds
-  // ONLY the new champion to the Elo ledger (rank --only; every other engine's Elo is
-  // reused), ranked at the gen/gate depth (--rank-depth, 6) and one below it so its
-  // nn6@/nn5@ labels each get a precise Elo. The refreshes below read the ledger to relabel
-  // the WEAKEST engine's `v` first instead of a blind random fraction. --no-rank reverts.
+  // Engine ranking for smart weakest-first v refresh. On by default, now driven by the
+  // self-relative Bradley-Terry POOL (rank:pool / depth-ladder.mjs), not the old anchor
+  // gauntlet. EVERY cycle the loop refits the pool: it folds the whole dataset's harvested
+  // games into the fit (--corpus — so the new champion is rated automatically from its gate
+  // matches, no dedicated gauntlet) and plays a short --rank-minutes budget of the most-
+  // ambiguous matchups to tighten ratings. The refreshes below read the resulting parallel
+  // ledger (engine-elo.ladder.json) to relabel the WEAKEST engine's `v` first. --no-rank reverts.
   rank: !args['no-rank'],
+  // hc pin depth for the pool (Elo 0) — every rating lands on this stable scale.
   rankDepth: num(args['rank-depth'], 6),
-  // Default 800, decoupled from the gate. The ledger's main consumer is weakest-first `v`
-  // refresh (which engine's labels to recompute), not a fine promote/reject decision, so it
-  // doesn't need the gate's full length — and the gate is now 2000, which would make every
-  // post-promotion rank gauntlet needlessly long. Raise --rank-games if the ledger ordering
-  // looks noisy (champions sit only ~elo1 apart).
-  rankGames: num(args['rank-games'], 800),
+  // Wall-clock the pool plays per cycle, on top of the (free) corpus fold. Short, because the
+  // corpus already rates the champion from its gate games and the store accumulates across
+  // cycles — each cycle just tightens the most-ambiguous orderings.
+  rankMinutes: num(args['rank-minutes'], 5),
+  // Games per scheduled pool matchup. Kept SMALL on purpose: the pool's --minutes budget is
+  // only checked BETWEEN matchups (a matchup always plays to completion), and a depth-8 matchup
+  // is slow — so a big batch would blow far past --rank-minutes. Small batches let the budget
+  // bound the step to ~rank-minutes; the store accumulates the games across cycles regardless.
+  rankGames: num(args['rank-games'], 10),
   // On each promotion the OUTGOING champion is retired into the playable net catalog
   // (web/public/nn) under the next free human name, so past champions stay pickable in the
   // app. Only the most recent --keep-champions retired nets are kept; older ones are pruned
@@ -465,45 +474,27 @@ function run(label, cmd, argv, cwd = webDir) {
   return true;
 }
 
-// Depths the champion is ranked at. The gate depth (cfg.rankDepth) and generation depth
-// (cfg.depth) carry its direct nnD@ harvest labels — every position is now tagged with the
-// mover's own engine×depth, so the harvest no longer emits any depth-(d-1) labels. We keep
-// ranking ONE BELOW EACH (d-1) only to value the legacy nn(d-1)@ labels still in the dataset
-// from the old winner-derived harvest, so weakest-first refresh drains them correctly instead
-// of misranking the shallow labels as strong (see eloForTag). Drop the d-1 entries once that
-// legacy data is gone.
-const rankDepths = [...new Set([cfg.rankDepth, cfg.rankDepth - 1, cfg.depth, cfg.depth - 1])]
-  .filter((d) => d >= 1);
+// Depths the pool rates every engine at: the gate depth (cfg.rankDepth, also the hc pin)
+// and the generation depth (cfg.depth) — the two depths positions are labeled at (nn6@/nn8@).
+// hc<rankDepth> is the pinned Elo-0 node, so all ratings land on one stable scale.
+const poolDepths = [...new Set([cfg.rankDepth, cfg.depth])].filter((d) => d >= 1);
 
-// Add a just-promoted champion to the engine-strength ledger — ONLY that champion plays,
-// every other engine's Elo is reused unchanged (via rank's --only), so a promotion never
-// re-ranks engines that didn't change. The champion is ranked at each of `rankDepths`, so
-// each of its engine×depth labels gets a precise Elo (the consumers look an exact engine×
-// depth tag up first). The first promotion has no ledger yet, so it seeds one with a full
-// incremental gauntlet at the gate depth before adding the champion's other entries.
-// --no-scan keeps it fast (record counts aren't needed to drive the refresh).
+// Refit the Bradley-Terry strength pool (rank:pool / depth-ladder.mjs). Runs EVERY cycle:
+//   --corpus folds the whole dataset's harvested games (each record's players + result) into
+//   the fit, so the current champion is rated automatically from its gate matches — no
+//   dedicated gauntlet, and a just-promoted champion already has games against the engine it
+//   dethroned. On top of that the pool plays a short --rank-minutes budget of the matchups
+//   whose ORDERING is currently most ambiguous (naturally including the new champion), and
+//   persists every game into the store so ratings tighten cumulatively across cycles.
+// The fitted ledger (engine-elo.ladder.json) is what the weakest-first refreshes read.
 // Maintenance, like the refreshes — a failure logs but doesn't stop the loop.
-function runRank(label, champHash) {
+function runRankPool(label) {
   if (!cfg.rank) return;
-  // No ledger yet (first promotion): seed it with a full gauntlet at the gate depth —
-  // every instantiable engine plays the stable hc anchor once (--incremental falls back to
-  // a full rank when no ledger exists). Later promotions skip this: the ledger already
-  // ranks every prior engine, and --only adds just the new champion.
-  const seeding = !existsSync(ledgerFile);
-  if (seeding) {
-    run(`${label} (seed ledger @ depth ${cfg.rankDepth})`, process.execPath,
-      [rankScript, '--incremental', '--no-scan', '--no-save-games',
-        `--depth=${cfg.rankDepth}`, `--games=${cfg.rankGames}`, `--out=${ledgerFile}`, ...jobArg]);
-  }
-  if (champHash === '?') return; // unhashable champion — can't target it with --only
-  // Rank ONLY the new champion at each label depth (skip the gate depth the seed gauntlet
-  // just covered for this champion).
-  const depths = rankDepths.filter((d) => !(seeding && d === cfg.rankDepth));
-  for (const d of depths) {
-    run(`${label} @ depth ${d}`, process.execPath,
-      [rankScript, `--only=${champHash}`, '--no-scan', '--no-save-games',
-        `--depth=${d}`, `--games=${cfg.rankGames}`, `--out=${ledgerFile}`, ...jobArg]);
-  }
+  run(label, process.execPath,
+    [rankScript, '--corpus', `--minutes=${cfg.rankMinutes}`,
+      `--depths=${poolDepths.join(',')}`, `--anchor-depth=${cfg.rankDepth}`,
+      `--games=${cfg.rankGames}`, `--store=${ladderStore}`, `--ledger=${ledgerFile}`,
+      '--no-scan', `--seed=${Date.now()}`, ...jobArg]);
 }
 
 // Build refresh-v args. With ranking on AND a ledger present, target the WEAKEST cohort
@@ -597,16 +588,16 @@ log(`train:loop start — batch ${cfg.batch} @ depth ${cfg.depth} | gate ${cfg.g
   + `${existsSync(lineage) ? ' (resuming lineage)' : ''} | `
   + `refresh/cycle ${cfg.refreshCycle > 0 ? `${(cfg.refreshCycle * 100).toFixed(1)}% @ depth ${cfg.refreshCycleDepth}` : 'off'} | `
   + `refresh on promotion ${cfg.refreshFrac > 0 ? `${(cfg.refreshFrac * 100).toFixed(0)}% @ depth ${cfg.refreshDepth}` : 'off'} | `
-  + `rank ${cfg.rank ? `on (hc anchor, new champion @ depths ${rankDepths.join('+')}, ${cfg.rankGames}g/matchup)` : 'off'} | `
+  + `rank ${cfg.rank ? `pool every cycle (hc${cfg.rankDepth} pin, depths ${poolDepths.join('+')}, corpus + ${cfg.rankMinutes}m play)` : 'off'} | `
   + `cycles ${cfg.cycles === Infinity ? '∞' : cfg.cycles}`);
 log('Pause/resume from another terminal: `npm run train:pause` / `npm run train:resume` (frees all CPU, no work lost).');
 
 const jobArg = cfg.jobs !== undefined ? [`--jobs=${cfg.jobs}`] : [];
 
-// No startup ranking: the ledger is built lazily on the first promotion (see runRank in
-// the promote branch). Until a champion is crowned there's nothing new to rank, so the
-// early cycles simply refresh with the classic random fraction; weakest-first kicks in
-// once the first promotion has seeded the ledger.
+// No startup ranking: the pool is refit at the END of each cycle (runRankPool), after that
+// cycle's gate games have been harvested into the dataset. So cycle 1 still refreshes with
+// the classic random fraction (no ledger yet); from cycle 2 on the ledger exists and the
+// refreshes go weakest-first.
 
 const loopT0 = Date.now();
 let promotions = 0;
@@ -719,11 +710,9 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
     log(`cycle ${c}: PROMOTED ✓  candidate ${pct}% / Elo +${res.elo.toFixed(0)} over champion `
       + `(${res.games} games, cycle took ${fmtDur((Date.now() - cycleT0) / 1000)}). `
       + `New champion published as 'loop-champion' (archived ${champHash}.json). Total promotions: ${promotions}.`);
-    // Add the new champion to the strength ledger so the refresh below — and every later
-    // cycle — recognizes it as the new best and can relabel the now-second-best champion's
-    // `v` weakest-first. Only the new champion plays (--only), at both the gate and
-    // generation depths; the FIRST promotion (no ledger yet) seeds the gauntlet first.
-    runRank(`Rank engines (add champion ${champHash})`, champHash);
+    // (The strength pool is refit at the end of every cycle — runRankPool below — so the
+    // just-promoted champion is rated automatically from its harvested gate games via
+    // --corpus; no per-promotion ranking step is needed here.)
     // The champion (hence the `v` target) just changed: value-iterate by recomputing
     // `v` on a fraction of the dataset with the NEW champion. Optional maintenance —
     // a failure shouldn't kill the loop, so we don't gate on its result (a Ctrl-C
@@ -750,6 +739,13 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
       + `(SPRT ${res.sprt}, ${res.games} games, cycle took ${fmtDur((Date.now() - cycleT0) / 1000)}). `
       + `Not a gain.${hadLineage ? ' Lineage reset to the champion.' : ''}`);
   }
+
+  // Refit the strength pool now that this cycle's gate games are harvested into the dataset:
+  // --corpus folds them into the Bradley-Terry fit (rating the current champion from its own
+  // gate matches) plus a short play budget tightens the most-ambiguous orderings. Runs every
+  // cycle so the next cycle's weakest-first refresh reads a current ledger. Maintenance: a
+  // failure logs but doesn't abort the run (Ctrl-C still ends it via the `stopping` flag).
+  if (!stopping) runRankPool('Rank pool (Bradley-Terry, corpus + scheduled play)');
 }
 
 log(`train:loop stopped after ${promotions} promotion(s) in ${fmtDur((Date.now() - loopT0) / 1000)}. `

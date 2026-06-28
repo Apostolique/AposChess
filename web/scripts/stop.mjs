@@ -15,7 +15,7 @@
 // so a hung finalize can still be escaped.
 //
 // Keypresses are only captured for a TOP-LEVEL interactive run. When a tool is
-// spawned by an orchestrator (train:loop, rank-engines), the orchestrator sets
+// spawned by an orchestrator (train:loop, rank:pool), the orchestrator sets
 // APOS_CHILD in the child's env and the keypress capture is disabled there — only
 // one process can own the TTY's raw mode, and raw mode would also swallow the
 // Ctrl-C the orchestrator relies on. In that case we fall back to a plain SIGINT

@@ -113,7 +113,7 @@ export function serializeGameRecord(rec) {
 export const parseGameRecord = (line) => JSON.parse(line);
 
 // Tally a game record's per-position `vs` tags into `tagCounts` (tag -> count), for the
-// dataset cross-reference scans in rank-engines.mjs / depth-ladder.mjs. Returns the number
+// dataset cross-reference scans in depth-ladder.mjs (rank:pool). Returns the number
 // of positions and how many lack a value. A scalar vs counts once per position.
 export function tallyVs(rec, tagCounts) {
   const n = rec.v ? rec.v.length : rec.moves.length + 1;

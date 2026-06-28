@@ -11,7 +11,6 @@
     "build:wasm": "node scripts/build-wasm.mjs",
     "preview": "vite preview",
     "match": "node scripts/match-zig.mjs",
-    "rank": "node scripts/rank-engines.mjs",
     "rank:pool": "node scripts/depth-ladder.mjs",
     "train": "node scripts/train-pipeline.mjs",
     "train:gen": "node scripts/gen-zig.mjs",

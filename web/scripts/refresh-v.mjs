@@ -31,7 +31,7 @@
 // Defaults: depth 6, jobs = CPU cores, eval 'nn' (weights = ./src/nn-weights.json), in/out
 //           = ../training/data/selfplay.jsonl (atomic replace), seed 1.
 //
-// Smart weakest-first refresh (--ledger): read the strength ledger from `npm run rank` and
+// Smart weakest-first refresh (--ledger): read the strength ledger from `npm run rank:pool` and
 // let it drive the whole refresh. The recompute engine DEFAULTS to the ledger's STRONGEST
 // engine (explicit --eval/--weights still win). Each run, in priority order: (1) FILL every
 // position with no `v` (never throttled by --frac); (2) REFRESH the WEAKEST BAND of
@@ -67,13 +67,13 @@ const minutes = args.minutes !== undefined ? Number(args.minutes) : 10;
 
 // --- smart weakest-first refresh (--ledger) --------------------------------------
 const ledgerPath = args.ledger === true
-  ? resolve(here, '../../training/data/loop/engine-elo.json')
+  ? resolve(here, '../../training/data/loop/engine-elo.ladder.json')
   : (typeof args.ledger === 'string' ? resolve(process.cwd(), args.ledger) : null);
 let eloByVersion = null, eloByTag = null, best = null;
 if (ledgerPath) {
   let ledger;
   try { ledger = JSON.parse(readFileSync(ledgerPath, 'utf8')); }
-  catch (e) { console.error(`Could not read ledger ${ledgerPath}: ${e.message}. Run 'npm run rank' first.`); process.exit(1); }
+  catch (e) { console.error(`Could not read ledger ${ledgerPath}: ${e.message}. Run 'npm run rank:pool' first.`); process.exit(1); }
   eloByVersion = new Map(); eloByTag = new Map();
   // The material fallback ('?') is excluded — its Elo is only an internal ledger stat, so
   // anything it (or an unrecoverable/untagged source) labeled is treated as weakest (-Inf).

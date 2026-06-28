@@ -3,7 +3,7 @@
 //
 // Self-relative engine ranking — ONE Bradley-Terry / BayesElo rating pool (no modes).
 //
-// The anchor approach (rank-engines.mjs) measures every engine against ONE fixed reference.
+// The old anchor-gauntlet approach (since retired) measured every engine against ONE fixed reference.
 // That floors the far end of a wide range: a contender >~400 Elo from the anchor scores
 // ~0%/100%, which carries no information no matter how many games you play (and the champions
 // are now far above the hc anchor, so the gauntlet saturates). The fix: stop measuring against
@@ -18,7 +18,7 @@
 // scale. So there is no separate "depth curve" mode: a curve is just the ledger filtered to one
 // net's nodes. The store persists pairwise results, so re-running ACCUMULATES games.
 //
-// Output is the ledger (engine-elo.*.json), the same schema rank-engines.mjs emits, so
+// Output is the ledger (engine-elo.*.json), the schema refresh-v/merge already read, so
 // refresh-v/merge can read it. The ACTIVE scheduler targets the RANKING objective — each step
 // it plays the matchup whose ORDERING is currently most ambiguous (P(mis-order) from the full
 // Bradley-Terry covariance), with periodic rigidity cross-links. Runs until stopped (q/Ctrl-C),
@@ -53,8 +53,8 @@
 //   --seed=S        base seed (default 1). The store advances a seed cursor so accumulated
 //                   re-runs never replay identical games.
 //   --store=FILE    pairwise-results store (default loop/ladder-pool.json — one shared pool).
-//   --ledger=FILE   ledger output (default loop/engine-elo.ladder.json — a PARALLEL ledger,
-//                   NOT the live engine-elo.json, so it can be A/B'd safely).
+//   --ledger=FILE   ledger output (default loop/engine-elo.ladder.json — the live strength
+//                   ledger train:loop / refresh-v / merge consume for weakest-first v refresh).
 //   --data=FILE     dataset to scan for record counts (default selfplay.jsonl). --no-scan skips.
 //   --corpus        fold the WHOLE dataset's game results into the fit: every game record's
 //                   players + result becomes a pairwise W/D/L among the ranked nodes, so the
@@ -384,7 +384,7 @@ function playPair(a, b) {
 
 
 // --- dataset cross-reference (--rank): record counts + unrecoverable tags ------
-// Same read-only regex scan as rank-engines.mjs, so the emitted ledger carries the same
+// Read-only regex scan over the dataset's vs tags, so the emitted ledger carries the same
 // `records` / `unrecoverable` fields the report and downstream tooling expect.
 const tagCounts = new Map();
 let totalLines = 0, noV = 0, legacyNoTag = 0;
@@ -471,7 +471,7 @@ async function scanCorpus() {
 }
 const parseTag = (tag) => { const m = /^(nn|hc)(\d+|t)@(.+)$/.exec(tag); return m ? { eng: m[1], depth: m[2], version: m[3] } : null; };
 
-// Build + write the ledger (drop-in for rank-engines.mjs's engine-elo.json). Callable
+// Build + write the ledger (the engine-elo.*.json refresh-v/merge consume). Callable
 // periodically (verbose=false) during a long run and once at the end (verbose=true), so the
 // ledger is always reasonably fresh even if the run is killed hard.
 function writeRankLedger(verbose) {
@@ -529,7 +529,7 @@ function writeRankLedger(verbose) {
     console.log(`\nCSV -> ${cfg.csv}`);
   }
   console.log(`\nLedger -> ${cfg.ledger}  (store ${cfg.store}; re-run to add games and tighten all ratings)`);
-  console.log('This is a parallel ledger — point refresh-v/merge at it with --ledger=engine-elo.ladder.json to A/B it against `npm run rank`.');
+  console.log('This is the strength ledger refresh-v/merge read for weakest-first v refresh (they default to engine-elo.ladder.json).');
 }
 
 console.log(`Engine ranking pool (active scheduler)`);

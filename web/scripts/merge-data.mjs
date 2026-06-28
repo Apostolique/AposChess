@@ -14,7 +14,7 @@
 //     to ONE record;
 //   - reconcile their per-position `v` PLY BY PLY, keeping each position's BEST `v`
 //     provenance — a real value beats a missing one, a stronger engine's label beats a
-//     weaker one (by the `npm run rank` Elo ledger, read from `vs` tags), and at equal
+//     weaker one (by the `npm run rank:pool` Elo ledger, read from `vs` tags), and at equal
 //     strength a deeper search wins. So if machine A refreshed plies 10-20 and machine B
 //     plies 30-40 of the same game, the merge keeps both improvements;
 //   - keep every game not already present, so NEW games from either machine are all added.
@@ -39,8 +39,8 @@
 // Options:
 //   --dir=PATH      data folder (default ../training/data, relative to web/)
 //   --out=NAME      merged filename within that folder (default selfplay.jsonl)
-//   --ledger[=FILE] strength ledger from `npm run rank` used to rank `v` provenance
-//                   (default training/data/loop/engine-elo.json; auto-used if present)
+//   --ledger[=FILE] strength ledger from `npm run rank:pool` used to rank `v` provenance
+//                   (default training/data/loop/engine-elo.ladder.json; auto-used if present)
 //   --no-ledger     ignore the ledger; rank provenance by has-v then search depth only
 
 import {
@@ -73,7 +73,7 @@ const mb = (bytes) => (bytes / 1e6).toFixed(1) + ' MB';
 // --- provenance ranking (the "best v" rule) --------------------------------------
 // A `vs` tag is "<engine><depth>@<version>" (see vtag.mjs): e.g. "nn6@a3f2c1", "hc6@2".
 // We score a position's value by (engine Elo, search depth); a position with no `v` scores
-// lowest of all. The Elo comes from the strength ledger written by `npm run rank`, which
+// lowest of all. The Elo comes from the strength ledger written by `npm run rank:pool`, which
 // holds one entry PER engine×depth — so we look the exact tag up first (its true strength
 // at that depth) and fall back to the engine's BEST per-version Elo for a depth that was
 // never ranked (a deeper-than-ranked search is at least as strong). An untagged / unknown
@@ -87,7 +87,7 @@ const parseTag = (tag) => {
 const ephemeralElo = (version) => { const m = /^elo(-?\d+)$/.exec(version || ''); return m ? Number(m[1]) : null; };
 
 const ledgerPath = args.ledger === true || args.ledger === undefined
-  ? resolve(here, '../../training/data/loop/engine-elo.json')
+  ? resolve(here, '../../training/data/loop/engine-elo.ladder.json')
   : (typeof args.ledger === 'string' ? resolve(process.cwd(), args.ledger) : null);
 const ledgerExplicit = args.ledger === true || typeof args.ledger === 'string';
 const useLedger = !args['no-ledger'];
@@ -115,7 +115,7 @@ if (useLedger && ledgerPath) {
       process.exit(1);
     }
   } else if (ledgerExplicit) {
-    console.error(`No ledger at ${ledgerPath}. Run 'npm run rank' or pass --no-ledger.`);
+    console.error(`No ledger at ${ledgerPath}. Run 'npm run rank:pool' or pass --no-ledger.`);
     process.exit(1);
   } else {
     console.log('No strength ledger found — ranking v by has-v then search depth only.');
