@@ -438,10 +438,12 @@ fn vtagFmt(buf: []u8, kind: ai.EvalKind, depth: u32, io: std.Io, gpa: std.mem.Al
     return std.fmt.bufPrint(buf, "hc{d}@{d}", .{ depth, ai.HC_VERSION }) catch unreachable;
 }
 
-// --eval-a/--eval-b parse: "nn" -> nn, "hc3" -> handcrafted3, anything else -> handcrafted.
+// --eval-a/--eval-b parse: "nn" -> nn, "hc3" -> handcrafted3, "material" -> material,
+// anything else -> handcrafted.
 fn parseEval(v: []const u8) ai.EvalKind {
     if (std.mem.eql(u8, v, "nn")) return .nn;
     if (std.mem.eql(u8, v, "hc3")) return .handcrafted3;
+    if (std.mem.eql(u8, v, "material")) return .material;
     return .handcrafted;
 }
 
@@ -568,8 +570,12 @@ pub fn main(init: std.process.Init) !void {
     var jobs: usize = std.Thread.getCpuCount() catch 1;
     var eval_a: ai.EvalKind = .handcrafted;
     var eval_b: ai.EvalKind = .handcrafted;
-    var weights_a: []const u8 = "src/nn-weights.json";
-    var weights_b: []const u8 = "src/nn-weights.json";
+    // No default weights on purpose: --eval=nn must name its net explicitly. A silent default
+    // (formerly "src/nn-weights.json", the champion) turns any "forgot --weights" into the
+    // champion playing under the wrong label — exactly what made the pool's material node rank
+    // as the champion. Non-nn evals (handcrafted/hc3/material) need no net and leave it null.
+    var weights_a: ?[]const u8 = null;
+    var weights_b: ?[]const u8 = null;
     var sprt = false;
     var elo0: f64 = 0;
     var elo1: f64 = 15;
@@ -611,14 +617,22 @@ pub fn main(init: std.process.Init) !void {
     else
         .{ .depth = 0, .movetime = movetime_b_opt orelse movetime_a };
 
+    if (eval_a == .nn and weights_a == null) {
+        std.debug.print("error: --eval-a=nn requires --weights-a=<file> (no silent champion fallback).\n", .{});
+        std.process.exit(2);
+    }
+    if (eval_b == .nn and weights_b == null) {
+        std.debug.print("error: --eval-b=nn requires --weights-b=<file> (no silent champion fallback).\n", .{});
+        std.process.exit(2);
+    }
     const net_a: ?*const nn.Net = if (eval_a == .nn) blk: {
         const n = try gpa.create(nn.Net);
-        n.* = try loadNet(io, gpa, weights_a);
+        n.* = try loadNet(io, gpa, weights_a.?);
         break :blk n;
     } else null;
     const net_b: ?*const nn.Net = if (eval_b == .nn) blk: {
         const n = try gpa.create(nn.Net);
-        n.* = try loadNet(io, gpa, weights_b);
+        n.* = try loadNet(io, gpa, weights_b.?);
         break :blk n;
     } else null;
 
@@ -678,7 +692,7 @@ pub fn main(init: std.process.Init) !void {
     });
 
     if (save_games) |sg| {
-        if (shared.games.items.len > 0) try writeHarvest(&shared, gpa, io, sg, budget_a.depth, budget_b.depth, eval_a, eval_b, weights_a, weights_b);
+        if (shared.games.items.len > 0) try writeHarvest(&shared, gpa, io, sg, budget_a.depth, budget_b.depth, eval_a, eval_b, weights_a orelse "", weights_b orelse "");
     }
 
     if (result_file) |rf| {

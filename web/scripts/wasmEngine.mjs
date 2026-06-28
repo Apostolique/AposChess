@@ -43,8 +43,9 @@ function wasmModule() {
   return _module;
 }
 
-// Create an engine instance with its own TT. evalName 'handcrafted' | 'nn'; for 'nn' pass
-// the weights file path (omit → the net's material fallback).
+// Create an engine instance with its own TT. evalName 'handcrafted' | 'nn'; for 'nn' a
+// weights file path is REQUIRED (there is no material fallback — nn with no net loaded would
+// fault on the first eval; want a bare material baseline? select EvalKind.material instead).
 export function makeEngine(evalName = 'nn', weightsPath = null) {
   const env = { aposNowMs: () => performance.now(), aposProgress: () => {} };
   const x = new WebAssembly.Instance(wasmModule(), { env }).exports;

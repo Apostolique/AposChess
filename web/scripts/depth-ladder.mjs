@@ -146,7 +146,11 @@ const cfg = {
 // --- resolve an engine spec to { eng, eval, weights, version } ------------------
 function makeEngine(spec) {
   if (spec === 'hc' || spec === 'handcrafted') return { eng: 'hc', eval: 'handcrafted', weights: null, version: String(HC_VERSION) };
-  if (spec === 'material') return { eng: 'nn', eval: 'nn', weights: null, version: '?' };
+  // The material baseline: the engine's bare piece-count eval (EvalKind.material), NOT an
+  // nn eval with a missing net. (It was the latter, which silently made apos-match fall back
+  // to its default --weights = the champion — so the "material" node was really the champion
+  // in disguise and ranked absurdly high. id stays nn<d>@? for the pool's material floor.)
+  if (spec === 'material') return { eng: 'nn', eval: 'material', weights: null, version: '?' };
   if (spec === 'champion') {
     if (!existsSync(champion)) { console.error(`No champion at ${champion}.`); process.exit(1); }
     return { eng: 'nn', eval: 'nn', weights: champion, version: weightsHash(champion) };
