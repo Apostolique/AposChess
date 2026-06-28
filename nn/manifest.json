@@ -1,5 +1,5 @@
 {
-  "default": "loop-champion",
+  "default": "Jack",
   "nets": [
     {
       "name": "Ada",
@@ -127,8 +127,8 @@
       "note": "Retired train:loop champion (3938a0, 2026-06-26)."
     },
     {
-      "name": "loop-champion",
-      "file": "loop-champion.json",
+      "name": "Jack",
+      "file": "jack.json",
       "arch": [
         768,
         64,
@@ -136,7 +136,11 @@
         16,
         1
       ],
-      "note": "Latest gated train:loop champion (current)."
+      "loopChampion": true,
+      "current": true,
+      "hash": "c76205",
+      "gen": 10,
+      "note": "train:loop champion Jack (gen 10, c76205, 2026-06-28)."
     },
     {
       "name": "random-noise",
