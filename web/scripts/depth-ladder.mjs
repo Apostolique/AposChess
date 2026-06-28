@@ -67,7 +67,7 @@
 //   --save-games[=F]  harvest the games as training data (default OFF).
 //   --fresh         discard any existing store and start the pool from scratch.
 
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync, readdirSync, createReadStream, statSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { resolve, dirname, join } from 'node:path';
@@ -361,6 +361,15 @@ function buildEngine() {
   const r = spawnSync('zig build -Doptimize=ReleaseFast', { cwd: engineDir, stdio: 'inherit', shell: true });
   if (r.status !== 0) { console.error('zig build failed (is Zig 0.16 on PATH?).'); process.exit(1); }
 }
+// The currently-running apos-match child, so a stop request can kill it immediately
+// instead of waiting the whole matchup out. null when no match is in flight.
+let activeChild = null;
+let killedByStop = false;
+function killActive() { if (activeChild) { killedByStop = true; try { activeChild.kill(); } catch { /* already gone */ } } }
+
+// Async spawn (not spawnSync) so Node's event loop stays free to handle q/Ctrl-C while a
+// matchup runs — a synchronous spawn would block the stop handler for the whole matchup.
+// stdin is 'ignore' so the parent keeps sole ownership of the TTY for keypress detection.
 function playPair(a, b) {
   const tmp = join(loopDir, 'ladder-match.json');
   const seed = store.seedCursor;
@@ -376,10 +385,19 @@ function playPair(a, b) {
   if (cfg.saveGames === true) argv.push('--save-games');
   else if (typeof cfg.saveGames === 'string') argv.push(`--save-games=${cfg.saveGames}`);
   console.log(`\n=== ${a.id}  vs  ${b.id}  (${cfg.games} games) ===`);
-  const r = spawnSync(matchBin, argv, { stdio: 'inherit', cwd: webDir, env: { ...process.env, APOS_CHILD: '1' } });
-  if (r.status !== 0) { console.error(`  match failed (exit ${r.status}); skipping.`); return; }
-  try { const res = JSON.parse(readFileSync(tmp, 'utf8')); rmSync(tmp, { force: true }); record(a.id, b.id, res.games, res.score); }
-  catch (e) { console.error(`  could not read result: ${e.message}`); }
+  return new Promise((done) => {
+    const child = spawn(matchBin, argv, { stdio: ['ignore', 'inherit', 'inherit'], cwd: webDir, env: { ...process.env, APOS_CHILD: '1' } });
+    activeChild = child;
+    child.on('error', (e) => { activeChild = null; console.error(`  could not run match: ${e.message}; skipping.`); done(); });
+    child.on('exit', (code, signal) => {
+      activeChild = null;
+      if (killedByStop) { done(); return; } // we killed it on a stop request — not a failure
+      if (code !== 0) { console.error(`  match failed (exit ${code ?? signal}); skipping.`); done(); return; }
+      try { const res = JSON.parse(readFileSync(tmp, 'utf8')); rmSync(tmp, { force: true }); record(a.id, b.id, res.games, res.score); }
+      catch (e) { console.error(`  could not read result: ${e.message}`); }
+      done();
+    });
+  });
 }
 
 
@@ -552,7 +570,7 @@ if (cfg.rounds === 0) {
   buildEngine();
   printStopHint();
   let stopped = false;
-  const stopper = installStop(() => { if (!stopped) { stopped = true; console.log('\n  Stopping after the current matchup…'); } });
+  const stopper = installStop(() => { if (!stopped) { stopped = true; console.log('\n  Stopping…'); } killActive(); });
   const t0 = Date.now();
   const deadline = cfg.minutes ? t0 + cfg.minutes * 60000 : Infinity;
   let played = 0;
@@ -564,7 +582,8 @@ if (cfg.rounds === 0) {
     const tag = `[${played + 1}${Number.isFinite(cfg.matchups) ? `/${cfg.matchups}` : ''}]`;
     const why = reason === 'ordering' ? `ordering: P(mis-order) ${(metric * 100).toFixed(0)}%` : `rigidity: ±${metric.toFixed(0)} Elo`;
     console.log(`\n${tag} ${why} -> ${a.id} vs ${b.id}`);
-    playPair(a, b);
+    await playPair(a, b);
+    if (stopped) break; // a stop killed the match mid-way — don't record/loop a partial result
     writeFileSync(cfg.store, JSON.stringify(store, null, 2) + '\n');
     played++;
     if (played % EMIT_EVERY === 0) writeRankLedger(false);
