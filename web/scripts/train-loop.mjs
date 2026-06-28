@@ -112,6 +112,7 @@
 import { spawnSync } from 'node:child_process';
 import {
   existsSync, rmSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, appendFileSync, statSync,
+  openSync, readSync, closeSync,
 } from 'node:fs';
 import { dirname, resolve, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -233,6 +234,13 @@ const gateHarvest = join(loopDir, 'gate-harvest.jsonl');
 // store accumulates games across cycles; the ledger is the fitted Elo the refreshes consume.
 const ledgerFile = join(loopDir, 'engine-elo.ladder.json');
 const ladderStore = join(loopDir, 'ladder-pool.json');
+// rank:pool's harvested games (its --save-games default). A persistent, accumulating archive of
+// every game the strength pool has played — kept in lockstep with ladderStore. Each cycle we
+// append only the games it ADDED this cycle into the dataset (like the gate harvest), so the
+// next incremental featurize trains on them; their players are all rankable engines (champion /
+// hc / archived / material), so no provenance rewrite is needed. --corpus subtracts the store,
+// so re-reading them from the dataset never double-counts in the ratings.
+const ladderGames = join(loopDir, 'ladder-games.jsonl');
 const logFile = join(loopDir, 'loop.log');
 // PID of this loop, so `npm run train:pause`/`train:resume` (scripts/loop-ctl.mjs) can find
 // and freeze/thaw the loop's whole process tree from another terminal — a long run pegs every
@@ -490,11 +498,38 @@ const poolDepths = [...new Set([cfg.rankDepth, cfg.depth])].filter((d) => d >= 1
 // Maintenance, like the refreshes — a failure logs but doesn't stop the loop.
 function runRankPool(label) {
   if (!cfg.rank) return;
+  // With harvesting on (default), rank:pool appends its games to its archive (ladderGames); we
+  // then fold this cycle's additions into the dataset. With --no-harvest, suppress the archive
+  // too (--no-save-games), consistent with the gate. Capture the archive size up front so we can
+  // append only the games this run added.
+  const before = (cfg.harvest && existsSync(ladderGames)) ? statSync(ladderGames).size : 0;
   run(label, process.execPath,
     [rankScript, '--corpus', `--minutes=${cfg.rankMinutes}`,
       `--depths=${poolDepths.join(',')}`, `--anchor-depth=${cfg.rankDepth}`,
       `--games=${cfg.rankGames}`, `--store=${ladderStore}`, `--ledger=${ledgerFile}`,
+      ...(cfg.harvest ? [] : ['--no-save-games']),
       '--no-scan', `--seed=${Date.now()}`, ...jobArg]);
+  if (cfg.harvest) foldNewLadderGames(before);
+}
+
+// Append the games rank:pool added to its archive THIS cycle (everything past `beforeSize`) into
+// the dataset, so the next incremental featurize trains on them. The games are fresh (unique
+// game ids), so no dedup is needed here; merge-data later collapses any overlap idempotently.
+// Their players are all rankable engines, so labels are kept as-is (no ephemeral rewrite).
+function foldNewLadderGames(beforeSize) {
+  if (!existsSync(ladderGames)) return;
+  const size = statSync(ladderGames).size;
+  if (size <= beforeSize) return; // nothing new (rank played no games, or harvesting was off)
+  const fd = openSync(ladderGames, 'r');
+  try {
+    const buf = Buffer.alloc(size - beforeSize);
+    readSync(fd, buf, 0, buf.length, beforeSize);
+    let chunk = buf.toString('utf8');
+    if (!chunk.endsWith('\n')) chunk += '\n'; // each game is a full line; guard a torn tail
+    appendFileSync(rawFile, chunk);
+    const added = chunk.split('\n').filter(Boolean).length;
+    log(`  Folded ${added} new ladder game(s) into the dataset (next featurize trains on them).`);
+  } finally { closeSync(fd); }
 }
 
 // Build refresh-v args. With ranking on AND a ledger present, target the WEAKEST cohort

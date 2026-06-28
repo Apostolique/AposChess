@@ -26,6 +26,11 @@
 // Inputs are assumed to be CLEAN per-game datasets (each game listed once) — which is what
 // gen, refresh-v, the gate/rank harvests, and this tool all emit.
 //
+// The rank:pool game archive (loop/ladder-games.jsonl) is folded in as a READ-ONLY extra
+// input: its games join the dataset (deduped by game id), but the file is kept on disk, not
+// deleted — it stays the ladder's own regenerable record (and rank:pool's --corpus subtracts
+// its pool store before folding, so those games are never double-counted in the ratings).
+//
 // Records are keyed by game in memory (far fewer than positions, since each game is one
 // entry); the npm script raises the V8 heap ceiling for the large datasets this runs on.
 // The originals are removed only after the merged file is fully written, so an interrupted
@@ -42,6 +47,10 @@
 //   --ledger[=FILE] strength ledger from `npm run rank:pool` used to rank `v` provenance
 //                   (default training/data/loop/engine-elo.ladder.json; auto-used if present)
 //   --no-ledger     ignore the ledger; rank provenance by has-v then search depth only
+//   --drop-unlabeled  purge games whose engines are unknown (no `players`) — the pre-refactor
+//                   games, plus any legacy position-primary / unkeyed / unparseable line. Shrinks
+//                   the dataset but leaves every survivor with known provenance. Rewrites even a
+//                   lone selfplay.jsonl (so it works as a standalone in-place purge).
 
 import {
   createReadStream, createWriteStream, readdirSync, rmSync, renameSync, statSync,
@@ -67,6 +76,16 @@ const dataDir = typeof args.dir === 'string'
 const outName = typeof args.out === 'string' ? args.out : 'selfplay.jsonl';
 const target = join(dataDir, outName);
 const tmp = join(dataDir, '_merged.jsonl.tmp'); // .tmp, so it isn't itself a *.jsonl input
+
+// --drop-unlabeled: purge games whose ENGINES are unknown — the pre-refactor games, whose old
+// position-primary format recorded who LABELED each position (`vs`) but not who PLAYED
+// (`players`). Without players a game can't inform the corpus rating or be quality-controlled by
+// engine, so this drops it (and any legacy position-primary / unkeyed / unparseable line). It
+// shrinks the dataset now, but every surviving game has known provenance. The material floor
+// (players like "nn6@?") IS labeled and is kept; only a missing/literal-'?' player is unlabeled.
+const dropUnlabeled = !!args['drop-unlabeled'];
+const labeledPlayer = (p) => !!p && p !== '?';
+const hasPlayers = (rec) => rec.players != null && labeledPlayer(rec.players.w) && labeledPlayer(rec.players.b);
 
 const mb = (bytes) => (bytes / 1e6).toFixed(1) + ' MB';
 
@@ -155,17 +174,32 @@ try {
 // Merge only the RAW game files; *.features.jsonl are derived and regenerable.
 const files = entries.filter((f) => f.endsWith('.jsonl') && !f.endsWith('.features.jsonl'))
   .map((f) => join(dataDir, f)).sort();
-if (files.length === 0) {
+
+// Read-only extra inputs: the rank:pool harvest (loop/ladder-games.jsonl) is the ladder's
+// self-contained game archive (every game the strength pool has played, in lockstep with its
+// store). We FOLD it into the dataset — deduped by game id like any source — but never DELETE
+// it, so it stays the regenerable ladder archive. Ingested LAST, so existing dataset labels are
+// the tie incumbents and a ladder position only upgrades a label when it's strictly stronger by
+// the ledger. (The dataset and the pool store can hold the same ladder games, but rank:pool's
+// --corpus subtracts the store before folding, so ranking never double-counts them.)
+const readonlyInputs = [join(dataDir, 'loop', 'ladder-games.jsonl')].filter(existsSync);
+
+if (files.length === 0 && readonlyInputs.length === 0) {
   console.log(`No .jsonl files in ${dataDir}. Nothing to merge.`);
   process.exit(0);
 }
-if (files.length === 1 && files[0] === target) {
+// Only the target and nothing to fold in — a no-op, UNLESS --drop-unlabeled, which rewrites
+// even a lone selfplay.jsonl to purge the unlabeled games.
+if (!dropUnlabeled && readonlyInputs.length === 0 && files.length === 1 && files[0] === target) {
   console.log(`Only ${outName} present — nothing to merge.`);
   process.exit(0);
 }
 
-console.log(`Merging ${files.length} file(s) into ${outName}:`);
+const allInputs = [...files, ...readonlyInputs];
+console.log(`Merging ${allInputs.length} file(s) into ${outName}`
+  + `${readonlyInputs.length ? ` (${readonlyInputs.length} read-only, kept on disk)` : ''}:`);
 for (const f of files) console.log(`  - ${f.slice(dataDir.length + 1)} (${mb(statSync(f).size)})`);
+for (const f of readonlyInputs) console.log(`  - ${f.slice(dataDir.length + 1)} (${mb(statSync(f).size)}, read-only)`);
 
 // --- build the merged set --------------------------------------------------------
 // Keyed by game id `g`. best.get(g) = the winning record object; on a repeat we reconcile
@@ -175,7 +209,7 @@ for (const f of files) console.log(`  - ${f.slice(dataDir.length + 1)} (${mb(sta
 // Records with no game id (or unparseable lines) can't be de-duplicated, so each is kept
 // verbatim.
 const best = new Map();
-let totalLines = 0, games = 0, collapsed = 0, upgrades = 0, malformed = 0, noGame = 0;
+let totalLines = 0, games = 0, collapsed = 0, upgrades = 0, malformed = 0, noGame = 0, dropped = 0;
 const verbatim = []; // non-game lines kept as-is
 
 // Reconcile `src` into `dst` (same game): adopt each position's v/vs when it's better.
@@ -196,8 +230,13 @@ async function ingest(path) {
     if (!line) continue;
     totalLines++;
     let rec;
-    try { rec = JSON.parse(line); } catch { verbatim.push(line); malformed++; continue; }
-    if (!isGameRecord(rec) || rec.g == null) { verbatim.push(line); noGame++; continue; }
+    try { rec = JSON.parse(line); }
+    catch { if (dropUnlabeled) { dropped++; continue; } verbatim.push(line); malformed++; continue; }
+    if (!isGameRecord(rec) || rec.g == null) {
+      if (dropUnlabeled) { dropped++; continue; } // legacy position-primary / unkeyed line
+      verbatim.push(line); noGame++; continue;
+    }
+    if (dropUnlabeled && !hasPlayers(rec)) { dropped++; continue; } // pre-refactor: engines unknown
     const cur = best.get(rec.g);
     if (!cur) { best.set(rec.g, rec); games++; continue; }
     collapsed++;            // a duplicate of an already-seen game
@@ -205,7 +244,7 @@ async function ingest(path) {
   }
 }
 
-for (const f of files) await ingest(f);
+for (const f of allInputs) await ingest(f);
 
 // --- write out, then atomically replace the sources ------------------------------
 const out = createWriteStream(tmp);
@@ -214,16 +253,20 @@ for (const rec of best.values()) await write(serializeGameRecord(rec) + '\n');
 for (const line of verbatim) await write(line + '\n');
 await new Promise((res) => out.end(res));
 
-// Delete the sources first (Windows rename can't overwrite), then move the temp into
-// place — the merge is already safely on disk.
+// Delete the (deletable) sources first (Windows rename can't overwrite), then move the temp
+// into place — the merge is already safely on disk. Read-only inputs (the ladder archive) are
+// NOT removed: they were folded in but stay on disk as their own regenerable record.
 for (const f of files) rmSync(f);
 renameSync(tmp, target);
 
 console.log(`\nDone: ${games} unique game(s) in ${outName} (${mb(statSync(target).size)}).`);
 console.log(`  ${totalLines} input line(s) -> ${collapsed} duplicate game(s) collapsed`
   + `${upgrades ? `, ${upgrades} position(s) kept a better v` : ''}.`);
+if (dropUnlabeled) console.log(`  Dropped ${dropped} unlabeled record(s) (no engines / pre-refactor).`);
 if (noGame || malformed) {
   console.log(`  Passed through unchanged: ${noGame} record(s) without a game id`
     + `${malformed ? `, ${malformed} unparseable line(s)` : ''}.`);
 }
-console.log(`Removed ${files.length} source file(s). Re-featurize next: npm run train:featurize`);
+console.log(`Removed ${files.length} source file(s)`
+  + `${readonlyInputs.length ? `; kept ${readonlyInputs.length} read-only archive(s)` : ''}. `
+  + `Re-featurize next: npm run train:featurize`);
