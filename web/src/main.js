@@ -422,6 +422,8 @@ function onBoardChange() {
 // that column drops underneath). Re-run placement when crossing the breakpoint.
 const desktopMql = window.matchMedia('(min-width: 981px)');
 desktopMql.addEventListener('change', updateStatusText);
+// The move list flips order at this breakpoint (newest-first on mobile), so re-render it.
+desktopMql.addEventListener('change', renderMoveList);
 function placeStatus(el, where) {
   const belowSlot = desktopMql.matches ? $('status-above') : $('status-below');
   const parent = where === 'below' ? belowSlot
@@ -565,12 +567,17 @@ function moveSpan(k) {
 function renderMoveList() {
   const el = $('moves');
   if (history.length <= 1) { el.innerHTML = '<div class="empty">No moves yet.</div>'; return; }
-  let html = '';
+  const rows = [];
   for (let k = 1; k < history.length; k += 2) {
     const black = (k + 1 < history.length) ? moveSpan(k + 1) : '<span></span>';
-    html += `<div class="moverow"><span class="moveno">${(k + 1) / 2}.</span>${moveSpan(k)}${black}</div>`;
+    rows.push(`<div class="moverow"><span class="moveno">${(k + 1) / 2}.</span>${moveSpan(k)}${black}</div>`);
   }
-  el.innerHTML = html;
+  // On a phone the list sits below the board, so the newest move must be visible
+  // without scrolling: render newest-pair-first (top). We reverse the DOM rather than
+  // flipping with `flex-direction: column-reverse`, because a reversed-flex scroll box
+  // can't be touch-scrolled (overflow escapes the unreachable start/top edge).
+  if (!desktopMql.matches) rows.reverse();
+  el.innerHTML = rows.join('');
   const cur = el.querySelector('.current');
   // Scroll within the move list only — `scrollIntoView` would also scroll
   // every ancestor (the page itself on mobile) and yank the viewport around.

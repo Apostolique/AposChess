@@ -629,13 +629,14 @@ button:disabled:hover { background: var(--panel); } /* no hover lift when locked
   .actions > .control-row { flex-wrap: nowrap; }
   .actions > .control-row label,
   .actions > .control-row button { flex: 1 1 0; min-width: 0; }
-  /* On a phone the latest move is the one you care about, so flip the list to put it
-     at the top (column-reverse renders the last DOM row first). renderMoveList's
-     autoscroll keeps the current ply in view regardless of direction. justify-content
-     flex-end anchors the rows to the TOP (column-reverse's main-end): the first few
-     moves start at the top and each new move pushes the older ones down, instead of
-     the whole cluster sitting pinned to the bottom of the box. */
-  .moves { max-height: 36vh; display: flex; flex-direction: column-reverse; justify-content: flex-end; }
+  /* Cap the list height on a phone so it doesn't push the rest of the page down, and
+     keep it a normal block scroll container (inherited overflow-y: auto) so it stays
+     touch-scrollable. The newest move is floated to the top by reversing the row order
+     in renderMoveList (DOM reverse, NOT `flex-direction: column-reverse`: a reversed-flex
+     scroll box can't be touch-scrolled — its overflow escapes the unreachable top edge).
+     The autoscroll there only sets the list's own scrollTop, so the page/board never
+     scrolls when the current ply moves. */
+  .moves { max-height: 36vh; }
   /* Put the move controls above the list so they don't require scrolling the
      list down and back up. status (order 0) stays on top. */
   .side-col .nav { order: 1; }
