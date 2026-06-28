@@ -127,28 +127,6 @@
       "note": "Retired train:loop champion (3938a0, 2026-06-26)."
     },
     {
-      "name": "balanced-64",
-      "file": "balanced-64.json",
-      "arch": [
-        768,
-        64,
-        1
-      ],
-      "note": "Baseline 64-wide net (~parity with the handcrafted eval)."
-    },
-    {
-      "name": "deep3",
-      "file": "deep3.json",
-      "arch": [
-        768,
-        256,
-        64,
-        16,
-        1
-      ],
-      "note": ""
-    },
-    {
       "name": "loop-champion",
       "file": "loop-champion.json",
       "arch": [

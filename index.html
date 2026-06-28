@@ -21,7 +21,7 @@
 
     gtag('config', 'G-TYM1QSCNLT');
   </script>
-  <script type="module" crossorigin src="./assets/index-Ci-Ghm3q.js"></script>
+  <script type="module" crossorigin src="./assets/index-BeC-xH8c.js"></script>
   <link rel="stylesheet" crossorigin href="./assets/index-DNK3jv4s.css">
 </head>
 <body>
@@ -157,20 +157,21 @@
             <div class="engine-field">
               <span class="seg-label">Engine</span>
               <div class="seg" role="radiogroup" aria-label="Opponent engine">
-                <input type="radio" name="engine-ai" id="engine-ai-hc" value="handcrafted" checked />
+                <input type="radio" name="engine-ai" id="engine-ai-hc" value="handcrafted" />
                 <label for="engine-ai-hc" title="Handcrafted evaluation">Handcrafted</label>
-                <input type="radio" name="engine-ai" id="engine-ai-nn" value="nn" />
-                <label for="engine-ai-nn" title="Neural net — still weak, experimental">Neural net</label>
+                <input type="radio" name="engine-ai" id="engine-ai-nn" value="nn" checked />
+                <label for="engine-ai-nn" title="Neural net">Neural net</label>
               </div>
             </div>
-            <label class="hc-field" id="hc-field-ai">
+            <label class="hc-field" id="hc-field-ai" hidden>
               Version
               <select id="hc-ai">
                 <option value="handcrafted" selected>v2</option>
                 <option value="handcrafted3" title="Material &amp; piece-square tables distilled from the neural net">v3 — NN-distilled</option>
+                <option value="material" title="Bare piece count — no positional knowledge (deliberately weak)">Material only</option>
               </select>
             </label>
-            <label class="net-field" id="net-field-ai" hidden>
+            <label class="net-field" id="net-field-ai">
               Net
               <select id="net-ai"></select>
             </label>
@@ -212,20 +213,21 @@
             <div class="engine-field">
               <span class="seg-label">Engine</span>
               <div class="seg" role="radiogroup" aria-label="White engine">
-                <input type="radio" name="engine-white" id="engine-white-hc" value="handcrafted" checked />
+                <input type="radio" name="engine-white" id="engine-white-hc" value="handcrafted" />
                 <label for="engine-white-hc" title="Handcrafted evaluation">Handcrafted</label>
-                <input type="radio" name="engine-white" id="engine-white-nn" value="nn" />
-                <label for="engine-white-nn" title="Neural net — still weak, experimental">Neural net</label>
+                <input type="radio" name="engine-white" id="engine-white-nn" value="nn" checked />
+                <label for="engine-white-nn" title="Neural net">Neural net</label>
               </div>
             </div>
-            <label class="hc-field" id="hc-field-white">
+            <label class="hc-field" id="hc-field-white" hidden>
               Version
               <select id="hc-white">
                 <option value="handcrafted" selected>v2</option>
                 <option value="handcrafted3" title="Material &amp; piece-square tables distilled from the neural net">v3 — NN-distilled</option>
+                <option value="material" title="Bare piece count — no positional knowledge (deliberately weak)">Material only</option>
               </select>
             </label>
-            <label class="net-field" id="net-field-white" hidden>
+            <label class="net-field" id="net-field-white">
               Net
               <select id="net-white"></select>
             </label>
@@ -261,20 +263,21 @@
             <div class="engine-field">
               <span class="seg-label">Engine</span>
               <div class="seg" role="radiogroup" aria-label="Black engine">
-                <input type="radio" name="engine-black" id="engine-black-hc" value="handcrafted" checked />
+                <input type="radio" name="engine-black" id="engine-black-hc" value="handcrafted" />
                 <label for="engine-black-hc" title="Handcrafted evaluation">Handcrafted</label>
-                <input type="radio" name="engine-black" id="engine-black-nn" value="nn" />
-                <label for="engine-black-nn" title="Neural net — still weak, experimental">Neural net</label>
+                <input type="radio" name="engine-black" id="engine-black-nn" value="nn" checked />
+                <label for="engine-black-nn" title="Neural net">Neural net</label>
               </div>
             </div>
-            <label class="hc-field" id="hc-field-black">
+            <label class="hc-field" id="hc-field-black" hidden>
               Version
               <select id="hc-black">
                 <option value="handcrafted" selected>v2</option>
                 <option value="handcrafted3" title="Material &amp; piece-square tables distilled from the neural net">v3 — NN-distilled</option>
+                <option value="material" title="Bare piece count — no positional knowledge (deliberately weak)">Material only</option>
               </select>
             </label>
-            <label class="net-field" id="net-field-black" hidden>
+            <label class="net-field" id="net-field-black">
               Net
               <select id="net-black"></select>
             </label>
@@ -294,11 +297,11 @@
         <div class="control-row" id="row-ai-swap" hidden>
           <button id="ai-swap" type="button" title="Swap the White and Black AI settings">⇄ Swap</button>
           <label class="check-field" title="Avoid replaying a recent opening: White's first move differs from its last few games, so each game opens differently.">
-            <input type="checkbox" id="vary-openings" />
+            <input type="checkbox" id="vary-openings" checked />
             Vary openings
           </label>
           <label class="check-field" title="Show each engine's own evaluation beside the board — the bottom engine's bar on the left, the top engine's on the right. The white fill is how strong White's position looks to that engine; the bars can disagree when the engines use different evaluations.">
-            <input type="checkbox" id="show-evals" />
+            <input type="checkbox" id="show-evals" checked />
             Eval bars
           </label>
         </div>
