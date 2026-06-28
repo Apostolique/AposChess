@@ -31,6 +31,7 @@ fn progressCb(score: i32, depth: u32) callconv(.c) void {
 var searcher: ?ai.Searcher = null;
 var net: ?nn.Net = null;
 var eval_kind: ai.EvalKind = .handcrafted;
+var minimize: bool = false; // loser ("Lemming") mode: keep the worst root move (nn eval)
 
 // Side outputs of the last search()/ponderSearch(), read via the getters below.
 var out_score: i32 = 0;
@@ -47,7 +48,10 @@ fn ensureSearcher() void {
     if (searcher != null) return;
     const np: ?*const nn.Net = if (eval_kind == .nn and net != null) &net.? else null;
     searcher = ai.Searcher.init(gpa, null, eval_kind, np, 1) catch null;
-    if (searcher) |*s| s.on_progress = &progressCb;
+    if (searcher) |*s| {
+        s.on_progress = &progressCb;
+        s.minimize = minimize;
+    }
 }
 
 fn rebuildSearcher() void {
@@ -66,15 +70,17 @@ export fn allocBytes(n: usize) usize {
 }
 
 /// Select the evaluation: 0 = handcrafted, 1 = nn, 2 = handcrafted3 (NN-distilled PSTs),
-/// 3 = material (bare piece count).
+/// 3 = material (bare piece count), 4 = loser ("Lemming": nn eval, but keeps the worst root
+/// move — tries to lose as fast as possible).
 /// Rebuilds the searcher so the TT is eval-namespaced correctly and the right net is bound.
 export fn setEval(kind: u32) void {
     eval_kind = switch (kind) {
-        1 => .nn,
+        1, 4 => .nn,
         2 => .handcrafted3,
         3 => .material,
         else => .handcrafted,
     };
+    minimize = (kind == 4);
     rebuildSearcher();
 }
 

@@ -1762,7 +1762,10 @@ function applyAiLock() {
 function aiParams(turn) {
   const slot = ui.mode === 'ai-ai' ? turn : 'ai';
   const engine = engineOf(slot);
-  const net = engine === 'nn' ? netUrl(netOf(slot)) : undefined; // weights URL for the worker
+  // 'nn' uses the slot's chosen net; 'loser' (Lemming) always runs the reigning champion.
+  const net = engine === 'nn' ? netUrl(netOf(slot))
+    : engine === 'loser' ? netUrl(championNet())
+    : undefined; // weights URL for the worker
   const v = strengthOf(slot);
   if (v !== 'custom') return { depth: parseInt(v, 10), maxMs: ui.maxMs, engine, net };
   // 0 means "no limit" for either field. Both unlimited would never return, so
@@ -1783,7 +1786,8 @@ function playerName(color) {
   const slot = ui.mode === 'ai-ai' ? color : 'ai';
   const e = engine === 'nn' ? `Neural net (${netOf(slot) || '?'})`
     : engine === 'handcrafted3' ? 'Handcrafted v3'
-    : engine === 'material' ? 'Material' : 'Handcrafted';
+    : engine === 'material' ? 'Material'
+    : engine === 'loser' ? 'Lemming' : 'Handcrafted';
   const d = depth === Infinity ? 'unlimited' : depth;
   const t = maxMs === Infinity ? 'no time limit' : `${maxMs}ms`;
   return `AI (${e}, depth ${d}, ${t})`;
@@ -1799,7 +1803,8 @@ function playerLabel(color) {
   const slot = ui.mode === 'ai-ai' ? color : 'ai';
   const name = engine === 'nn' ? (netOf(slot) || 'Neural net')
     : engine === 'handcrafted3' ? 'Handcrafted v3'
-    : engine === 'material' ? 'Material' : 'Handcrafted';
+    : engine === 'material' ? 'Material'
+    : engine === 'loser' ? 'Lemming' : 'Handcrafted';
   const meta = [];
   if (depth !== Infinity) meta.push(`d${depth}`);
   if (maxMs !== Infinity) meta.push(maxMs % 1000 === 0 ? `${maxMs / 1000}s` : `${maxMs}ms`);

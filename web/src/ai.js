@@ -637,9 +637,14 @@ export function chooseMoveDetailed(state, maxDepth = 2, rand = Math.random, maxM
   // engine is 'handcrafted', 'nn', or 'nn:<slot>' (a specific net). Split off the slot.
   const colon = engine.indexOf(':');
   const evalName = colon < 0 ? engine : engine.slice(0, colon);
+  // 'loser' (the Lemming): the nn champion eval, but the root keeps the WORST-scoring move
+  // instead of the best — it tries to lose as fast as possible (see the root loop below).
+  // It is a move-selection mode, not a distinct eval, so it borrows the nn eval + TT slice.
+  const minimize = evalName === 'loser';
+  const realEval = minimize ? 'nn' : evalName;
   nnSlot = colon < 0 ? 'default' : engine.slice(colon + 1);
-  activeEval = EVALS[evalName] || evalStm;
-  evalKey = (EVAL_KEYS[evalName] || 0n) ^ slotKey(nnSlot);
+  activeEval = EVALS[realEval] || evalStm;
+  evalKey = (EVAL_KEYS[realEval] || 0n) ^ slotKey(nnSlot);
   let root = legalMoves(state);
   if (root.length === 0) return { move: null, ponder: null, depth: 0 };
 
@@ -675,21 +680,25 @@ export function chooseMoveDetailed(state, maxDepth = 2, rand = Math.random, maxM
   const depthCap = Math.min(maxDepth, 99);
   for (let depth = 1; depth <= depthCap; depth++) {
     orderMoves(root, state.board, 0, keyOf(bestMove));
-    let alpha = -Infinity, bestScore = -Infinity, localBest = root[0], aborted = false, moveCount = 0;
+    let alpha = -Infinity, bestScore = minimize ? Infinity : -Infinity, localBest = root[0], aborted = false, moveCount = 0;
     for (const m of root) {
       moveCount++;
       const child = applyMove(state, m);
       const childHash = useTT ? hashAfter(rootHash, state, m) : 0n;
       let score;
-      if (moveCount === 1) {
+      if (minimize) {
+        // Loser mode: every root move needs its TRUE score (so the worst is exact), so
+        // search each with a full window — no alpha tightening, no PVS — and keep the min.
+        score = -search(child, depth - 1, -Infinity, Infinity, 1, true, childHash, deadline);
+      } else if (moveCount === 1) {
         score = -search(child, depth - 1, -Infinity, -alpha, 1, true, childHash, deadline);
       } else {
         score = -search(child, depth - 1, -alpha - 1, -alpha, 1, true, childHash, deadline);
         if (score > alpha) score = -search(child, depth - 1, -Infinity, -alpha, 1, true, childHash, deadline);
       }
       if (now() > deadline) { aborted = true; break; }
-      if (score > bestScore) { bestScore = score; localBest = m; }
-      if (score > alpha) alpha = score;
+      if (minimize ? score < bestScore : score > bestScore) { bestScore = score; localBest = m; }
+      if (!minimize && score > alpha) alpha = score;
     }
     if (!aborted) {
       bestMove = localBest; completed = depth; rootScore = bestScore;
@@ -697,7 +706,8 @@ export function chooseMoveDetailed(state, maxDepth = 2, rand = Math.random, maxM
       // can stream a live eval while the deeper iterations are still running.
       if (onProgress) onProgress(rootScore, completed);
     }
-    if (aborted || bestScore >= MATE_THRESH) break;
+    // Stop once the outcome is forced: a found win (normal) or a found loss (loser mode).
+    if (aborted || (minimize ? bestScore <= -MATE_THRESH : bestScore >= MATE_THRESH)) break;
   }
 
   // The predicted reply is the best move stored for the position *after* ours.

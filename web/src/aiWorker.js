@@ -96,9 +96,10 @@ function writeExcl(keys) {
 // the searcher (a fresh TT), so they're called only on an actual change — matching the JS
 // path's reset-TT-on-net-switch and otherwise persistent table.
 async function ensureEvalNet(engine, netUrl) {
-  const kind = engine === 'nn' ? 1 : engine === 'handcrafted3' ? 2 : engine === 'material' ? 3 : 0;
+  const kind = engine === 'nn' ? 1 : engine === 'handcrafted3' ? 2 : engine === 'material' ? 3 : engine === 'loser' ? 4 : 0;
   if (kind !== curEvalKind) { wasm.setEval(kind); curEvalKind = kind; curNetUrl = null; }
-  if (kind === 1 && netUrl && netUrl !== curNetUrl) {
+  // kind 1 (nn) and kind 4 (loser) both run the nn eval, so both need weights loaded.
+  if ((kind === 1 || kind === 4) && netUrl && netUrl !== curNetUrl) {
     let p = netCache.get(netUrl);
     if (!p) { p = fetch(netUrl).then((r) => r.arrayBuffer()); netCache.set(netUrl, p); }
     let buf;

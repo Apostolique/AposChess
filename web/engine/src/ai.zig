@@ -110,6 +110,10 @@ pub const Searcher = struct {
     eval_kind: EvalKind,
     eval_key: u64,
     net: ?*const nn.Net,
+    // Loser ("Lemming") mode: keep the WORST-scoring root move instead of the best, so the
+    // engine tries to lose as fast as possible. A move-selection mode layered on the nn eval
+    // (set by the host after init); the search itself is unchanged. See chooseMoveExcl.
+    minimize: bool = false,
     // Incremental NNUE accumulators (raw, pre-clip), maintained through make/unmake when
     // the selected net is quantized — one per fixed perspective (us = white / us = black).
     // The leaf eval reads the side-to-move one (see evalNn). Float nets recompute instead.
@@ -573,7 +577,7 @@ pub const Searcher = struct {
         while (depth <= depth_cap) : (depth += 1) {
             self.orderMoves(root.items[0..root.len], &state.board, 0, keyOf(best_move));
             var alpha: i32 = -INF;
-            var best_score: i32 = -INF;
+            var best_score: i32 = if (self.minimize) INF else -INF;
             var local_best = root.items[0];
             var aborted = false;
             var move_count: i32 = 0;
@@ -583,7 +587,11 @@ pub const Searcher = struct {
                 const child_hash = zobrist.hashAfter(root_hash, state, m);
                 const u = self.nnMake(&work, m);
                 var score: i32 = undefined;
-                if (move_count == 1) {
+                if (self.minimize) {
+                    // Loser mode: every root move needs its TRUE score (so the worst is exact),
+                    // so search each with a full window — no alpha tightening, no PVS.
+                    score = -self.search(&work, d, -INF, INF, 1, true, child_hash);
+                } else if (move_count == 1) {
                     score = -self.search(&work, d, -INF, -alpha, 1, true, child_hash);
                 } else {
                     score = -self.search(&work, d, -alpha - 1, -alpha, 1, true, child_hash);
@@ -594,11 +602,11 @@ pub const Searcher = struct {
                     aborted = true;
                     break;
                 }
-                if (score > best_score) {
+                if (if (self.minimize) score < best_score else score > best_score) {
                     best_score = score;
                     local_best = m;
                 }
-                if (score > alpha) alpha = score;
+                if (!self.minimize and score > alpha) alpha = score;
             }
             if (!aborted) {
                 best_move = local_best;
@@ -606,7 +614,8 @@ pub const Searcher = struct {
                 root_score = best_score;
                 if (self.on_progress) |cb| cb(root_score, depth); // stream the live eval bar
             }
-            if (aborted or best_score >= MATE_THRESH) break;
+            // Stop once the outcome is forced: a found win (normal) or a found loss (loser mode).
+            if (aborted or (if (self.minimize) best_score <= -MATE_THRESH else best_score >= MATE_THRESH)) break;
         }
 
         // Ponder: the opponent's predicted reply = the best move the warmed TT stored for
