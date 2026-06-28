@@ -8,9 +8,10 @@
 // can NEVER regress — it either improves or stays put. Runs until --cycles or Ctrl-C.
 //
 // The champion is web/src/nn-weights.json (what `gen --eval=nn` plays with, and the
-// Node-tools default). On each promotion it's also published to the web catalog as
-// 'loop-champion', so you can play the current champion in the app (rebuild for the
-// production bundle; `npm run dev` serves it live).
+// Node-tools default). On each promotion it's also published to the web catalog under the
+// next free human name (Ada, Boris, …) and flagged the current champion, so you can play it
+// in the app under a real name from the moment it's promoted (rebuild for the production
+// bundle; `npm run dev` serves it live).
 //
 // Reality check: this makes the loop SAFE (no regression), but improvement is not
 // guaranteed — the net is signal-limited, so the gate may rarely fire unless the
@@ -249,7 +250,6 @@ const pidFile = join(loopDir, 'loop.pid');
 const pauseFlag = join(loopDir, 'PAUSED'); // marker loop-ctl writes while suspended
 const publicNN = resolve(webDir, 'public', 'nn');
 const manifestFile = join(publicNN, 'manifest.json');
-const loopChampPub = join(publicNN, 'loop-champion.json');
 
 const args = Object.fromEntries(
   process.argv.slice(2).map((a) => {
@@ -321,10 +321,12 @@ const cfg = {
   // is slow — so a big batch would blow far past --rank-minutes. Small batches let the budget
   // bound the step to ~rank-minutes; the store accumulates the games across cycles regardless.
   rankGames: num(args['rank-games'], 10),
-  // On each promotion the OUTGOING champion is retired into the playable net catalog
-  // (web/public/nn) under the next free human name, so past champions stay pickable in the
-  // app. Only the most recent --keep-champions retired nets are kept; older ones are pruned
-  // (weights file + manifest entry) to bound the deployed bundle (~0.5 MB each). 0 = off.
+  // On each promotion the NEW champion is published into the playable net catalog
+  // (web/public/nn) under the next free human name and flagged the current champion, so it's
+  // pickable in the app under a real name from the moment it's promoted (past champions stay
+  // too). Only the most recent --keep-champions retired nets are kept (the current champion is
+  // always kept); older ones are pruned (weights file + manifest entry) to bound the deployed
+  // bundle (~0.5 MB each). 0 = off.
   keepChampions: num(args['keep-champions'], 12),
 };
 
@@ -544,48 +546,53 @@ function refreshArgs(frac, depth) {
 }
 const refreshMode = () => (cfg.rank && existsSync(ledgerFile)) ? 'weakest-first' : 'random';
 
-// Human names for retired champions, handed out in order (the first eight — Ada..Hugo —
-// were the initial hand-published lineage). A name freed by pruning becomes reusable.
+// Human names for champions, handed out in order (the first eight — Ada..Hugo — were the
+// initial hand-published lineage). A name freed by pruning becomes reusable.
 const CHAMPION_NAMES = ['Ada', 'Boris', 'Clara', 'Dexter', 'Elena', 'Felix', 'Greta', 'Hugo',
   'Ivy', 'Jack', 'Kara', 'Leo', 'Mona', 'Nash', 'Olga', 'Pia', 'Quinn', 'Rosa', 'Sven',
   'Tara', 'Uma', 'Victor', 'Wren', 'Xena', 'Yuri', 'Zara'];
 
-function upsertManifest(arch, retireFile) {
-  let man = { default: 'balanced-64', nets: [] };
+// Publish the just-promoted champion `file` into the net catalog under the next free human
+// name and flag it the current champion (named at PROMOTION, not when dethroned) — so it's
+// pickable in the app under a real name from the moment it's promoted, and the app default +
+// analysis eval bar resolve to it via its `current` flag. Clears the previous current flag,
+// then prunes to the most recent cfg.keepChampions retired champions (deleting their weights +
+// manifest entries; the current one is always kept). Idempotent by content hash, so re-running
+// a promotion is a no-op. Returns the assigned name. Loads + writes the manifest itself.
+function publishChampion(file, arch) {
+  let man = { default: null, nets: [] };
   try { man = JSON.parse(readFileSync(manifestFile, 'utf8')); } catch { /* new manifest */ }
+  // Drop any legacy generic 'loop-champion' alias entry (superseded by named champions).
   man.nets = (man.nets || []).filter((n) => n.name !== 'loop-champion');
-  man.nets.push({ name: 'loop-champion', file: 'loop-champion.json', arch, note: 'Latest gated train:loop champion (current).' });
-  if (retireFile) retireChampion(man, retireFile);
+  const champs = () => man.nets.filter((n) => n.loopChampion);
+  const hash = weightsHash(file);
+  let entry = hash !== '?' ? champs().find((n) => n.hash === hash) : null;
+  if (!entry) {
+    const used = new Set(man.nets.map((n) => n.name));
+    const name = CHAMPION_NAMES.find((n) => !used.has(n)) || `champ-${hash}`;
+    const out = `${name.toLowerCase()}.json`;
+    const gen = Math.max(0, ...champs().map((n) => n.gen || 0)) + 1;
+    copyFileSync(file, join(publicNN, out));
+    entry = { name, file: out, arch, loopChampion: true, current: true, hash, gen,
+      note: `train:loop champion ${name} (gen ${gen}, ${hash}, ${new Date().toISOString().slice(0, 10)}).` };
+    man.nets.push(entry);
+  }
+  // Exactly one current champion; it's also the catalog default (so the UI shows its name).
+  for (const n of champs()) delete n.current;
+  entry.current = true;
+  man.default = entry.name;
+  // Keep only the most recent cfg.keepChampions retired champions; never prune the current one.
+  if (cfg.keepChampions > 0) {
+    const byAge = champs().filter((n) => !n.current).sort((a, b) => (a.gen || 0) - (b.gen || 0));
+    for (const e of byAge.slice(0, Math.max(0, byAge.length - cfg.keepChampions))) {
+      const p = join(publicNN, e.file);
+      if (existsSync(p)) rmSync(p);
+      man.nets = man.nets.filter((n) => n !== e);
+    }
+  }
   man.nets.sort((a, b) => a.name.localeCompare(b.name));
   writeFileSync(manifestFile, JSON.stringify(man, null, 2) + '\n');
-}
-
-// Publish the just-dethroned champion `file` into the net catalog under the next free human
-// name so it stays pickable in the app, then prune the catalog to the most recent
-// cfg.keepChampions retired champions (deleting their weights + manifest entries). Mutates
-// `man.nets`; the caller writes the manifest. Idempotent by content hash, so re-running a
-// promotion (or starting a loop whose champion is already retired) is a no-op.
-function retireChampion(man, file) {
-  if (cfg.keepChampions <= 0) return;
-  const hash = weightsHash(file);
-  if (hash === '?') return;
-  const retired = () => man.nets.filter((n) => n.loopChampion);
-  if (retired().some((n) => n.hash === hash)) return; // already published
-  const arch = JSON.parse(readFileSync(file, 'utf8')).arch;
-  const used = new Set(man.nets.map((n) => n.name));
-  const name = CHAMPION_NAMES.find((n) => !used.has(n)) || `champ-${hash}`;
-  const out = `${name.toLowerCase()}.json`;
-  const gen = Math.max(0, ...retired().map((n) => n.gen || 0)) + 1;
-  copyFileSync(file, join(publicNN, out));
-  man.nets.push({ name, file: out, arch, loopChampion: true, hash, gen,
-    note: `Retired train:loop champion (${hash}, ${new Date().toISOString().slice(0, 10)}).` });
-  // Keep only the most recent cfg.keepChampions; prune the oldest by generation.
-  const byAge = retired().sort((a, b) => (a.gen || 0) - (b.gen || 0));
-  for (const e of byAge.slice(0, Math.max(0, byAge.length - cfg.keepChampions))) {
-    const p = join(publicNN, e.file);
-    if (existsSync(p)) rmSync(p);
-    man.nets = man.nets.filter((n) => n !== e);
-  }
+  return entry.name;
 }
 
 if (!existsSync(champion)) {
@@ -738,13 +745,13 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
     copyFileSync(candidate, champion);      // candidate becomes champion
     const champHash = archiveChampion(champion); // keep it reconstructable by its vs version
     if (existsSync(lineage)) rmSync(lineage); // lineage cleared the gate; next start = new champion
-    // prevChampion now holds the dethroned champion (backed up just above): retire it into
-    // the catalog under a name, and publish the new one as the live 'loop-champion'.
-    upsertManifest(arch, prevChampion); copyFileSync(candidate, loopChampPub);
+    // Publish the new champion into the catalog under its own human name right away, flagged
+    // the current champion (so the app shows a real name during its reign, not a generic id).
+    const champName = publishChampion(champion, arch);
     promotions++;
     log(`cycle ${c}: PROMOTED ✓  candidate ${pct}% / Elo +${res.elo.toFixed(0)} over champion `
       + `(${res.games} games, cycle took ${fmtDur((Date.now() - cycleT0) / 1000)}). `
-      + `New champion published as 'loop-champion' (archived ${champHash}.json). Total promotions: ${promotions}.`);
+      + `New champion named '${champName}' in the catalog (archived ${champHash}.json). Total promotions: ${promotions}.`);
     // (The strength pool is refit at the end of every cycle — runRankPool below — so the
     // just-promoted champion is rated automatically from its harvested gate games via
     // --corpus; no per-promotion ranking step is needed here.)
@@ -784,5 +791,5 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
 }
 
 log(`train:loop stopped after ${promotions} promotion(s) in ${fmtDur((Date.now() - loopT0) / 1000)}. `
-  + `Champion: web/src/nn-weights.json${promotions ? " (also catalog 'loop-champion')" : ''}.`);
+  + `Champion: web/src/nn-weights.json${promotions ? ' (also published in the net catalog under its name)' : ''}.`);
 if (promotions) console.log('Run `npm run build` to ship the new champion in the production bundle.');

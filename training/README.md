@@ -116,8 +116,9 @@ harvesting supplements generation rather than replacing it — generation stays 
 deep-label anchor and guarantees fixed data volume even when the SPRT stops early.
 
 - The champion is `web/src/nn-weights.json`. On each promotion it's also published to
-  the catalog as **`loop-champion`**, so you can play the current champion in the app
-  (rebuild for the production bundle; `npm run dev` serves it live).
+  the catalog under its **own human name** (Ada, Boris, …) and flagged the current
+  champion, so you can play it in the app under a real name from the moment it's
+  promoted (rebuild for the production bundle; `npm run dev` serves it live).
 - Runs forever until `Ctrl-C` (or pass `--cycles=N`). Per-cycle decisions are printed
   and appended to `training/data/loop/loop.log`.
 - **`--fresh` deletes the dataset** before the first cycle (irreversible — the raw
@@ -273,9 +274,10 @@ Every idea follows the same shape: **train a candidate, then compare it head-to-
 against the current best with an SPRT**. A net vs *itself* scores ~50% — that's the
 built-in sanity check, and the comparison is far more sensitive than each-vs-handcrafted.
 
-The current best is the live `train:loop` champion (`web/public/nn/loop-champion.json`,
-the manifest `default`); use it as the opponent. (`balanced-64.json` is the older
-~handcrafted-parity baseline, kept as a fixed yardstick.)
+The current best is the live `train:loop` champion (`web/src/nn-weights.json`; in the
+catalog it's the entry flagged `current` and the manifest `default`, published under its
+human name); use it as the opponent. (`balanced-64.json` is the older ~handcrafted-parity
+baseline, kept as a fixed yardstick.)
 
 ### A. Try a different network shape (width/depth)
 
@@ -284,7 +286,7 @@ Architecture only — features are unchanged, so no re-featurize:
 ```
 npm run train:fit -- --hidden=256,64,16 --name=cand      # each comma value = one hidden layer
 npm run match -- --eval-a=nn --eval-b=nn \
-  --weights-a=public/nn/cand.json --weights-b=public/nn/loop-champion.json --sprt
+  --weights-a=public/nn/cand.json --weights-b=src/nn-weights.json --sprt
 ```
 
 ### B. Add a new input feature
@@ -310,7 +312,7 @@ data) and train + compare:
 npm run train:featurize
 npm run train:fit -- --name=cand
 npm run match -- --eval-a=nn --eval-b=nn \
-  --weights-a=public/nn/cand.json --weights-b=public/nn/loop-champion.json --sprt
+  --weights-a=public/nn/cand.json --weights-b=src/nn-weights.json --sprt
 ```
 
 Notes: only `board` + `turn` are available to `featureIndices` (a castling- or

@@ -829,11 +829,11 @@ let puzzleResume = null;
 
 // The analysis engine: a fixed strong default (the Opponent row isn't shown in
 // puzzle mode — analysis wants one good answer, not a sparring partner's level).
-// The loop-champion net at depth 7, our strongest eval; net resolved at request
-// time (the catalog has loaded by the time you reach analysis), falling back to
-// material if the catalog is unavailable. This drives the analysis eval bar AND
-// the best-move arrow that shares its reply (see EVAL_BAR), so the two agree.
-const PUZZLE_AI = { depth: 7, engine: 'nn', net: 'loop-champion' };
+// The current loop-champion net at depth 7, our strongest eval; the net is resolved at
+// request time via championNet() (the catalog has loaded by the time you reach analysis),
+// falling back to material if the catalog is unavailable. This drives the analysis eval bar
+// AND the best-move arrow that shares its reply (see EVAL_BAR), so the two agree.
+const PUZZLE_AI = { depth: 7, engine: 'nn' };
 
 const puzzleUci = (m) => squareName(m.from) + squareName(m.to) + (m.promotion || '');
 
@@ -1130,10 +1130,10 @@ function renderPuzzleMeta() {
 //     bar on each ponder burst (onPonderResult), so neither bar sits frozen between
 //     moves. The final per-ply value (onSearchResult) is what review replays.
 // The analysis eval bar (and the best-move arrow that shares its reply) runs the same
-// engine as "AI move" — loop-champion at depth 7 — so the bar, the arrow, and the move
+// engine as "AI move" — the current loop champion at depth 7 — so the bar, the arrow, and the move
 // AI move would play all agree. It lives in its own worker, so the heavier nn search
 // never blocks the UI; it just updates a touch more deliberately as you navigate.
-const EVAL_BAR = { depth: PUZZLE_AI.depth, maxMs: ui.maxMs, engine: PUZZLE_AI.engine, net: PUZZLE_AI.net };
+const EVAL_BAR = { depth: PUZZLE_AI.depth, maxMs: ui.maxMs, engine: PUZZLE_AI.engine };
 // Scores beyond this magnitude encode a forced mate (ai.js MATE = 1,000,000; no
 // real centipawn eval comes anywhere near) — pin the bar to the winner's end.
 const EVAL_BAR_MATE = 500_000;
@@ -1255,7 +1255,7 @@ function requestEvalBar() {
   // so netUrl is briefly null; firing the search then would run the wasm nn eval with no
   // weights loaded — a "memory access out of bounds" trap that kills the worker (no bar, no
   // arrow). Defer until loadNetCatalog resolves and kicks us again with the net in hand.
-  if (EVAL_BAR.engine === 'nn' && !netUrl(EVAL_BAR.net)) return;
+  if (EVAL_BAR.engine === 'nn' && !netUrl(championNet())) return;
   const fen = repFens[viewIndex];
   if (fen === evalBar.fen) return; // already showing (or searching) this position
   if (evalBar.pending) { evalBar.dirty = true; return; }
@@ -1275,7 +1275,7 @@ function requestEvalBar() {
   evalBar.turn = st.turn;
   evalBar.worker.postMessage({
     type: 'search', seq: ++evalBar.seq, state: st,
-    depth: EVAL_BAR.depth, maxMs: EVAL_BAR.maxMs, engine: EVAL_BAR.engine, net: netUrl(EVAL_BAR.net),
+    depth: EVAL_BAR.depth, maxMs: EVAL_BAR.maxMs, engine: EVAL_BAR.engine, net: netUrl(championNet()),
     // The repetition window up to the VIEWED ply (same trimming as repWindow).
     posHistory: repFens.slice(0, viewIndex + 1).slice(-(st.halfmove + 1)),
     wasmUrl: WASM_URL,
@@ -1642,6 +1642,14 @@ const netOf = (slot) =>
 function netUrl(name) {
   const entry = netCatalog.find((n) => n.name === name);
   return entry ? new URL(`${import.meta.env.BASE_URL}nn/${entry.file}`, location.href).href : null;
+}
+
+// The reigning train:loop champion's net name, resolved from the catalog at call time (the
+// entry flagged `current`, set when it's promoted), falling back to the manifest default.
+// The analysis eval bar / best-move arrow run this so they always use the latest champion
+// without a hardcoded net id (champions now carry their human name from promotion on).
+function championNet() {
+  return (netCatalog.find((n) => n.current) || {}).name || netDefault;
 }
 
 // The wasm search engine (web/engine → public/apos.wasm). Resolved here against the
