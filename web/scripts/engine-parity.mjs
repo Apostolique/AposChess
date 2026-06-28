@@ -201,8 +201,21 @@ for (const p of positions) {
     process.exit(1);
   }
   invMoves += r.checked;
+  // moveKey (from–to + promotion) must INJECTIVELY identify a legal move: the game
+  // dataset stores moves in exactly this compact form (gameRecord.mjs) and replays them
+  // by matching legalMoves, so a collision would make a stored game un-replayable. This
+  // holds by construction (slides stop before a piece, jumps land beyond it; knights
+  // dedup; promotions differ by piece; castling lands two squares off) — assert it so a
+  // future rule edit that broke it would fail here, not silently corrupt the data.
+  const keys = legalMoves(p.state).map(moveKey);
+  if (new Set(keys).size !== keys.length) {
+    console.error(`\nFAIL: from–to(+promo) move key is not unique at ${p.id} (${toFen(p.state)}).`);
+    console.error('  The compact move encoding the dataset relies on would be lossy — aborting.');
+    process.exit(1);
+  }
 }
 console.log(`  Zobrist invariant OK: incremental == recompute across ${invMoves.toLocaleString()} moves.`);
+console.log('  Move-key uniqueness OK: from–to(+promo) identifies every legal move.');
 
 // --- emit the structural (frozen) reference + the eval (champion-tagged) reference -
 const structural = { meta: {}, positions: [] };

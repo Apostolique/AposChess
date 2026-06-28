@@ -6,30 +6,30 @@
 // machines (or in several runs): drop all the files into training/data/ and run
 // this to fold them into one selfplay.jsonl.
 //
-// SMART merge (not a blind concatenation). When you share a base dataset across two
-// computers, each may refresh `v` on a different slice and generate fresh games, then
-// you want to fold the two copies back together. A naive cat would DUPLICATE every
-// shared position and randomly keep one machine's (possibly staler) `v`. Instead we:
-//   - identify each record by its game + ply  (g + position-within-the-game), so the
-//     same position in two copies of the same game collapses to ONE record;
-//   - among the copies, keep the one with the BEST `v` provenance — a real value beats
-//     a missing one, a stronger engine's label beats a weaker one (by the `npm run rank`
-//     Elo ledger, read from `vs` tags), and at equal strength a deeper search wins;
-//   - keep every record whose game/ply isn't already present, so NEW games from either
-//     machine are all added.
+// SMART merge (not a blind concatenation). The dataset is GAME-PRIMARY (one line per game;
+// scripts/gameRecord.mjs). When you share a base dataset across two computers, each may
+// refresh `v` on a different slice and generate fresh games, then you want to fold the two
+// copies back together. A naive cat would DUPLICATE every shared game. Instead we:
+//   - identify each record by its game id `g`, so the two copies of a shared game collapse
+//     to ONE record;
+//   - reconcile their per-position `v` PLY BY PLY, keeping each position's BEST `v`
+//     provenance — a real value beats a missing one, a stronger engine's label beats a
+//     weaker one (by the `npm run rank` Elo ledger, read from `vs` tags), and at equal
+//     strength a deeper search wins. So if machine A refreshed plies 10-20 and machine B
+//     plies 30-40 of the same game, the merge keeps both improvements;
+//   - keep every game not already present, so NEW games from either machine are all added.
 // The game id `g` is "<seed36>-<index>", deterministic from the generator seed, so the
-// same `g` really is the same game (same seed+index => identical play); different
-// machines get genuinely-new games by using different --seed values.
+// same `g` really is the same game (same seed+index => identical play, hence identical
+// moves/players/result — only `v`/`vs` can differ); different machines get genuinely-new
+// games by using different --seed values.
 //
-// Inputs are assumed to be CLEAN per-game datasets (each game listed once, in ply order)
-// — which is what gen-selfplay, refresh-v, the gate harvest, and this tool itself all
-// emit. (A file that already contains a game twice non-contiguously — e.g. an artifact of
-// the old concatenating merge — can't be de-duplicated within itself, only across files.)
+// Inputs are assumed to be CLEAN per-game datasets (each game listed once) — which is what
+// gen, refresh-v, the gate/rank harvests, and this tool all emit.
 //
-// Records are keyed in memory, so peak memory is ~the number of UNIQUE positions across
-// all inputs (the shared base collapses); the npm script raises the V8 heap ceiling for
-// the multi-hundred-MB datasets this is used on. The originals are removed only after the
-// merged file is fully written, so an interrupted run never loses data.
+// Records are keyed by game in memory (far fewer than positions, since each game is one
+// entry); the npm script raises the V8 heap ceiling for the large datasets this runs on.
+// The originals are removed only after the merged file is fully written, so an interrupted
+// run never loses data.
 //
 // `*.features.jsonl` are derived (per-net inputs from featurize.mjs) and regenerable, so
 // they're skipped — folding them into the raw dataset would poison it.
@@ -51,6 +51,8 @@ import { createInterface } from 'node:readline';
 import { dirname, resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { isGameRecord, vsAt, setVsAt, normalizeVs, serializeGameRecord } from './gameRecord.mjs';
+
 const here = dirname(fileURLToPath(import.meta.url));
 const args = Object.fromEntries(
   process.argv.slice(2).map((a) => {
@@ -70,13 +72,13 @@ const mb = (bytes) => (bytes / 1e6).toFixed(1) + ' MB';
 
 // --- provenance ranking (the "best v" rule) --------------------------------------
 // A `vs` tag is "<engine><depth>@<version>" (see vtag.mjs): e.g. "nn6@a3f2c1", "hc6@2".
-// We score a record's value by (engine Elo, search depth); a record with no `v` scores
+// We score a position's value by (engine Elo, search depth); a position with no `v` scores
 // lowest of all. The Elo comes from the strength ledger written by `npm run rank`, which
-// holds one entry PER engine×depth — so we look the record's exact tag up first (its true
-// strength at that depth) and fall back to the engine's BEST per-version Elo for a depth
-// that was never ranked (a deeper-than-ranked search is at least as strong). An untagged /
-// unknown label counts as weakest (-Inf), like refresh-v's weakest-first cohort logic.
-// Without a ledger every Elo is -Inf, so the rule degrades to "has-v, then deeper wins".
+// holds one entry PER engine×depth — so we look the exact tag up first (its true strength
+// at that depth) and fall back to the engine's BEST per-version Elo for a depth that was
+// never ranked (a deeper-than-ranked search is at least as strong). An untagged / unknown
+// label counts as weakest (-Inf), like refresh-v's weakest-first cohort logic. Without a
+// ledger every Elo is -Inf, so the rule degrades to "has-v, then deeper wins".
 const parseTag = (tag) => {
   const m = /^(nn|hc)(\d+|t)@(.+)$/.exec(tag || '');
   return m ? { eng: m[1], depth: m[2], version: m[3] } : null;
@@ -120,13 +122,12 @@ if (useLedger && ledgerPath) {
   }
 }
 
-// Quality of a record's `v`, as a comparable [elo, depth] pair (higher is better). A
-// missing value is the worst possible. Used both to choose between two copies of a
-// position and to count how often a refreshed value displaced a staler one.
+// Quality of a single position's `v`, as a comparable [elo, depth] pair (higher is better).
+// A missing value is the worst possible. Used to choose between two copies of a position.
 const NONE = { elo: -Infinity, depth: -Infinity };
-function vQuality(rec) {
-  if (rec.v === undefined || rec.v === null) return NONE;
-  const t = parseTag(rec.vs);
+function plyQuality(v, vsTag) {
+  if (v === undefined || v === null) return NONE;
+  const t = parseTag(vsTag);
   if (!t) return NONE;
   const depth = t.depth === 't' ? 0 : Number(t.depth);
   // A self-described ephemeral candidate ("nn6@elo37") carries its strength in the tag.
@@ -134,7 +135,7 @@ function vQuality(rec) {
   if (eph !== null) return { elo: eph, depth };
   // Exact engine×depth Elo if that depth was ranked; otherwise the engine's best per-version
   // Elo (unranked depth). Unknown engine -> -Inf (weakest), same as a missing value.
-  const elo = eloByTag.has(rec.vs) ? eloByTag.get(rec.vs)
+  const elo = eloByTag.has(vsTag) ? eloByTag.get(vsTag)
     : (eloByVersion.has(t.version) ? eloByVersion.get(t.version) : -Infinity);
   return { elo, depth };
 }
@@ -151,7 +152,7 @@ try {
   process.exit(0);
 }
 
-// Merge only the RAW position files; *.features.jsonl are derived and regenerable.
+// Merge only the RAW game files; *.features.jsonl are derived and regenerable.
 const files = entries.filter((f) => f.endsWith('.jsonl') && !f.endsWith('.features.jsonl'))
   .map((f) => join(dataDir, f)).sort();
 if (files.length === 0) {
@@ -167,33 +168,40 @@ console.log(`Merging ${files.length} file(s) into ${outName}:`);
 for (const f of files) console.log(`  - ${f.slice(dataDir.length + 1)} (${mb(statSync(f).size)})`);
 
 // --- build the merged set --------------------------------------------------------
-// key = "<game>:<ply>"  (ply = the record's 0-based position within its game IN THIS FILE).
-// best.get(key) = { line, q }  where line is the winning record (newline-stripped) and q
-// is its v-quality. Map iteration order is insertion order, so output = first-seen order
-// (the sorted-first file's records first, then any games unique to later files appended) —
-// games stay grouped and in ply order, which doesn't matter to the (shuffling) trainer but
-// keeps the file readable. Records with no game id can't be de-duplicated, so each is kept
-// under a unique synthetic key.
+// Keyed by game id `g`. best.get(g) = the winning record object; on a repeat we reconcile
+// its per-position v/vs ply by ply (same g => identical moves/players/result). Map iteration
+// order is insertion order, so output = first-seen order (sorted-first file's games first,
+// then games unique to later files) — which doesn't matter to the (shuffling) trainer.
+// Records with no game id (or unparseable lines) can't be de-duplicated, so each is kept
+// verbatim.
 const best = new Map();
-let totalLines = 0, kept = 0, collapsed = 0, upgrades = 0, malformed = 0, noGame = 0;
+let totalLines = 0, games = 0, collapsed = 0, upgrades = 0, malformed = 0, noGame = 0;
+const verbatim = []; // non-game lines kept as-is
+
+// Reconcile `src` into `dst` (same game): adopt each position's v/vs when it's better.
+function mergeInto(dst, src) {
+  if (!Array.isArray(dst.v) || !Array.isArray(src.v)) return;
+  const n = Math.min(dst.v.length, src.v.length);
+  for (let i = 0; i < n; i++) {
+    const dq = plyQuality(dst.v[i], vsAt(dst, i));
+    const sq = plyQuality(src.v[i], vsAt(src, i));
+    if (better(sq, dq)) { dst.v[i] = src.v[i]; setVsAt(dst, i, vsAt(src, i)); upgrades++; }
+  }
+  normalizeVs(dst);
+}
 
 async function ingest(path) {
-  const ply = new Map(); // game id -> next ply index, reset per file (each game listed once)
   const rl = createInterface({ input: createReadStream(path), crlfDelay: Infinity });
   for await (const line of rl) {
     if (!line) continue;
     totalLines++;
     let rec;
-    try { rec = JSON.parse(line); } catch { best.set(` bad${malformed++}`, { line, q: NONE }); kept++; continue; }
-    if (rec.g == null) { best.set(` nog${noGame++}`, { line, q: NONE }); kept++; continue; }
-    const p = ply.get(rec.g) || 0;
-    ply.set(rec.g, p + 1);
-    const key = `${rec.g}:${p}`;
-    const q = vQuality(rec);
-    const cur = best.get(key);
-    if (!cur) { best.set(key, { line, q }); kept++; continue; }
-    collapsed++;                       // a duplicate of an already-seen position
-    if (better(q, cur.q)) { cur.line = line; cur.q = q; upgrades++; } // adopt the better v
+    try { rec = JSON.parse(line); } catch { verbatim.push(line); malformed++; continue; }
+    if (!isGameRecord(rec) || rec.g == null) { verbatim.push(line); noGame++; continue; }
+    const cur = best.get(rec.g);
+    if (!cur) { best.set(rec.g, rec); games++; continue; }
+    collapsed++;            // a duplicate of an already-seen game
+    mergeInto(cur, rec);    // reconcile per-position v/vs
   }
 }
 
@@ -201,9 +209,9 @@ for (const f of files) await ingest(f);
 
 // --- write out, then atomically replace the sources ------------------------------
 const out = createWriteStream(tmp);
-for (const { line } of best.values()) {
-  if (!out.write(line + '\n')) await new Promise((res) => out.once('drain', res));
-}
+const write = async (s) => { if (!out.write(s)) await new Promise((res) => out.once('drain', res)); };
+for (const rec of best.values()) await write(serializeGameRecord(rec) + '\n');
+for (const line of verbatim) await write(line + '\n');
 await new Promise((res) => out.end(res));
 
 // Delete the sources first (Windows rename can't overwrite), then move the temp into
@@ -211,9 +219,9 @@ await new Promise((res) => out.end(res));
 for (const f of files) rmSync(f);
 renameSync(tmp, target);
 
-console.log(`\nDone: ${kept} unique record(s) in ${outName} (${mb(statSync(target).size)}).`);
-console.log(`  ${totalLines} input line(s) -> ${collapsed} duplicate position(s) collapsed`
-  + `${upgrades ? `, ${upgrades} kept a better v` : ''}.`);
+console.log(`\nDone: ${games} unique game(s) in ${outName} (${mb(statSync(target).size)}).`);
+console.log(`  ${totalLines} input line(s) -> ${collapsed} duplicate game(s) collapsed`
+  + `${upgrades ? `, ${upgrades} position(s) kept a better v` : ''}.`);
 if (noGame || malformed) {
   console.log(`  Passed through unchanged: ${noGame} record(s) without a game id`
     + `${malformed ? `, ${malformed} unparseable line(s)` : ''}.`);

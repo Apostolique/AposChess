@@ -2,9 +2,9 @@
 // Copyright (C) 2019-2026 Jean-David Moisan
 //
 // Native self-play data generator behind `npm run train:gen`. Plays whole games from
-// seeded random openings in parallel across threads and appends one JSONL line per
-// position to the dataset: the raw {fen, r, g} (net-agnostic — features come later via
-// scripts/featurize.mjs) plus the search value {v, vs} for TD/bootstrap targets.
+// seeded random openings in parallel across threads and appends one JSONL line per GAME
+// to the dataset (game-primary; see scripts/gameRecord.mjs) — far smaller than the old
+// per-position FEN lines, and it records WHO PLAYED, not only who labeled each position.
 //
 //   apos-gen --games=200 --depth=6 --eval=nn --openings=8 [--opening-topk=N] \
 //     [--movetime=MS] [--maxmoves=200] [--out=../training/data/selfplay.jsonl] \
@@ -12,10 +12,13 @@
 // Paths are relative to the current directory (run from web/). With --eval=nn the
 // teacher is the champion at src/nn-weights.json.
 //
-//   r   game result from the SIDE-TO-MOVE's view (+1 it went on to win / 0 / -1)
-//   g   "<seed-base36>-<index>" game id (groups a game for the train/val split)
-//   v   the search's value of the position (cp, side-to-move-relative)
-//   vs  provenance tag "<engine><depth>@<version>" (mirrors scripts/vtag.mjs)
+// Each line is one game record (features come later via scripts/featurize.mjs):
+//   g        "<seed-base36>-<index>" game id (groups a game for the train/val split)
+//   players  {w,b} engine×depth tag of each side — both the same self-play eval here
+//   r        WHITE-view result (+1 white win / 0 / -1); per-position view derived on replay
+//   moves    ["e2e4",...] compact from+to[promo], connecting consecutive recorded positions
+//   v        per recorded position, the search value (cp, side-to-move-relative); len = moves+1
+//   vs       provenance tag "<engine><depth>@<version>" (mirrors scripts/vtag.mjs)
 
 const std = @import("std");
 const board = @import("board.zig");
@@ -79,8 +82,19 @@ fn appendBase36(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, value: u64) !
     try buf.appendSlice(alloc, tmp[i..]);
 }
 
+// Append a compact move token "<from><to>[promo]" (e.g. "e2e4", "e7e8q") — the dataset's
+// move encoding (mirrors scripts/gameRecord.mjs encodeMove; no '=' before the promo char).
+// Castling is the king's from→to, which uniquely identifies it on replay.
+fn appendMoveToken(out: *std.ArrayList(u8), alloc: std.mem.Allocator, m: engine.Move) !void {
+    const fr = board.squareName(m.from);
+    const to = board.squareName(m.to);
+    try out.appendSlice(alloc, &fr);
+    try out.appendSlice(alloc, &to);
+    if (m.promotion) |role| try out.append(alloc, board.charFromRole(role));
+}
+
 // Play one game with the given searcher (same eval on both sides — self-play), append
-// each position's JSONL record to `out`. Returns the White-view result (+1/0/-1).
+// the game's JSONL record to `out`. Returns the White-view result (+1/0/-1).
 fn playGame(s: *ai.Searcher, cfg: *const Cfg, g: u64, alloc: std.mem.Allocator, out: *std.ArrayList(u8), positions: *u64, nodes: *u64) !i32 {
     var prng = std.Random.DefaultPrng.init(gameSeed(cfg.seed, g));
     const rng = prng.random();
@@ -89,6 +103,8 @@ fn playGame(s: *ai.Searcher, cfg: *const Cfg, g: u64, alloc: std.mem.Allocator, 
     defer states.deinit(alloc);
     var scores: std.ArrayList(i32) = .empty; // parallel to states (search value, cp/stm)
     defer scores.deinit(alloc);
+    var moves_played: std.ArrayList(engine.Move) = .empty; // the move applied from each state
+    defer moves_played.deinit(alloc);
     var seen: std.ArrayList(u64) = .empty; // Zobrist of every earlier position
     defer seen.deinit(alloc);
 
@@ -148,30 +164,43 @@ fn playGame(s: *ai.Searcher, cfg: *const Cfg, g: u64, alloc: std.mem.Allocator, 
 
         const m = move orelse break;
         try seen.append(alloc, zobrist.hashOf(&st));
+        try moves_played.append(alloc, m);
         st = engine.applyMove(&st, m);
     }
 
-    // Serialize every recorded position. `r` is the result from that position's
-    // side-to-move view; `v`/`vs` carry the search value + provenance.
-    var fenbuf: [128]u8 = undefined;
-    for (states.items, 0..) |*ps, i| {
-        const fen = board.toFen(ps, &fenbuf);
-        const r: i32 = if (ps.turn == .white) result else -result;
-        try out.appendSlice(alloc, "{\"fen\":\"");
-        try out.appendSlice(alloc, fen);
-        try out.appendSlice(alloc, "\",\"r\":");
-        try fmtInt(out, alloc, r);
-        try out.appendSlice(alloc, ",\"g\":\"");
-        try appendBase36(out, alloc, cfg.seed);
-        try out.append(alloc, '-');
-        try fmtInt(out, alloc, @as(i64, @intCast(g)));
-        try out.appendSlice(alloc, "\",\"v\":");
-        try fmtInt(out, alloc, scores.items[i]);
-        try out.appendSlice(alloc, ",\"vs\":\"");
-        try out.appendSlice(alloc, cfg.vtag);
-        try out.appendSlice(alloc, "\"}\n");
+    // Serialize the whole game as ONE record { g, players, r, moves, v, vs }. `moves`
+    // connects consecutive recorded positions, so there is one fewer than positions (the
+    // final move leads to the unrecorded terminal); `v` is per recorded position, the
+    // search value (side-to-move view). `vs` is a scalar tag — self-play uses one eval.
+    const npos = states.items.len;
+    if (npos == 0) return result;
+    try out.appendSlice(alloc, "{\"g\":\"");
+    try appendBase36(out, alloc, cfg.seed);
+    try out.append(alloc, '-');
+    try fmtInt(out, alloc, @as(i64, @intCast(g)));
+    try out.appendSlice(alloc, "\",\"players\":{\"w\":\"");
+    try out.appendSlice(alloc, cfg.vtag);
+    try out.appendSlice(alloc, "\",\"b\":\"");
+    try out.appendSlice(alloc, cfg.vtag);
+    try out.appendSlice(alloc, "\"},\"r\":");
+    try fmtInt(out, alloc, result);
+    try out.appendSlice(alloc, ",\"moves\":[");
+    var mi: usize = 0;
+    while (mi + 1 < npos) : (mi += 1) {
+        if (mi > 0) try out.append(alloc, ',');
+        try out.append(alloc, '"');
+        try appendMoveToken(out, alloc, moves_played.items[mi]);
+        try out.append(alloc, '"');
     }
-    positions.* = states.items.len;
+    try out.appendSlice(alloc, "],\"v\":[");
+    for (scores.items, 0..) |sc, i| {
+        if (i > 0) try out.append(alloc, ',');
+        try fmtInt(out, alloc, sc);
+    }
+    try out.appendSlice(alloc, "],\"vs\":\"");
+    try out.appendSlice(alloc, cfg.vtag);
+    try out.appendSlice(alloc, "\"}\n");
+    positions.* = npos;
     return result;
 }
 

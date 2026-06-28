@@ -1,32 +1,35 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2019-2026 Jean-David Moisan
 //
-// Turn the raw self-play dataset (positions + outcomes) into per-net training inputs.
-// The generator (apos-gen) stores only the raw position — net-agnostic:
-// { fen, r, g }. This reads each position and applies the CURRENT nn.js
-// featureIndices, writing the training-ready { f, r, g } that train.py consumes. So
-// the position is the source of truth and features are a derived, regenerable
-// artifact: changing featureIndices is just a re-run of this script, never a
+// Turn the raw self-play dataset into per-net training inputs.
+//
+// The dataset is GAME-PRIMARY (scripts/gameRecord.mjs): one JSONL line per game, holding
+// the move list + per-position v/vs. This script REPLAYS each game into its positions and
+// applies the CURRENT nn.js featureIndices, writing the training-ready { f, r, g } (plus v)
+// that train.py consumes. So the position is the source of truth and features are a derived,
+// regenerable artifact: changing featureIndices is just a re-run of this script, never a
 // regeneration of self-play, and the trainer still needs no chess logic.
 //
-// The position comes from `fen` (preferred — carries castling etc.), or, for legacy
-// pre-FEN records, is reconstructed from the stored `f`: features are CANONICAL
-// side-to-move, so each index decodes to (role, us/them, square) and rebuilds a board
-// that is feature-equivalent (verified to round-trip). That fallback can't recover
-// state outside the canonical board (castling/move counters), so any feature needing
-// those requires FEN-bearing (freshly generated) data.
+// It also reads LEGACY position-primary records ({fen,r,g,v} or pre-fen {f,...}) so the
+// pre-migration dataset and the migration's loss-free check still work — a game record is
+// recognized by its `moves` array; anything else is treated as a single position.
 //
-// Streamed line by line (never loaded whole), written to a temp file that replaces
-// the target only after a complete pass, so an interrupted run can't corrupt it.
+// Streamed line by line (never loaded whole), written to a temp file that replaces the
+// target only after a complete pass, so an interrupted run can't corrupt it.
 //
-// INCREMENTAL: the raw dataset is append-only in the common case (the generator
-// appends whole games), so the meta sidecar records how many raw bytes were
-// processed, a hash of the tail of that prefix, and the output size. When the
-// current raw file still starts with that exact prefix (size grew, tail hash
-// matches) and the output is exactly as we left it, only the appended tail is
-// featurized and appended — turning the per-cycle cost from "whole dataset" into
-// "new games only". Anything else (refresh-v / dedup-cap rewrites, a feature-set
-// change via num_features, an interrupted append) falls back to the full pass.
+// INCREMENTAL: the raw dataset is append-only in the common case (the generator appends
+// whole games), so the meta sidecar records how many raw bytes were processed, a hash of
+// the tail of that prefix, and the output size. When the current raw file still starts with
+// that exact prefix (size grew, tail hash matches) and the output is exactly as we left it,
+// only the appended tail is featurized and appended. Anything else (refresh-v rewrites, a
+// feature-set/quiet/cap change, an interrupted append) falls back to the full pass.
+//
+// --cap=N folds in the old dedup-cap: count-cap how many times any single training input
+// (canonical feature set) appears, to undo the heavy duplication of common positions (the
+// start position occurs once per game). It needs a global count, so it forces a full
+// TWO-pass run (count, then Bernoulli-thin to ~cap copies preserving the win/draw/loss
+// ratio) and disables the incremental fast path; it's recorded in the meta sidecar, so
+// changing it forces a full re-featurize. Omit it (or --cap=0) for the uncapped default.
 //
 // Usage (run from web/):
 //   npm run train:featurize
@@ -34,6 +37,8 @@
 //   --in=FILE    raw dataset to read   (default ../training/data/selfplay.jsonl)
 //   --out=FILE   features to write      (default ../training/data/selfplay.features.jsonl)
 //   --full       force a full rebuild (skip the incremental fast path)
+//   --cap=N      count-cap each canonical input to ~N copies (full two-pass; default off)
+//   --seed=S     RNG seed for the cap thinning (default 1)
 //   --quiet-only drop tactically loud positions (side to move in check, or a winning
 //                capture available) — NNUE is queried only on quiet positions at qsearch
 //                leaves, so training on loud ones mismatches that distribution + adds noise.
@@ -51,6 +56,7 @@ import { fileURLToPath } from 'node:url';
 import { parseFen } from '../src/board.js';
 import { featureIndices, PIECE_SQUARE_FEATURES, NUM_FEATURES } from '../src/nn.js';
 import { generatePseudoMoves, kingAttacked } from '../src/engine.js';
+import { expandPositions, isGameRecord } from './gameRecord.mjs';
 import { fmtDur, fmtNum, fmtMB, liveStatus, everyMs } from './fmt.mjs';
 
 // Rebuild a canonical board from stored feature indices (the legacy fallback when a
@@ -76,12 +82,9 @@ function boardFromFeatures(f) {
 // NNUE is a STATIC eval, called only at the leaves of quiescence search — which
 // resolves captures/checks before evaluating — so at runtime the net is only ever
 // queried on relatively quiet positions. Training on "loud" positions both mismatches
-// that distribution and injects label noise (a still-frame with a hanging piece has a
-// value dominated by tactics the static features can't see). Standard NNUE practice
-// filters them out. With no stored best move (the raw record is just {fen,r,g,v}), we
-// approximate "best move is a capture" statically: a position is LOUD if the side to
-// move is in check, or it has a capture of an enemy piece worth strictly more than the
-// capturer (a pending winning capture / hanging piece — almost always the best move).
+// that distribution and injects label noise. With no stored best move, we approximate
+// "best move is a capture" statically: a position is LOUD if the side to move is in
+// check, or it has a capture of an enemy piece worth strictly more than the capturer.
 // Variant-calibrated values (knight ≈ rook), kept in lockstep with ai.js / nn.js VALUE.
 const VALUE = { p: 100, n: 500, b: 330, r: 500, q: 900, k: 0 };
 function isQuiet(board, turn) {
@@ -110,6 +113,8 @@ const outFile = typeof args.out === 'string'
   ? resolve(process.cwd(), args.out)
   : resolve(here, '../../training/data/selfplay.features.jsonl');
 const quietOnly = !!args['quiet-only'];
+const cap = args.cap !== undefined ? Number(args.cap) : 0; // 0 = uncapped
+const seed = args.seed !== undefined ? Number(args.seed) : 1;
 
 if (!existsSync(inFile)) {
   console.error(`No dataset at ${inFile}. Generate it first:  npm run train:gen`);
@@ -117,37 +122,137 @@ if (!existsSync(inFile)) {
 }
 
 const tmp = outFile + '.tmp';
-// The sidecar carries num_features for train.py plus the incremental state. Keep
-// it next to the data with a matching name: <data>.meta.json (strip .jsonl, add
-// .meta.json).
 const metaFile = outFile.replace(/\.jsonl$/, '') + '.meta.json';
 
-// Hash the tail (up to 64 KB) of the first `prefixBytes` of `file` — enough to
-// detect an in-place rewrite (refresh-v / dedup-cap touch lines everywhere, and
-// the file's own growth moves the boundary) without reading the whole prefix.
+// Expand one raw line into its training positions: a game record replays into many
+// positions; a legacy line is a single position (fen-bearing or pre-fen features). Yields
+// { board, turn, r, v, g } — exactly what featureIndices / the quiet filter / train.py need.
+function* positionsOf(rec) {
+  if (isGameRecord(rec)) {
+    for (const p of expandPositions(rec)) {
+      yield { board: p.state.board, turn: p.state.turn, r: p.r, v: p.v, g: rec.g };
+    }
+  } else {
+    const { board, turn } = typeof rec.fen === 'string' ? parseFen(rec.fen) : boardFromFeatures(rec.f);
+    yield { board, turn, r: rec.r, v: rec.v, g: rec.g };
+  }
+}
+
+// 64-bit key over the sorted feature indices (for --cap counting), so the count map holds
+// compact keys instead of full feature lists. Collisions across a few million keys are
+// negligible. (Same hashing the old dedup-cap used.)
+function keyOfF(f) {
+  const s = f.slice().sort((a, b) => a - b);
+  let h = 0x811c9dc5 >>> 0, g = 0x9e3779b1 >>> 0;
+  for (const x of s) {
+    h = Math.imul(h ^ x, 0x01000193) >>> 0;
+    g = Math.imul(g ^ (x + 0x7f4a7c15), 0x85ebca6b) >>> 0;
+  }
+  return h.toString(36) + ':' + g.toString(36);
+}
+function mulberry32(a) {
+  a >>>= 0;
+  return () => { a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+}
+
+// Build the output record for a featurized position.
+function featurize(p) {
+  const f = featureIndices(p.board, p.turn);
+  const o = { f, r: p.r, g: p.g };
+  if (p.v != null) o.v = p.v; // search value, for TD/bootstrap targets (train.py --lambda)
+  return o;
+}
+
+const writeMeta = (outBytes, rawBytes, rawTailHash) => writeFileSync(metaFile, JSON.stringify({
+  num_features: NUM_FEATURES,
+  quiet_only: quietOnly,
+  cap,
+  incremental: { rawBytes, rawTailHash, outBytes },
+}, null, 2) + '\n');
+
+// Hash the tail (up to 64 KB) of the first `prefixBytes` of `file` — enough to detect an
+// in-place rewrite without reading the whole prefix.
 const TAIL = 64 * 1024;
 function tailHash(file, prefixBytes) {
   const len = Math.min(TAIL, prefixBytes);
   const buf = Buffer.alloc(len);
   const fd = openSync(file, 'r');
-  try {
-    readSync(fd, buf, 0, len, prefixBytes - len);
-  } finally {
-    closeSync(fd);
-  }
+  try { readSync(fd, buf, 0, len, prefixBytes - len); } finally { closeSync(fd); }
   return createHash('sha1').update(buf).digest('hex');
 }
 
-// Snapshot the raw size up front and process exactly that prefix, so the recorded
-// state stays correct even if a generator appends while we run.
 const rawSize = statSync(inFile).size;
+const t0 = Date.now();
+const status = liveStatus();
 
-// Try the incremental fast path: same feature layout, the raw file still begins
-// with the prefix we already processed, and the output is exactly as we left it.
+// =========================================================================
+// --cap: full two-pass (count canonical inputs, then Bernoulli-thin). Disables the
+// incremental fast path — a global count can't be maintained incrementally.
+// =========================================================================
+if (cap > 0) {
+  console.log(`Featurizing ${inFile} (${fmtMB(rawSize)}, full pass, cap ${cap})`);
+  console.log(`  -> ${outFile}`);
+  const counts = new Map();
+  let total = 0, games = 0;
+  // pass 1: count occurrences of each canonical input (after the quiet filter, so counts
+  // match what pass 2 writes).
+  {
+    const tick = everyMs(500);
+    const rl = createInterface({ input: createReadStream(inFile), crlfDelay: Infinity });
+    for await (const line of rl) {
+      if (!line) continue;
+      const rec = JSON.parse(line); games++;
+      for (const p of positionsOf(rec)) {
+        if (quietOnly && !isQuiet(p.board, p.turn)) continue;
+        const k = keyOfF(featureIndices(p.board, p.turn));
+        counts.set(k, (counts.get(k) || 0) + 1);
+        total++;
+      }
+      if (tick()) status.update(`  pass 1/2: counting — ${fmtNum(total)} positions in ${fmtNum(games)} games`);
+    }
+  }
+  status.clear();
+  // pass 2: write each kept position with probability min(1, cap/count).
+  const out = createWriteStream(tmp);
+  const rng = mulberry32(seed);
+  let written = 0, scanned = 0;
+  {
+    const tick = everyMs(500);
+    const rl = createInterface({ input: createReadStream(inFile), crlfDelay: Infinity });
+    for await (const line of rl) {
+      if (!line) continue;
+      const rec = JSON.parse(line);
+      for (const p of positionsOf(rec)) {
+        if (quietOnly && !isQuiet(p.board, p.turn)) continue;
+        const o = featurize(p);
+        scanned++;
+        const c = counts.get(keyOfF(o.f));
+        if (c <= cap || rng() < cap / c) {
+          if (!out.write(JSON.stringify(o) + '\n')) await new Promise((res) => out.once('drain', res));
+          written++;
+        }
+      }
+      if (tick()) status.update(`  pass 2/2: thinning — ${fmtNum(written)} kept of ${fmtNum(scanned)}`);
+    }
+  }
+  await new Promise((res) => out.end(res));
+  if (existsSync(outFile)) rmSync(outFile);
+  renameSync(tmp, outFile);
+  writeMeta(statSync(outFile).size, rawSize, tailHash(inFile, rawSize));
+  status.clear();
+  console.log(`Done: ${fmtNum(written)} positions kept of ${fmtNum(scanned)} (${(100 * (1 - written / Math.max(1, scanned))).toFixed(1)}% capped) `
+    + `in ${fmtDur((Date.now() - t0) / 1000)} -> ${outFile} (${fmtMB(statSync(outFile).size)}, num_features=${NUM_FEATURES}).`);
+  process.exit(0);
+}
+
+// =========================================================================
+// Default path: incremental when possible, else a full single pass.
+// =========================================================================
 let meta = null;
 try { meta = JSON.parse(readFileSync(metaFile, 'utf8')); } catch { /* no sidecar yet */ }
 const inc = !args.full && meta && meta.num_features === NUM_FEATURES
-  && !!meta.quiet_only === quietOnly // a filter toggle changes output content -> full pass
+  && !!meta.quiet_only === quietOnly       // a filter toggle changes output content -> full pass
+  && (meta.cap || 0) === 0                  // last run was capped -> can't append; full pass
   && meta.incremental
   && meta.incremental.rawBytes <= rawSize
   && existsSync(outFile) && statSync(outFile).size === meta.incremental.outBytes
@@ -163,74 +268,49 @@ console.log(inc
   : `Featurizing ${inFile} (${fmtMB(rawSize)}, full pass)`);
 console.log(`  -> ${outFile}`);
 
-// Incremental appends straight to the output (an interrupted append leaves a size
-// mismatch, which forces a clean full rebuild next run); a full pass goes through
-// a temp file that replaces the target only after completing.
-const out = inc
-  ? createWriteStream(outFile, { flags: 'a' })
-  : createWriteStream(tmp);
+const out = inc ? createWriteStream(outFile, { flags: 'a' }) : createWriteStream(tmp);
 const rl = createInterface({
   input: createReadStream(inFile, { start: startAt, end: Math.max(startAt, rawSize - 1) }),
   crlfDelay: Infinity,
 });
 
-// Live progress: lines are ASCII (FEN + JSON), so line lengths track the byte
-// offset closely enough for a percentage and ETA over the prefix being processed.
-const status = liveStatus();
 const tick = everyMs(500);
-const t0 = Date.now();
 const span = rawSize - startAt;
 let bytesDone = 0;
-
-let fromFen = 0, fromFeatures = 0, skippedLoud = 0;
+let games = 0, positions = 0, skippedLoud = 0, fromFeatures = 0;
 for await (const line of rl) {
   if (!line) continue;
   bytesDone += line.length + 1;
-  const n = fromFen + fromFeatures;
-  if (tick() && n) {
+  if (tick() && positions) {
     const el = (Date.now() - t0) / 1000;
-    status.update(`  ${fmtNum(n)} positions | ${(100 * bytesDone / span).toFixed(1)}% | `
-      + `${fmtNum(n / el)}/s | ETA ${fmtDur((span - bytesDone) / (bytesDone / el))}`);
+    status.update(`  ${fmtNum(positions)} positions | ${(100 * bytesDone / span).toFixed(1)}% | `
+      + `${fmtNum(positions / el)}/s | ETA ${fmtDur((span - bytesDone) / (bytesDone / el))}`);
   }
   const rec = JSON.parse(line);
-  const { board, turn } = typeof rec.fen === 'string'
-    ? (fromFen++, parseFen(rec.fen))
-    : (fromFeatures++, boardFromFeatures(rec.f));
-  if (quietOnly && !isQuiet(board, turn)) { skippedLoud++; continue; } // drop tactically loud positions
-  const f = featureIndices(board, turn);
-  const o = { f, r: rec.r, g: rec.g };
-  if (rec.v != null) o.v = rec.v; // search value, for TD/bootstrap targets (train.py --lambda)
-  if (!out.write(JSON.stringify(o) + '\n')) {
-    await new Promise((res) => out.once('drain', res)); // respect backpressure on a big file
+  if (!isGameRecord(rec) && typeof rec.fen !== 'string') fromFeatures++;
+  games++;
+  for (const p of positionsOf(rec)) {
+    if (quietOnly && !isQuiet(p.board, p.turn)) { skippedLoud++; continue; }
+    if (!out.write(JSON.stringify(featurize(p)) + '\n')) {
+      await new Promise((res) => out.once('drain', res)); // respect backpressure on a big file
+    }
+    positions++;
   }
 }
 await new Promise((res) => out.end(res));
 
 if (!inc) {
-  // Replace the target only now that the full pass succeeded (Windows rename can't
-  // overwrite, so remove first).
   if (existsSync(outFile)) rmSync(outFile);
   renameSync(tmp, outFile);
 }
 
-// Stamp the input size (nn.js NUM_FEATURES) into the sidecar so train.py uses the
-// SAME value — no hand-syncing a constant in two languages — plus the incremental
-// state for the next run.
-writeFileSync(metaFile, JSON.stringify({
-  num_features: NUM_FEATURES,
-  quiet_only: quietOnly,
-  incremental: {
-    rawBytes: rawSize,
-    rawTailHash: tailHash(inFile, rawSize),
-    outBytes: statSync(outFile).size,
-  },
-}, null, 2) + '\n');
+writeMeta(statSync(outFile).size, rawSize, tailHash(inFile, rawSize));
 
 status.clear();
-console.log(`Done: ${fmtNum(fromFen + fromFeatures - skippedLoud)} positions featurized${inc ? ' (incremental)' : ''} `
+console.log(`Done: ${fmtNum(positions)} positions featurized${inc ? ' (incremental)' : ''} from ${fmtNum(games)} record(s) `
   + `in ${fmtDur((Date.now() - t0) / 1000)} (${fmtMB(statSync(outFile).size)} total, num_features=${NUM_FEATURES}).`);
 if (quietOnly) {
-  const scanned = fromFen + fromFeatures;
+  const scanned = positions + skippedLoud;
   console.log(`  --quiet-only: dropped ${fmtNum(skippedLoud)} loud positions `
     + `(${scanned ? (100 * skippedLoud / scanned).toFixed(1) : '0.0'}% of ${fmtNum(scanned)} scanned).`);
 }

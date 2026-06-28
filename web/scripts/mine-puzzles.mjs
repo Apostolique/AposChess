@@ -66,8 +66,10 @@ import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { cpus } from 'node:os';
 
+import { toFen } from '../src/board.js';
 import { ensureWasm } from './wasmEngine.mjs';
 import { fmtDur, fmtNum, fmtMB, liveStatus, everyMs } from './fmt.mjs';
+import { isGameRecord, expandPositions } from './gameRecord.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const args = Object.fromEntries(process.argv.slice(2).map((a) => {
@@ -123,41 +125,43 @@ const vMin = Math.max(300, win - 150);
 const candidates = [];
 const seen = new Set();
 {
-  let prev = null, prevPrev = null, lineIdx = 0;
+  let gamesScanned = 0;
   const rl = createInterface({ input: createReadStream(inFile), crlfDelay: Infinity });
   for await (const line of rl) {
-    const idx = lineIdx++;
-    if (!line) { prev = null; prevPrev = null; continue; }
+    if (!line) continue;
     let rec;
-    try { rec = JSON.parse(line); } catch { prev = null; prevPrev = null; continue; }
-    const pair = prev && prev.g === rec.g && typeof prev.v === 'number' && typeof prev.fen === 'string';
-    if (pair && typeof rec.v === 'number' && typeof rec.fen === 'string'
-        && rec.v >= vMin && prev.v + rec.v >= swing
+    try { rec = JSON.parse(line); } catch { continue; }
+    if (!isGameRecord(rec)) continue;
+    gamesScanned++;
+    // Replay the game into its positions: a blunder is a decisive v swing between two
+    // consecutive positions (prev's side was fine, then the new side to move sees a big
+    // edge). Each position carries its side-to-move v and a lazily-built FEN.
+    const ps = [];
+    for (const p of expandPositions(rec)) ps.push({ v: p.v, fen: toFen(p.state) });
+    for (let i = 1; i < ps.length; i++) {
+      const prev = ps[i - 1], cur = ps[i];
+      if (typeof prev.v !== 'number' || typeof cur.v !== 'number') continue;
+      if (!(cur.v >= vMin && prev.v + cur.v >= swing
         // The blunderer must not have been lost already: a dead-lost side "blundering"
         // is just delaying the end, and the solver was then already winning anyway.
         && prev.v >= preFloor
-        // Skip the opening: the generator's first plies are RANDOM moves, and
-        // punishing one of those isn't a tactic anyone needs to learn. The FEN's
-        // fullmove counter survives dataset rewrites (dedup-cap), unlike line order.
-        && Number(rec.fen.split(' ')[5]) >= minMove) {
-      const key = posKey(rec.fen);
-      if (!seen.has(key)) {
-        seen.add(key);
-        // prevFen is the position BEFORE the blunder: the worker derives the blunder
-        // move from it for the win puzzle's lead-in, and mines it as a defense
-        // (only-move) puzzle of its own — prevPrevFen then serves as THAT puzzle's
-        // lead-in, the same way.
-        candidates.push({
-          id: `${rec.g}#${idx}`,
-          fen: rec.fen,
-          prevFen: prev.fen,
-          prevPrevFen: prevPrev && prevPrev.g === rec.g && typeof prevPrev.fen === 'string' ? prevPrev.fen : undefined,
-        });
-      }
+        // Skip the opening: the generator's first plies are RANDOM moves, and punishing
+        // one of those isn't a tactic anyone needs to learn.
+        && Number(cur.fen.split(' ')[5]) >= minMove)) continue;
+      const key = posKey(cur.fen);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      // prevFen is the position BEFORE the blunder: the worker derives the blunder move
+      // from it for the win puzzle's lead-in, and mines it as a defense (only-move) puzzle
+      // of its own — prevPrevFen then serves as THAT puzzle's lead-in, the same way.
+      candidates.push({
+        id: `${rec.g}#${i}`,
+        fen: cur.fen,
+        prevFen: prev.fen,
+        prevPrevFen: i >= 2 ? ps[i - 2].fen : undefined,
+      });
     }
-    prevPrev = prev;
-    prev = rec;
-    if (tick()) status.update(`  scanning… ${fmtNum(lineIdx)} lines, ${fmtNum(candidates.length)} candidates`);
+    if (tick()) status.update(`  scanning… ${fmtNum(gamesScanned)} games, ${fmtNum(candidates.length)} candidates`);
   }
 }
 status.clear();

@@ -119,6 +119,7 @@ import { fmtDur, fmtNum, liveStatus, everyMs } from './fmt.mjs';
 import { weightsHash } from './vtag.mjs';
 import { installStop, printStopHint } from './stop.mjs';
 import { HC_VERSION } from '../src/ai.js';
+import { tallyVs } from './gameRecord.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const webDir = resolve(here, '..');
@@ -470,20 +471,23 @@ async function scanDataset() {
   console.log(`\nScanning ${cfg.data} for vs tags...`);
   const status = liveStatus();
   const tick = everyMs(500);
-  // Read-only and tolerant: regex over raw lines (no JSON.parse), so a half-written
-  // line from a concurrent in-place refresh just fails to match rather than throwing.
-  // If the read itself errors (e.g. the file is atomically renamed mid-read on another
-  // machine), treat the cross-reference as best-effort and carry on.
+  // Read-only and tolerant. Game records ("moves":) are parsed and tallied per position
+  // (vsAt handles scalar/array vs); legacy position lines use the cheap regex. A half-written
+  // line from a concurrent in-place refresh just fails to match/parse rather than throwing.
   try {
     const rl = createInterface({ input: createReadStream(cfg.data), crlfDelay: Infinity });
     for await (const line of rl) {
       if (!line) continue;
+      if (line.includes('"moves":')) {
+        let rec = null; try { rec = JSON.parse(line); } catch { /* half-written */ }
+        if (rec && Array.isArray(rec.moves)) { const { positions, missing } = tallyVs(rec, tagCounts); totalLines += positions; noV += missing; if (tick()) status.update(`  ${fmtNum(totalLines)} positions...`); continue; }
+      }
       totalLines++;
       if (!line.includes('"v":')) { noV++; continue; }
       const m = line.match(/"vs":"([^"]+)"/);
       if (!m) { legacyNoTag++; continue; }
       tagCounts.set(m[1], (tagCounts.get(m[1]) || 0) + 1);
-      if (tick()) status.update(`  ${fmtNum(totalLines)} lines...`);
+      if (tick()) status.update(`  ${fmtNum(totalLines)} positions...`);
     }
   } catch (e) {
     status.clear();

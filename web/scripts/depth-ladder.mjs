@@ -56,6 +56,12 @@
 //   --ledger=FILE   ledger output (default loop/engine-elo.ladder.json — a PARALLEL ledger,
 //                   NOT the live engine-elo.json, so it can be A/B'd safely).
 //   --data=FILE     dataset to scan for record counts (default selfplay.jsonl). --no-scan skips.
+//   --corpus        fold the WHOLE dataset's game results into the fit: every game record's
+//                   players + result becomes a pairwise W/D/L among the ranked nodes, so the
+//                   entire self-play corpus informs the ratings (not just dedicated matchups).
+//                   Recomputed each run (never persisted), so it can't double-count; self-play
+//                   games (same engine both sides) are skipped. Pairs with `node.js --rounds=0`
+//                   for a pure corpus-only refit.
 //   --csv=FILE      also write a flat engine,version,depth,elo,ci95,games CSV (for plotting a
 //                   depth curve — filter to one version). Off unless given.
 //   --save-games[=F]  harvest the games as training data (default OFF).
@@ -71,6 +77,7 @@ import { cpus } from 'node:os';
 import { weightsHash } from './vtag.mjs';
 import { installStop, printStopHint } from './stop.mjs';
 import { HC_VERSION } from '../src/ai.js';
+import { isGameRecord, tallyVs } from './gameRecord.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const webDir = resolve(here, '..');
@@ -122,6 +129,12 @@ const cfg = {
   maxmoves: num(args.maxmoves, 200),
   seed: num(args.seed, 1),
   scan: !args['no-scan'],
+  // Fold the WHOLE self-play corpus into the fit: every stored game records who played
+  // (players.w/.b) and its result, so the entire dataset becomes a pairwise W/D/L matrix
+  // among the ranked nodes — not just the pool's own dedicated matchups. The corpus
+  // contribution is recomputed each run (not persisted into the pool store), so it never
+  // double-counts. Self-play games (same engine both sides) are uninformative and skipped.
+  corpus: !!args.corpus,
   data: typeof args.data === 'string' ? resolve(process.cwd(), args.data) : join(dataDir, 'selfplay.jsonl'),
   store: typeof args.store === 'string' ? resolve(process.cwd(), args.store) : join(loopDir, 'ladder-pool.json'),
   ledger: typeof args.ledger === 'string' ? resolve(process.cwd(), args.ledger) : join(loopDir, 'engine-elo.ladder.json'),
@@ -204,6 +217,21 @@ for (const mf of cfg.merge) {
   console.log(`merged ${folded} games from ${mf.replace(/^.*[\\/]/, '')}`);
 }
 const pairKey = (a, b) => (a < b ? `${a}|${b}` : `${b}|${a}`);
+
+// Corpus-derived pairwise results (from --corpus): recomputed each run, NOT persisted into
+// the pool store, so re-runs never double-count. Same {games, sumA} shape (sumA = points for
+// the lexically-first id). fit() sums these on top of the persisted store.
+const corpusPairs = new Map();
+let corpusGames = 0;
+// Combined view of persisted + corpus pairs, summed by key (different bodies of games, so
+// additive). Used by fit() so the corpus contributes to every rating without touching disk.
+function combinedPairs() {
+  const m = new Map();
+  for (const [k, v] of Object.entries(store.pairs)) m.set(k, { games: v.games, sumA: v.sumA });
+  for (const [k, v] of corpusPairs) { const e = m.get(k) || { games: 0, sumA: 0 }; e.games += v.games; e.sumA += v.sumA; m.set(k, e); }
+  return m;
+}
+
 function record(idA, idB, gamesPlayed, scoreA) {
   // scoreA = A's average score (wins+0.5 draws)/games, from apos-match.
   const key = pairKey(idA, idB);
@@ -221,7 +249,8 @@ function fit() {
   const gamma = new Map(ids.map((id) => [id, 1]));
   const W = new Map(ids.map((id) => [id, cfg.prior * 0.5])); // points, incl. prior half-draws vs phantom
   const adj = new Map(ids.map((id) => [id, []]));            // id -> [{opp, N}]
-  for (const [key, v] of Object.entries(store.pairs)) {
+  const pairs = combinedPairs();                             // persisted store + --corpus games
+  for (const [key, v] of pairs) {
     const [i, j] = key.split('|');
     if (!W.has(i) || !W.has(j)) continue;
     W.set(i, W.get(i) + v.sumA);
@@ -254,7 +283,7 @@ function fit() {
   const pos = new Map(ids.map((id, k) => [id, k]));
   const H = Array.from({ length: n }, () => new Float64Array(n));
   for (let k = 0; k < n; k++) H[k][k] = cfg.prior * 0.25; // phantom self-anchor (p(1−p)=0.25 at parity)
-  for (const [key, v] of Object.entries(store.pairs)) {
+  for (const [key, v] of pairs) {
     const [i, j] = key.split('|');
     if (!pos.has(i) || !pos.has(j)) continue;
     const gi = gamma.get(i), gj = gamma.get(j);
@@ -381,6 +410,10 @@ async function scanDataset() {
     const rl = createInterface({ input: createReadStream(cfg.data), crlfDelay: Infinity });
     for await (const line of rl) {
       if (!line) continue;
+      if (line.includes('"moves":')) {
+        let rec = null; try { rec = JSON.parse(line); } catch { /* half-written */ }
+        if (rec && Array.isArray(rec.moves)) { const { positions, missing } = tallyVs(rec, tagCounts); totalLines += positions; noV += missing; continue; }
+      }
       totalLines++;
       if (!line.includes('"v":')) { noV++; continue; }
       const m = line.match(/"vs":"([^"]+)"/);
@@ -389,6 +422,52 @@ async function scanDataset() {
     }
     writeFileSync(scanCacheFile, JSON.stringify({ file: cfg.data, size: st.size, mtimeMs: st.mtimeMs, totalLines, noV, legacyNoTag, tagCounts: Object.fromEntries(tagCounts) }));
   } catch (e) { console.warn(`  dataset scan interrupted (${e.message}); cross-reference is partial.`); }
+}
+// --- corpus cross-reference (--corpus): the whole dataset as a pairwise W/D/L matrix ----
+// Every game record stores who played (players.w/.b) and its White-view result, so the entire
+// self-play corpus is a body of games among the ranked nodes. We fold those into the fit
+// (corpusPairs, summed on top of the persisted pool store) so ranking uses far more evidence
+// than the pool's own dedicated matchups. Self-play games (same engine both sides) carry no
+// relative-ranking signal and are skipped; legacy games without players are ignored.
+const corpusCacheFile = join(loopDir, 'ladder-corpus-cache.json');
+async function scanCorpus() {
+  if (!cfg.corpus) return;
+  if (!existsSync(cfg.data)) { console.warn(`(no dataset at ${cfg.data} — --corpus has nothing to fold in)`); return; }
+  const st = statSync(cfg.data);
+  if (existsSync(corpusCacheFile)) {
+    try {
+      const c = JSON.parse(readFileSync(corpusCacheFile, 'utf8'));
+      if (c.file === cfg.data && c.size === st.size && c.mtimeMs === st.mtimeMs) {
+        for (const [k, v] of Object.entries(c.pairs)) corpusPairs.set(k, v);
+        corpusGames = c.corpusGames;
+        console.log(`Using cached corpus scan (${corpusGames} games, ${corpusPairs.size} pairs).`);
+        return;
+      }
+    } catch { /* stale/unreadable -> rescan */ }
+  }
+  console.log(`\nScanning ${cfg.data} for game results (--corpus)...`);
+  let skippedSelf = 0, noPlayers = 0;
+  try {
+    const rl = createInterface({ input: createReadStream(cfg.data), crlfDelay: Infinity });
+    for await (const line of rl) {
+      if (!line) continue;
+      let rec; try { rec = JSON.parse(line); } catch { continue; }
+      if (!isGameRecord(rec) || !rec.players) { noPlayers++; continue; }
+      const a = rec.players.w, b = rec.players.b;
+      if (!a || !b || a === '?' || b === '?') { noPlayers++; continue; }
+      if (a === b) { skippedSelf++; continue; } // self-play: uninformative for relative ranking
+      const pointsW = rec.r > 0 ? 1 : (rec.r < 0 ? 0 : 0.5);
+      const key = pairKey(a, b);
+      const e = corpusPairs.get(key) || { games: 0, sumA: 0 };
+      e.games += 1;
+      e.sumA += (a < b) ? pointsW : (1 - pointsW); // sumA tracks the lexically-first id
+      corpusPairs.set(key, e);
+      corpusGames++;
+    }
+    writeFileSync(corpusCacheFile, JSON.stringify({ file: cfg.data, size: st.size, mtimeMs: st.mtimeMs, corpusGames, pairs: Object.fromEntries(corpusPairs) }));
+  } catch (e) { console.warn(`  corpus scan interrupted (${e.message}); partial.`); }
+  console.log(`  corpus: ${corpusGames} mixed-engine games -> ${corpusPairs.size} pair(s) folded into the fit `
+    + `(${skippedSelf} self-play skipped).`);
 }
 const parseTag = (tag) => { const m = /^(nn|hc)(\d+|t)@(.+)$/.exec(tag); return m ? { eng: m[1], depth: m[2], version: m[3] } : null; };
 
@@ -457,6 +536,7 @@ console.log(`Engine ranking pool (active scheduler)`);
 console.log(`  ${competitors.length} node(s): ${competitors.map((c) => `${c.id.split('@')[0]}@${c.version.slice(0, 6)}`).join(', ')}`);
 console.log(`  pin ${pinId} | ${cfg.games} games/matchup | store ${cfg.store}`);
 if (cfg.rounds !== 0) await scanDataset(); // once up front, so the periodic ledger emit has record counts
+await scanCorpus(); // fold the dataset's game results into the fit (no-op unless --corpus)
 
 if (cfg.rounds === 0) {
   // Offline: no matches — just persist the (possibly merged) store, refit, and emit.

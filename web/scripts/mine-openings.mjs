@@ -43,8 +43,8 @@ import { createInterface } from 'node:readline';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { parseFen, toFen, squareName } from '../src/board.js';
-import { legalMoves, applyMove } from '../src/engine.js';
+import { toFen } from '../src/board.js';
+import { isGameRecord, expandPositions } from './gameRecord.mjs';
 import { fmtDur, fmtNum, fmtMB, liveStatus, everyMs } from './fmt.mjs';
 import { installStop, printStopHint } from './stop.mjs';
 
@@ -68,10 +68,6 @@ if (!existsSync(inFile)) { console.error(`No dataset at ${inFile}`); process.exi
 // counters — the same key the app uses to look up the viewed position, and what
 // makes the same position reached via different games collapse to one node.
 const posKey = (fen) => fen.split(' ').slice(0, 3).join(' ');
-// Plies since the start, derived from the FEN alone (robust to missing leading
-// plies from dedup-cap): fullmove is field 5, side to move is field 1.
-const plyOf = (fen) => { const p = fen.split(' '); return (Number(p[5]) - 1) * 2 + (p[1] === 'b' ? 1 : 0); };
-const uci = (m) => squareName(m.from) + squareName(m.to) + (m.promotion || '');
 
 const t0 = Date.now();
 const status = liveStatus();
@@ -82,68 +78,46 @@ printStopHint();
 let stopping = false;
 const stopper = installStop(() => { stopping = true; });
 
-// parent posKey -> Map(uci -> { n, w, d, l, evSum, fromTo }). fromTo keeps the move
-// squares so we can reconstruct only once per distinct parent position (see below).
+// parent posKey -> Map(move -> { n, w, d, l, evSum }). A game record stores its moves
+// directly, so each move connects position i to i+1 with no reconstruction needed.
 const nodes = new Map();
-let lines = 0, pairs = 0, matched = 0, unmatched = 0;
-
-// Reconstructing the move re-generates legal moves and applies each — costly, so we
-// cache the parent's "child posKey -> uci" table the first time we see that parent.
-const moveCache = new Map();
-function moveTable(parentFen) {
-  const key = posKey(parentFen);
-  let tbl = moveCache.get(key);
-  if (tbl) return tbl;
-  tbl = new Map();
-  const state = parseFen(parentFen);
-  for (const m of legalMoves(state)) tbl.set(posKey(toFen(applyMove(state, m))), uci(m));
-  moveCache.set(key, tbl);
-  return tbl;
-}
+let games = 0, pairs = 0;
 
 {
-  let prev = null;
   const rl = createInterface({ input: createReadStream(inFile), crlfDelay: Infinity });
   for await (const line of rl) {
-    lines++;
     if (stopping) break;
-    if (!line) { prev = null; continue; }
+    if (!line) continue;
     let rec;
-    try { rec = JSON.parse(line); } catch { prev = null; continue; }
-    if (typeof rec.fen !== 'string') { prev = null; continue; }
-
-    if (prev && prev.g === rec.g && typeof prev.r === 'number') {
-      const pPly = plyOf(prev.fen), cPly = plyOf(rec.fen);
-      // Only consecutive plies within the ply window: a gap means dedup-cap removed
-      // the intervening position, so no single move connects these two records.
-      if (cPly === pPly + 1 && pPly <= maxPly) {
-        pairs++;
-        const u = moveTable(prev.fen).get(posKey(rec.fen));
-        if (u) {
-          matched++;
-          let node = nodes.get(posKey(prev.fen));
-          if (!node) nodes.set(posKey(prev.fen), node = new Map());
-          let e = node.get(u);
-          if (!e) node.set(u, e = { n: 0, w: 0, d: 0, l: 0, evSum: 0 });
-          e.n++;
-          // r is the game result from the side-to-move's view at the child; fold to
-          // White's POV so every column reads the same way regardless of side.
-          const childWhite = rec.fen.split(' ')[1] === 'w';
-          const res = childWhite ? rec.r : -rec.r;
-          if (res > 0) e.w++; else if (res < 0) e.l++; else e.d++;
-          if (typeof rec.v === 'number') e.evSum += childWhite ? rec.v : -rec.v;
-        } else {
-          unmatched++;
-        }
-      }
+    try { rec = JSON.parse(line); } catch { continue; }
+    if (!isGameRecord(rec)) continue;
+    games++;
+    // Replay into positions; moves[i] is the move from position i to i+1.
+    const ps = [];
+    for (const p of expandPositions(rec)) ps.push(p.state);
+    for (let i = 0; i < rec.moves.length && i <= maxPly; i++) {
+      const child = ps[i + 1];
+      if (!child) break;
+      pairs++;
+      const parentKey = posKey(toFen(ps[i]));
+      const u = rec.moves[i];
+      let node = nodes.get(parentKey);
+      if (!node) nodes.set(parentKey, node = new Map());
+      let e = node.get(u);
+      if (!e) node.set(u, e = { n: 0, w: 0, d: 0, l: 0, evSum: 0 });
+      e.n++;
+      // rec.r is the game's White-view result; report every column from White's POV.
+      if (rec.r > 0) e.w++; else if (rec.r < 0) e.l++; else e.d++;
+      // child's v is side-to-move-relative; fold to White's POV.
+      const cv = rec.v ? rec.v[i + 1] : undefined;
+      if (typeof cv === 'number') e.evSum += child.turn === 'white' ? cv : -cv;
     }
-    prev = rec;
-    if (tick()) status.update(`  scanning… ${fmtNum(lines)} lines, ${fmtNum(nodes.size)} positions`);
+    if (tick()) status.update(`  scanning… ${fmtNum(games)} games, ${fmtNum(nodes.size)} positions`);
   }
 }
 stopper.dispose();
 status.clear();
-console.log(`  scan: ${fmtNum(lines)} lines -> ${fmtNum(pairs)} in-window pairs (${fmtNum(matched)} matched, ${fmtNum(unmatched)} unmatched) in ${fmtDur((Date.now() - t0) / 1000)}`);
+console.log(`  scan: ${fmtNum(games)} games -> ${fmtNum(pairs)} move(s) in window in ${fmtDur((Date.now() - t0) / 1000)}`);
 
 // Prune + shape the catalog: drop rare moves, keep the most-played `top`, sort by
 // games desc (eval as a tiebreak so equal-popularity moves read best-first).

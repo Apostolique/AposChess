@@ -119,6 +119,7 @@ import { fileURLToPath } from 'node:url';
 import { fmtDur, fmtMB } from './fmt.mjs';
 import { weightsHash, ephemeralVersion } from './vtag.mjs';
 import { STOP_EXIT_CODE } from './stop.mjs';
+import { isGameRecord, vsAt, setVsAt, normalizeVs, serializeGameRecord } from './gameRecord.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const webDir = resolve(here, '..');
@@ -409,18 +410,27 @@ function foldGateHarvest(promoted, res) {
   for (const line of readFileSync(gateHarvest, 'utf8').split('\n')) {
     if (!line) continue;
     folded++;
-    // Cheap pre-check before a JSON.parse: only candidate-hash labels need a rewrite.
-    const m = champElo && line.match(/"vs":"nn(\d+|t)@([0-9a-f]+)"/);
-    if (m && m[2] === candHash) {
+    // Each harvested GAME interleaves both players' positions in its per-position `vs`
+    // array; only the candidate's own positions (tagged with its content hash) need the
+    // ephemeral rewrite, since a non-promoted candidate is never archived/rankable. The
+    // champion's positions stay as-is (it IS rankable). Cheap pre-check: a game without the
+    // candidate's hash anywhere needs no work. (When promoted, champElo is null — the
+    // candidate became the champion and is recoverable, so nothing is relabeled.)
+    if (!champElo || !line.includes(candHash)) { out.push(line); continue; }
+    let rec; try { rec = JSON.parse(line); } catch { out.push(line); continue; }
+    if (!isGameRecord(rec)) { out.push(line); continue; }
+    const n = rec.v ? rec.v.length : rec.moves.length + 1;
+    let changed = false;
+    for (let i = 0; i < n; i++) {
+      const m = /^nn(\d+|t)@([0-9a-f]+)$/.exec(vsAt(rec, i) || '');
+      if (!m || m[2] !== candHash) continue;
       const depth = m[1];
       const base = champElo.byDepth.has(depth) ? champElo.byDepth.get(depth) : champElo.best;
-      const rec = JSON.parse(line);
-      rec.vs = `nn${depth}@${ephemeralVersion(base + gateEloLo)}`;
-      out.push(JSON.stringify(rec));
-      relabeled++;
-    } else {
-      out.push(line);
+      setVsAt(rec, i, `nn${depth}@${ephemeralVersion(base + gateEloLo)}`);
+      relabeled++; changed = true;
     }
+    if (changed) normalizeVs(rec);
+    out.push(serializeGameRecord(rec));
   }
   if (out.length) appendFileSync(rawFile, out.join('\n') + '\n');
   rmSync(gateHarvest, { force: true });

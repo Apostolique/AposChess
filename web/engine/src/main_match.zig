@@ -96,21 +96,23 @@ fn fmtDur(buf: []u8, secs_f: f64) []const u8 {
 // One searched position: the position, the result from its side-to-move view, the
 // mover's search value, and which engine ('a'/'b') moved (its provenance on harvest).
 const PlyRec = struct {
-    fen: [128]u8 = undefined,
-    fen_len: u8 = 0,
     r: i32 = 0,
     r_turn_white: bool = false, // side-to-move was White (to set `r` once the game ends)
     v: i32 = 0,
     mover: u8 = 0, // 'a' or 'b'
-
-    fn fenSlice(self: *const PlyRec) []const u8 {
-        return self.fen[0..self.fen_len];
-    }
+    move: engine.Move = undefined, // the move played from this position (for the game record)
 };
 const Game = struct {
     pair: usize,
     color: u8, // 'w' (A is White) or 'b' (A is Black)
+    result_white: i32 = 0, // White-view result of this game (+1/0/-1)
+    start_fen: [128]u8 = undefined, // the random-opening start position (recorded positions begin here)
+    start_len: u8 = 0,
     recs: std.ArrayList(PlyRec),
+
+    fn startSlice(self: *const Game) []const u8 {
+        return self.start_fen[0..self.start_len];
+    }
 };
 
 // Per-side search budget: a fixed depth (depth > 0) OR a per-move time budget (depth ==
@@ -173,17 +175,15 @@ fn playGame(
         const m = res.move orelse break;
 
         if (recs) |list| {
-            var rec = PlyRec{
+            // One record per searched position: its mover's value + the move played from
+            // it (positions and moves are reassembled into a game record on harvest). r
+            // from the side-to-move's view is set once the game's outcome is known.
+            try list.append(alloc, .{
                 .v = res.score,
                 .mover = if (a_to_move) 'a' else 'b',
-            };
-            var fenbuf: [128]u8 = undefined;
-            const fen = board.toFen(&st, &fenbuf);
-            @memcpy(rec.fen[0..fen.len], fen);
-            rec.fen_len = @intCast(fen.len);
-            // r from the side-to-move's view is set once the game's outcome is known.
-            rec.r_turn_white = st.turn == .white;
-            try list.append(alloc, rec);
+                .move = m,
+                .r_turn_white = st.turn == .white,
+            });
         }
 
         try seen.append(alloc, zobrist.hashOf(&st));
@@ -312,8 +312,18 @@ fn worker(sh: *Shared) void {
         sh.scores.append(sh.alloc, s2) catch {};
         sh.nodes += nodes;
         if (sh.cfg.save_games) {
-            sh.games.append(sh.alloc, .{ .pair = pair, .color = 'w', .recs = recs_w }) catch {};
-            sh.games.append(sh.alloc, .{ .pair = pair, .color = 'b', .recs = recs_b }) catch {};
+            // Both games of the pair start from the same random opening; record it so the
+            // harvested positions (which begin AT the opening) can be replayed.
+            var ofbuf: [128]u8 = undefined;
+            const ofen = board.toFen(&opening, &ofbuf);
+            var gw = Game{ .pair = pair, .color = 'w', .result_white = r1, .recs = recs_w };
+            var gb = Game{ .pair = pair, .color = 'b', .result_white = r2, .recs = recs_b };
+            @memcpy(gw.start_fen[0..ofen.len], ofen);
+            gw.start_len = @intCast(ofen.len);
+            @memcpy(gb.start_fen[0..ofen.len], ofen);
+            gb.start_len = @intCast(ofen.len);
+            sh.games.append(sh.alloc, gw) catch {};
+            sh.games.append(sh.alloc, gb) catch {};
         }
         if (sh.sprt and sh.decided == null and sh.scores.items.len >= 16) {
             const l = llr(sh.scores.items, sh.elo0, sh.elo1);
@@ -457,11 +467,21 @@ fn appendInt(out: *std.ArrayList(u8), alloc: std.mem.Allocator, v: i64) !void {
     try out.appendSlice(alloc, std.fmt.bufPrint(&buf, "{d}", .{v}) catch unreachable);
 }
 
-// Append the harvested games as raw training data (the gate harvest train:loop folds in).
-// Every position is labeled with the value from the engine that actually searched it (the
-// mover), at that engine's own depth, tagged with its provenance. No winner-based derivation:
-// a label's trustworthiness is captured by its `vs` tag (and the engine's Elo), so the
-// downstream merge/refresh tooling — not who won this game — decides label quality.
+// Compact move token "<from><to>[promo]" (mirrors scripts/gameRecord.mjs encodeMove).
+fn appendMoveToken(out: *std.ArrayList(u8), alloc: std.mem.Allocator, m: engine.Move) !void {
+    const fr = board.squareName(m.from);
+    const to = board.squareName(m.to);
+    try out.appendSlice(alloc, &fr);
+    try out.appendSlice(alloc, &to);
+    if (m.promotion) |role| try out.append(alloc, board.charFromRole(role));
+}
+
+// Append the harvested games as game-primary training data (the gate harvest train:loop
+// folds in; see scripts/gameRecord.mjs). One line per game records WHO PLAYED (players)
+// and labels every position with the value from the engine that actually searched it (the
+// mover), at that engine's own depth, tagged with its provenance — so per-position `vs` is
+// an array (the movers alternate). No winner-based derivation: a label's trustworthiness is
+// captured by its `vs` tag (and the engine's Elo), not by who won.
 fn writeHarvest(sh: *Shared, gpa: std.mem.Allocator, io: std.Io, path: []const u8, depth_a: u32, depth_b: u32, eval_a: ai.EvalKind, eval_b: ai.EvalKind, weights_a: []const u8, weights_b: []const u8) !void {
     var tag_a_buf: [40]u8 = undefined;
     var tag_b_buf: [40]u8 = undefined;
@@ -473,27 +493,51 @@ fn writeHarvest(sh: *Shared, gpa: std.mem.Allocator, io: std.Io, path: []const u
     var n_pos: usize = 0;
     var n_a: usize = 0;
     for (sh.games.items) |g| {
-        for (g.recs.items) |rec| {
-            try out.appendSlice(gpa, "{\"fen\":\"");
-            try out.appendSlice(gpa, rec.fenSlice());
-            try out.appendSlice(gpa, "\",\"r\":");
-            try appendInt(&out, gpa, rec.r);
-            try out.appendSlice(gpa, ",\"g\":\"m");
-            try appendBase36(&out, gpa, sh.cfg.seed);
-            try out.append(gpa, '-');
-            try appendInt(&out, gpa, @as(i64, @intCast(g.pair)));
-            try out.append(gpa, g.color); // 'w' or 'b'
+        const npos = g.recs.items.len;
+        if (npos == 0) continue;
+        // players: color 'w' means engine A had White, so w=A's tag, b=B's tag (swapped otherwise).
+        const pw = if (g.color == 'w') tag_a else tag_b;
+        const pb = if (g.color == 'w') tag_b else tag_a;
+        try out.appendSlice(gpa, "{\"g\":\"m");
+        try appendBase36(&out, gpa, sh.cfg.seed);
+        try out.append(gpa, '-');
+        try appendInt(&out, gpa, @as(i64, @intCast(g.pair)));
+        try out.append(gpa, g.color); // 'w' or 'b'
+        // The random-opening start (recorded positions begin here, not the standard start).
+        try out.appendSlice(gpa, "\",\"start\":\"");
+        try out.appendSlice(gpa, g.startSlice());
+        try out.appendSlice(gpa, "\",\"players\":{\"w\":\"");
+        try out.appendSlice(gpa, pw);
+        try out.appendSlice(gpa, "\",\"b\":\"");
+        try out.appendSlice(gpa, pb);
+        try out.appendSlice(gpa, "\"},\"r\":");
+        try appendInt(&out, gpa, g.result_white);
+        // moves connect consecutive recorded positions (one fewer than positions).
+        try out.appendSlice(gpa, ",\"moves\":[");
+        var mi: usize = 0;
+        while (mi + 1 < npos) : (mi += 1) {
+            if (mi > 0) try out.append(gpa, ',');
             try out.append(gpa, '"');
-            // The mover's own search value, tagged with the mover's engine + depth.
-            try out.appendSlice(gpa, ",\"v\":");
+            try appendMoveToken(&out, gpa, g.recs.items[mi].move);
+            try out.append(gpa, '"');
+        }
+        // v: the mover's own search value per recorded position.
+        try out.appendSlice(gpa, "],\"v\":[");
+        for (g.recs.items, 0..) |rec, i| {
+            if (i > 0) try out.append(gpa, ',');
             try appendInt(&out, gpa, rec.v);
-            try out.appendSlice(gpa, ",\"vs\":\"");
+        }
+        // vs: per-position provenance (mover's engine×depth tag), parallel to v.
+        try out.appendSlice(gpa, "],\"vs\":[");
+        for (g.recs.items, 0..) |rec, i| {
+            if (i > 0) try out.append(gpa, ',');
+            try out.append(gpa, '"');
             try out.appendSlice(gpa, if (rec.mover == 'a') tag_a else tag_b);
             try out.append(gpa, '"');
-            try out.appendSlice(gpa, "}\n");
             if (rec.mover == 'a') n_a += 1;
-            n_pos += 1;
         }
+        try out.appendSlice(gpa, "]}\n");
+        n_pos += npos;
     }
 
     if (std.fs.path.dirname(path)) |dir| std.Io.Dir.cwd().createDirPath(io, dir) catch {};

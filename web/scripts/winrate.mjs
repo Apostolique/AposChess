@@ -2,12 +2,11 @@
 // Copyright (C) 2019-2026 Jean-David Moisan
 //
 // Read-only winrate report for the self-play dataset: what share of games White
-// wins, Black wins, and draws. Each dataset record is one position carrying `r`, the
-// game result from the *side-to-move's* perspective (so it alternates +1/-1 down a
-// decisive game, 0 throughout a draw). We collapse to one outcome per game by `g`
-// (the game id) and re-express it from White's point of view:
-//   whiteResult = (side-to-move is White) ? r : -r
-// then tally white wins / black wins / draws.
+// wins, Black wins, and draws. The dataset is GAME-PRIMARY (one record per game;
+// scripts/gameRecord.mjs), and each game record's `r` is already the WHITE-view result
+// (1 White won, -1 Black won, 0 draw) — so we just tally `r` per game. (Legacy
+// position-primary lines, whose `r` is side-to-move-relative, are still handled by
+// collapsing per game id and folding to White's view via the FEN's side to move.)
 //
 //   npm run winrate                 # report on ../training/data/selfplay.jsonl
 //   npm run winrate -- --data=FILE   # point at a different *.jsonl dataset
@@ -58,10 +57,15 @@ for await (const line of rl) {
     continue;
   }
   const { g, fen, r } = rec;
-  if (typeof g !== 'string' || typeof fen !== 'string' || typeof r !== 'number') {
-    bad += 1;
+  if (typeof g !== 'string' || typeof r !== 'number') { bad += 1; continue; }
+  if (Array.isArray(rec.moves)) {
+    // Game record: r is already White-view; one record per game, count its positions.
+    positions += (rec.v ? rec.v.length : rec.moves.length + 1) - 1; // -1: this line counted as 1 above
+    games.set(g, Math.sign(r));
     continue;
   }
+  // Legacy position-primary line: r is side-to-move-relative; fold to White's view.
+  if (typeof fen !== 'string') { bad += 1; continue; }
   if (games.has(g)) continue;
   const stm = fen.split(' ')[1]; // 'w' or 'b'
   const whiteResult = stm === 'b' ? -r : r;
