@@ -384,7 +384,20 @@ function evalStmV3(board, turn) {
 let nnSlot = 'default';
 const evalNN = (board, turn) => nnEvaluate(board, turn, nnSlot);
 
-const EVALS = { handcrafted: evalStm, handcrafted3: evalStmV3, nn: evalNN };
+// Material-only eval: the bare piece count (same VALUE table the nn eval falls back to
+// before its weights load), side-to-move relative. Exposed as its own 'material' engine
+// so a deliberately weak, positionally-blind opponent can be picked in the UI — distinct
+// from the nn fallback (which is an accident waiting for weights), this is a real choice.
+function evalMaterial(board, turn) {
+  let s = 0;
+  for (let i = 0; i < 64; i++) {
+    const p = board[i];
+    if (p) s += p.color === 'white' ? VALUE[p.role] : -VALUE[p.role];
+  }
+  return turn === 'white' ? s : -s;
+}
+
+const EVALS = { handcrafted: evalStm, handcrafted3: evalStmV3, material: evalMaterial, nn: evalNN };
 let activeEval = evalStm;
 
 // The transposition table persists across searches and — in AI-vs-AI on a single
@@ -396,7 +409,7 @@ let activeEval = evalStm;
 // ttProbe/ttStore) so each eval occupies a disjoint slice of the table. Handcrafted
 // uses 0n, so single-eval behaviour — and the match runner's separate-instance
 // engines — stay byte-for-byte unchanged; only the nn keys move out of the way.
-const EVAL_KEYS = { handcrafted: 0n, handcrafted3: 0x2545f4914f6cdd1dn, nn: 0x9e3779b97f4a7c15n };
+const EVAL_KEYS = { handcrafted: 0n, handcrafted3: 0x2545f4914f6cdd1dn, material: 0x6a09e667f3bcc908n, nn: 0x9e3779b97f4a7c15n };
 let evalKey = 0n;
 
 // Distinct TT namespace per nn slot, so a single instance that switches nets mid-run
@@ -702,4 +715,4 @@ export function chooseMove(state, maxDepth, rand, maxMs, useTT, prevHashes, engi
 
 // Exposed for tests only: Zobrist hash equivalence check + table reset so a
 // benchmark/test can start each game from a cold table despite persistence.
-export const _internal = { hashOf, hashAfter, resetTT: ttReset, evalStm, evalStmV3, MATE, MATE_THRESH };
+export const _internal = { hashOf, hashAfter, resetTT: ttReset, evalStm, evalStmV3, evalMaterial, MATE, MATE_THRESH };

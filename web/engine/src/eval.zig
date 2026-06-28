@@ -114,6 +114,20 @@ pub fn evalStm(b: *const [64]?Piece, turn: Color) i32 {
     return if (turn == .white) s else -s;
 }
 
+// Material-only eval: the bare piece count (VALUE table, the nn eval's pre-weights
+// fallback), side-to-move relative. Selected by EvalKind.material. Mirrors evalMaterial
+// in web/src/ai.js — keep in lockstep.
+pub fn evalMaterial(b: *const [64]?Piece, turn: Color) i32 {
+    var s: i32 = 0;
+    var i: usize = 0;
+    while (i < 64) : (i += 1) {
+        const p = b[i] orelse continue;
+        const v = VALUE[roleIndex(p.role)];
+        s += if (p.color == .white) v else -v;
+    }
+    return if (turn == .white) s else -s;
+}
+
 // --- handcrafted v3 ----------------------------------------------------------
 // Material + PSTs distilled from the champion neural net (per-(role,square) ridge
 // regression of the net's eval, decomposed into base value + positional residual,

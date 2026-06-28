@@ -26,12 +26,13 @@ const ui = {
   strengthBlack: '6',
   // Which engine family drives each AI slot: 'handcrafted' or 'nn' (neural net).
   // Orthogonal to strength — the chosen engine still searches to the depth/time above.
-  engineAi: 'handcrafted',
-  engineWhite: 'handcrafted',
-  engineBlack: 'handcrafted',
-  // Handcrafted version per slot ('handcrafted' = v2, 'handcrafted3' = v3, the
-  // NN-distilled material+PSTs). Picked from a dropdown, like netAi for nn; only
-  // consulted when that slot's engine family is 'handcrafted'.
+  // Defaults to the neural net (our strongest eval).
+  engineAi: 'nn',
+  engineWhite: 'nn',
+  engineBlack: 'nn',
+  // Handcrafted version per slot ('handcrafted' = v2, 'handcrafted3' = v3 the
+  // NN-distilled material+PSTs, 'material' = bare piece count). Picked from a dropdown,
+  // like netAi for nn; only consulted when that slot's engine family is 'handcrafted'.
   hcAi: 'handcrafted',
   hcWhite: 'handcrafted',
   hcBlack: 'handcrafted',
@@ -52,11 +53,11 @@ const ui = {
   started: false,      // AI-vs-AI game has been started at least once (Pause/Resume vs Start)
   // AI-vs-AI opening variety: when on, the engine's first move (White) is forbidden
   // from matching its last few games, so consecutive games open differently.
-  varyOpenings: false,
+  varyOpenings: true,
   recentOpenings: [],  // move keys (from*64+to) of recent games' opening moves, oldest first
   // AI-vs-AI: show each engine's own evaluation as a bar beside the board
   // (bottom engine left, top engine right). See the eval-bars section.
-  showEvalBars: false,
+  showEvalBars: true,
   // Flip board: invert the point of view (board orientation, trays, eval-bar
   // sides). A pure view toggle, reset when the mode changes so mode-specific
   // auto-orientation (puzzles, online colour) starts out right.
@@ -1749,7 +1750,8 @@ function playerName(color) {
   const { depth, maxMs, engine } = aiParams(color);
   const slot = ui.mode === 'ai-ai' ? color : 'ai';
   const e = engine === 'nn' ? `Neural net (${netOf(slot) || '?'})`
-    : engine === 'handcrafted3' ? 'Handcrafted v3' : 'Handcrafted';
+    : engine === 'handcrafted3' ? 'Handcrafted v3'
+    : engine === 'material' ? 'Material' : 'Handcrafted';
   const d = depth === Infinity ? 'unlimited' : depth;
   const t = maxMs === Infinity ? 'no time limit' : `${maxMs}ms`;
   return `AI (${e}, depth ${d}, ${t})`;

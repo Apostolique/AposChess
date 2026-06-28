@@ -49,7 +49,7 @@ import { _internal, HC_VERSION } from '../src/ai.js';
 import { loadWeights, hasWeights, evaluate as nnEvaluate } from '../src/nn.js';
 import { weightsHash } from './vtag.mjs';
 
-const { hashOf, hashAfter, evalStm, evalStmV3 } = _internal;
+const { hashOf, hashAfter, evalStm, evalStmV3, evalMaterial } = _internal;
 const here = dirname(fileURLToPath(import.meta.url));
 
 const args = Object.fromEntries(process.argv.slice(2).map((a) => {
@@ -248,6 +248,7 @@ positions.forEach((p, i) => {
       id: p.id, fen,
       evalHc: Math.round(evalStm(state.board, state.turn)),
       evalHc3: Math.round(evalStmV3(state.board, state.turn)),
+      evalMat: Math.round(evalMaterial(state.board, state.turn)),
       evalNn: Math.round(nnEvaluate(state.board, state.turn)),
     });
   }

@@ -54,7 +54,7 @@ const TT_BITS: u6 = 20;
 const TT_SIZE: usize = @as(usize, 1) << TT_BITS;
 const TT_MASK: u64 = TT_SIZE - 1;
 
-pub const EvalKind = enum { handcrafted, nn, handcrafted3 };
+pub const EvalKind = enum { handcrafted, nn, handcrafted3, material };
 
 // Handcrafted-eval version (mirrors HC_VERSION in src/ai.js) — bumped by hand when the
 // PST eval changes, so a `v` from it is stamped with which version produced it (vtag).
@@ -144,6 +144,7 @@ pub const Searcher = struct {
                 .handcrafted => 0,
                 .nn => 0x9e3779b97f4a7c15,
                 .handcrafted3 => 0x2545f4914f6cdd1d,
+                .material => 0x6a09e667f3bcc908,
             },
             .net = net,
             .nn_inc = eval_kind == .nn and net != null and net.?.is_int,
@@ -171,6 +172,7 @@ pub const Searcher = struct {
         return switch (self.eval_kind) {
             .handcrafted => eval.evalStm(b, turn),
             .handcrafted3 => eval.evalStmV3(b, turn),
+            .material => eval.evalMaterial(b, turn),
             .nn => self.evalNn(b, turn),
         };
     }
