@@ -534,7 +534,7 @@ function writeRankLedger(verbose) {
 
 console.log(`Engine ranking pool (active scheduler)`);
 console.log(`  ${competitors.length} node(s): ${competitors.map((c) => `${c.id.split('@')[0]}@${c.version.slice(0, 6)}`).join(', ')}`);
-console.log(`  pin ${pinId} | ${cfg.games} games/matchup | store ${cfg.store}`);
+console.log(`  pin ${pinId} | ${cfg.games} games/matchup | ${cfg.jobs} parallel job(s) | store ${cfg.store}`);
 if (cfg.rounds !== 0) await scanDataset(); // once up front, so the periodic ledger emit has record counts
 await scanCorpus(); // fold the dataset's game results into the fit (no-op unless --corpus)
 

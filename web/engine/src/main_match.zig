@@ -649,6 +649,8 @@ pub fn main(init: std.process.Init) !void {
         },
     };
 
+    std.debug.print("Playing {d} games | openings {d} | jobs {d} | seed {d}\n", .{ games, openings, jobs, seed });
+
     const t0 = std.Io.Clock.now(.awake, io).nanoseconds;
     shared.t0_ns = @intCast(t0); // so the live progress line can show elapsed/ETA
     const threads = try gpa.alloc(std.Thread, jobs);
