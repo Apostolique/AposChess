@@ -636,9 +636,10 @@ function writeRankLedger(verbose) {
   writeFileSync(cfg.ledger, JSON.stringify(ledger, null, 2) + '\n');
   if (!verbose) return;
   console.log(`\n===== Elo ladder (${pinId} := 0) — weakest first =====`);
-  console.log(`  ${'engine'.padEnd(16)} ${'Elo'.padStart(8)} ${'±95'.padStart(6)} ${'games'.padStart(7)}`);
-  for (const c of ranked) {
-    console.log(`  ${c.id.padEnd(16)} ${(`${elo.get(c.id) >= 0 ? '+' : ''}${elo.get(c.id).toFixed(0)}`).padStart(8)} ${(ci.get(c.id) == null ? '' : ci.get(c.id).toFixed(0)).padStart(6)} ${String(gamesOf(c.id)).padStart(7)}${c.id === pinId ? '  (pin)' : ''}`);
+  console.log(`  ${'#'.padStart(3)} ${'engine'.padEnd(16)} ${'Elo'.padStart(8)} ${'±95'.padStart(6)} ${'games'.padStart(7)}`);
+  for (const [i, c] of ranked.entries()) {
+    const rank = ranked.length - i; // ranked is weakest-first, so #1 = strongest
+    console.log(`  ${String(rank).padStart(3)} ${c.id.padEnd(16)} ${(`${elo.get(c.id) >= 0 ? '+' : ''}${elo.get(c.id).toFixed(0)}`).padStart(8)} ${(ci.get(c.id) == null ? '' : ci.get(c.id).toFixed(0)).padStart(6)} ${String(gamesOf(c.id)).padStart(7)}${c.id === pinId ? '  (pin)' : ''}`);
   }
   if (unrecoverable.length) {
     console.log(`\n  Unrecoverable contributors (no Elo -> weakest, refresh on sight):`);
