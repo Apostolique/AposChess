@@ -242,6 +242,12 @@ const ladderStore = join(loopDir, 'ladder-pool.json');
 // hc / archived / material), so no provenance rewrite is needed. --corpus subtracts the store,
 // so re-reading them from the dataset never double-counts in the ratings.
 const ladderGames = join(loopDir, 'ladder-games.jsonl');
+// Persistent high-water mark: bytes of ladderGames already folded into the dataset. Persisting
+// it (vs a per-cycle snapshot) means the fold also catches games a STANDALONE `rank:pool` in
+// another terminal appended between cycles — not just the loop's own rank step. Missing/0 ⇒ fold
+// the whole archive (first run on this clone, or after --fresh clears the dataset but keeps the
+// archive); merge-data dedups by game id any game an earlier fold already added.
+const ladderFoldMark = join(loopDir, 'ladder-fold.json');
 const logFile = join(loopDir, 'loop.log');
 // PID of this loop, so `npm run train:pause`/`train:resume` (scripts/loop-ctl.mjs) can find
 // and freeze/thaw the loop's whole process tree from another terminal — a long run pegs every
@@ -501,37 +507,45 @@ const poolDepths = [...new Set([cfg.rankDepth, cfg.depth])].filter((d) => d >= 1
 function runRankPool(label) {
   if (!cfg.rank) return;
   // With harvesting on (default), rank:pool appends its games to its archive (ladderGames); we
-  // then fold this cycle's additions into the dataset. With --no-harvest, suppress the archive
-  // too (--no-save-games), consistent with the gate. Capture the archive size up front so we can
-  // append only the games this run added.
-  const before = (cfg.harvest && existsSync(ladderGames)) ? statSync(ladderGames).size : 0;
+  // then fold everything past the persistent mark into the dataset — the loop's own rank games
+  // AND any a standalone rank:pool added between cycles. With --no-harvest, suppress the archive
+  // too (--no-save-games), consistent with the gate.
   run(label, process.execPath,
     [rankScript, '--corpus', `--minutes=${cfg.rankMinutes}`,
       `--depths=${poolDepths.join(',')}`, `--anchor-depth=${cfg.rankDepth}`,
       `--games=${cfg.rankGames}`, `--store=${ladderStore}`, `--ledger=${ledgerFile}`,
       ...(cfg.harvest ? [] : ['--no-save-games']),
       '--no-scan', `--seed=${Date.now()}`, ...jobArg]);
-  if (cfg.harvest) foldNewLadderGames(before);
+  if (cfg.harvest) foldNewLadderGames();
 }
 
-// Append the games rank:pool added to its archive THIS cycle (everything past `beforeSize`) into
-// the dataset, so the next incremental featurize trains on them. The games are fresh (unique
-// game ids), so no dedup is needed here; merge-data later collapses any overlap idempotently.
-// Their players are all rankable engines, so labels are kept as-is (no ephemeral rewrite).
-function foldNewLadderGames(beforeSize) {
+// Last byte of ladderGames already folded into the dataset (0 if never / after --fresh).
+const readLadderMark = () => { try { return JSON.parse(readFileSync(ladderFoldMark, 'utf8')).offset || 0; } catch { return 0; } };
+const writeLadderMark = (offset) => { try { writeFileSync(ladderFoldMark, JSON.stringify({ offset }) + '\n'); } catch { /* best-effort: a missed write only re-folds dedup-able games next run */ } };
+
+// Fold every ladder game past the persistent mark into the dataset, so the next incremental
+// featurize trains on it. The mark persists across cycles (and across runs), so this catches not
+// just the loop's own rank games but any a STANDALONE rank:pool appended to the archive between
+// cycles — the whole point of persisting it. On a clone with no mark yet it folds the entire
+// archive once; games an earlier fold already placed are collapsed by merge-data's game-id dedup.
+// Players are all rankable engines, so labels are kept as-is (no ephemeral rewrite).
+function foldNewLadderGames() {
   if (!existsSync(ladderGames)) return;
   const size = statSync(ladderGames).size;
-  if (size <= beforeSize) return; // nothing new (rank played no games, or harvesting was off)
+  const mark = readLadderMark();
+  const from = mark > size ? 0 : mark; // archive shrank (deleted + recreated) ⇒ re-fold from 0
+  if (size <= from) return; // nothing new (rank played no games, or harvesting was off)
   const fd = openSync(ladderGames, 'r');
   try {
-    const buf = Buffer.alloc(size - beforeSize);
-    readSync(fd, buf, 0, buf.length, beforeSize);
+    const buf = Buffer.alloc(size - from);
+    readSync(fd, buf, 0, buf.length, from);
     let chunk = buf.toString('utf8');
     if (!chunk.endsWith('\n')) chunk += '\n'; // each game is a full line; guard a torn tail
     appendFileSync(rawFile, chunk);
     const added = chunk.split('\n').filter(Boolean).length;
     log(`  Folded ${added} new ladder game(s) into the dataset (next featurize trains on them).`);
   } finally { closeSync(fd); }
+  writeLadderMark(size); // advance only after a successful append
 }
 
 // Build refresh-v args. With ranking on AND a ledger present, target the WEAKEST cohort
@@ -611,6 +625,9 @@ writeFileSync(pidFile, `${process.pid}\n`);
 rmSync(pauseFlag, { force: true });
 process.on('exit', () => { try { rmSync(pidFile, { force: true }); } catch { /* best effort */ } });
 if (cfg.fresh && existsSync(rawFile)) { rmSync(rawFile); log('Cleared dataset (--fresh).'); }
+// --fresh empties the dataset but keeps the ladder archive (games between static engines), so
+// reset the fold mark too — otherwise the kept archive wouldn't re-enter the fresh dataset.
+if (cfg.fresh && existsSync(ladderFoldMark)) rmSync(ladderFoldMark);
 
 const hidden = championHidden();
 // A leftover lineage only makes sense for the warm path and the current candidate

@@ -529,6 +529,71 @@ async function scanCorpus() {
 }
 const parseTag = (tag) => { const m = /^(nn|hc)(\d+|t)@(.+)$/.exec(tag); return m ? { eng: m[1], depth: m[2], version: m[3] } : null; };
 
+const median = (xs) => { if (!xs.length) return null; const s = [...xs].sort((a, b) => a - b); const m = s.length >> 1; return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2; };
+
+// Is the pool actually trustworthy yet? Two orthogonal signals that "100 games each" misses:
+//  1) RESOLUTION — median ±95 margin vs the median gap between rank-adjacent engines. While the
+//     bootstrap pairs leave the graph under-connected, margins (±600) dwarf the gaps they must
+//     distinguish, so the whole order sits inside the noise. Converged ⇒ ratio drops toward ~1.
+//  2) DEPTH ORDER — deeper search MUST be monotonically stronger, so each engine's depth curve is
+//     a free ground truth. Strict inversions (a deeper node estimated weaker) are the visible
+//     non-monotonicity; a "confident" inversion (gap exceeds the pair's combined CI) is a real
+//     transitivity/bug alarm that should never survive convergence.
+function convergenceReport(elo, ci) {
+  const sorted = [...competitors].sort((a, b) => elo.get(a.id) - elo.get(b.id));
+  const gaps = [];
+  for (let i = 1; i < sorted.length; i++) gaps.push(elo.get(sorted[i].id) - elo.get(sorted[i - 1].id));
+  const margins = competitors.map((c) => ci.get(c.id)).filter((m) => m != null && m > 0 && isFinite(m));
+  const medMargin = median(margins), medGap = median(gaps);
+  const ratio = (medMargin != null && medGap > 0) ? medMargin / medGap : null;
+
+  // Per-version depth curves (need ≥2 depths to say anything about monotonicity).
+  const byVersion = new Map();
+  for (const c of competitors) { const k = `${c.eng}@${c.version}`; (byVersion.get(k) || byVersion.set(k, []).get(k)).push(c); }
+  const curves = [];
+  for (const [k, nodes] of byVersion) {
+    if (nodes.length < 2) continue;
+    nodes.sort((a, b) => a.depth - b.depth);
+    let inv = 0, confInv = 0, worst = 0;
+    for (let i = 0; i < nodes.length; i++) for (let j = i + 1; j < nodes.length; j++) {
+      const drop = elo.get(nodes[i].id) - elo.get(nodes[j].id); // shallower minus deeper; >0 = inverted
+      if (drop > 1e-9) {
+        inv++; worst = Math.max(worst, drop);
+        const comb = Math.hypot(ci.get(nodes[i].id) || 0, ci.get(nodes[j].id) || 0);
+        if (drop > comb) confInv++;
+      }
+    }
+    curves.push({ k, nodes, inv, confInv, worst });
+  }
+  const monotonic = curves.filter((c) => c.inv === 0).length;
+  const confInvTotal = curves.reduce((s, c) => s + c.confInv, 0);
+  const nonMono = curves.filter((c) => c.inv > 0).sort((a, b) => b.worst - a.worst);
+
+  const resolved = ratio != null && ratio < 1.5;
+  const ordered = confInvTotal === 0;
+  let verdict;
+  if (!resolved) verdict = `NOT converged — under-resolved (ratio ${ratio == null ? 'n/a' : ratio.toFixed(1)} ≥ 1.5). Keep running.`;
+  else if (!ordered) verdict = `RESOLVED but ${confInvTotal} confident depth inversion(s) — possible non-transitivity/bug, inspect.`;
+  else verdict = `converged ✓ — margins resolved and every depth curve monotonic.`;
+
+  return {
+    summary: { medMargin, medGap, ratio, versionsMonotonic: monotonic, versionsWithDepthCurve: curves.length, confidentInversions: confInvTotal, resolved, ordered, converged: resolved && ordered, verdict },
+    nonMono, elo,
+  };
+}
+
+function printConvergence(rep) {
+  const s = rep.summary;
+  console.log(`\n===== Convergence check =====`);
+  console.log(`  resolution:  median ±95 = ${s.medMargin == null ? 'n/a' : s.medMargin.toFixed(0)}  |  median neighbor gap = ${s.medGap == null ? 'n/a' : s.medGap.toFixed(0)}  |  ratio ${s.ratio == null ? 'n/a' : s.ratio.toFixed(1)}  (want < ~1.5)`);
+  console.log(`  depth order: ${s.versionsMonotonic}/${s.versionsWithDepthCurve} versions monotonic  |  ${s.confidentInversions} confident inversion(s)`);
+  for (const c of rep.nonMono.slice(0, 4)) {
+    const seq = c.nodes.map((n) => `d${n.depth}=${rep.elo.get(n.id) >= 0 ? '+' : ''}${rep.elo.get(n.id).toFixed(0)}`).join(' ');
+    console.log(`    ${c.k.padEnd(12)} ${seq}   (${c.inv} inv${c.confInv ? `, ${c.confInv} confident` : ''})`);
+  }
+  console.log(`  verdict: ${s.verdict}`);
+}
+
 // Build + write the ledger (the engine-elo.*.json refresh-v/merge consume). Callable
 // periodically (verbose=false) during a long run and once at the end (verbose=true), so the
 // ledger is always reasonably fresh even if the run is killed hard.
@@ -559,10 +624,12 @@ function writeRankLedger(verbose) {
     }
     unrecoverable.sort((a, b) => b.records - a.records);
   }
+  const conv = convergenceReport(elo, ci);
   const ledger = {
     generated: new Date().toISOString(), anchor: pinId, method: 'bradley-terry-pool',
     depths: cfg.depths, games: cfg.games, seed: cfg.seed,
     dataset: cfg.scan ? { file: cfg.data, totalLines, withV: totalLines - noV, legacyNoTag } : null,
+    convergence: conv.summary,
     ranking, unrecoverable,
   };
   mkdirSync(dirname(cfg.ledger), { recursive: true });
@@ -577,6 +644,7 @@ function writeRankLedger(verbose) {
     console.log(`\n  Unrecoverable contributors (no Elo -> weakest, refresh on sight):`);
     for (const u of unrecoverable.slice(0, 12)) console.log(`    ${u.tag.padEnd(16)} ${String(u.records).padStart(10)} records  — ${u.reason}`);
   }
+  printConvergence(conv);
   // Optional flat CSV (engine,version,depth,elo,ci95,games) for plotting — a derived view of
   // the ledger (e.g. filter to one version for that net's depth curve), not a separate artifact.
   if (cfg.csv) {
