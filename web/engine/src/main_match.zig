@@ -11,12 +11,14 @@
 //     --result-file=match.json --save-games=../training/data/selfplay.jsonl --jobs=14
 // Paths are relative to the current directory (run from web/).
 //
-// --save-games harvests the played positions as raw training data ({fen,r,g,v,vs}):
-// every position carries the value from the engine that actually searched it (the mover),
-// at that engine's own depth, tagged with its provenance (`vs`). The dataset machinery then
-// sorts label quality by provenance — merge-data prefers the stronger engine on dedup and
-// refresh-v relabels the weakest cohort first — so there's no need to second-guess a label
-// by who won the game. The game result is kept separately in `r`.
+// --save-games harvests each game as one game-primary record (scripts/gameRecord.mjs:
+// g/players/r/moves/v/vs). Games run from the standard start; the random opening plies are
+// played from a scripted line but still SEARCHED, so every position — opening included —
+// carries the value from the engine that was to move (the mover), at that engine's own depth,
+// tagged with its provenance (`vs`). The dataset machinery then sorts label quality by
+// provenance — merge-data prefers the stronger engine on dedup and refresh-v relabels the
+// weakest cohort first — so there's no need to second-guess a label by who won the game. The
+// game result is kept separately in `r`.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -106,13 +108,17 @@ const Game = struct {
     pair: usize,
     color: u8, // 'w' (A is White) or 'b' (A is Black)
     result_white: i32 = 0, // White-view result of this game (+1/0/-1)
-    start_fen: [128]u8 = undefined, // the random-opening start position (recorded positions begin here)
-    start_len: u8 = 0,
     recs: std.ArrayList(PlyRec),
+};
 
-    fn startSlice(self: *const Game) []const u8 {
-        return self.start_fen[0..self.start_len];
-    }
+// A scripted random opening line, shared (color-reversed) by both games of a pair so the
+// pairing stays balanced. We play these exact moves at the start of each game but still
+// SEARCH each position, so the opening plies are recorded with the to-move engine's own
+// value (its point of view of the position it's about to move from) — see playGame.
+const MAX_OPENING = 64;
+const Opening = struct {
+    moves: [MAX_OPENING]engine.Move = undefined,
+    len: u32 = 0,
 };
 
 // Per-side search budget: a fixed depth (depth > 0) OR a per-move time budget (depth ==
@@ -126,17 +132,26 @@ fn searchBudget(s: *ai.Searcher, st: *const State, b: Budget, seen: []const u64,
     return if (no_tt) s.chooseMoveNoTT(st, d, ms, seen) else s.chooseMove(st, d, ms, seen);
 }
 
-fn randomOpening(rng: std.Random, plies: u32) State {
+// Build a random opening as a MOVE SEQUENCE from the standard start. Returned (not applied)
+// so both color-reversed games of a pair replay the identical line. If a random ply ends the
+// game, the whole opening is abandoned (len 0) and the pair plays from the standard start —
+// mirroring the old fast-forward behavior, which discarded such openings.
+fn randomOpening(rng: std.Random, plies: u32) Opening {
+    var op = Opening{};
     var st = board.newGameState();
+    const want = @min(plies, MAX_OPENING);
     var i: u32 = 0;
-    while (i < plies) : (i += 1) {
+    while (i < want) : (i += 1) {
         var moves: engine.MoveList = .{};
         engine.legalMoves(&st, &moves);
         if (moves.len == 0) break;
-        st = engine.applyMove(&st, moves.items[rng.intRangeLessThan(usize, 0, moves.len)]);
-        if (engine.gameStatus(&st).status != .ongoing) return board.newGameState();
+        const m = moves.items[rng.intRangeLessThan(usize, 0, moves.len)];
+        st = engine.applyMove(&st, m);
+        if (engine.gameStatus(&st).status != .ongoing) return .{}; // opening ended the game
+        op.moves[op.len] = m;
+        op.len += 1;
     }
-    return st;
+    return op;
 }
 
 // Play one game. `white_is_a` decides which engine has White. Returns +1 white win /
@@ -146,7 +161,7 @@ fn playGame(
     white: *ai.Searcher,
     black: *ai.Searcher,
     white_is_a: bool,
-    start: State,
+    opening: *const Opening, // scripted random opening plies (still searched, see below)
     bw: Budget, // White's search budget
     bb: Budget, // Black's search budget
     max_plies: u32,
@@ -156,7 +171,7 @@ fn playGame(
 ) !i32 {
     var seen: std.ArrayList(u64) = .empty;
     defer seen.deinit(alloc);
-    var st = start;
+    var st = board.newGameState();
     var result_white: i32 = 0;
     var plies: u32 = 0;
     while (plies < max_plies) : (plies += 1) {
@@ -170,9 +185,12 @@ fn playGame(
         const a_to_move = (st.turn == .white) == white_is_a;
         const mover = if (st.turn == .white) white else black;
         const mover_b = if (st.turn == .white) bw else bb;
+        // Always search — even in the opening — so each position is recorded with the mover's
+        // own value. During the scripted opening we discard the engine's choice and play the
+        // predetermined random move (so the pair shares one opening line); after it we play best.
         const res = searchBudget(mover, &st, mover_b, seen.items, false);
         nodes.* += res.nodes;
-        const m = res.move orelse break;
+        const m = if (plies < opening.len) opening.moves[plies] else (res.move orelse break);
 
         if (recs) |list| {
             // One record per searched position: its mover's value + the move played from
@@ -298,11 +316,11 @@ fn worker(sh: *Shared) void {
         sa.reseed(sh.cfg.seed +% pair *% 4 +% 0);
         sb.reseed(sh.cfg.seed +% pair *% 4 +% 1);
         // A = White: White's budget is A's, Black's is B's.
-        const r1 = playGame(&sa, &sb, true, opening, sh.cfg.budget_a, sh.cfg.budget_b, sh.cfg.max_plies, pa, &nodes, pw) catch 0;
+        const r1 = playGame(&sa, &sb, true, &opening, sh.cfg.budget_a, sh.cfg.budget_b, sh.cfg.max_plies, pa, &nodes, pw) catch 0;
         sb.reseed(sh.cfg.seed +% pair *% 4 +% 2);
         sa.reseed(sh.cfg.seed +% pair *% 4 +% 3);
         // A = Black: White's budget is B's, Black's is A's.
-        const r2 = playGame(&sb, &sa, false, opening, sh.cfg.budget_b, sh.cfg.budget_a, sh.cfg.max_plies, pa, &nodes, pb) catch 0;
+        const r2 = playGame(&sb, &sa, false, &opening, sh.cfg.budget_b, sh.cfg.budget_a, sh.cfg.max_plies, pa, &nodes, pb) catch 0;
 
         const s1: f64 = if (r1 > 0) 1 else if (r1 < 0) 0 else 0.5; // A is white
         const s2: f64 = if (r2 < 0) 1 else if (r2 > 0) 0 else 0.5; // A is black
@@ -312,16 +330,10 @@ fn worker(sh: *Shared) void {
         sh.scores.append(sh.alloc, s2) catch {};
         sh.nodes += nodes;
         if (sh.cfg.save_games) {
-            // Both games of the pair start from the same random opening; record it so the
-            // harvested positions (which begin AT the opening) can be replayed.
-            var ofbuf: [128]u8 = undefined;
-            const ofen = board.toFen(&opening, &ofbuf);
-            var gw = Game{ .pair = pair, .color = 'w', .result_white = r1, .recs = recs_w };
-            var gb = Game{ .pair = pair, .color = 'b', .result_white = r2, .recs = recs_b };
-            @memcpy(gw.start_fen[0..ofen.len], ofen);
-            gw.start_len = @intCast(ofen.len);
-            @memcpy(gb.start_fen[0..ofen.len], ofen);
-            gb.start_len = @intCast(ofen.len);
+            // Both games of the pair share one scripted opening line and begin at the
+            // standard start (no `start` field), so the records hold the full game.
+            const gw = Game{ .pair = pair, .color = 'w', .result_white = r1, .recs = recs_w };
+            const gb = Game{ .pair = pair, .color = 'b', .result_white = r2, .recs = recs_b };
             sh.games.append(sh.alloc, gw) catch {};
             sh.games.append(sh.alloc, gb) catch {};
         }
@@ -505,9 +517,8 @@ fn writeHarvest(sh: *Shared, gpa: std.mem.Allocator, io: std.Io, path: []const u
         try out.append(gpa, '-');
         try appendInt(&out, gpa, @as(i64, @intCast(g.pair)));
         try out.append(gpa, g.color); // 'w' or 'b'
-        // The random-opening start (recorded positions begin here, not the standard start).
-        try out.appendSlice(gpa, "\",\"start\":\"");
-        try out.appendSlice(gpa, g.startSlice());
+        // Games begin at the standard start (the opening is searched and recorded inline),
+        // so no `start` field — readers default to the standard start position.
         try out.appendSlice(gpa, "\",\"players\":{\"w\":\"");
         try out.appendSlice(gpa, pw);
         try out.appendSlice(gpa, "\",\"b\":\"");
