@@ -297,7 +297,7 @@
         </div>
         <div class="control-row" id="row-ai-swap" hidden>
           <button id="ai-swap" type="button" title="Swap the White and Black AI settings">⇄ Swap</button>
-          <label class="check-field" title="Avoid replaying a recent opening: White's first move differs from its last few games, so each game opens differently.">
+          <label class="check-field" title="Branch the openings so consecutive games diverge: the engines avoid replaying a recent opening line, an early move can recur but the continuation after it is forced to differ until that branch is explored. Uncheck to have the engines always play their best move.">
             <input type="checkbox" id="vary-openings" checked />
             Vary openings
           </label>

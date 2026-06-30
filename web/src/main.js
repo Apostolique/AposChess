@@ -51,10 +51,12 @@ const ui = {
   delay: 450,          // ms pause before an AI move, so play is watchable
   running: false,      // AI-vs-AI loop active
   started: false,      // AI-vs-AI game has been started at least once (Pause/Resume vs Start)
-  // AI-vs-AI opening variety: when on, the engine's first move (White) is forbidden
-  // from matching its last few games, so consecutive games open differently.
+  // AI-vs-AI opening variety: when ON, the engines branch their openings so
+  // consecutive games diverge — a shallow move can recur, but the continuation
+  // after it is forced to differ until that branch is explored (see openingExclude).
+  // When OFF, the engines simply always play their best move.
   varyOpenings: true,
-  recentOpenings: [],  // move keys (from*64+to) of recent games' opening moves, oldest first
+  recentLines: [],  // recent games' opening lines (each an array of move keys), oldest first
   // AI-vs-AI: show each engine's own evaluation as a bar beside the board
   // (bottom engine left, top engine right). See the eval-bars section.
   showEvalBars: true,
@@ -64,9 +66,15 @@ const ui = {
   flipped: false,
 };
 
-// How many recent opening moves to remember/forbid, so the engines cycle through a
-// few different first moves before one can recur.
-const OPENING_HISTORY = 4;
+// Opening-variety tuning. The filter diversifies the first OPENING_PLIES plies: at
+// each such ply it forbids the moves recent games took from the same position, but
+// only until OPENING_BRANCH distinct moves have been tried there — after that the
+// move is allowed to recur and the variety comes from a deeper ply instead (so the
+// same first move can return while the second move differs). OPENING_HISTORY caps how
+// many recent opening lines are remembered (a rolling window).
+const OPENING_PLIES = 6;
+const OPENING_BRANCH = 3;
+const OPENING_HISTORY = 12;
 // The standard initial position's FEN: the opening-variety filter only applies to a
 // true fresh game from here, never to a loaded/edited starting position.
 const STANDARD_START_FEN = toFen(newGameState());
@@ -524,12 +532,8 @@ function commit(move) {
   supersedeAi();
   aiThinking = false;
   const wasLive = viewIndex === history.length - 1;
-  // If this is the opening move the variety filter constrained, remember it so the
-  // next game's filter forbids it (checked before recordMove advances the ply).
-  const isVariedOpening = ui.mode === 'ai-ai' && ui.varyOpenings
-    && history.length === 1 && toFen(state) === STANDARD_START_FEN;
   recordMove(move);
-  if (isVariedOpening) rememberOpening(move);
+  maybeRememberOpening(); // feed this game's opening line into the variety rotation
   if (wasLive) viewIndex = history.length - 1; // follow the game unless reviewing
   lastCommitAt = performance.now();
   // Only sound the new move if we're following the live game; while reviewing an
@@ -702,24 +706,54 @@ function startSearch(slot) {
   slot.worker.postMessage({ type: 'search', seq, state, depth, maxMs, engine, net, posHistory: repWindow(state), exclude: openingExclude(), wasmUrl: WASM_URL });
 }
 
-// Move keys to forbid for the game's very first move, so an AI-vs-AI game doesn't
-// replay a recent opening. Active only in AI-vs-AI with the option on, only on the
-// opening ply of a standard fresh game (a loaded/edited start is left alone). The
-// search applies this to White's first move; the game diverges from there.
-function openingExclude() {
-  if (ui.mode !== 'ai-ai' || !ui.varyOpenings) return undefined;
-  if (history.length !== 1) return undefined;             // not the opening ply
-  if (toFen(state) !== STANDARD_START_FEN) return undefined; // loaded/edited start — don't constrain
-  return ui.recentOpenings.length ? ui.recentOpenings.slice() : undefined;
+// The move keys (from*64+to) of the moves played so far this game.
+function openingPrefix() {
+  const keys = [];
+  for (let i = 1; i < history.length; i++) {
+    const m = history[i].lastMove;
+    keys.push(m.from * 64 + m.to);
+  }
+  return keys;
 }
 
-// Remember an opening move so later games avoid it (rolling window, most-recent last;
-// re-playing a remembered move just moves it to the front of the window).
-function rememberOpening(move) {
-  const key = move.from * 64 + move.to;
-  ui.recentOpenings = ui.recentOpenings.filter((k) => k !== key);
-  ui.recentOpenings.push(key);
-  while (ui.recentOpenings.length > OPENING_HISTORY) ui.recentOpenings.shift();
+// Move keys to forbid at the position about to be searched, so AI-vs-AI games branch
+// into different openings instead of replaying a recent one. Active only in AI-vs-AI
+// with the option on, only during the first OPENING_PLIES plies of a standard fresh
+// game (a loaded/edited start is left alone). At the current ply we look at the recent
+// games that followed the same moves up to here and forbid the moves they then chose —
+// but only while fewer than OPENING_BRANCH distinct continuations have been tried from
+// this position. Once that branch is explored we let the best move recur and the
+// variety comes from a deeper ply, so the same opening moves can return while the game
+// still diverges further down. The exclude is soft: if it would remove every legal
+// move the search keeps the full list, so a move is always available.
+function openingExclude() {
+  if (ui.mode !== 'ai-ai' || !ui.varyOpenings) return undefined;
+  const ply = history.length - 1;                          // moves already played this game
+  if (ply >= OPENING_PLIES) return undefined;              // past the opening phase
+  if (toFen(history[0].state) !== STANDARD_START_FEN) return undefined; // not a standard start
+  const prefix = openingPrefix();
+  const used = new Set();
+  for (const line of ui.recentLines) {
+    if (line.length > ply && line.every((k, i) => i >= ply || k === prefix[i])) used.add(line[ply]);
+  }
+  if (!used.size || used.size >= OPENING_BRANCH) return undefined; // nothing to avoid, or branch explored
+  return [...used];
+}
+
+// Once a game's opening phase is complete (or it ended early), record its opening line
+// so later games avoid replaying it. Rolling window, most-recent last; a repeated line
+// just moves to the front. Only AI-vs-AI games from a standard start contribute.
+function maybeRememberOpening() {
+  if (ui.mode !== 'ai-ai' || !ui.varyOpenings) return;
+  if (toFen(history[0].state) !== STANDARD_START_FEN) return;
+  const ply = history.length - 1;
+  if (ply !== OPENING_PLIES && !(status.over && ply < OPENING_PLIES)) return;
+  const line = openingPrefix().slice(0, OPENING_PLIES);
+  if (!line.length) return;
+  const same = (l) => l.length === line.length && l.every((k, i) => k === line[i]);
+  ui.recentLines = ui.recentLines.filter((l) => !same(l));
+  ui.recentLines.push(line);
+  while (ui.recentLines.length > OPENING_HISTORY) ui.recentLines.shift();
 }
 
 function onSearchResult(slot, data) {
@@ -2027,7 +2061,7 @@ for (const slot of ['ai', 'white', 'black']) {
 }
 $('vary-openings').addEventListener('change', (e) => {
   ui.varyOpenings = e.target.checked;
-  ui.recentOpenings = []; // start a fresh rotation when the option is toggled
+  ui.recentLines = []; // start a fresh rotation when the option is toggled
 });
 $('show-evals').addEventListener('change', (e) => {
   ui.showEvalBars = e.target.checked;

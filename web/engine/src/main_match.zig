@@ -282,7 +282,12 @@ const Cfg = struct {
 
 const Shared = struct {
     mutex: std.Io.Mutex = .init,
-    next_pair: usize = 0,
+    // Work is dispatched one GAME at a time (not one color-reversed pair), so the tail of a
+    // matchup tapers over single games rather than pairs — finished workers idle for at most one
+    // game-time, not one pair-time, keeping cores fuller near the end. Game index gi maps to
+    // pair = gi >> 1, color = gi & 1 (0 = A is White, 1 = A is Black); both games of a pair still
+    // share one seeded opening, so the color-reversed balance is unchanged.
+    next_game: usize = 0,
     total_pairs: usize,
     scores: *std.ArrayList(f64),
     games: *std.ArrayList(Game), // harvested games (--save-games)
@@ -361,10 +366,9 @@ fn paintLive(sh: *Shared) void {
     const now_ns: i128 = @intCast(std.Io.Clock.now(.awake, sh.cfg.io).nanoseconds);
     const elapsed_s: f64 = @as(f64, @floatFromInt(now_ns - sh.t0_ns)) / 1e9;
 
-    // In-flight pairs = dispatched − finished ≈ busy workers. This is the key liveness signal
+    // In-flight games = dispatched − finished = busy workers. This is the key liveness signal
     // during the opening stretch when ng is still 0: it shows N games are actively searching.
-    const finished_pairs = ng / 2;
-    const running = if (sh.next_pair > finished_pairs) sh.next_pair - finished_pairs else 0;
+    const running = if (sh.next_game > ng) sh.next_game - ng else 0;
 
     var etaseg: []const u8 = "";
     var etastore: [40]u8 = undefined;
@@ -433,47 +437,55 @@ fn worker(sh: *Shared) void {
 
     while (true) {
         sh.mutex.lockUncancelable(sh.cfg.io);
-        const done = sh.stop or sh.next_pair >= sh.total_pairs;
-        const pair = sh.next_pair;
-        if (!done) sh.next_pair += 1;
+        const done = sh.stop or sh.next_game >= sh.total_pairs * 2;
+        const gi = sh.next_game; // game index: pair = gi >> 1, color = gi & 1
+        if (!done) sh.next_game += 1;
         sh.mutex.unlock(sh.cfg.io);
         if (done) break;
+
+        const pair = gi >> 1;
+        const a_is_white = (gi & 1) == 0; // even game of a pair = A has White, odd = A has Black
 
         var op_prng = std.Random.DefaultPrng.init(sh.cfg.seed +% pair);
         const opening = randomOpening(op_prng.random(), sh.cfg.openings);
         var nodes: u64 = 0;
 
         // Collect per-game records only when harvesting.
-        var recs_w: std.ArrayList(PlyRec) = .empty;
-        var recs_b: std.ArrayList(PlyRec) = .empty;
-        const pw: ?*std.ArrayList(PlyRec) = if (sh.cfg.save_games) &recs_w else null;
-        const pb: ?*std.ArrayList(PlyRec) = if (sh.cfg.save_games) &recs_b else null;
+        var recs: std.ArrayList(PlyRec) = .empty;
+        const pr: ?*std.ArrayList(PlyRec) = if (sh.cfg.save_games) &recs else null;
 
-        // Reseed per game so openings/variety are a function of the pair index, not
-        // thread timing (the persistent TT still makes exact games order-sensitive).
-        sa.reseed(sh.cfg.seed +% pair *% 4 +% 0);
-        sb.reseed(sh.cfg.seed +% pair *% 4 +% 1);
-        // A = White: White's budget is A's, Black's is B's.
-        const r1 = playGame(&sa, &sb, true, &opening, sh.cfg.budget_a, sh.cfg.budget_b, sh.cfg.max_plies, pa, &nodes, pw) catch 0;
-        sb.reseed(sh.cfg.seed +% pair *% 4 +% 2);
-        sa.reseed(sh.cfg.seed +% pair *% 4 +% 3);
-        // A = Black: White's budget is B's, Black's is A's.
-        const r2 = playGame(&sb, &sa, false, &opening, sh.cfg.budget_b, sh.cfg.budget_a, sh.cfg.max_plies, pa, &nodes, pb) catch 0;
+        // Reseed per game so openings/variety are a function of the (pair, color), not thread
+        // timing — the same offsets the pair-dispatched version used, so a game's seeding is
+        // identical regardless of which worker plays it (the persistent TT still makes exact
+        // games order-sensitive, as before).
+        var r: i32 = undefined;
+        if (a_is_white) {
+            sa.reseed(sh.cfg.seed +% pair *% 4 +% 0);
+            sb.reseed(sh.cfg.seed +% pair *% 4 +% 1);
+            // A = White: White's budget is A's, Black's is B's.
+            r = playGame(&sa, &sb, true, &opening, sh.cfg.budget_a, sh.cfg.budget_b, sh.cfg.max_plies, pa, &nodes, pr) catch 0;
+        } else {
+            sb.reseed(sh.cfg.seed +% pair *% 4 +% 2);
+            sa.reseed(sh.cfg.seed +% pair *% 4 +% 3);
+            // A = Black: White's budget is B's, Black's is A's.
+            r = playGame(&sb, &sa, false, &opening, sh.cfg.budget_b, sh.cfg.budget_a, sh.cfg.max_plies, pa, &nodes, pr) catch 0;
+        }
 
-        const s1: f64 = if (r1 > 0) 1 else if (r1 < 0) 0 else 0.5; // A is white
-        const s2: f64 = if (r2 < 0) 1 else if (r2 > 0) 0 else 0.5; // A is black
+        // A's score for this game: +1 win / 0.5 draw / 0 loss, from A's color this game.
+        const s: f64 = if (a_is_white)
+            (if (r > 0) @as(f64, 1) else if (r < 0) @as(f64, 0) else @as(f64, 0.5))
+        else
+            (if (r < 0) @as(f64, 1) else if (r > 0) @as(f64, 0) else @as(f64, 0.5));
 
         sh.mutex.lockUncancelable(sh.cfg.io);
-        sh.scores.append(sh.alloc, s1) catch {};
-        sh.scores.append(sh.alloc, s2) catch {};
+        sh.scores.append(sh.alloc, s) catch {};
         sh.nodes += nodes;
         if (sh.cfg.save_games) {
-            // Both games of the pair share one scripted opening line and begin at the
-            // standard start (no `start` field), so the records hold the full game.
-            const gw = Game{ .pair = pair, .color = 'w', .result_white = r1, .recs = recs_w };
-            const gb = Game{ .pair = pair, .color = 'b', .result_white = r2, .recs = recs_b };
-            sh.games.append(sh.alloc, gw) catch {};
-            sh.games.append(sh.alloc, gb) catch {};
+            // The game shares its pair's scripted opening line and begins at the standard
+            // start (no `start` field), so the record holds the full game. color 'w' = A had
+            // White, 'b' = A had Black (so writeHarvest assigns the player tags correctly).
+            const g = Game{ .pair = pair, .color = if (a_is_white) 'w' else 'b', .result_white = r, .recs = recs };
+            sh.games.append(sh.alloc, g) catch {};
         }
         if (sh.sprt and sh.decided == null and sh.scores.items.len >= 16) {
             const l = llr(sh.scores.items, sh.elo0, sh.elo1);
@@ -498,11 +510,11 @@ fn worker(sh: *Shared) void {
         }
         const pp = ssum / @as(f64, @floatFromInt(ng));
 
-        // 1) Live, in-place line refreshed after every finished pair (and ~1×/s by the
+        // 1) Live, in-place line refreshed after every finished game (and ~1×/s by the
         //    heartbeat thread in between, so even a long match never looks frozen).
         paintLive(sh);
 
-        // 2) Committed milestone every 5 pairs (or on an SPRT decision): clear the live
+        // 2) Committed milestone every 10 games (or on an SPRT decision): clear the live
         //    line and print a permanent snapshot with the full Elo ± 95% CI.
         if (sh.decided != null or ng % 10 == 0) {
             clearLive(sh);
