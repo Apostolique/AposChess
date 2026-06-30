@@ -40,6 +40,44 @@ fn enableUtf8Console() void {
     if (builtin.os.tag == .windows) _ = SetConsoleOutputCP(65001);
 }
 
+// --- interrupt handling (keep completed games on Ctrl-C) ----------------------------
+// Set when the user interrupts (Ctrl-C / console close on Windows, SIGINT on POSIX). The
+// heartbeat polls it (via stopRequested) and finalizes the match from the games COMPLETED so
+// far, then exits — so an interrupt during the loop's GATE, or a standalone `npm run match`,
+// keeps every finished game instead of the OS killing the process and losing the whole matchup.
+// (The rank pool's orchestrated stop arrives as a stop-file, also handled by stopRequested.)
+var g_interrupt = std.atomic.Value(bool).init(false);
+
+const win = std.os.windows;
+extern "kernel32" fn SetConsoleCtrlHandler(
+    handler: ?*const fn (ctrl_type: win.DWORD) callconv(.winapi) win.BOOL,
+    add: win.BOOL,
+) callconv(.winapi) win.BOOL;
+
+fn consoleCtrlHandler(ctrl_type: win.DWORD) callconv(.winapi) win.BOOL {
+    _ = ctrl_type; // Ctrl-C, Ctrl-Break, close — all mean "stop and save what's done"
+    g_interrupt.store(true, .seq_cst);
+    return .TRUE; // handled: don't terminate; the heartbeat finalizes + exits within ~1s
+}
+
+fn posixSigint(_: std.posix.SIG) callconv(.c) void {
+    g_interrupt.store(true, .seq_cst); // async-signal-safe: just set the flag
+}
+
+// Catch the OS interrupt so the match can finalize (keep completed games) instead of dying.
+fn installInterruptHandler() void {
+    if (builtin.os.tag == .windows) {
+        _ = SetConsoleCtrlHandler(consoleCtrlHandler, .TRUE);
+    } else {
+        const act = std.posix.Sigaction{
+            .handler = .{ .handler = posixSigint },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        std.posix.sigaction(std.posix.SIG.INT, &act, null);
+    }
+}
+
 // --- Elo / SPRT --------------------------------------------------------------------
 fn scoreFromElo(e: f64) f64 {
     return 1.0 / (1.0 + std.math.pow(f64, 10.0, -e / 400.0));
@@ -227,6 +265,18 @@ const Cfg = struct {
     net_a: ?*const nn.Net,
     net_b: ?*const nn.Net,
     save_games: bool,
+    // When set, the heartbeat thread polls this path; once it exists, the match finalizes
+    // IMMEDIATELY — it writes the result-file + harvest from the games already COMPLETED and
+    // exits, abandoning the games still in flight. This is how an orchestrator (rank:pool /
+    // the loop) requests a stop that takes effect right away while keeping every finished
+    // game, instead of either killing the process (losing the whole matchup) or waiting for
+    // the in-flight games to drain.
+    stop_file: ?[]const u8,
+    // Finalize context (so the heartbeat can write the same result/harvest the normal end does).
+    weights_a: []const u8,
+    weights_b: []const u8,
+    result_file: ?[]const u8,
+    save_games_path: ?[]const u8,
     io: std.Io,
 };
 
@@ -248,6 +298,8 @@ const Shared = struct {
     cfg: Cfg,
     t0_ns: i128 = 0, // match start, for live elapsed/ETA
     live_len: usize = 0, // chars in the current in-place status line (for repaint padding)
+    heartbeat_stop: bool = false, // workers done -> the heartbeat thread should exit
+    finalized: bool = false, // report/harvest/result-file written once (normal end OR stop)
 };
 
 // In-place status line on stderr (carriage-return repaint), mirroring fmt.mjs's
@@ -284,6 +336,92 @@ fn clearLive(sh: *Shared) void {
     n += 1;
     std.debug.print("{s}", .{buf[0..n]});
     sh.live_len = 0;
+}
+
+// Repaint the in-place live status line from the current shared counters. MUST be called
+// with sh.mutex held. Shared by the per-pair worker update AND the heartbeat thread, so the
+// elapsed/ETA clock and the in-flight count keep advancing even when no pair has finished —
+// a slow depth-8-vs-depth-8 matchup otherwise looks frozen for minutes between completions
+// (the first batch of games all search at once and none finish for a long while). Returns
+// without touching the line once the match is settled, so it never clobbers the final
+// milestone (the committed snapshot the worker prints on completion / an SPRT decision).
+fn paintLive(sh: *Shared) void {
+    const ng = sh.scores.items.len;
+    const total: usize = sh.total_pairs * 2;
+    if (sh.decided != null or ng >= total) return;
+    var w: usize = 0;
+    var dr: usize = 0;
+    var ls: usize = 0;
+    var ssum: f64 = 0;
+    for (sh.scores.items) |sc| {
+        ssum += sc;
+        if (sc == 1) w += 1 else if (sc == 0.5) dr += 1 else ls += 1;
+    }
+    const pp = if (ng > 0) ssum / @as(f64, @floatFromInt(ng)) else 0;
+    const now_ns: i128 = @intCast(std.Io.Clock.now(.awake, sh.cfg.io).nanoseconds);
+    const elapsed_s: f64 = @as(f64, @floatFromInt(now_ns - sh.t0_ns)) / 1e9;
+
+    // In-flight pairs = dispatched − finished ≈ busy workers. This is the key liveness signal
+    // during the opening stretch when ng is still 0: it shows N games are actively searching.
+    const finished_pairs = ng / 2;
+    const running = if (sh.next_pair > finished_pairs) sh.next_pair - finished_pairs else 0;
+
+    var etaseg: []const u8 = "";
+    var etastore: [40]u8 = undefined;
+    if (ng > 0) {
+        const eta_s = elapsed_s / @as(f64, @floatFromInt(ng)) * @as(f64, @floatFromInt(total - ng));
+        var b2: [16]u8 = undefined;
+        etaseg = std.fmt.bufPrint(&etastore, " | ETA {s}", .{fmtDur(&b2, eta_s)}) catch "";
+    }
+    var llrseg: []const u8 = "";
+    var llrstore: [64]u8 = undefined;
+    if (sh.sprt) {
+        llrseg = std.fmt.bufPrint(&llrstore, " | LLR {d:.2} [{d:.2}, {d:.2}]", .{
+            llr(sh.scores.items, sh.elo0, sh.elo1), sh.lower, sh.upper,
+        }) catch "";
+    }
+    var ebuf: [16]u8 = undefined;
+    var livebuf: [320]u8 = undefined;
+    const live = std.fmt.bufPrint(&livebuf, "  game {d}/{d} | {d} running | A +{d} ={d} -{d} | {d:.1}% | {s} elapsed{s}{s}", .{
+        ng, total, running, w, dr, ls, pp * 100, fmtDur(&ebuf, elapsed_s), etaseg, llrseg,
+    }) catch livebuf[0..0];
+    printLive(sh, live);
+}
+
+// Has a stop been requested — an OS interrupt (Ctrl-C / SIGINT) or the orchestrator's
+// stop-file appearing? (success on `access` = the file is there.)
+fn stopRequested(sh: *Shared) bool {
+    if (g_interrupt.load(.seq_cst)) return true;
+    const p = sh.cfg.stop_file orelse return false;
+    std.Io.Dir.cwd().access(sh.cfg.io, p, .{}) catch return false;
+    return true;
+}
+
+// Heartbeat thread: repaint the live status line about once a second so a long matchup never
+// looks frozen between pair completions, and poll the orchestrator's stop-file. When the
+// stop-file appears it finalizes (writes the result-file + harvest from the COMPLETED games)
+// and exits the process immediately — abandoning the games still in flight. Holding the mutex
+// across the exit means no worker can append a pair between the snapshot and the exit, so what
+// lands on disk is exactly the set of fully completed games. It only holds the mutex briefly
+// otherwise (workers keep ownership of the milestone lines), and exits once main signals
+// heartbeat_stop at the normal end.
+fn heartbeat(sh: *Shared) void {
+    while (true) {
+        sh.cfg.io.sleep(std.Io.Duration.fromMilliseconds(1000), .awake) catch {};
+        const stop_now = stopRequested(sh);
+        sh.mutex.lockUncancelable(sh.cfg.io);
+        if (sh.heartbeat_stop) {
+            sh.mutex.unlock(sh.cfg.io);
+            break;
+        }
+        if (stop_now) {
+            sh.stop = true; // marks the early stop (finalizeLocked notes it; no SPRT decision)
+            if (!sh.finalized) finalizeLocked(sh);
+            std.process.exit(0); // hold the lock through exit so no in-flight pair sneaks in
+        }
+        paintLive(sh);
+        sh.mutex.unlock(sh.cfg.io);
+    }
 }
 
 fn worker(sh: *Shared) void {
@@ -359,33 +497,10 @@ fn worker(sh: *Shared) void {
             if (sc == 1) w += 1 else if (sc == 0.5) dr += 1 else ls += 1;
         }
         const pp = ssum / @as(f64, @floatFromInt(ng));
-        const total: usize = sh.total_pairs * 2;
-        const now_ns: i128 = @intCast(std.Io.Clock.now(.awake, sh.cfg.io).nanoseconds);
-        const elapsed_s: f64 = @as(f64, @floatFromInt(now_ns - sh.t0_ns)) / 1e9;
 
-        // 1) Live, in-place line refreshed after EVERY finished pair, so a long match
-        //    never looks frozen between milestones. Lightweight: counts + score + elapsed
-        //    (+ ETA, + LLR with --sprt); no Elo/CI — that's the milestone's job.
-        var ebuf: [16]u8 = undefined;
-        var etaseg: []const u8 = "";
-        var etastore: [40]u8 = undefined;
-        if (sh.decided == null and ng < total) {
-            const eta_s = elapsed_s / @as(f64, @floatFromInt(ng)) * @as(f64, @floatFromInt(total - ng));
-            var b2: [16]u8 = undefined;
-            etaseg = std.fmt.bufPrint(&etastore, " | ETA {s}", .{fmtDur(&b2, eta_s)}) catch "";
-        }
-        var llrseg: []const u8 = "";
-        var llrstore: [64]u8 = undefined;
-        if (sh.sprt) {
-            llrseg = std.fmt.bufPrint(&llrstore, " | LLR {d:.2} [{d:.2}, {d:.2}]", .{
-                llr(sh.scores.items, sh.elo0, sh.elo1), sh.lower, sh.upper,
-            }) catch "";
-        }
-        var livebuf: [320]u8 = undefined;
-        const live = std.fmt.bufPrint(&livebuf, "  game {d}/{d} | A +{d} ={d} -{d} | {d:.1}% | {s} elapsed{s}{s}", .{
-            ng, total, w, dr, ls, pp * 100, fmtDur(&ebuf, elapsed_s), etaseg, llrseg,
-        }) catch livebuf[0..0];
-        printLive(sh, live);
+        // 1) Live, in-place line refreshed after every finished pair (and ~1×/s by the
+        //    heartbeat thread in between, so even a long match never looks frozen).
+        paintLive(sh);
 
         // 2) Committed milestone every 5 pairs (or on an SPRT decision): clear the live
         //    line and print a permanent snapshot with the full Elo ± 95% CI.
@@ -563,8 +678,65 @@ fn writeHarvest(sh: *Shared, gpa: std.mem.Allocator, io: std.Io, path: []const u
     });
 }
 
+// Write the report + harvest + result-file ONCE (guarded by sh.finalized). MUST be called with
+// sh.mutex held. Called at the normal end (all games played) and on a stop-file stop (from the
+// heartbeat, which then exits immediately) — either way it reads the games COMPLETED so far
+// from sh.scores/sh.games, so a stop keeps every finished game and just drops the in-flight ones.
+fn finalizeLocked(sh: *Shared) void {
+    if (sh.finalized) return;
+    sh.finalized = true;
+    clearLive(sh); // erase any lingering live line before the permanent report
+    const io = sh.cfg.io;
+    const gpa = sh.alloc;
+    const now_ns: i128 = @intCast(std.Io.Clock.now(.awake, io).nanoseconds);
+    const ms: u64 = @intCast(@max(1, @divTrunc(now_ns - sh.t0_ns, 1_000_000)));
+
+    const n = sh.scores.items.len;
+    var sum: f64 = 0;
+    var wins: usize = 0;
+    var draws: usize = 0;
+    var losses: usize = 0;
+    for (sh.scores.items) |s| {
+        sum += s;
+        if (s == 1) wins += 1 else if (s == 0.5) draws += 1 else losses += 1;
+    }
+    const p = if (n > 0) sum / @as(f64, @floatFromInt(n)) else 0;
+    const elo = eloFromScore(p);
+    const ci = eloWithCI(sh.scores.items);
+    const sign = if (ci.elo >= 0) "+" else "";
+    // A stop with no SPRT decision means we were stopped early: say so, since fewer games than
+    // requested were played (the in-flight ones were abandoned, the completed ones kept).
+    if (sh.stop and sh.decided == null) {
+        std.debug.print("Stopped early: kept {d} completed game(s), abandoned those in flight.\n", .{n});
+    }
+    const verdict = if (sh.sprt) (sh.decided orelse "inconclusive") else "n/a";
+    std.debug.print("A vs B: {d} games | +{d} ={d} -{d} | score {d:.1}% | Elo {s}{d:.0} ± {d:.0} (95% CI [{d:.0}, {d:.0}]) | SPRT {s} | nodes {d} nps {d}\n", .{
+        n, wins, draws, losses, p * 100, sign, ci.elo, ci.margin, ci.lo, ci.hi, verdict, sh.nodes, sh.nodes * 1000 / ms,
+    });
+
+    if (sh.cfg.save_games_path) |sg| {
+        if (sh.games.items.len > 0)
+            writeHarvest(sh, gpa, io, sg, sh.cfg.budget_a.depth, sh.cfg.budget_b.depth, sh.cfg.kind_a, sh.cfg.kind_b, sh.cfg.weights_a, sh.cfg.weights_b) catch {};
+    }
+
+    if (sh.cfg.result_file) |rf| {
+        var buf: [512]u8 = undefined;
+        const sprt_field = if (sh.sprt) sh.decided orelse "inconclusive" else null;
+        const json = if (sprt_field) |sf|
+            std.fmt.bufPrint(&buf,
+                \\{{"games":{d},"wins":{d},"draws":{d},"losses":{d},"score":{d},"elo":{d},"llr":{d},"sprt":"{s}"}}
+            , .{ n, wins, draws, losses, p, elo, llr(sh.scores.items, sh.elo0, sh.elo1), sf }) catch return
+        else
+            std.fmt.bufPrint(&buf,
+                \\{{"games":{d},"wins":{d},"draws":{d},"losses":{d},"score":{d},"elo":{d},"llr":null,"sprt":null}}
+            , .{ n, wins, draws, losses, p, elo }) catch return;
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = rf, .data = json }) catch {};
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
     enableUtf8Console(); // so `±` and friends render instead of mojibake on Windows
+    installInterruptHandler(); // Ctrl-C finalizes (keeps completed games) instead of killing
     const gpa = init.arena.allocator();
     const io = init.io;
 
@@ -594,6 +766,7 @@ pub fn main(init: std.process.Init) !void {
     var beta: f64 = 0.05;
     var result_file: ?[]const u8 = null;
     var save_games: ?[]const u8 = null;
+    var stop_file: ?[]const u8 = null;
 
     const argv = try init.minimal.args.toSlice(gpa);
     for (argv[1..]) |arg| {
@@ -617,6 +790,7 @@ pub fn main(init: std.process.Init) !void {
         if (argStr(arg, "--beta=")) |v| beta = std.fmt.parseFloat(f64, v) catch beta;
         if (argStr(arg, "--result-file=")) |v| result_file = v;
         if (argStr(arg, "--save-games=")) |v| save_games = v;
+        if (argStr(arg, "--stop-file=")) |v| stop_file = v;
     }
     if (jobs < 1) jobs = 1;
 
@@ -670,6 +844,11 @@ pub fn main(init: std.process.Init) !void {
             .net_a = net_a,
             .net_b = net_b,
             .save_games = save_games != null,
+            .stop_file = stop_file,
+            .weights_a = weights_a orelse "",
+            .weights_b = weights_b orelse "",
+            .result_file = result_file,
+            .save_games_path = save_games,
             .io = io,
         },
     };
@@ -680,43 +859,17 @@ pub fn main(init: std.process.Init) !void {
     shared.t0_ns = @intCast(t0); // so the live progress line can show elapsed/ETA
     const threads = try gpa.alloc(std.Thread, jobs);
     for (threads) |*t| t.* = try std.Thread.spawn(.{}, worker, .{&shared});
+    // Heartbeat repaints the live line ~1×/s so a slow matchup never looks frozen between
+    // pair completions. Signal it to stop once the workers are done, then join it.
+    const hb = try std.Thread.spawn(.{}, heartbeat, .{&shared});
     for (threads) |t| t.join();
-    const ms: u64 = @intCast(@max(1, @divTrunc(std.Io.Clock.now(.awake, io).nanoseconds - t0, 1_000_000)));
-
-    // --- report -------------------------------------------------------------------
-    const n = scores.items.len;
-    var sum: f64 = 0;
-    var wins: usize = 0;
-    var draws: usize = 0;
-    var losses: usize = 0;
-    for (scores.items) |s| {
-        sum += s;
-        if (s == 1) wins += 1 else if (s == 0.5) draws += 1 else losses += 1;
-    }
-    const p = if (n > 0) sum / @as(f64, @floatFromInt(n)) else 0;
-    const elo = eloFromScore(p);
-    const ci = eloWithCI(scores.items);
-    const sign = if (ci.elo >= 0) "+" else "";
-    const verdict = if (sprt) (shared.decided orelse "inconclusive") else "n/a";
-    std.debug.print("A vs B: {d} games | +{d} ={d} -{d} | score {d:.1}% | Elo {s}{d:.0} ± {d:.0} (95% CI [{d:.0}, {d:.0}]) | SPRT {s} | nodes {d} nps {d}\n", .{
-        n, wins, draws, losses, p * 100, sign, ci.elo, ci.margin, ci.lo, ci.hi, verdict, shared.nodes, shared.nodes * 1000 / ms,
-    });
-
-    if (save_games) |sg| {
-        if (shared.games.items.len > 0) try writeHarvest(&shared, gpa, io, sg, budget_a.depth, budget_b.depth, eval_a, eval_b, weights_a orelse "", weights_b orelse "");
-    }
-
-    if (result_file) |rf| {
-        var buf: [512]u8 = undefined;
-        const sprt_field = if (sprt) shared.decided orelse "inconclusive" else null;
-        const json = if (sprt_field) |sf|
-            try std.fmt.bufPrint(&buf,
-                \\{{"games":{d},"wins":{d},"draws":{d},"losses":{d},"score":{d},"elo":{d},"llr":{d},"sprt":"{s}"}}
-            , .{ n, wins, draws, losses, p, elo, llr(scores.items, elo0, elo1), sf })
-        else
-            try std.fmt.bufPrint(&buf,
-                \\{{"games":{d},"wins":{d},"draws":{d},"losses":{d},"score":{d},"elo":{d},"llr":null,"sprt":null}}
-            , .{ n, wins, draws, losses, p, elo });
-        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = rf, .data = json });
-    }
+    // Normal end (every game played): stop the heartbeat, then finalize under the mutex. A
+    // stop-file stop instead finalizes from inside the heartbeat and exits before reaching here.
+    shared.mutex.lockUncancelable(io);
+    shared.heartbeat_stop = true;
+    shared.mutex.unlock(io);
+    hb.join();
+    shared.mutex.lockUncancelable(io);
+    finalizeLocked(&shared);
+    shared.mutex.unlock(io);
 }

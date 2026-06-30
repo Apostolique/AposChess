@@ -400,11 +400,13 @@ function buildEngine() {
   const r = spawnSync('zig build -Doptimize=ReleaseFast', { cwd: engineDir, stdio: 'inherit', shell: true });
   if (r.status !== 0) { console.error('zig build failed (is Zig 0.16 on PATH?).'); process.exit(1); }
 }
-// The currently-running apos-match child, so a stop request can kill it immediately
-// instead of waiting the whole matchup out. null when no match is in flight.
-let activeChild = null;
-let killedByStop = false;
-function killActive() { if (activeChild) { killedByStop = true; try { activeChild.kill(); } catch { /* already gone */ } } }
+// Stop request via a stop-file (loop/ladder-stop) that apos-match polls ~1×/s. On seeing it,
+// the match stops RIGHT AWAY: it writes its result + harvest from the games already COMPLETED
+// and exits 0, abandoning the games still in flight. So the finished games are RECORDED (no
+// more round-multiple-of-100 counts) while the stop is near-instant. The old behavior killed
+// the child outright, discarding the whole matchup. The file is cleared at startup and on exit.
+const stopFile = join(loopDir, 'ladder-stop');
+function requestMatchStop() { try { writeFileSync(stopFile, ''); } catch { /* best effort */ } }
 
 // Async spawn (not spawnSync) so Node's event loop stays free to handle q/Ctrl-C while a
 // matchup runs — a synchronous spawn would block the stop handler for the whole matchup.
@@ -417,7 +419,7 @@ function playPair(a, b) {
     `--games=${cfg.games}`, `--jobs=${cfg.jobs}`, `--openings=${cfg.openings}`, `--maxmoves=${cfg.maxmoves}`,
     `--seed=${seed}`,
     `--eval-a=${a.eval}`, `--eval-b=${b.eval}`, `--depth=${a.depth}`, `--depth-b=${b.depth}`,
-    `--result-file=${tmp}`,
+    `--result-file=${tmp}`, `--stop-file=${stopFile}`,
   ];
   if (a.eval === 'nn' && a.weights) argv.push(`--weights-a=${a.weights}`);
   if (b.eval === 'nn' && b.weights) argv.push(`--weights-b=${b.weights}`);
@@ -427,11 +429,9 @@ function playPair(a, b) {
   console.log(`\n=== ${a.id}  vs  ${b.id}  (${cfg.games} games) ===`);
   return new Promise((done) => {
     const child = spawn(matchBin, argv, { stdio: ['ignore', 'inherit', 'inherit'], cwd: webDir, env: { ...process.env, APOS_CHILD: '1' } });
-    activeChild = child;
-    child.on('error', (e) => { activeChild = null; console.error(`  could not run match: ${e.message}; skipping.`); done(); });
+    child.on('error', (e) => { console.error(`  could not run match: ${e.message}; skipping.`); done(); });
     child.on('exit', (code, signal) => {
-      activeChild = null;
-      if (killedByStop) { done(); return; } // we killed it on a stop request — not a failure
+      // A stop-file stop still exits 0 with the completed-games result, so it's recorded like any other.
       if (code !== 0) { console.error(`  match failed (exit ${code ?? signal}); skipping.`); done(); return; }
       try { const res = JSON.parse(readFileSync(tmp, 'utf8')); rmSync(tmp, { force: true }); record(a.id, b.id, res.games, res.score); }
       catch (e) { console.error(`  could not read result: ${e.message}`); }
@@ -678,9 +678,16 @@ if (cfg.rounds === 0) {
   // re-emitted every few matchups so it's never far behind even on a hard kill.
   const EMIT_EVERY = 5;
   buildEngine();
+  rmSync(stopFile, { force: true }); // clear any stale stop-file from a prior run
   printStopHint();
   let stopped = false;
-  const stopper = installStop(() => { if (!stopped) { stopped = true; console.log('\n  Stopping…'); } killActive(); });
+  // Stop right away while keeping finished games: drop the stop-file so the in-flight matchup
+  // saves its completed games and exits immediately — pressing q/Ctrl-C no longer waits out the
+  // whole matchup, nor throws away the games already played.
+  const stopper = installStop(() => {
+    if (!stopped) { stopped = true; console.log('\n  Stopping — saving completed games, abandoning those in flight…'); }
+    requestMatchStop();
+  });
   const t0 = Date.now();
   const deadline = cfg.minutes ? t0 + cfg.minutes * 60000 : Infinity;
   let played = 0;
@@ -693,12 +700,15 @@ if (cfg.rounds === 0) {
     const why = reason === 'ordering' ? `ordering: P(mis-order) ${(metric * 100).toFixed(0)}%` : `rigidity: ±${metric.toFixed(0)} Elo`;
     console.log(`\n${tag} ${why} -> ${a.id} vs ${b.id}`);
     await playPair(a, b);
-    if (stopped) break; // a stop killed the match mid-way — don't record/loop a partial result
+    // playPair recorded this matchup — a full run, or the completed games if a stop landed
+    // mid-matchup. Persist the store either way so the games already played are never lost.
     writeFileSync(cfg.store, JSON.stringify(store, null, 2) + '\n');
     played++;
     if (played % EMIT_EVERY === 0) writeRankLedger(false);
+    if (stopped) break; // stop requested: the in-flight matchup drained + was saved; finish up.
   }
   stopper.dispose();
+  rmSync(stopFile, { force: true }); // don't leave a stop-file that would halt the next run
   console.log(`\nActive ranking: ${played} matchup(s) in ${((Date.now() - t0) / 60000).toFixed(1)} min` +
     `${stopped ? ' (stopped)' : cfg.minutes && Date.now() >= deadline ? ' (time budget reached)' : ''}.`);
 }
