@@ -82,7 +82,7 @@ const tmp = join(dataDir, '_merged.jsonl.tmp'); // .tmp, so it isn't itself a *.
 // (`players`). Without players a game can't inform the corpus rating or be quality-controlled by
 // engine, so this drops it (and any legacy position-primary / unkeyed / unparseable line). It
 // shrinks the dataset now, but every surviving game has known provenance. The material floor
-// (players like "nn6@?") IS labeled and is kept; only a missing/literal-'?' player is unlabeled.
+// (players like "hc6@?") IS labeled and is kept; only a missing/literal-'?' player is unlabeled.
 const dropUnlabeled = !!args['drop-unlabeled'];
 const labeledPlayer = (p) => !!p && p !== '?';
 const hasPlayers = (rec) => rec.players != null && labeledPlayer(rec.players.w) && labeledPlayer(rec.players.b);

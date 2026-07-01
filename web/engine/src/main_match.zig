@@ -573,6 +573,12 @@ fn vtagFmt(buf: []u8, kind: ai.EvalKind, depth: u32, io: std.Io, gpa: std.mem.Al
         if (depth == 0) return std.fmt.bufPrint(buf, "hc3t@{d}", .{ai.HC_VERSION}) catch unreachable;
         return std.fmt.bufPrint(buf, "hc3-{d}@{d}", .{ depth, ai.HC_VERSION }) catch unreachable;
     }
+    if (kind == .material) {
+        // The bare piece-count floor: an hc-family engine with no net, versioned '?' so it's
+        // distinct from real handcrafted (hc<d>@<HC_VERSION>) and matches the ladder's hc<d>@? id.
+        if (depth == 0) return std.fmt.bufPrint(buf, "hct@?", .{}) catch unreachable;
+        return std.fmt.bufPrint(buf, "hc{d}@?", .{depth}) catch unreachable;
+    }
     if (depth == 0) return std.fmt.bufPrint(buf, "hct@{d}", .{ai.HC_VERSION}) catch unreachable;
     return std.fmt.bufPrint(buf, "hc{d}@{d}", .{ depth, ai.HC_VERSION }) catch unreachable;
 }

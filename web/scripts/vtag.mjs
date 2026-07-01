@@ -10,8 +10,8 @@
 //   depth    the fixed search depth (or 't' for a time-based search)
 //   version  handcrafted -> HC_VERSION (bumped by hand when the eval changes);
 //            nn -> a short content hash of the weights file, so every distinct champion
-//                  is automatically its own version. '?' = weights missing (material
-//                  fallback), so v from a fallback eval is never mistaken for a real net.
+//                  is automatically its own version. '?' = the bare material floor (hc<d>@?,
+//                  no net), so v from the fallback eval is never mistaken for a real net.
 import { readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { HC_VERSION } from '../src/ai.js';
@@ -36,6 +36,9 @@ function nnVersion(weightsPath) {
 }
 
 export function vtag(evalName, depth, weightsPath) {
+  // material = the bare piece-count floor: hc-family, no net, version '?' (mirrors main_match.zig
+  // vtagFmt), so it's distinct from real handcrafted hc<d>@<HC_VERSION>.
+  if (evalName === 'material') return `hc${depth != null ? depth : 't'}@?`;
   const eng = evalName && evalName.startsWith('nn') ? 'nn' : 'hc';
   const ver = eng === 'nn' ? nnVersion(weightsPath) : HC_VERSION;
   return `${eng}${depth != null ? depth : 't'}@${ver}`;

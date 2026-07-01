@@ -44,13 +44,13 @@
 //   --play=SPEC     restrict NEW scheduled games to matchups among these specs only (comma list).
 //                   Each is EITHER a bare engine spec (same forms as --engines) — every --depths
 //                   of it is schedulable — OR a depth-qualified NODE id `<eng><depth>@<spec>` (the
-//                   exact string the ladder prints, e.g. nn8@08df7b, hc6@2, nn6@?) — only that one
+//                   exact string the ladder prints, e.g. nn8@08df7b, hc6@2, hc6@?) — only that one
 //                   (engine, depth) node, so you can target an asymmetric cross-depth matchup like
 //                   --play=nn8@08df7b,nn6@22577c. A named depth outside --depths is force-added.
 //                   The pin and the rest of the pool are STILL rated from the games already in the
 //                   store + --corpus; they just don't play any new games. Use this to pile games
 //                   onto a specific head-to-head while keeping everyone on the stable hc6 scale.
-//   --no-material   skip the nn material fallback node (otherwise included as the floor).
+//   --no-material   skip the hc<d>@? material fallback node (otherwise included as the floor).
 //   --minutes=M     play for M minutes, then finalize. Omit to run until you stop it (q/Ctrl-C).
 //   --matchups=N    stop after N matchups (default unlimited).
 //   --rounds=0      play nothing; just merge/refit the existing store and emit (offline).
@@ -180,8 +180,9 @@ function makeEngine(spec) {
   // The material baseline: the engine's bare piece-count eval (EvalKind.material), NOT an
   // nn eval with a missing net. (It was the latter, which silently made apos-match fall back
   // to its default --weights = the champion — so the "material" node was really the champion
-  // in disguise and ranked absurdly high. id stays nn<d>@? for the pool's material floor.)
-  if (spec === 'material') return { eng: 'nn', eval: 'material', weights: null, version: '?' };
+  // in disguise and ranked absurdly high.) id is hc<d>@? — an hc-family engine (no net) whose
+  // '?' version marks it the material floor, distinct from real handcrafted hc<d>@<HC_VERSION>.
+  if (spec === 'material') return { eng: 'hc', eval: 'material', weights: null, version: '?' };
   if (spec === 'champion') {
     if (!existsSync(champion)) { console.error(`No champion at ${champion}.`); process.exit(1); }
     return { eng: 'nn', eval: 'nn', weights: champion, version: weightsHash(champion) };
@@ -201,7 +202,7 @@ function allEngines() {
 // Parse one --play token into { engine, depth }. A bare engine spec (08df7b, champion, hc,
 // material, a path) has depth = null: EVERY --depths of that engine is schedulable. A
 // depth-qualified NODE id — the exact `<eng><depth>@<spec>` string the ladder prints, e.g.
-// nn8@08df7b / hc6@2 / nn6@? — pins the schedulable set to that one (engine, depth) node, so
+// nn8@08df7b / hc6@2 / hc6@? — pins the schedulable set to that one (engine, depth) node, so
 // you can target an asymmetric cross-depth matchup. The part after @ is resolved like any spec
 // (hash/'champion'/path), with the ladder's own hc/material node ids handled specially so a
 // pasted id round-trips.
@@ -209,7 +210,8 @@ function parsePlaySpec(spec) {
   const m = /^(nn|hc)(\d+)@(.+)$/.exec(spec);
   if (!m) return { engine: makeEngine(spec), depth: null }; // bare engine spec -> all depths
   const [, eng, d, ver] = m;
-  const engine = eng === 'hc' ? makeEngine('hc') : ver === '?' ? makeEngine('material') : makeEngine(ver);
+  // '?' version -> the material floor (hc-family, no net); else hc<ver> = real handcrafted, nn<ver> = a net.
+  const engine = ver === '?' ? makeEngine('material') : eng === 'hc' ? makeEngine('hc') : makeEngine(ver);
   if (engine.eng !== eng) { console.error(`--play: '${spec}' names a ${eng} node but '${ver}' resolves to a ${engine.eng} engine.`); process.exit(1); }
   return { engine, depth: Number(d) };
 }
@@ -230,7 +232,7 @@ if (!engines.some((e) => `${e.eng}@${e.version}` === `hc@${HC_VERSION}`)) engine
 
 // --- competitors (nodes of the rating pool) ------------------------------------
 // Each node is an (engine, depth) pair; id is its `vs`-tag (stable across runs, the store
-// key AND the ledger tag): nn<d>@<ver> / hc<d>@<HC_VERSION> / nn<d>@? (material).
+// key AND the ledger tag): nn<d>@<ver> / hc<d>@<HC_VERSION> / hc<d>@? (material).
 const node = (e, d) => ({ id: `${e.eng}${d}@${e.version}`, eng: e.eng, eval: e.eval, weights: e.weights, version: e.version, depth: d });
 const competitors = [];
 for (const e of engines) for (const d of cfg.depths) competitors.push(node(e, d));
@@ -674,8 +676,8 @@ function writeRankLedger(verbose) {
       if (byId.has(tag)) continue;                       // ranked node at this exact depth
       if (competitors.some((c) => c.eng === t.eng && c.version === t.version)) continue; // engine ranked (other depth)
       let reason;
-      if (t.eng === 'hc') reason = `old handcrafted (HC_VERSION now ${HC_VERSION})`;
-      else if (t.version === '?') reason = 'nn material fallback (drop --no-material to rank it)';
+      if (t.version === '?') reason = 'material fallback (drop --no-material to rank it)';
+      else if (t.eng === 'hc') reason = `old handcrafted (HC_VERSION now ${HC_VERSION})`;
       else reason = 'champion not archived (overwritten)';
       unrecoverable.push({ tag, records: n, reason });
     }
