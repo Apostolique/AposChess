@@ -61,10 +61,10 @@ though the net is now the teacher.
 
 - **Watch the `--match` score.** If it went up, keep going. If it dropped, this run
   regressed.
-- **You can always roll back.** `npm run train` backs up the previous net to
-  `web/src/nn-weights.bak.json` before overwriting. To restore it:
+- **You can always roll back.** `web/src/nn-weights.json` is committed to git, so the
+  previous net is its checked-in version. To restore it:
   ```
-  copy src\nn-weights.bak.json src\nn-weights.json
+  git checkout -- web/src/nn-weights.json
   npm run build
   ```
 - If a strength jump makes the old data feel like a drag, start the dataset over

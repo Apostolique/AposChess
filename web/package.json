@@ -24,8 +24,7 @@
     "train:merge": "node --max-old-space-size=8192 scripts/merge-data.mjs",
     "puzzles:mine": "node scripts/mine-puzzles.mjs",
     "winrate": "node scripts/winrate.mjs",
-    "parity": "node scripts/engine-parity.mjs",
-    "openings:mine": "node --max-old-space-size=8192 scripts/mine-openings.mjs"
+    "parity": "node scripts/engine-parity.mjs"
   },
   "dependencies": {
     "@lichess-org/chessground": "^10.1.1",

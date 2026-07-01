@@ -28,7 +28,7 @@
 //   --patience=N      early-stopping patience passed to the trainer
 
 import { spawnSync } from 'node:child_process';
-import { existsSync, rmSync, copyFileSync, readFileSync } from 'node:fs';
+import { existsSync, rmSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -49,7 +49,6 @@ const genBin = resolve(engineDir, 'zig-out', 'bin', isWin ? 'apos-gen.exe' : 'ap
 const matchBin = resolve(engineDir, 'zig-out', 'bin', isWin ? 'apos-match.exe' : 'apos-match');
 const dataFile = resolve(repoDir, 'training', 'data', 'selfplay.jsonl');
 const weightsFile = resolve(webDir, 'src', 'nn-weights.json');
-const backupFile = resolve(webDir, 'src', 'nn-weights.bak.json');
 
 const args = Object.fromEntries(
   process.argv.slice(2).map((a) => {
@@ -123,19 +122,6 @@ if (cfg.fresh && existsSync(dataFile)) {
   console.log('Removed existing dataset (--fresh).');
 }
 
-// Safety net: training overwrites nn-weights.json with a freshly trained net, and
-// improvement isn't guaranteed. Back up the current (real) weights first so a
-// regressing run can be rolled back — restore with:
-//   copy src\nn-weights.bak.json src\nn-weights.json   (then npm run build)
-if (existsSync(weightsFile)) {
-  try {
-    if (JSON.parse(readFileSync(weightsFile, 'utf8')).arch) {
-      copyFileSync(weightsFile, backupFile);
-      console.log(`Backed up current weights -> ${backupFile}`);
-    }
-  } catch { /* unreadable/placeholder weights: nothing worth backing up */ }
-}
-
 const t0 = Date.now();
 for (let g = 0; g < cfg.generations; g++) {
   const evalName = g === 0 ? cfg.evalFirst : 'nn';
@@ -174,7 +160,5 @@ console.log('   Pick "Engine → Neural net" in the app (npm run dev reloads wei
 if (cfg.match === 0) {
   console.log(`   To gauge strength: npm run match -- --eval-a=nn --depth=${cfg.depth} --games=100`);
 }
-if (existsSync(backupFile)) {
-  console.log('   If this run came out WORSE than before, roll back the previous net:');
-  console.log('     copy src\\nn-weights.bak.json src\\nn-weights.json   (then npm run build)');
-}
+console.log('   If this run came out WORSE than before, roll back to the committed net:');
+console.log('     git checkout -- src/nn-weights.json   (then npm run build)');
