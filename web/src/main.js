@@ -720,10 +720,13 @@ function renderMoveList() {
     // White move.
     if (siblingsOf(node).length) {
       // Break the pair: White alone, its variations, then Black's reply on a "…" row.
-      rows.push(gridRow(`${num}.`, moveSpan(node), empty));
+      // When Black's reply drops down to that continuation row, mark the Black cell it left
+      // behind with "…" (mirroring the "…" that fills White's empty spot on the row below).
+      const hasBlack = i + 1 < line.length && plyOf(line[i + 1]) % 2 === 0;
+      rows.push(gridRow(`${num}.`, moveSpan(node), hasBlack ? dots : empty));
       rows.push(varRows(node));
       i++;
-      if (i < line.length && plyOf(line[i]) % 2 === 0) {
+      if (hasBlack) {
         const black = line[i];
         rows.push(gridRow(`${num}…`, dots, moveSpan(black)));
         rows.push(varRows(black));

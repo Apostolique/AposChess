@@ -512,6 +512,7 @@ button:disabled:hover { background: var(--panel); } /* no hover lift when locked
   min-height: 120px;
   overflow-y: auto;
   position: relative; /* make this the offsetParent so move-list autoscroll math is local */
+  user-select: none; /* moves are click targets, not selectable text */
   background: var(--panel);
   border-radius: 6px;
   font-size: 1rem;
