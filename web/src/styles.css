@@ -517,22 +517,34 @@ button:disabled:hover { background: var(--panel); } /* no hover lift when locked
   font-size: 1rem;
   font-variant-numeric: tabular-nums;
 }
-/* The move list is a flowing tree (variations inline), not a fixed grid. */
-.movetree { padding: 6px 8px; line-height: 2; }
-.moveno { color: var(--muted); margin: 0 1px 0 3px; }
-.move {
-  display: inline-block;
-  padding: 1px 5px;
-  border-radius: 3px;
-  cursor: pointer;
-  white-space: nowrap;
+/* Main line: the classic [number | White | Black] grid. */
+.moverow { display: grid; grid-template-columns: 2.6em 1fr 1fr; }
+.moveno {
+  color: var(--muted);
+  text-align: right;
+  padding: 5px 8px;
+  background: rgba(0, 0, 0, 0.18);
 }
+.move { padding: 5px 10px; cursor: pointer; white-space: nowrap; }
 .move:hover { background: #4a443f; }
 .move.current { background: var(--accent); color: #15110d; font-weight: 600; }
-/* Variations render muted and slightly smaller, with their own parentheses; nesting just
-   nests the spans (and the parens), so no per-level rule is needed. */
-.variation { color: var(--muted); font-size: 0.92em; }
-.variation .moveno { margin-left: 1px; }
+.move-cont { padding: 5px 10px; color: var(--muted); } /* the "…" placeholder for a broken pair */
+
+/* Variations: a full-width, shaded row just under the move they branch from. The moves flow
+   inline (numbers inline, nested variations as parenthesised (…) blocks); a long nested
+   variation gets its own row, indented one step further via --indent. */
+.variation-row { grid-template-columns: 1fr; background: rgba(126, 132, 194, 0.12); }
+.variation-row + .variation-row { border-top: 1px solid rgba(0, 0, 0, 0.15); }
+.varmoves {
+  display: block;
+  padding: 4px 10px 4px calc(10px + var(--indent, 0) * 16px);
+  color: var(--muted);
+  font-size: 0.92em;
+  line-height: 1.8;
+}
+.varmoves .move { display: inline-block; padding: 1px 5px; border-radius: 3px; }
+.varmoves .moveno { display: inline; padding: 0 2px 0 4px; background: none; text-align: left; }
+.variation { color: inherit; }
 .moves .empty { padding: 12px; color: var(--muted); }
 
 /* Per-move context menu (Promote / Make main line / Copy variation PGN / Delete). */

@@ -608,21 +608,31 @@ function toSan(pre, move, st) {
 }
 
 // --- move list & review navigation ---
-// The move list is a flowing render of the whole tree (variations inline): the main line
-// reads left-to-right and each branch point drops its alternatives into a parenthesised
-// `(…)` block right after the main move, nesting recursively. A ply's move number comes
-// from its depth (root = ply 0, ply 1 = White's first move); Black shows a number only at
-// the start of a line/variation or just after a variation block (`needNum`).
+// The move list keeps the classic two-column (White | Black) grid for the MAIN line, and
+// drops each branch's variations into their own full-width, shaded rows just below the
+// move they replace. Inside a variation row the moves flow left-to-right (numbers inline),
+// with nested variations shown as parenthesised `(…)` blocks (`renderSequence`).
+const plyOf = (node) => pathTo(node).length - 1; // moves from the root (root = 0)
+// A main-line node's variations are its later siblings (it is always children[0]).
+const siblingsOf = (node) => (node.parent && node.parent.children[0] === node ? node.parent.children.slice(1) : []);
+
+// One move number+move span pair for a variation row (flowing). White always prints its
+// number; Black prints one only at the start of a line/variation or after a variation block.
 function moveHtml(node, needNum) {
-  const ply = pathTo(node).length - 1;
-  const white = ply % 2 === 1;
-  const label = white ? `${Math.ceil(ply / 2)}.` : (needNum ? `${Math.ceil(ply / 2)}…` : '');
+  const ply = plyOf(node);
+  const label = ply % 2 === 1 ? `${Math.ceil(ply / 2)}.` : (needNum ? `${Math.ceil(ply / 2)}…` : '');
   const numHtml = label ? `<span class="moveno">${label}</span>` : '';
-  return `${numHtml}<span class="move${node === curNode ? ' current' : ''}" data-id="${node.id}">${node.san}</span>`;
+  return `${numHtml}${moveSpan(node)}`;
+}
+
+// Just the clickable move span (no number) — used for the main line's grid cells.
+function moveSpan(node) {
+  return `<span class="move${node === curNode ? ' current' : ''}" data-id="${node.id}">${node.san}</span>`;
 }
 
 // Render the line beginning at move node `node`, following main children; at each branch
-// its sibling variations are emitted (recursively) right after the main move.
+// its sibling variations are emitted (recursively) as inline `(…)` blocks. Used for SHORT
+// variations that stay inline (see variationRows for the long-variation row breaking).
 function renderSequence(node, forceNumber) {
   let html = '', needNum = forceNumber, n = node;
   while (n) {
@@ -638,10 +648,98 @@ function renderSequence(node, forceNumber) {
   return html;
 }
 
+// A single shaded variation row, indented by nesting depth.
+const varRowHtml = (inner, indent) => `<div class="moverow variation-row" style="--indent:${indent}"><span class="varmoves">${inner}</span></div>`;
+const VAR_INLINE_MAX = 8; // a straight sub-variation up to this many plies stays inline as (…)
+
+// A sub-variation is "inlineable" — shown flowing in parentheses like Lichess — when it's a
+// single straight line (no branch of its own) and not too long. Anything that itself
+// branches, or runs long, is complex and gets pulled onto its own row instead.
+function inlineable(node) {
+  let len = 0;
+  for (let n = node; n; n = n.children[0]) { if (n.children.length > 1) return false; if (++len > VAR_INLINE_MAX) return false; }
+  return true;
+}
+
+// Rows for the variation line starting at move `node`, indented by `indent`. The line flows
+// continuously (numbers inline), keeping simple sub-variations inline as `(…)` right after
+// the move they replace. When a reply branches into a *complex* variation (one that itself
+// branches or runs long), the line breaks *before* that reply: the mainline continuation and
+// every variation there drop onto their own aligned, further-indented rows. This mirrors
+// Lichess — keep a line whole, and only split where there's a real sub-tree.
+function variationRows(node, indent) {
+  const rows = [];
+  let html = moveHtml(node, true); // the variation's first move (forced number)
+  let n = node;
+  while (n.children.length) {
+    const kids = n.children;
+    const vars = kids.slice(1);
+    if (vars.some((v) => !inlineable(v))) {
+      // Break here: the mainline reply and every variation become their own aligned rows.
+      rows.push(varRowHtml(html, indent));
+      for (const k of kids) rows.push(...variationRows(k, indent + 1));
+      return rows;
+    }
+    // Advance along the mainline, inlining any simple variations right after the reply.
+    const main = kids[0];
+    html += moveHtml(main, false);
+    for (const v of vars) html += `<span class="variation">(${renderSequence(v, true)})</span>`;
+    n = main;
+  }
+  rows.push(varRowHtml(html, indent));
+  return rows;
+}
+
 function renderMoveList() {
   const el = $('moves');
   if (!rootNode.children.length) { el.innerHTML = '<div class="empty">No moves yet.</div>'; return; }
-  el.innerHTML = `<div class="movetree">${renderSequence(rootNode.children[0], true)}</div>`;
+
+  const empty = '<span></span>';
+  const dots = '<span class="move-cont">…</span>';
+  const gridRow = (num, white, black) => `<div class="moverow"><span class="moveno">${num}</span>${white}${black}</div>`;
+  // Each sibling variation of `node` becomes its own shaded row(s); a long sub-variation
+  // inside one breaks onto a further-indented row of its own (see variationRows).
+  const varRows = (node) => siblingsOf(node).map((sib) => variationRows(sib, 0).join('')).join('');
+
+  // Walk the main line (children[0] chain). Normally two plies share a row; a variation on
+  // a White move breaks the pair so it can be inserted, and Black's reply resumes on a new
+  // "…" continuation row.
+  const line = [];
+  for (let n = rootNode.children[0]; n; n = n.children[0]) line.push(n);
+
+  const rows = [];
+  for (let i = 0; i < line.length;) {
+    const node = line[i];
+    const num = Math.ceil(plyOf(node) / 2);
+    if (plyOf(node) % 2 === 0) { // Black to start a row (custom Black-to-move start position)
+      rows.push(gridRow(`${num}…`, dots, moveSpan(node)));
+      rows.push(varRows(node));
+      i++;
+      continue;
+    }
+    // White move.
+    if (siblingsOf(node).length) {
+      // Break the pair: White alone, its variations, then Black's reply on a "…" row.
+      rows.push(gridRow(`${num}.`, moveSpan(node), empty));
+      rows.push(varRows(node));
+      i++;
+      if (i < line.length && plyOf(line[i]) % 2 === 0) {
+        const black = line[i];
+        rows.push(gridRow(`${num}…`, dots, moveSpan(black)));
+        rows.push(varRows(black));
+        i++;
+      }
+    } else {
+      // Normal pair: White, then Black if present.
+      let black = empty, bnode = null;
+      if (i + 1 < line.length && plyOf(line[i + 1]) % 2 === 0) { bnode = line[i + 1]; black = moveSpan(bnode); }
+      rows.push(gridRow(`${num}.`, moveSpan(node), black));
+      if (bnode) rows.push(varRows(bnode));
+      i += bnode ? 2 : 1;
+    }
+  }
+  el.innerHTML = rows.join('');
+
   const cur = el.querySelector('.current');
   // Scroll within the move list only — `scrollIntoView` would also scroll
   // every ancestor (the page itself on mobile) and yank the viewport around.
@@ -737,14 +835,22 @@ async function copyVariationPgn(node) {
 // --- move-list context menu (right-click / long-press a move) ---
 let moveMenuEl = null;
 function closeMoveMenu() { if (moveMenuEl) { moveMenuEl.remove(); moveMenuEl = null; } }
+// True if `node` lies on the game's main line (children[0] all the way up to the root).
+function isMainline(node) {
+  for (let n = node; n.parent; n = n.parent) if (n.parent.children[0] !== n) return false;
+  return true;
+}
 function showMoveMenu(node, x, y) {
   closeMoveMenu();
-  const items = [
-    ['Promote variation', () => promoteVariation(node)],
-    ['Make main line', () => makeMainLine(node)],
-    ['Copy variation PGN', () => copyVariationPgn(node)],
-    ['Delete from here', () => deleteNode(node)],
-  ];
+  const idx = node.parent ? node.parent.children.indexOf(node) : 0;
+  const main = isMainline(node);
+  const items = [];
+  // "Promote variation" only when there's another variation above to swap with — for the
+  // topmost variation (idx 1) promoting just makes it the main line, so hide it there.
+  if (idx > 1) items.push(['Promote variation', () => promoteVariation(node)]);
+  if (!main) items.push(['Make main line', () => makeMainLine(node)]);
+  items.push(['Copy variation PGN', () => copyVariationPgn(node)]);
+  items.push(['Delete from here', () => deleteNode(node)]);
   const menu = document.createElement('div');
   menu.className = 'move-menu';
   for (const [label, fn] of items) {
