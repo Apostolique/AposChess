@@ -158,7 +158,7 @@ function cloneTree(root) {
   const byId = new Map();
   const rec = (node, parent) => {
     const copy = { id: node.id, state: node.state, lastMove: node.lastMove, san: node.san,
-                   check: node.check, evals: { ...node.evals }, parent, children: [] };
+                   check: node.check, evals: { ...node.evals }, ann: node.ann, parent, children: [] };
     byId.set(node.id, copy);
     copy.children = node.children.map((c) => rec(c, copy));
     return copy;
@@ -616,6 +616,41 @@ const plyOf = (node) => pathTo(node).length - 1; // moves from the root (root = 
 // A main-line node's variations are its later siblings (it is always children[0]).
 const siblingsOf = (node) => (node.parent && node.parent.children[0] === node ? node.parent.children.slice(1) : []);
 
+// --- move-quality annotation (Lichess-style ?!/?/?? glyphs) ---
+// Judgment is on the drop in WIN PROBABILITY, not raw centipawns: the same cp swing means
+// nothing in an already-decided game but everything in a balanced one. We reuse the exact
+// sigmoid the eval bar paints with (see evalBarPct), so bar and glyphs never disagree.
+const winProb = (moverCp) => 1 / (1 + Math.exp(-0.00368208 * moverCp)); // 0..1, mover's view
+// Win-probability drop thresholds (tunable). Only the three negative marks are assigned;
+// good/brilliant (!/!!) need extra heuristics and are intentionally out of scope.
+const GLYPH_INACCURACY = 0.10, GLYPH_MISTAKE = 0.20, GLYPH_BLUNDER = 0.30;
+const GLYPH_CLASS = { '?!': 'inaccuracy', '?': 'mistake', '??': 'blunder' };
+
+// The annotation for the move that produced `node`, from the mover's perspective: how much
+// win probability they gave up versus best play (its parent's eval). Empty until BOTH the
+// position before the move and the one after it have been evaluated (both anns present).
+function moveGlyph(node) {
+  if (!node.parent || !node.parent.ann || !node.ann) return '';
+  const sign = node.parent.state.turn === 'white' ? 1 : -1; // to the mover's view
+  const drop = winProb(sign * node.parent.ann.cp) - winProb(sign * node.ann.cp);
+  if (drop >= GLYPH_BLUNDER) return '??';
+  if (drop >= GLYPH_MISTAKE) return '?';
+  if (drop >= GLYPH_INACCURACY) return '?!';
+  return '';
+}
+
+// Repaint the move list (for freshly-arrived glyphs) at most once per frame, coalescing the
+// burst of background evals so a whole line's glyphs land without a rebuild per reply.
+let glyphRefreshQueued = false;
+function refreshGlyphs() {
+  if (glyphRefreshQueued) return;
+  glyphRefreshQueued = true;
+  requestAnimationFrame(() => {
+    glyphRefreshQueued = false;
+    if (analysisBarVisible()) renderMoveList();
+  });
+}
+
 // One move number+move span pair for a variation row (flowing). White always prints its
 // number; Black prints one only at the start of a line/variation or after a variation block.
 function moveHtml(node, needNum) {
@@ -627,7 +662,9 @@ function moveHtml(node, needNum) {
 
 // Just the clickable move span (no number) — used for the main line's grid cells.
 function moveSpan(node) {
-  return `<span class="move${node === curNode ? ' current' : ''}" data-id="${node.id}">${node.san}</span>`;
+  const g = moveGlyph(node);
+  const glyph = g ? `<span class="move-glyph ${GLYPH_CLASS[g]}">${g}</span>` : '';
+  return `<span class="move${node === curNode ? ' current' : ''}" data-id="${node.id}">${node.san}${glyph}</span>`;
 }
 
 // Render the line beginning at move node `node`, following main children; at each branch
@@ -1428,7 +1465,11 @@ const EVAL_BAR = { depth: PUZZLE_AI.depth, maxMs: ui.maxMs, engine: PUZZLE_AI.en
 // Scores beyond this magnitude encode a forced mate (ai.js MATE = 1,000,000; no
 // real centipawn eval comes anywhere near) — pin the bar to the winner's end.
 const EVAL_BAR_MATE = 500_000;
-const evalBar = { worker: null, seq: 0, pending: false, dirty: false, fen: null, turn: 'white' };
+// `jobNode` is the tree node the worker is currently searching (null = idle); replies are
+// stored into that node's `ann`. The scheduler (requestEvalBar) always serves the VIEWED
+// node first (it feeds the bar), then quietly evaluates nearby nodes in the background so
+// their move-quality glyphs are ready before you navigate to them.
+const evalBar = { worker: null, seq: 0, pending: false, jobNode: null, fen: null, turn: 'white' };
 // Analysis "best-move arrow": reuse the eval-bar worker's reply (it already searches
 // the viewed position) to draw an arrow to its best move, refreshed as you navigate
 // or fork — no extra worker, no need to actually play the move.
@@ -1441,15 +1482,25 @@ function createEvalBarWorker() {
   const w = new Worker(new URL('./aiWorker.js', import.meta.url), { type: 'module' });
   w.onmessage = ({ data }) => {
     if (data.type !== 'search' || data.seq !== evalBar.seq) return;
-    evalBar.pending = false;
-    // A queued re-search picks up where this left off; it sets pending again and
-    // refreshes the status, so don't clear the "thinking…" line here.
-    if (evalBar.dirty) { evalBar.dirty = false; evalBar.fen = null; requestEvalBar(); return; }
+    const node = evalBar.jobNode;
+    evalBar.jobNode = null;
+    // Cache the result on the node it was searched for (White's view; the search
+    // score is side-to-move-relative). This is what both the bar and the glyphs read.
+    if (node && typeof data.score === 'number') {
+      node.ann = { cp: node.state.turn === 'white' ? data.score : -data.score, move: data.move || null };
+    }
     if (!analysisBarVisible()) return;
-    // The search score is side-to-move-relative; the bar wants White's view.
-    if (typeof data.score === 'number') paintEvalBar(evalBar.turn === 'white' ? data.score : -data.score);
-    drawBestArrow(data.move);
-    updateStatusText(); // the search settled — drop the "thinking…" line
+    if (node === curNode) {
+      // The reply is for the viewed position: paint the bar + best-move arrow.
+      evalBar.pending = false;
+      evalBar.turn = curNode.state.turn;
+      if (node.ann) paintEvalBar(node.ann.cp);
+      drawBestArrow(data.move);
+      evalBar.fen = toFen(node.state);
+      updateStatusText(); // the search settled — drop the "thinking…" line
+    }
+    refreshGlyphs();    // a new eval may reveal a nearby move's glyph
+    requestEvalBar();   // dispatch the next job (viewed node first, then neighbours)
   };
   w.onerror = (e) => console.error('Eval-bar worker error:', e.message);
   return w;
@@ -1529,7 +1580,8 @@ function syncEvalBar() {
     // in-flight reply) whenever that bar isn't showing.
     if (evalBar.worker) { evalBar.worker.terminate(); evalBar.worker = null; }
     evalBar.seq++;
-    evalBar.pending = evalBar.dirty = false;
+    evalBar.pending = false;
+    evalBar.jobNode = null;
     evalBar.fen = null;
   }
   if (!analysisBar && !duel) return;
@@ -1540,38 +1592,81 @@ function syncEvalBar() {
   else requestEvalBar();
 }
 
+// A terminal position has a known eval (mate = the winner's end, draw = level), so fill
+// it in directly rather than searching (there are no moves to search). This lets a move
+// that walks into mate still get flagged, and lets the bar paint a finished line.
+function ensureTerminalAnn(node) {
+  if (!node || node.ann) return;
+  const here = node === liveNode ? status : gameStatus(node.state);
+  if (!here.over) return;
+  const cp = here.result === 'checkmate' ? (here.winner === 'white' ? EVAL_BAR_MATE : -EVAL_BAR_MATE) : 0;
+  node.ann = { cp, move: null };
+}
+
+// A node is worth a background search only if it isn't already evaluated and isn't terminal.
+function searchable(node) {
+  if (!node || node.ann) return false;
+  const here = node === liveNode ? status : gameStatus(node.state);
+  return !here.over;
+}
+
+// Nodes near the viewed one, in priority order, whose evals make nearby glyphs seamless:
+// the parent (the viewed move's own "before" eval), then children/grandchildren (the moves
+// you're about to step into), then the rest of the local family. Terminal neighbours get
+// their eval filled synchronously here so a walk-into-mate is flagged without a search.
+function neighborNodes(node) {
+  const seen = new Set([node]);
+  const out = [];
+  const add = (n) => { if (n && !seen.has(n)) { seen.add(n); out.push(n); } };
+  add(node.parent);
+  if (node.parent) add(node.parent.parent);
+  for (const c of node.children) { add(c); for (const g of c.children) add(g); }
+  if (node.parent) for (const s of node.parent.children) add(s);
+  for (const n of out) ensureTerminalAnn(n);
+  return out;
+}
+
+// Dispatch one background/foreground eval for `node` on the shared analysis worker.
+function dispatchEval(node) {
+  if (!evalBar.worker) evalBar.worker = createEvalBarWorker();
+  evalBar.jobNode = node;
+  evalBar.worker.postMessage({
+    type: 'search', seq: ++evalBar.seq, state: node.state,
+    depth: EVAL_BAR.depth, maxMs: EVAL_BAR.maxMs, engine: EVAL_BAR.engine, net: netUrl(championNet()),
+    // The repetition window up to this node (same trimming as repWindow).
+    posHistory: pathFens(node).slice(-(node.state.halfmove + 1)),
+    wasmUrl: WASM_URL,
+  });
+}
+
+// The eval-bar/annotation scheduler. Paints the bar for the viewed node the instant its
+// eval is known (cached from an earlier visit or filled here), then keeps the worker busy
+// evaluating the viewed node (top priority — it feeds the bar) and, once that's in hand,
+// its neighbours in the background, so move-quality glyphs are ready before you arrive.
 function requestEvalBar() {
+  if (!analysisBarVisible()) return;
   // The analysis eval runs the nn (loop champion), with the weights resolved from the
   // catalog at request time. On a deep-link/restore boot the catalog loads asynchronously,
   // so netUrl is briefly null; firing the search then would run the wasm nn eval with no
   // weights loaded — a "memory access out of bounds" trap that kills the worker (no bar, no
   // arrow). Defer until loadNetCatalog resolves and kicks us again with the net in hand.
   if (EVAL_BAR.engine === 'nn' && !netUrl(championNet())) return;
-  const st = curNode.state;
-  const fen = toFen(st);
-  if (fen === evalBar.fen) return; // already showing (or searching) this position
-  if (evalBar.pending) { evalBar.dirty = true; return; }
-  evalBar.fen = fen;
-  // Terminal positions need no search (and have no moves to search).
-  const here = curNode === liveNode ? status : gameStatus(st);
-  if (here.over) {
-    paintEvalBar(here.result === 'checkmate' ? (here.winner === 'white' ? EVAL_BAR_MATE : -EVAL_BAR_MATE) : 0);
-    drawBestArrow(null); // no move in a finished position
-    updateStatusText();  // nothing to search here — no "thinking…" line
-    return;
+  evalBar.turn = curNode.state.turn;
+  ensureTerminalAnn(curNode);
+  const fen = toFen(curNode.state);
+  // Paint the bar + arrow for the viewed node as soon as its eval exists (a cache hit on
+  // a revisited node is instant; `fen` guards against reprocessing the same position).
+  if (evalBar.fen !== fen) {
+    if (curNode.ann) { paintEvalBar(curNode.ann.cp); drawBestArrow(curNode.ann.move); }
+    else drawBestArrow(null); // no eval yet — clear the stale arrow until the search lands
+    evalBar.fen = fen;
   }
-  drawBestArrow(null); // clear the arrow for the old position until the new search lands
-  if (!evalBar.worker) evalBar.worker = createEvalBarWorker();
-  evalBar.pending = true;
-  evalBar.turn = st.turn;
-  evalBar.worker.postMessage({
-    type: 'search', seq: ++evalBar.seq, state: st,
-    depth: EVAL_BAR.depth, maxMs: EVAL_BAR.maxMs, engine: EVAL_BAR.engine, net: netUrl(championNet()),
-    // The repetition window up to the VIEWED node (same trimming as repWindow).
-    posHistory: pathFens(curNode).slice(-(st.halfmove + 1)),
-    wasmUrl: WASM_URL,
-  });
-  updateStatusText(); // a search is now in flight — show the "thinking…" line
+  evalBar.pending = searchable(curNode); // "thinking…" while the viewed node has no eval yet
+  updateStatusText();
+  if (evalBar.jobNode) return; // worker busy; its reply re-runs this and picks the next job
+  // The viewed node feeds the bar, so it always jumps the queue ahead of the neighbours.
+  const target = searchable(curNode) ? curNode : neighborNodes(curNode).find(searchable);
+  if (target) dispatchEval(target);
 }
 
 // --- promotion picker ---
