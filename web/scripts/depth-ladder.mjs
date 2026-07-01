@@ -41,6 +41,15 @@
 //   --depths=LIST   depths to rate each engine at: range (1-8) or list (6,8). Default 1-8
 //                   (the whole spectrum). Narrow it (e.g. --depths=6,8) for a quick run.
 //   --anchor-depth=D  the hc depth that is the pin / Elo 0 (default 6). Always present as a node.
+//   --play=SPEC     restrict NEW scheduled games to matchups among these specs only (comma list).
+//                   Each is EITHER a bare engine spec (same forms as --engines) — every --depths
+//                   of it is schedulable — OR a depth-qualified NODE id `<eng><depth>@<spec>` (the
+//                   exact string the ladder prints, e.g. nn8@08df7b, hc6@2, nn6@?) — only that one
+//                   (engine, depth) node, so you can target an asymmetric cross-depth matchup like
+//                   --play=nn8@08df7b,nn6@22577c. A named depth outside --depths is force-added.
+//                   The pin and the rest of the pool are STILL rated from the games already in the
+//                   store + --corpus; they just don't play any new games. Use this to pile games
+//                   onto a specific head-to-head while keeping everyone on the stable hc6 scale.
 //   --no-material   skip the nn material fallback node (otherwise included as the floor).
 //   --minutes=M     play for M minutes, then finalize. Omit to run until you stop it (q/Ctrl-C).
 //   --matchups=N    stop after N matchups (default unlimited).
@@ -125,6 +134,10 @@ const cfg = {
   engines: typeof args.net === 'string' ? args.net : (typeof args.engines === 'string' ? args.engines : 'all'),
   depths: parseDepths(args.depths, [1, 2, 3, 4, 5, 6, 7, 8]),
   anchorDepth: num(args['anchor-depth'], 6), // the hc depth that is the pin (Elo := 0)
+  // --play: restrict NEW scheduled games to matchups among these engines (comma list of specs).
+  // The pin + the rest of the pool are still rated from already-played store/--corpus games;
+  // they just don't play new games. null = schedule across the whole pool (default).
+  play: typeof args.play === 'string' ? args.play.split(',').map((s) => s.trim()).filter(Boolean) : null,
   material: !args['no-material'],
   // Pool stores from other machines to fold in before fitting (pairwise counts are additive).
   // Each MUST come from a distinct --seed (else identical games would be double-counted).
@@ -185,6 +198,21 @@ function allEngines() {
   if (cfg.material) list.push(makeEngine('material'));
   return list;
 }
+// Parse one --play token into { engine, depth }. A bare engine spec (08df7b, champion, hc,
+// material, a path) has depth = null: EVERY --depths of that engine is schedulable. A
+// depth-qualified NODE id — the exact `<eng><depth>@<spec>` string the ladder prints, e.g.
+// nn8@08df7b / hc6@2 / nn6@? — pins the schedulable set to that one (engine, depth) node, so
+// you can target an asymmetric cross-depth matchup. The part after @ is resolved like any spec
+// (hash/'champion'/path), with the ladder's own hc/material node ids handled specially so a
+// pasted id round-trips.
+function parsePlaySpec(spec) {
+  const m = /^(nn|hc)(\d+)@(.+)$/.exec(spec);
+  if (!m) return { engine: makeEngine(spec), depth: null }; // bare engine spec -> all depths
+  const [, eng, d, ver] = m;
+  const engine = eng === 'hc' ? makeEngine('hc') : ver === '?' ? makeEngine('material') : makeEngine(ver);
+  if (engine.eng !== eng) { console.error(`--play: '${spec}' names a ${eng} node but '${ver}' resolves to a ${engine.eng} engine.`); process.exit(1); }
+  return { engine, depth: Number(d) };
+}
 
 // Selected engines + the ALWAYS-included handcrafted, deduped by eng@version. hc is a full
 // participant at EVERY --depth (near-strength anchor points connecting every depth band to the
@@ -192,6 +220,11 @@ function allEngines() {
 // stable scale at each depth, not just reaching down from hc6.
 let engines = cfg.engines === 'all' ? allEngines()
   : cfg.engines.split(',').map((s) => s.trim()).filter(Boolean).map(makeEngine);
+// --play engines must be in the rated pool too (so they're competitors that can play AND be
+// rated). Parse each spec (bare = all depths, or a depth-qualified node id — see parsePlaySpec)
+// and fold any engine that --engines didn't already include into the list.
+const playSpecs = cfg.play ? cfg.play.map(parsePlaySpec) : null;
+if (playSpecs) for (const { engine } of playSpecs) if (!engines.some((e) => `${e.eng}@${e.version}` === `${engine.eng}@${engine.version}`)) engines.push(engine);
 if (!engines.some((e) => `${e.eng}@${e.version}` === `hc@${HC_VERSION}`)) engines.push(makeEngine('hc'));
 { const seen = new Set(); engines = engines.filter((e) => { const k = `${e.eng}@${e.version}`; if (seen.has(k)) return false; seen.add(k); return true; }); }
 
@@ -204,8 +237,30 @@ for (const e of engines) for (const d of cfg.depths) competitors.push(node(e, d)
 // The pin node hc<anchor-depth> is ALWAYS present, even if anchor-depth ∉ --depths.
 const pinId = `hc${cfg.anchorDepth}@${HC_VERSION}`;
 if (!competitors.some((c) => c.id === pinId)) competitors.push(node(makeEngine('hc'), cfg.anchorDepth));
+// A depth-qualified --play node may name a depth outside --depths; force that exact node in
+// (like the pin) so it can play and be rated.
+if (playSpecs) for (const { engine, depth } of playSpecs) {
+  if (depth == null) continue;
+  const id = `${engine.eng}${depth}@${engine.version}`;
+  if (!competitors.some((c) => c.id === id)) competitors.push(node(engine, depth));
+}
 if (competitors.length < 2) { console.error('Need at least 2 nodes (engines × depths).'); process.exit(1); }
 const byId = new Map(competitors.map((c) => [c.id, c]));
+
+// --- schedulable subset (--play): which nodes may play NEW games ---------------
+// fit() always rates ALL competitors (the pin + the whole pool) from the persisted store +
+// --corpus. --play just restricts the ACTIVE SCHEDULER to matchups among the named specs, so
+// only that head-to-head gains new games while everyone else keeps their from-existing-data
+// estimate. A bare engine spec (depth == null) matches every --depths of that engine; a
+// depth-qualified node id matches only that exact (engine, depth) node.
+const playMatch = playSpecs
+  ? (c) => playSpecs.some(({ engine, depth }) => c.eng === engine.eng && c.version === engine.version && (depth == null || c.depth === depth))
+  : null;
+const schedulable = playMatch ? competitors.filter(playMatch) : competitors;
+if (cfg.rounds !== 0 && schedulable.length < 2) {
+  console.error(`--play needs ≥2 schedulable nodes to play (got ${schedulable.length}); widen --play or --depths.`);
+  process.exit(1);
+}
 
 // --- persistent pairwise store -------------------------------------------------
 // pairs: { "idA|idB" (sorted): { games, sumA } } where sumA = points scored by idA. One shared
@@ -372,8 +427,10 @@ const ncdf = (x) => 0.5 * (1 + erf(x / Math.SQRT2));
 // uncertainty. Score each rank-adjacent pair by P(mis-ordered) = Φ(−|Δ|/σ_Δ); play the worst.
 // Every 6th pick (or once all orderings are sharp) play the least-constrained near-strength
 // contrast instead, to keep the graph rigid and catch transitivity errors.
+// Scheduling is restricted to `schedulable` (the --play subset; the whole pool by default) — the
+// elo/varDiff still come from the full fit, so only the chosen engines play new games.
 function pickMatchup(elo, varDiff, iter) {
-  const sorted = [...competitors].sort((a, b) => elo.get(a.id) - elo.get(b.id));
+  const sorted = [...schedulable].sort((a, b) => elo.get(a.id) - elo.get(b.id));
   let best = null, bestAmb = -1;
   for (let k = 0; k < sorted.length - 1; k++) {
     const a = sorted[k], b = sorted[k + 1];
@@ -384,8 +441,8 @@ function pickMatchup(elo, varDiff, iter) {
   }
   if (iter % 6 === 5 || bestAmb < 0.02) {
     let rb = null, rv = -1;
-    for (let i = 0; i < competitors.length; i++) for (let j = i + 1; j < competitors.length; j++) {
-      const a = competitors[i], b = competitors[j];
+    for (let i = 0; i < schedulable.length; i++) for (let j = i + 1; j < schedulable.length; j++) {
+      const a = schedulable[i], b = schedulable[j];
       if (Math.abs(elo.get(a.id) - elo.get(b.id)) > 300) continue; // keep p(1−p) meaningful
       const v = varDiff(a.id, b.id);
       if (v > rv) { rv = v; rb = [a, b]; }
@@ -662,6 +719,7 @@ function writeRankLedger(verbose) {
 console.log(`Engine ranking pool (active scheduler)`);
 console.log(`  ${competitors.length} node(s): ${competitors.map((c) => `${c.id.split('@')[0]}@${c.version.slice(0, 6)}`).join(', ')}`);
 console.log(`  pin ${pinId} | ${cfg.games} games/matchup | ${cfg.jobs} parallel job(s) | store ${cfg.store}`);
+if (playMatch) console.log(`  --play: new games only among ${schedulable.map((c) => c.id.split('@')[0] + '@' + c.version.slice(0, 6)).join(', ')} (rest rated from existing data)`);
 console.log(`  games -> ${cfg.saveGames || '(not harvested; --no-save-games)'}`);
 if (cfg.rounds !== 0) await scanDataset(); // once up front, so the periodic ledger emit has record counts
 await scanCorpus(); // fold the dataset's game results into the fit (no-op unless --corpus)

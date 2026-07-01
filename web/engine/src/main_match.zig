@@ -633,9 +633,22 @@ fn writeHarvest(sh: *Shared, gpa: std.mem.Allocator, io: std.Io, path: []const u
     defer out.deinit(gpa);
     var n_pos: usize = 0;
     var n_a: usize = 0;
+    var dropped: usize = 0;
     for (sh.games.items) |g| {
         const npos = g.recs.items.len;
         if (npos == 0) continue;
+        // Keep only color-balanced openings: an early stop (SPRT / abort) can finish one game of a
+        // pair without its color-reversed partner, since work is dispatched one game at a time. Such
+        // a lone game would skew the opening's color balance, so skip any game whose pair partner
+        // isn't also present. (A natural full run dispatches every pair complete, so nothing drops.)
+        var pair_games: usize = 0;
+        for (sh.games.items) |o| {
+            if (o.pair == g.pair and o.recs.items.len > 0) pair_games += 1;
+        }
+        if (pair_games < 2) {
+            dropped += 1;
+            continue;
+        }
         // players: color 'w' means engine A had White, so w=A's tag, b=B's tag (swapped otherwise).
         const pw = if (g.color == 'w') tag_a else tag_b;
         const pb = if (g.color == 'w') tag_b else tag_a;
@@ -685,8 +698,13 @@ fn writeHarvest(sh: *Shared, gpa: std.mem.Allocator, io: std.Io, path: []const u
     defer file.close(io);
     const offset: u64 = (file.stat(io) catch unreachable).size;
     try file.writePositionalAll(io, out.items, offset);
-    std.debug.print("Saved {d} positions from {d} games to {s} ({d} A {s}, {d} B {s}).\n", .{
-        n_pos, sh.games.items.len, path, n_a, tag_a, n_pos - n_a, tag_b,
+    var dropbuf: [48]u8 = undefined;
+    const dropmsg = if (dropped > 0)
+        (std.fmt.bufPrint(&dropbuf, " (dropped {d} unpaired tail game(s))", .{dropped}) catch "")
+    else
+        "";
+    std.debug.print("Saved {d} positions from {d} games to {s} ({d} A {s}, {d} B {s}){s}.\n", .{
+        n_pos, sh.games.items.len - dropped, path, n_a, tag_a, n_pos - n_a, tag_b, dropmsg,
     });
 }
 

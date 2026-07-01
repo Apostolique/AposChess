@@ -172,7 +172,7 @@ const scriptCmd = new Map([
 const scriptDefaults = {
   'npm run train:gen': { games: '200', depth: '6', eval: 'handcrafted', openings: '8', 'opening-topk': '0', maxmoves: '200' },
   'npm run match': { games: '100', movetime: '50', 'eval-a': 'handcrafted', 'eval-b': 'handcrafted', openings: '6', maxmoves: '200', elo0: '0', elo1: '15', alpha: '0.05', beta: '0.05' },
-  'npm run rank:pool': { depths: '6,8', 'anchor-depth': '6', games: '10', openings: '6', maxmoves: '200', prior: '1' },
+  'npm run rank:pool': { 'anchor-depth': '6', games: '10', openings: '6', maxmoves: '200', prior: '1' },
   'node scripts/refresh-v.mjs': { frac: '1', depth: '6', minutes: '10' },
   'npm run train:fit': { hidden: '128', lambda: '1' }, // train:fit forwards to train.py
 };
@@ -188,12 +188,19 @@ function relArg(tok) {
 // The hand-runnable form of a spawned step: `npm run … -- <flags>` (npm needs the `--`
 // to forward flags), with redundant defaults and the clock-based seed stripped so only
 // the meaningful overrides show. Returns null for anything not in the map.
-function friendlyCmd(argv) {
-  const base = scriptCmd.get(argv[0]);
+function friendlyCmd(cmd, argv) {
+  // The spawned program is either `cmd` itself (the native binaries apos-gen / apos-match,
+  // whose flags are ALL of argv) or, when cmd is the node/python interpreter, the script in
+  // argv[0] (whose flags are argv.slice(1)). Resolve whichever the scriptCmd map knows, and
+  // take the flag list from the matching position — otherwise the native steps (Generate,
+  // Gate) would look up a --flag as the program and silently echo nothing.
+  let base = scriptCmd.get(cmd), flagArgs;
+  if (base) { flagArgs = argv; }
+  else { base = scriptCmd.get(argv[0]); flagArgs = argv.slice(1); }
   if (!base) return null;
   const def = scriptDefaults[base] || {};
   const flags = [];
-  for (const tok of argv.slice(1)) {
+  for (const tok of flagArgs) {
     const eq = tok.indexOf('=');
     const key = (eq < 0 ? tok : tok.slice(0, eq)).replace(/^--/, '');
     const val = eq < 0 ? null : tok.slice(eq + 1);
@@ -472,7 +479,7 @@ function run(label, cmd, argv, cwd = webDir) {
   console.log(`\n--- ${label} — ${hms()} ---`);
   // Echo the equivalent stand-alone command so the step can be reproduced/resumed by
   // hand (run from web/). Logged too, so the persisted log records exactly what ran.
-  const friendly = friendlyCmd(argv);
+  const friendly = friendlyCmd(cmd, argv);
   if (friendly) log(`  $ ${friendly}`);
   // APOS_CHILD tells the child tools they're orchestrated: they use a SIGINT-only
   // graceful stop instead of grabbing the TTY's raw mode, so the loop's own Ctrl-C
@@ -490,10 +497,12 @@ function run(label, cmd, argv, cwd = webDir) {
   return true;
 }
 
-// Depths the pool rates every engine at: the gate depth (cfg.rankDepth, also the hc pin)
-// and the generation depth (cfg.depth) — the two depths positions are labeled at (nn6@/nn8@).
-// hc<rankDepth> is the pinned Elo-0 node, so all ratings land on one stable scale.
-const poolDepths = [...new Set([cfg.rankDepth, cfg.depth])].filter((d) => d >= 1);
+// The loop rates the SAME full pool as a standalone `npm run rank:pool` — every engine across
+// depth-ladder's default depth spectrum (1-8), not a narrowed slice — so its ledger is the one
+// unified pool, not a loop-specific variant. hc<rankDepth> stays the pinned Elo-0 node (via
+// --anchor-depth below), so all ratings land on the same stable scale. (The two depths positions
+// are LABELED at, nn6@/nn8@, are just a subset of that spectrum — foldGateHarvest still finds
+// them in the ledger.)
 
 // Refit the Bradley-Terry strength pool (rank:pool / depth-ladder.mjs). Runs EVERY cycle:
 //   --corpus folds the whole dataset's harvested games (each record's players + result) into
@@ -512,7 +521,7 @@ function runRankPool(label) {
   // too (--no-save-games), consistent with the gate.
   run(label, process.execPath,
     [rankScript, '--corpus', `--minutes=${cfg.rankMinutes}`,
-      `--depths=${poolDepths.join(',')}`, `--anchor-depth=${cfg.rankDepth}`,
+      `--anchor-depth=${cfg.rankDepth}`,
       `--games=${cfg.rankGames}`, `--store=${ladderStore}`, `--ledger=${ledgerFile}`,
       ...(cfg.harvest ? [] : ['--no-save-games']),
       '--no-scan', `--seed=${Date.now()}`, ...jobArg]);
@@ -647,7 +656,7 @@ log(`train:loop start — batch ${cfg.batch} @ depth ${cfg.depth} | gate ${cfg.g
   + `${existsSync(lineage) ? ' (resuming lineage)' : ''} | `
   + `refresh/cycle ${cfg.refreshCycle > 0 ? `${(cfg.refreshCycle * 100).toFixed(1)}% @ depth ${cfg.refreshCycleDepth}` : 'off'} | `
   + `refresh on promotion ${cfg.refreshFrac > 0 ? `${(cfg.refreshFrac * 100).toFixed(0)}% @ depth ${cfg.refreshDepth}` : 'off'} | `
-  + `rank ${cfg.rank ? `pool every cycle (hc${cfg.rankDepth} pin, depths ${poolDepths.join('+')}, corpus + ${cfg.rankMinutes}m play)` : 'off'} | `
+  + `rank ${cfg.rank ? `full pool every cycle (hc${cfg.rankDepth} pin, all depths, corpus + ${cfg.rankMinutes}m play)` : 'off'} | `
   + `cycles ${cfg.cycles === Infinity ? '∞' : cfg.cycles}`);
 log('Pause/resume from another terminal: `npm run train:pause` / `npm run train:resume` (frees all CPU, no work lost).');
 
