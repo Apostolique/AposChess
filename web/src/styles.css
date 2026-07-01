@@ -530,6 +530,8 @@ button:disabled:hover { background: var(--panel); } /* no hover lift when locked
 .move:hover { background: #4a443f; }
 .move.current { background: var(--accent); color: #15110d; font-weight: 600; }
 .move-cont { padding: 5px 10px; color: var(--muted); } /* the "…" placeholder for a broken pair */
+.move-cont[data-id] { cursor: pointer; } /* placeholder standing in for a displaced move */
+.move-cont[data-id]:hover { background: #4a443f; }
 
 /* Variations: a full-width, shaded row just under the move they branch from. The moves flow
    inline (numbers inline, nested variations as parenthesised (…) blocks); a long nested

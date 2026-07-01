@@ -696,6 +696,9 @@ function renderMoveList() {
 
   const empty = '<span></span>';
   const dots = '<span class="move-cont">…</span>';
+  // A "…" placeholder standing in for a move displaced to another row by a variation break;
+  // clicking it selects that move (the one that would sit here if there were no variations).
+  const contFor = (n) => `<span class="move-cont" data-id="${n.id}">…</span>`;
   const gridRow = (num, white, black) => `<div class="moverow"><span class="moveno">${num}</span>${white}${black}</div>`;
   // Each sibling variation of `node` becomes its own shaded row(s); a long sub-variation
   // inside one breaks onto a further-indented row of its own (see variationRows).
@@ -723,12 +726,12 @@ function renderMoveList() {
       // When Black's reply drops down to that continuation row, mark the Black cell it left
       // behind with "…" (mirroring the "…" that fills White's empty spot on the row below).
       const hasBlack = i + 1 < line.length && plyOf(line[i + 1]) % 2 === 0;
-      rows.push(gridRow(`${num}.`, moveSpan(node), hasBlack ? dots : empty));
+      const black = hasBlack ? line[i + 1] : null;
+      rows.push(gridRow(`${num}.`, moveSpan(node), black ? contFor(black) : empty));
       rows.push(varRows(node));
       i++;
-      if (hasBlack) {
-        const black = line[i];
-        rows.push(gridRow(`${num}…`, dots, moveSpan(black)));
+      if (black) {
+        rows.push(gridRow(`${num}…`, contFor(node), moveSpan(black)));
         rows.push(varRows(black));
         i++;
       }
