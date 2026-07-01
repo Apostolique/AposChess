@@ -70,6 +70,7 @@
 //   --corpus        fold the WHOLE dataset's game results into the fit: every game record's
 //                   players + result becomes a pairwise W/D/L among the ranked nodes, so the
 //                   entire self-play corpus informs the ratings (not just dedicated matchups).
+//                   ON by default; pass --no-corpus for the pool's dedicated matchups only.
 //                   Recomputed each run (never persisted), so it can't double-count itself;
 //                   self-play games (same engine both sides) are skipped. The pool store's own
 //                   games are SUBTRACTED per pair before folding (corpus contributes only the
@@ -179,7 +180,7 @@ const cfg = {
   // among the ranked nodes — not just the pool's own dedicated matchups. The corpus
   // contribution is recomputed each run (not persisted into the pool store), so it never
   // double-counts. Self-play games (same engine both sides) are uninformative and skipped.
-  corpus: !!args.corpus,
+  corpus: !args['no-corpus'],
   data: typeof args.data === 'string' ? resolve(process.cwd(), args.data) : join(dataDir, 'selfplay.jsonl'),
   store: typeof args.store === 'string' ? resolve(process.cwd(), args.store) : join(loopDir, 'ladder-pool.json'),
   ledger: typeof args.ledger === 'string' ? resolve(process.cwd(), args.ledger) : join(loopDir, 'engine-elo.ladder.json'),
