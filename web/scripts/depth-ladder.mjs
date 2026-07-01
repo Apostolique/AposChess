@@ -110,6 +110,19 @@ const champion = resolve(webDir, 'src', 'nn-weights.json');
 const engineDir = resolve(webDir, 'engine');
 const matchBin = resolve(engineDir, 'zig-out', 'bin', process.platform === 'win32' ? 'apos-match.exe' : 'apos-match');
 
+// Nice display names from the web UI net catalog (public/nn/manifest.json), keyed by the same
+// 6-char content hash weightsHash() produces — which is exactly a node's version. Best-effort:
+// a version not in the manifest (an unarchived/quantized net, hc, material) simply has no name.
+const nnNames = (() => {
+  const m = new Map();
+  try {
+    const mani = JSON.parse(readFileSync(resolve(webDir, 'public', 'nn', 'manifest.json'), 'utf8'));
+    for (const n of mani.nets || []) if (n.hash && n.name) m.set(n.hash, n.name);
+  } catch { /* no manifest -> no nice names */ }
+  return m;
+})();
+const niceName = (version) => nnNames.get(version) || null;
+
 const args = Object.fromEntries(process.argv.slice(2).map((a) => {
   const m = a.replace(/^--/, '').split('='); return [m[0], m.length > 1 ? m[1] : true];
 }));
@@ -662,7 +675,7 @@ function writeRankLedger(verbose) {
   const recordsByVersion = new Map();
   for (const [tag, n] of tagCounts) { const t = parseTag(tag); if (!t) continue; const k = `${t.eng}@${t.version}`; recordsByVersion.set(k, (recordsByVersion.get(k) || 0) + n); }
   const ranking = ranked.map((c) => ({
-    tag: c.id, eng: c.eng, version: c.version, depth: String(c.depth),
+    tag: c.id, eng: c.eng, version: c.version, name: niceName(c.version), depth: String(c.depth),
     anchor: c.id === pinId, elo: elo.get(c.id), score: null,
     margin: ci.get(c.id) ?? null, games: gamesOf(c.id),
     records: recordsByVersion.get(`${c.eng}@${c.version}`) || 0, recoverable: true, file: c.weights,
@@ -695,10 +708,10 @@ function writeRankLedger(verbose) {
   writeFileSync(cfg.ledger, JSON.stringify(ledger, null, 2) + '\n');
   if (!verbose) return;
   console.log(`\n===== Elo ladder (${pinId} := 0) — weakest first =====`);
-  console.log(`  ${'#'.padStart(3)} ${'engine'.padEnd(16)} ${'Elo'.padStart(8)} ${'±95'.padStart(6)} ${'games'.padStart(7)}`);
+  console.log(`  ${'#'.padStart(3)} ${'engine'.padEnd(16)} ${'name'.padEnd(12)} ${'Elo'.padStart(8)} ${'±95'.padStart(6)} ${'games'.padStart(7)}`);
   for (const [i, c] of ranked.entries()) {
     const rank = ranked.length - i; // ranked is weakest-first, so #1 = strongest
-    console.log(`  ${String(rank).padStart(3)} ${c.id.padEnd(16)} ${(`${elo.get(c.id) >= 0 ? '+' : ''}${elo.get(c.id).toFixed(0)}`).padStart(8)} ${(ci.get(c.id) == null ? '' : ci.get(c.id).toFixed(0)).padStart(6)} ${String(gamesOf(c.id)).padStart(7)}${c.id === pinId ? '  (pin)' : ''}`);
+    console.log(`  ${String(rank).padStart(3)} ${c.id.padEnd(16)} ${(niceName(c.version) || '').padEnd(12)} ${(`${elo.get(c.id) >= 0 ? '+' : ''}${elo.get(c.id).toFixed(0)}`).padStart(8)} ${(ci.get(c.id) == null ? '' : ci.get(c.id).toFixed(0)).padStart(6)} ${String(gamesOf(c.id)).padStart(7)}${c.id === pinId ? '  (pin)' : ''}`);
   }
   if (unrecoverable.length) {
     console.log(`\n  Unrecoverable contributors (no Elo -> weakest, refresh on sight):`);
@@ -719,7 +732,7 @@ function writeRankLedger(verbose) {
 }
 
 console.log(`Engine ranking pool (active scheduler)`);
-console.log(`  ${competitors.length} node(s): ${competitors.map((c) => `${c.id.split('@')[0]}@${c.version.slice(0, 6)}`).join(', ')}`);
+console.log(`  ${competitors.length} node(s): ${competitors.map((c) => `${c.id.split('@')[0]}@${c.version.slice(0, 6)}${niceName(c.version) ? ` (${niceName(c.version)})` : ''}`).join(', ')}`);
 console.log(`  pin ${pinId} | ${cfg.games} games/matchup | ${cfg.jobs} parallel job(s) | store ${cfg.store}`);
 if (playMatch) console.log(`  --play: new games only among ${schedulable.map((c) => c.id.split('@')[0] + '@' + c.version.slice(0, 6)).join(', ')} (rest rated from existing data)`);
 console.log(`  games -> ${cfg.saveGames || '(not harvested; --no-save-games)'}`);
