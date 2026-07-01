@@ -781,7 +781,10 @@ function renderMoveList() {
       i += bnode ? 2 : 1;
     }
   }
-  el.innerHTML = rows.join('');
+  // On mobile the list sits below the board, so newest-first reads better: reverse the
+  // DOM row order (not `flex-direction: column-reverse`, which breaks touch-scrolling —
+  // see styles.css). Desktop keeps the natural oldest-first order.
+  el.innerHTML = (desktopMql.matches ? rows : rows.slice().reverse()).join('');
 
   const cur = el.querySelector('.current');
   // Scroll within the move list only — `scrollIntoView` would also scroll
