@@ -848,9 +848,12 @@ function showMoveMenu(node, x, y) {
   const idx = node.parent ? node.parent.children.indexOf(node) : 0;
   const main = isMainline(node);
   const items = [];
-  // "Promote variation" only when there's another variation above to swap with — for the
-  // topmost variation (idx 1) promoting just makes it the main line, so hide it there.
-  if (idx > 1) items.push(['Promote variation', () => promoteVariation(node)]);
+  // "Promote variation" whenever there's a sibling above to swap with (idx > 0) — except when
+  // that swap would make it the game's main line, which is "Make main line"'s job. That only
+  // happens at idx 1 under a mainline parent; under a nested (non-mainline) parent, promoting
+  // the topmost variation just reorders within that branch, so keep it available.
+  const parentMain = !node.parent || isMainline(node.parent);
+  if (idx > 0 && !(idx === 1 && parentMain)) items.push(['Promote variation', () => promoteVariation(node)]);
   if (!main) items.push(['Make main line', () => makeMainLine(node)]);
   items.push(['Copy variation PGN', () => copyVariationPgn(node)]);
   items.push(['Delete from here', () => deleteNode(node)]);
