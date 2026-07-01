@@ -1474,6 +1474,10 @@ const evalBar = { worker: null, seq: 0, pending: false, jobNode: null, fen: null
 // the viewed position) to draw an arrow to its best move, refreshed as you navigate
 // or fork — no extra worker, no need to actually play the move.
 let showBestArrow = false;
+// The viewed node's best move (from the eval reply), remembered so the arrow can be
+// toggled/recomposed without a fresh search. The board's analysis autoshapes are the
+// move-quality badge + this arrow, owned solely by syncAnalysisShapes().
+let bestArrowMove = null;
 
 const analysisBarVisible = () => ui.mode === 'analysis';
 const duelBarsVisible = () => ui.mode === 'ai-ai' && ui.showEvalBars;
@@ -1498,6 +1502,10 @@ function createEvalBarWorker() {
       drawBestArrow(data.move);
       evalBar.fen = toFen(node.state);
       updateStatusText(); // the search settled — drop the "thinking…" line
+    } else {
+      // A neighbour's eval (e.g. the viewed move's parent) can complete the viewed
+      // move's own badge, so recompose the board shapes.
+      syncAnalysisShapes();
     }
     refreshGlyphs();    // a new eval may reveal a nearby move's glyph
     requestEvalBar();   // dispatch the next job (viewed node first, then neighbours)
@@ -1529,17 +1537,36 @@ function paintEvalBarEl(el, whiteCp, who) {
 // The puzzle bar (left, dedicated worker).
 function paintEvalBar(whiteCp) { paintEvalBarEl($('eval-bar-left'), whiteCp, 'Eval'); }
 
-// Draw (or clear) the analysis best-move arrow from an eval-bar search reply.
-// Off, out of analysis, or a terminal position (no move) all clear it. When the
-// best move is a promotion, drop a ghost piece (Lichess-style) on the landing
-// square so it's clear which piece the pawn should become.
+// On-board move-quality badges (Lichess-style), drawn into the top-right corner of the
+// square the viewed move landed on — same 100×100 customSvg cell as the puzzle ✓/✗.
+const glyphBadge = (text, fill) =>
+  `<g transform="translate(54,2)"><circle cx="22" cy="22" r="22" fill="${fill}" stroke="#fff" stroke-width="2"/>` +
+  `<text x="22" y="24" fill="#fff" font-family="sans-serif" font-weight="bold" font-size="${text.length > 1 ? 24 : 30}" ` +
+  `text-anchor="middle" dominant-baseline="central">${text}</text></g>`;
+const GLYPH_BADGE = { '?!': glyphBadge('?!', '#d99a2b'), '?': glyphBadge('?', '#e58f2a'), '??': glyphBadge('??', '#ca3431') };
+
+// Record the viewed node's best move (from an eval reply) and recompose the board shapes.
+// A terminal/absent move just clears the arrow; the badge is independent of it.
 function drawBestArrow(move) {
-  if (!showBestArrow || !analysisBarVisible()) return;
-  if (!move || move.from == null) { cg.setAutoShapes([]); return; }
-  const dest = squareName(move.to);
-  const shapes = [{ orig: squareName(move.from), dest, brush: 'paleBlue' }];
-  if (move.promotion) {
-    shapes.push({ orig: dest, piece: { role: CG_ROLE[move.promotion], color: evalBar.turn, scale: 0.6 } });
+  bestArrowMove = move && move.from != null ? move : null;
+  syncAnalysisShapes();
+}
+
+// The single owner of the analysis board's autoshapes: the move-quality badge for the
+// viewed move (shown whenever it has a glyph, arrow or not) plus the best-move arrow when
+// enabled. A promotion arrow also drops a ghost piece on the landing square (Lichess-style)
+// so it's clear which piece the pawn should become.
+function syncAnalysisShapes() {
+  if (!analysisBarVisible()) return;
+  const shapes = [];
+  const g = curNode.lastMove && moveGlyph(curNode);
+  if (g) shapes.push({ orig: squareName(curNode.lastMove.to), customSvg: { html: GLYPH_BADGE[g] } });
+  if (showBestArrow && bestArrowMove) {
+    const dest = squareName(bestArrowMove.to);
+    shapes.push({ orig: squareName(bestArrowMove.from), dest, brush: 'paleBlue' });
+    if (bestArrowMove.promotion) {
+      shapes.push({ orig: dest, piece: { role: CG_ROLE[bestArrowMove.promotion], color: evalBar.turn, scale: 0.6 } });
+    }
   }
   cg.setAutoShapes(shapes);
 }
@@ -2500,9 +2527,9 @@ $('analysis-back').addEventListener('click', () => {
 // to draw; off, clear the arrow immediately.
 $('analysis-arrows').addEventListener('change', (e) => {
   showBestArrow = e.target.checked;
-  if (!showBestArrow) { cg.setAutoShapes([]); return; }
-  evalBar.fen = null; // bypass the "same position" short-circuit so the move comes back
-  requestEvalBar();
+  syncAnalysisShapes(); // add/drop the arrow; the move-quality badge stays either way
+  // Turned on with no move remembered yet (node not searched): kick a search to fetch it.
+  if (showBestArrow && !bestArrowMove) { evalBar.fen = null; requestEvalBar(); }
 });
 for (const id of ['puzzle-difficulty', 'puzzle-theme']) {
   $(id).addEventListener('change', () => {
