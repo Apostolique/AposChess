@@ -517,18 +517,48 @@ button:disabled:hover { background: var(--panel); } /* no hover lift when locked
   font-size: 1rem;
   font-variant-numeric: tabular-nums;
 }
-.moverow { display: grid; grid-template-columns: 2.6em 1fr 1fr; }
-.moverow:nth-child(odd) { background: rgba(255, 255, 255, 0.025); }
-.moveno {
-  color: var(--muted);
-  text-align: right;
-  padding: 5px 8px;
-  background: rgba(0, 0, 0, 0.18);
+/* The move list is a flowing tree (variations inline), not a fixed grid. */
+.movetree { padding: 6px 8px; line-height: 2; }
+.moveno { color: var(--muted); margin: 0 1px 0 3px; }
+.move {
+  display: inline-block;
+  padding: 1px 5px;
+  border-radius: 3px;
+  cursor: pointer;
+  white-space: nowrap;
 }
-.move { padding: 5px 10px; cursor: pointer; white-space: nowrap; }
 .move:hover { background: #4a443f; }
 .move.current { background: var(--accent); color: #15110d; font-weight: 600; }
+/* Variations render muted and slightly smaller, with their own parentheses; nesting just
+   nests the spans (and the parens), so no per-level rule is needed. */
+.variation { color: var(--muted); font-size: 0.92em; }
+.variation .moveno { margin-left: 1px; }
 .moves .empty { padding: 12px; color: var(--muted); }
+
+/* Per-move context menu (Promote / Make main line / Copy variation PGN / Delete). */
+.move-menu {
+  position: fixed;
+  z-index: 50;
+  min-width: 168px;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  border: 1px solid #4a443f;
+  border-radius: 6px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4);
+}
+.move-menu button {
+  padding: 7px 10px;
+  text-align: left;
+  background: none;
+  border: none;
+  border-radius: 4px;
+  color: var(--text);
+  font-size: 0.9rem;
+  cursor: pointer;
+}
+.move-menu button:hover { background: #4a443f; }
 
 .nav { display: flex; gap: 6px; }
 .nav button { flex: 1; padding: 8px 0; font-size: 0.95rem; }

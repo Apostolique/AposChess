@@ -46,12 +46,43 @@ function wrap(text) {
   return out + line;
 }
 
-// Build a .pgn string from main.js's `history` (per-ply snapshots, each with
-// `.state` and `.lastMove`) and the final game `status`. `players` carries the
-// White/Black names (e.g. "Human" or "AI (depth 7, 6000ms)"); unknown sides fall
-// back to PGN's "?".
-export function exportPgn(history, status, players = {}) {
-  const start = history[0].state;
+// Moves from the root to a node (root = 0; a node's own move is its depth).
+const depthOf = (node) => { let d = 0; for (let n = node; n.parent; n = n.parent) d++; return d; };
+
+// One movetext token with its (optional) move number. White always prints its number
+// (`12.`); Black prints `12...` only when it starts a line/variation or follows one.
+function numberedToken(node, needNum) {
+  const ply = depthOf(node);
+  const white = ply % 2 === 1;
+  const num = Math.ceil(ply / 2);
+  const prefix = white ? `${num}. ` : (needNum ? `${num}... ` : '');
+  return prefix + moveToken(node.parent.state, node.lastMove);
+}
+
+// Render the line beginning at move node `node`, following main children; at each branch
+// its sibling variations are emitted (recursively) as parenthesised `(…)` blocks right
+// after the main move — the same traversal the in-app move list uses.
+function renderSeq(node, needNum) {
+  let out = '';
+  while (node) {
+    out += (out ? ' ' : '') + numberedToken(node, needNum);
+    needNum = false;
+    const sibs = node.parent.children;
+    if (sibs[0] === node && sibs.length > 1) {
+      for (const sib of sibs.slice(1)) out += ' (' + renderSeq(sib, true) + ')';
+      needNum = true; // the main line resumes after a variation block
+    }
+    node = node.children[0];
+  }
+  return out;
+}
+
+// Build a .pgn string from main.js's move-tree `root` (a node with `.state`/`.children`,
+// each child a ply with `.lastMove`) and the final game `status`. Variations are written
+// as nested `(…)` blocks. `players` carries the White/Black names (e.g. "Human" or
+// "AI (depth 7, 6000ms)"); unknown sides fall back to PGN's "?".
+export function exportPgn(root, status, players = {}) {
+  const start = root.state;
   const result = resultToken(status);
 
   // The Seven Tag Roster (STR), in PGN's required order, comes first; supplemental
@@ -69,12 +100,8 @@ export function exportPgn(history, status, players = {}) {
   ];
   if (toFen(start) !== START_FEN) { tags.push(['SetUp', '1'], ['FEN', toFen(start)]); }
 
-  let movetext = '';
-  for (let k = 1; k < history.length; k++) {
-    if (k % 2 === 1) movetext += `${(k + 1) / 2}. `;
-    movetext += moveToken(history[k - 1].state, history[k].lastMove) + ' ';
-  }
-  movetext += result;
+  const moves = root.children.length ? renderSeq(root.children[0], true) : '';
+  const movetext = (moves ? moves + ' ' : '') + result;
 
   return tags.map(([k, v]) => `[${k} "${v}"]`).join('\n') + '\n\n' + wrap(movetext) + '\n';
 }
@@ -109,35 +136,75 @@ function matchCompact(state, token) {
   return legalMoves(state).find((mv) => mv.from === from && mv.to === to && (mv.promotion || null) === promo) || null;
 }
 
-// Parse one self-play JSONL record (one GAME per line; see scripts/gameRecord.mjs)
-// into the same { start, moves, white, black } shape as importPgn — so pasting a
-// single dataset line replays/visualizes that recorded game. Participant labels come
-// from `players` (the engine@depth vtag per colour) or fall back to the game id `g`.
+// A bare move-tree node. main.js fills in id/san/check/evals when it installs the tree;
+// here we only need the position, the move that produced it, and the parent/child links.
+const treeNode = (parent, state, lastMove) => ({ state, lastMove, parent, children: [] });
+
+// Parse one self-play JSONL record (one GAME per line; see scripts/gameRecord.mjs) into
+// the same { root, white, black } shape as importPgn — so pasting a single dataset line
+// replays/visualizes that recorded game (a linear tree). Participant labels come from
+// `players` (the engine@depth vtag per colour) or fall back to the game id `g`.
 function importGameLine(line) {
   let rec;
   try { rec = JSON.parse(line); }
   catch { throw new Error('Not a valid PGN or self-play game line'); }
   if (!Array.isArray(rec.moves)) throw new Error('Not a self-play game record (no "moves" array)');
 
-  const start = rec.start ? parseFen(rec.start) : newGameState();
-  let state = start;
-  const moves = [];
+  const root = treeNode(null, rec.start ? parseFen(rec.start) : newGameState(), null);
+  let cur = root;
   for (const tok of rec.moves) {
-    const mv = matchCompact(state, tok);
+    const mv = matchCompact(cur.state, tok);
     if (!mv) throw new Error(`Unparseable or illegal move: "${tok}"`);
-    moves.push(mv);
-    state = applyMove(state, mv);
+    const child = treeNode(cur, applyMove(cur.state, mv), mv);
+    cur.children.push(child);
+    cur = child;
   }
   const players = rec.players || {};
   const fallback = rec.g ? `Game ${rec.g}` : null;
-  return { start, moves, white: players.w || fallback, black: players.b || fallback };
+  return { root, white: players.w || fallback, black: players.b || fallback };
 }
 
-// Parse a PGN string (or a single self-play JSONL line) into { start, moves, white,
-// black }: `moves` are reconstructed engine move objects (ready to replay with
-// applyMove) and white/black are participant labels (or null). A line that begins
-// with '{' is treated as a self-play record; otherwise it's parsed as PGN. Throws on
-// an unparseable/illegal move so the caller can surface a clear error.
+// Split movetext into a token stream, dropping tags, `{…}` comments, `$n` NAGs, move
+// numbers, and result tokens, but keeping `(` and `)` as their own tokens so variations
+// can be parsed structurally.
+function tokenizeMovetext(body) {
+  const tokens = [];
+  for (let i = 0; i < body.length;) {
+    const c = body[i];
+    if (c === '{') { const e = body.indexOf('}', i); i = e < 0 ? body.length : e + 1; continue; }
+    if (c === '(' || c === ')') { tokens.push(c); i++; continue; }
+    if (/\s/.test(c)) { i++; continue; }
+    let j = i;
+    while (j < body.length && !/[\s(){}]/.test(body[j])) j++;
+    let word = body.slice(i, j).replace(/^\d+\.(\.\.)?/, ''); // strip a leading "12."/"12..." glued to the move
+    i = j;
+    if (!word || /^\$\d+$/.test(word) || /^\d+\.*$/.test(word) || RESULTS.has(word)) continue;
+    tokens.push(word);
+  }
+  return tokens;
+}
+
+// Recursive-descent parse of the token stream into the move tree. `cur` is the node whose
+// state is the current position; the next move appends a child to it. A `(` opens a
+// variation that is an alternative to the LAST move played, so it branches from that
+// move's parent; `)` closes the current variation and returns to the caller's line.
+function parseMovetext(cur, tokens, pos) {
+  while (pos.i < tokens.length) {
+    const tok = tokens[pos.i++];
+    if (tok === ')') return;
+    if (tok === '(') { parseMovetext(cur.parent || cur, tokens, pos); continue; }
+    const mv = matchToken(cur.state, tok);
+    if (!mv) throw new Error(`Unparseable or illegal move: "${tok}"`);
+    const child = treeNode(cur, applyMove(cur.state, mv), mv);
+    cur.children.push(child);
+    cur = child;
+  }
+}
+
+// Parse a PGN string (or a single self-play JSONL line) into { root, white, black }: a
+// move tree (variations preserved as sibling branches) and participant labels (or null).
+// A line that begins with '{' is treated as a self-play record; otherwise it's parsed as
+// PGN. Throws on an unparseable/illegal move so the caller can surface a clear error.
 export function importPgn(text) {
   const trimmed = text.trim();
   if (trimmed.startsWith('{')) {
@@ -151,25 +218,8 @@ export function importPgn(text) {
   let t;
   while ((t = tagRe.exec(text)) !== null) tags[t[1]] = t[2];
 
-  const start = tags.FEN ? parseFen(tags.FEN) : newGameState();
-
-  // Strip tags, comments {…}, variations (…), NAGs ($n), and move numbers (1. / 1...).
-  const body = text
-    .replace(tagRe, ' ')
-    .replace(/\{[^}]*\}/g, ' ')
-    .replace(/\([^)]*\)/g, ' ')
-    .replace(/\$\d+/g, ' ')
-    .replace(/\d+\.(\.\.)?/g, ' ');
-
-  const tokens = body.split(/\s+/).filter((tok) => tok && !RESULTS.has(tok));
-
-  let state = start;
-  const moves = [];
-  for (const tok of tokens) {
-    const mv = matchToken(state, tok);
-    if (!mv) throw new Error(`Unparseable or illegal move: "${tok}"`);
-    moves.push(mv);
-    state = applyMove(state, mv);
-  }
-  return { start, moves, white: tags.White || null, black: tags.Black || null };
+  const root = treeNode(null, tags.FEN ? parseFen(tags.FEN) : newGameState(), null);
+  const tokens = tokenizeMovetext(text.replace(tagRe, ' '));
+  parseMovetext(root, tokens, { i: 0 });
+  return { root, white: tags.White || null, black: tags.Black || null };
 }

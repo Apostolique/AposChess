@@ -101,48 +101,95 @@ function playConnectSound() {
   connectSound.currentTime = 0;
   connectSound.play().catch(() => {}); // gesture-unlocked by the Host/Join click
 }
-// Move history for review. Each entry is a snapshot after a ply; index 0 is the
-// start position. `viewIndex` is the position shown on the board, which may lag
-// the live game while the user steps back through earlier moves. Each entry also
-// carries `evals` — what each engine's eval bar showed while that position was
-// live (White's view; null = no opinion yet) — so review replays the bars too.
-let history = [startEntry(state)];
-let viewIndex = 0;
+// The game is a TREE of plies, not a flat line: from any position you can branch into
+// alternative continuations (analysis variations), nestable to any depth. Each node is a
+// snapshot after a ply — `state`, the `lastMove` that produced it, its `san` notation, a
+// `check` flag, and `evals` (what each engine's eval bar showed while that position was
+// live; White's view, null = no opinion yet, so review replays the bars). `children[0]`
+// is the main continuation; `children[1..]` are variations. See the tree helpers below.
+//   rootNode — the start position (children only, no move).
+//   curNode  — the ply shown on the board; may lag the live game during review.
+//   liveNode — the tip where live play appends (the game's real end). In play modes it
+//              only advances on real moves while curNode is rewound; `state`/`status`
+//              mirror liveNode, keeping "live game" vs "viewed ply" separated as before.
+let nextNodeId = 0;
+function newRoot(s) {
+  return { id: nextNodeId++, state: s, lastMove: null, san: null, check: false,
+           evals: { white: null, black: null }, parent: null, children: [] };
+}
+function makeNode(parent, s, move, san, check) {
+  // Inherit the parent's evals so a new live ply starts from both engines' latest views.
+  return { id: nextNodeId++, state: s, lastMove: move, san, check,
+           evals: { ...parent.evals }, parent, children: [] };
+}
+let rootNode = newRoot(state);
+let curNode = rootNode;
+let liveNode = rootNode;
 
 // Participant labels for an imported game ({ white, black }), shown in the trays so a
 // recorded self-play/PGN game is identifiable. Null for a live game (no labels shown).
 let importedNames = null;
 
-// FENs of every position in the live line, kept in lock-step with `history` and
-// sent to the AI worker so its search knows the real game's repetitions — without
-// this the engine has no game history and can shuffle a won position into a draw.
-let repFens = [toFen(state)];
+// --- tree navigation & path helpers ---
+// Root→node path (inclusive). Repetition and "the positions before this one" are
+// inherently per-line, and a line is exactly the path from the root to a node — so
+// these replace the old `repFens` array that was lock-stepped with a flat history.
+function pathTo(node) {
+  const out = [];
+  for (let n = node; n; n = n.parent) out.push(n);
+  return out.reverse();
+}
+function pathFens(node) { return pathTo(node).map((n) => toFen(n.state)); }
+// The live game's main line (follow the main child from the root) and its tip.
+function mainlineTip() { let n = rootNode; while (n.children.length) n = n.children[0]; return n; }
+function nodeById(id) {
+  const stack = [rootNode];
+  while (stack.length) { const n = stack.pop(); if (n.id === id) return n; for (const c of n.children) stack.push(c); }
+  return null;
+}
+// True if `node` lies on the root→`of` path (used when deleting a branch: if the
+// viewed/live node is inside the removed subtree it must fall back to the branch point).
+function onPath(node, of) { for (let n = of; n; n = n.parent) if (n === node) return true; return false; }
 
-// The repetition positions worth sending to the worker for position `s`: only those
-// since the last irreversible move (the last `halfmove` plies) can recur, so the
-// engine's lookup set stays tiny. Older positions can never match (material/pawns
-// differ), so dropping them changes nothing but speed.
-const repWindow = (s) => repFens.slice(-(s.halfmove + 1));
+// Deep-copy a tree (new node objects, parent/children rebuilt) so a saved snapshot can't
+// be mutated by later editing of the live tree. `state`/`lastMove` are immutable, shared.
+// Returns the new root and an id→node map so callers can re-point live/cur/etc.
+function cloneTree(root) {
+  const byId = new Map();
+  const rec = (node, parent) => {
+    const copy = { id: node.id, state: node.state, lastMove: node.lastMove, san: node.san,
+                   check: node.check, evals: { ...node.evals }, parent, children: [] };
+    byId.set(node.id, copy);
+    copy.children = node.children.map((c) => rec(c, copy));
+    return copy;
+  };
+  return { root: rec(root, null), byId };
+}
+
+// The repetition positions worth sending to the worker for the live line ending at
+// `liveNode`: only those since the last irreversible move (the last `halfmove` plies of
+// the given position `s`) can recur, so the engine's lookup set stays tiny. Older
+// positions can never match (material/pawns differ), so dropping them changes nothing
+// but speed. `s` may be a hypothetical position one move past the tip (a ponder state),
+// which isn't itself in the path — same approximation as the old flat-array version.
+const repWindow = (s) => pathFens(liveNode).slice(-(s.halfmove + 1));
 
 // Board-editor mode: which side is to move once you leave the editor. The edited
 // position only becomes a real game when you switch to a play mode (see the mode
 // change handler), so during editing we don't maintain `state` from the board.
 let editorTurn = 'white';
 
-// Threefold-repetition tracking: count occurrences of each position over the live
-// game. A position is identified by the first three FEN fields (piece placement,
-// side to move, castling rights) — the same identity used for repetition in chess.
-// The game is append-only (review changes viewIndex, not the live line), so a
-// forward-only count is sufficient.
-let posCounts = new Map();
+// Threefold-repetition tracking. A position is identified by the first three FEN fields
+// (piece placement, side to move, castling rights) — the same identity chess uses. A
+// repetition can only happen within one line, so we count occurrences along a node's own
+// root→node path rather than keeping a global map: that stays correct across variations.
 const positionKey = (s) => toFen(s).split(' ', 3).join(' ');
-function countPosition(s) {
-  const k = positionKey(s);
-  const n = (posCounts.get(k) || 0) + 1;
-  posCounts.set(k, n);
+function countAlongPath(node) {
+  const key = positionKey(node.state);
+  let n = 0;
+  for (let p = node; p; p = p.parent) if (positionKey(p.state) === key) n++;
   return n;
 }
-countPosition(state); // seed the start position
 
 // Online (peer-to-peer) play. `online` is the active session (or null); `onlineColor`
 // is the colour this client controls (host = White, joiner = Black); `onlineConnected`
@@ -156,10 +203,6 @@ let matchSession = null; // active matchmaking queue search (or null)
 // throwaway, so on a disconnect we go idle instead of keeping the lobby alive (that
 // host-rehost behaviour is only useful for a code you deliberately shared).
 let matchmade = false;
-
-function startEntry(s) {
-  return { state: s, lastMove: null, san: null, check: false, evals: { white: null, black: null } };
-}
 
 // Each AI colour gets its OWN worker — its own thread and its own persistent
 // transposition table. In AI-vs-AI that lets both sides think at once: the side to
@@ -305,8 +348,8 @@ function render() {
   // The editor owns the board directly (free placement); don't overwrite its pieces
   // from game state — just refresh the surrounding chrome. enterEditor() sets it up.
   if (ui.mode === 'editor') { updateStatusText(); applyAiLock(); return; }
-  const entry = history[viewIndex];
-  const atLive = viewIndex === history.length - 1;
+  const entry = curNode;
+  const atLive = curNode === liveNode;
   let color = atLive ? controllableColor() : undefined;
   let dests = (atLive && color) ? destsMap(status.legal) : new Map();
   // Analysis (and a finished puzzle): reviewing isn't read-only — EITHER side can move
@@ -501,29 +544,30 @@ function updateStatusText() {
   placeStatus(el, placement);
 }
 
-// Apply one move to the live game and record it (state, status, history snapshot,
-// repetition FEN). Shared by interactive play (`commit`) and bulk replay
-// (`loadGame`); does no rendering, sound, or AI driving of its own.
+// Apply one move at the live tip and record it as a tree node, advancing `liveNode`.
+// If the tip already has a child for this exact move (replaying an existing analysis
+// line), reuse it instead of duplicating — so stepping back and replaying a variation
+// is non-destructive. Shared by interactive play (`commit`) and bulk replay
+// (`loadTree`/imports); does no rendering, sound, or AI driving of its own.
 function recordMove(move) {
-  const pre = state;
+  const pre = liveNode.state;
+  const existing = liveNode.children.find((c) => c.lastMove
+    && c.lastMove.from === move.from && c.lastMove.to === move.to
+    && (c.lastMove.promotion || null) === (move.promotion || null)
+    && (c.lastMove.castle || null) === (move.castle || null));
+  if (existing) { liveNode = existing; state = existing.state; status = gameStatus(state); return; }
   state = applyMove(pre, move);
   status = gameStatus(state);
+  const node = makeNode(liveNode, state, move, null, false);
   // Threefold repetition is a draw. Override only if the game isn't already over
   // (checkmate/stalemate/insufficient-material/fifty-move take precedence and may share the position).
-  if (!status.over && countPosition(state) >= 3) {
+  if (!status.over && countAlongPath(node) >= 3) {
     status = { over: true, check: status.check, legal: status.legal, result: 'repetition', winner: null };
   }
-  history.push({
-    state,
-    lastMove: move,
-    san: toSan(pre, move, status),
-    check: status.check,
-    // Carry the engines' opinions forward: the mover's score for this move is
-    // already stamped on the pre-move entry (onSearchResult), so the new live
-    // entry starts from both engines' latest views.
-    evals: { ...history[history.length - 1].evals },
-  });
-  repFens.push(toFen(state));
+  node.san = toSan(pre, move, status);
+  node.check = status.check;
+  liveNode.children.push(node);
+  liveNode = node;
 }
 
 function commit(move) {
@@ -531,10 +575,10 @@ function commit(move) {
   clearTimeout(aiTimer);
   supersedeAi();
   aiThinking = false;
-  const wasLive = viewIndex === history.length - 1;
+  const wasLive = curNode === liveNode;
   recordMove(move);
   maybeRememberOpening(); // feed this game's opening line into the variety rotation
-  if (wasLive) viewIndex = history.length - 1; // follow the game unless reviewing
+  if (wasLive) curNode = liveNode; // follow the game unless reviewing
   lastCommitAt = performance.now();
   // Only sound the new move if we're following the live game; while reviewing an
   // earlier position (e.g. rewound during an AI-vs-AI game) the move isn't shown,
@@ -564,24 +608,40 @@ function toSan(pre, move, st) {
 }
 
 // --- move list & review navigation ---
-function moveSpan(k) {
-  return `<span class="move${k === viewIndex ? ' current' : ''}" data-i="${k}">${history[k].san}</span>`;
+// The move list is a flowing render of the whole tree (variations inline): the main line
+// reads left-to-right and each branch point drops its alternatives into a parenthesised
+// `(…)` block right after the main move, nesting recursively. A ply's move number comes
+// from its depth (root = ply 0, ply 1 = White's first move); Black shows a number only at
+// the start of a line/variation or just after a variation block (`needNum`).
+function moveHtml(node, needNum) {
+  const ply = pathTo(node).length - 1;
+  const white = ply % 2 === 1;
+  const label = white ? `${Math.ceil(ply / 2)}.` : (needNum ? `${Math.ceil(ply / 2)}…` : '');
+  const numHtml = label ? `<span class="moveno">${label}</span>` : '';
+  return `${numHtml}<span class="move${node === curNode ? ' current' : ''}" data-id="${node.id}">${node.san}</span>`;
+}
+
+// Render the line beginning at move node `node`, following main children; at each branch
+// its sibling variations are emitted (recursively) right after the main move.
+function renderSequence(node, forceNumber) {
+  let html = '', needNum = forceNumber, n = node;
+  while (n) {
+    html += moveHtml(n, needNum);
+    needNum = false;
+    const sibs = n.parent.children;
+    if (sibs[0] === n && sibs.length > 1) {
+      for (const sib of sibs.slice(1)) html += `<span class="variation">(${renderSequence(sib, true)})</span>`;
+      needNum = true; // the next main move follows a variation block, so re-show its number
+    }
+    n = n.children[0];
+  }
+  return html;
 }
 
 function renderMoveList() {
   const el = $('moves');
-  if (history.length <= 1) { el.innerHTML = '<div class="empty">No moves yet.</div>'; return; }
-  const rows = [];
-  for (let k = 1; k < history.length; k += 2) {
-    const black = (k + 1 < history.length) ? moveSpan(k + 1) : '<span></span>';
-    rows.push(`<div class="moverow"><span class="moveno">${(k + 1) / 2}.</span>${moveSpan(k)}${black}</div>`);
-  }
-  // On a phone the list sits below the board, so the newest move must be visible
-  // without scrolling: render newest-pair-first (top). We reverse the DOM rather than
-  // flipping with `flex-direction: column-reverse`, because a reversed-flex scroll box
-  // can't be touch-scrolled (overflow escapes the unreachable start/top edge).
-  if (!desktopMql.matches) rows.reverse();
-  el.innerHTML = rows.join('');
+  if (!rootNode.children.length) { el.innerHTML = '<div class="empty">No moves yet.</div>'; return; }
+  el.innerHTML = `<div class="movetree">${renderSequence(rootNode.children[0], true)}</div>`;
   const cur = el.querySelector('.current');
   // Scroll within the move list only — `scrollIntoView` would also scroll
   // every ancestor (the page itself on mobile) and yank the viewport around.
@@ -593,34 +653,113 @@ function renderMoveList() {
   }
 }
 
-function goTo(index) {
-  const clamped = Math.max(0, Math.min(history.length - 1, index));
-  if (clamped === viewIndex) return;
-  // Stepping/jumping forward replays moves: sound the one we land on (its capture
-  // and check flags). Stepping back is silent.
-  if (clamped > viewIndex) {
-    const entry = history[clamped];
-    playMoveSound(entry.lastMove && entry.lastMove.capture, entry.check);
-  }
-  viewIndex = clamped;
+// The end of the line reached by following main children from `node`.
+function lineTip(node) { let n = node; while (n.children.length) n = n.children[0]; return n; }
+
+function goTo(node) {
+  if (!node || node === curNode) return;
+  // Moving to a descendant replays moves: sound the ply we land on (its capture and
+  // check flags). Stepping back, or jumping sideways to another line, is silent.
+  if (onPath(curNode, node)) playMoveSound(node.lastMove && node.lastMove.capture, node.check);
+  curNode = node;
   render();
 }
 
-// Make the viewed ply the live end of the game: drop everything after it and
-// rebuild the live bookkeeping (state, status, repetition counts) from the
-// snapshot. Backs the rewind-and-fork in analysis mode.
-function truncateToView() {
-  history.length = viewIndex + 1;
-  repFens.length = viewIndex + 1;
-  const entry = history[viewIndex];
-  state = entry.state;
+// Step to the previous/next sibling variation at the current branch point (Up/Down):
+// among curNode's siblings, wrapping. No-op at the root or with a single child.
+function goToSibling(dir) {
+  const p = curNode.parent;
+  if (!p || p.children.length < 2) return;
+  const i = p.children.indexOf(curNode);
+  goTo(p.children[(i + dir + p.children.length) % p.children.length]);
+}
+
+// --- variation editing (the move-list context menu) ---
+// After any structural edit the live line may have changed shape, so re-anchor liveNode to
+// the current line's tip and refresh live state/status/UI (state/status mirror liveNode).
+function afterTreeEdit() {
+  liveNode = lineTip(curNode);
+  state = liveNode.state;
   status = gameStatus(state);
-  // Threefold tracking is forward-only, so recount over the surviving line.
-  posCounts = new Map();
-  for (const f of repFens) {
-    const k = f.split(' ', 3).join(' '); // same identity as positionKey
-    posCounts.set(k, (posCounts.get(k) || 0) + 1);
+  render();
+}
+
+// Move `node` one slot earlier among its siblings (toward the main line).
+function promoteVariation(node) {
+  const sibs = node.parent && node.parent.children;
+  if (!sibs) return;
+  const i = sibs.indexOf(node);
+  if (i > 0) { sibs.splice(i, 1); sibs.splice(i - 1, 0, node); afterTreeEdit(); }
+}
+
+// Make the whole line through `node` the main line: at every branch point on the root→node
+// path, move the on-path child to index 0.
+function makeMainLine(node) {
+  for (let n = node; n.parent; n = n.parent) {
+    const sibs = n.parent.children;
+    const i = sibs.indexOf(n);
+    if (i > 0) { sibs.splice(i, 1); sibs.unshift(n); }
   }
+  afterTreeEdit();
+}
+
+// Delete `node` and its subtree. If the viewed/live node was inside it, fall back to the
+// branch point (the parent). The root itself can't be deleted.
+function deleteNode(node) {
+  if (!node.parent) return;
+  const sibs = node.parent.children;
+  sibs.splice(sibs.indexOf(node), 1);
+  if (onPath(node, curNode)) curNode = node.parent;
+  afterTreeEdit();
+}
+
+// Build a throwaway linear tree (a chain, no variations) for the root→`node` line, so the
+// PGN exporter can render just that line for "Copy variation PGN".
+function lineTreeTo(node) {
+  const path = pathTo(node);
+  const root = newRoot(path[0].state);
+  let cur = root;
+  for (let i = 1; i < path.length; i++) {
+    const src = path[i];
+    const n = makeNode(cur, src.state, src.lastMove, src.san, src.check);
+    cur.children.push(n);
+    cur = n;
+  }
+  return root;
+}
+
+async function copyVariationPgn(node) {
+  const text = exportPgn(lineTreeTo(node), gameStatus(node.state),
+    { white: playerName('white'), black: playerName('black') });
+  try { await navigator.clipboard.writeText(text); } catch { downloadPgn(text); }
+}
+
+// --- move-list context menu (right-click / long-press a move) ---
+let moveMenuEl = null;
+function closeMoveMenu() { if (moveMenuEl) { moveMenuEl.remove(); moveMenuEl = null; } }
+function showMoveMenu(node, x, y) {
+  closeMoveMenu();
+  const items = [
+    ['Promote variation', () => promoteVariation(node)],
+    ['Make main line', () => makeMainLine(node)],
+    ['Copy variation PGN', () => copyVariationPgn(node)],
+    ['Delete from here', () => deleteNode(node)],
+  ];
+  const menu = document.createElement('div');
+  menu.className = 'move-menu';
+  for (const [label, fn] of items) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = label;
+    b.addEventListener('click', () => { closeMoveMenu(); fn(); });
+    menu.appendChild(b);
+  }
+  document.body.appendChild(menu);
+  // Clamp to the viewport so a menu opened near an edge stays on screen.
+  const r = menu.getBoundingClientRect();
+  menu.style.left = Math.min(x, window.innerWidth - r.width - 4) + 'px';
+  menu.style.top = Math.min(y, window.innerHeight - r.height - 4) + 'px';
+  moveMenuEl = menu;
 }
 
 // chessground reports a legal (from, to); resolve it to an engine move,
@@ -629,10 +768,13 @@ function onUserMove(orig, dest) {
   if (ui.mode === 'editor') return; // free placement: chessground keeps the move, no game logic
   // A move played while reviewing (enabled in analysis and in a finished puzzle —
   // everywhere else an off-live board is view-only) forks the game at the viewed ply:
-  // the moves after it are discarded and this move becomes the new continuation.
-  if (viewIndex !== history.length - 1) {
+  // the append point moves to the viewed node, so this move becomes a new variation
+  // there (a sibling of any existing continuation) rather than truncating the line.
+  if (curNode !== liveNode) {
     if (ui.mode !== 'analysis' && !(ui.mode === 'puzzle' && puzzleDone())) { render(); return; }
-    truncateToView();
+    liveNode = curNode;
+    state = curNode.state;
+    status = gameStatus(state);
   }
   const from = parseSquare(orig), to = parseSquare(dest);
   const matches = status.legal.filter((m) => m.from === from && m.to === to);
@@ -706,13 +848,10 @@ function startSearch(slot) {
   slot.worker.postMessage({ type: 'search', seq, state, depth, maxMs, engine, net, posHistory: repWindow(state), exclude: openingExclude(), wasmUrl: WASM_URL });
 }
 
-// The move keys (from*64+to) of the moves played so far this game.
+// The move keys (from*64+to) of the moves played so far this game (the live line).
 function openingPrefix() {
   const keys = [];
-  for (let i = 1; i < history.length; i++) {
-    const m = history[i].lastMove;
-    keys.push(m.from * 64 + m.to);
-  }
+  for (const n of pathTo(liveNode)) if (n.lastMove) keys.push(n.lastMove.from * 64 + n.lastMove.to);
   return keys;
 }
 
@@ -728,9 +867,9 @@ function openingPrefix() {
 // move the search keeps the full list, so a move is always available.
 function openingExclude() {
   if (ui.mode !== 'ai-ai' || !ui.varyOpenings) return undefined;
-  const ply = history.length - 1;                          // moves already played this game
+  const ply = pathTo(liveNode).length - 1;                 // moves already played this game
   if (ply >= OPENING_PLIES) return undefined;              // past the opening phase
-  if (toFen(history[0].state) !== STANDARD_START_FEN) return undefined; // not a standard start
+  if (toFen(rootNode.state) !== STANDARD_START_FEN) return undefined; // not a standard start
   const prefix = openingPrefix();
   const used = new Set();
   for (const line of ui.recentLines) {
@@ -745,8 +884,8 @@ function openingExclude() {
 // just moves to the front. Only AI-vs-AI games from a standard start contribute.
 function maybeRememberOpening() {
   if (ui.mode !== 'ai-ai' || !ui.varyOpenings) return;
-  if (toFen(history[0].state) !== STANDARD_START_FEN) return;
-  const ply = history.length - 1;
+  if (toFen(rootNode.state) !== STANDARD_START_FEN) return;
+  const ply = pathTo(liveNode).length - 1;
   if (ply !== OPENING_PLIES && !(status.over && ply < OPENING_PLIES)) return;
   const line = openingPrefix().slice(0, OPENING_PLIES);
   if (!line.length) return;
@@ -764,7 +903,7 @@ function onSearchResult(slot, data) {
   // history entry — the position it searched (the seq check above rules out a
   // superseded position) — so review can replay the eval bars ply by ply.
   if (typeof data.score === 'number') {
-    history[history.length - 1].evals[slot.color] = slot.color === 'white' ? data.score : -data.score;
+    liveNode.evals[slot.color] = slot.color === 'white' ? data.score : -data.score;
     if (duelBarsVisible()) paintDuelBars();
   }
   // Only the side to move's real search yields a move to play (a ponder-side worker
@@ -789,7 +928,7 @@ function onSearchResult(slot, data) {
 function onSearchProgress(slot, data) {
   if (data.seq !== slot.searchSeq) return; // stale: the position moved on
   if (typeof data.score !== 'number') return;
-  history[history.length - 1].evals[slot.color] = slot.color === 'white' ? data.score : -data.score;
+  liveNode.evals[slot.color] = slot.color === 'white' ? data.score : -data.score;
   if (duelBarsVisible()) paintDuelBars();
 }
 
@@ -817,7 +956,7 @@ function onPonderResult(slot, data) {
   // ply just like a real search. If the prediction holds, the next real search picks
   // up seamlessly; if not, the bar corrects when that search starts.
   if (typeof data.score === 'number') {
-    history[history.length - 1].evals[slot.color] = slot.color === 'white' ? data.score : -data.score;
+    liveNode.evals[slot.color] = slot.color === 'white' ? data.score : -data.score;
     if (duelBarsVisible()) paintDuelBars();
   }
   const { depth, engine, net } = aiParams(slot.color);
@@ -848,7 +987,7 @@ let puzzleColor = 'white'; // the solver's side (the side to move in the puzzle 
 let puzzlePhase = 'idle';  // 'playing' | 'wrong' | 'solved' | 'revealed' | 'idle'
 let puzzleStep = 0;        // index into puzzle.moves of the next expected move
 let puzzleTimer = null;    // pending scripted reply / solution playback step
-let puzzleSolvedPly = -1;  // history index of the solving move (-1 until solved); the ✓ pins to it
+let puzzleSolvedNode = null;  // the tree node of the solving move (null until solved); the ✓ pins to it
 
 // A finished puzzle (solved or solution shown). The board then opens up for free
 // exploration — either side hand-movable, rewind-and-fork like analysis — instead of
@@ -916,18 +1055,18 @@ async function enterPuzzleMode() {
 }
 
 // Capture everything needed to resume the current puzzle session after a detour
-// through analysis: the live game (state/status/history/repFens/viewIndex/counts) and
-// the puzzle tracking (which puzzle, whose move, phase, progress). The arrays are
-// copied so analysis's forking/truncation can't mutate the saved session; the catalog
+// through analysis: the live game (a deep-cloned move tree + which nodes were live/
+// viewed/solving) and the puzzle tracking (which puzzle, whose move, phase, progress).
+// The tree is cloned so analysis's forking can't mutate the saved session; the catalog
 // and filtered play order (puzzleList) are left shared — analysis can't change them.
 function snapshotPuzzleSession() {
+  const { root, byId } = cloneTree(rootNode);
   return {
-    state, status,
-    history: history.slice(),
-    repFens: repFens.slice(),
-    viewIndex,
-    posCounts: new Map(posCounts),
-    puzzle, puzzleColor, puzzlePhase, puzzleStep, puzzleIdx, puzzleSolvedPly,
+    root, status,
+    live: byId.get(liveNode.id),
+    cur: byId.get(curNode.id),
+    solved: puzzleSolvedNode ? byId.get(puzzleSolvedNode.id) : null,
+    puzzle, puzzleColor, puzzlePhase, puzzleStep, puzzleIdx,
   };
 }
 
@@ -936,18 +1075,17 @@ function snapshotPuzzleSession() {
 function resumePuzzleSession(s) {
   clearTimeout(puzzleTimer);
   cancelAi();
-  state = s.state;
+  rootNode = s.root;
+  liveNode = s.live;
+  curNode = s.cur;
+  state = liveNode.state;
   status = s.status;
-  history = s.history;
-  repFens = s.repFens;
-  viewIndex = s.viewIndex;
-  posCounts = s.posCounts;
+  puzzleSolvedNode = s.solved || null;
   puzzle = s.puzzle;
   puzzleColor = s.puzzleColor;
   puzzlePhase = s.puzzlePhase;
   puzzleStep = s.puzzleStep;
   puzzleIdx = s.puzzleIdx;
-  puzzleSolvedPly = s.puzzleSolvedPly ?? -1;
   lastCommitAt = performance.now();
   cg.setAutoShapes([]);
   applyModeVisibility();
@@ -1011,17 +1149,13 @@ function loadPuzzle(p) {
     lead = preStatus.legal.find((m) => puzzleUci(m) === p.opening) || null;
     if (lead) { state = pre; status = preStatus; } // fall back to the puzzle position if not
   }
-  history = [startEntry(state)];
-  repFens = [toFen(state)];
-  viewIndex = 0;
-  posCounts = new Map();
-  countPosition(state);
+  rootNode = curNode = liveNode = newRoot(state);
   lastCommitAt = performance.now();
   puzzle = p;
   puzzleColor = lead ? opponent(state.turn) : state.turn; // the solver = the side to move in p.fen
   puzzlePhase = 'playing';
   puzzleStep = 0;
-  puzzleSolvedPly = -1;
+  puzzleSolvedNode = null;
   cg.setAutoShapes([]);
   applyModeVisibility(); // keep the puzzle panel/buttons in sync with the new puzzle
   render();
@@ -1043,9 +1177,9 @@ const GLYPH_WRONG = '<g transform="translate(54,2)"><circle cx="22" cy="22" r="2
 // to it. A transient wrong-move ✗ is drawn directly by playPuzzleMove, outside this
 // path.
 function paintPuzzleGlyph() {
-  const entry = history[viewIndex];
+  const entry = curNode;
   cg.setAutoShapes(
-    puzzlePhase === 'solved' && viewIndex === puzzleSolvedPly && entry && entry.lastMove
+    puzzlePhase === 'solved' && curNode === puzzleSolvedNode && entry && entry.lastMove
       ? [{ orig: squareName(entry.lastMove.to), customSvg: { html: GLYPH_SOLVED } }]
       : [],
   );
@@ -1062,9 +1196,9 @@ function playPuzzleMove(move) {
     puzzleStep++;
     puzzlePhase = 'playing';
     const done = puzzleStep >= puzzle.moves.length;
-    if (done) { puzzlePhase = 'solved'; puzzleSolvedPly = history.length; } // the move commit is about to append
-    commit(move);
-    if (done) playConnectSound();
+    if (done) puzzlePhase = 'solved';
+    commit(move); // appends and advances liveNode to the solving move
+    if (done) { puzzleSolvedNode = liveNode; paintPuzzleGlyph(); playConnectSound(); }
     else schedulePuzzleReply();
     return;
   }
@@ -1072,8 +1206,9 @@ function playPuzzleMove(move) {
   if (after.result === 'checkmate') {
     puzzleStep = puzzle.moves.length;
     puzzlePhase = 'solved';
-    puzzleSolvedPly = history.length; // the mating move commit is about to append
     commit(move);
+    puzzleSolvedNode = liveNode; // the mating move is now the live tip
+    paintPuzzleGlyph();
     playConnectSound();
     return;
   }
@@ -1105,7 +1240,7 @@ function schedulePuzzleReply() {
 function revealPuzzleSolution() {
   if (!puzzle || puzzlePhase !== 'playing' && puzzlePhase !== 'wrong') return;
   clearTimeout(puzzleTimer);
-  goTo(history.length - 1); // make sure we're at the live position before extending it
+  goTo(liveNode); // make sure we're at the live position before extending it
   puzzlePhase = 'revealed';
   cg.setAutoShapes([]);
   const step = () => {
@@ -1121,7 +1256,7 @@ function revealPuzzleSolution() {
 
 function puzzleHint() {
   if (!puzzle || (puzzlePhase !== 'playing' && puzzlePhase !== 'wrong')) return;
-  if (state.turn !== puzzleColor || viewIndex !== history.length - 1) return;
+  if (state.turn !== puzzleColor || curNode !== liveNode) return;
   cg.setAutoShapes([{ orig: puzzle.moves[puzzleStep].slice(0, 2), brush: 'green' }]);
 }
 
@@ -1250,7 +1385,7 @@ function drawBestArrow(move) {
 // engine.
 function paintDuelBars() {
   const bottom = viewColor();
-  const evals = history[viewIndex].evals;
+  const evals = curNode.evals;
   const name = (c) => `${c === 'white' ? 'White' : 'Black'} engine`;
   paintEvalBarEl($('eval-bar-left'), evals[bottom], name(bottom));
   paintEvalBarEl($('eval-bar-right'), evals[opponent(bottom)], name(opponent(bottom)));
@@ -1297,13 +1432,13 @@ function requestEvalBar() {
   // weights loaded — a "memory access out of bounds" trap that kills the worker (no bar, no
   // arrow). Defer until loadNetCatalog resolves and kicks us again with the net in hand.
   if (EVAL_BAR.engine === 'nn' && !netUrl(championNet())) return;
-  const fen = repFens[viewIndex];
+  const st = curNode.state;
+  const fen = toFen(st);
   if (fen === evalBar.fen) return; // already showing (or searching) this position
   if (evalBar.pending) { evalBar.dirty = true; return; }
   evalBar.fen = fen;
-  const st = history[viewIndex].state;
   // Terminal positions need no search (and have no moves to search).
-  const here = viewIndex === history.length - 1 ? status : gameStatus(st);
+  const here = curNode === liveNode ? status : gameStatus(st);
   if (here.over) {
     paintEvalBar(here.result === 'checkmate' ? (here.winner === 'white' ? EVAL_BAR_MATE : -EVAL_BAR_MATE) : 0);
     drawBestArrow(null); // no move in a finished position
@@ -1317,8 +1452,8 @@ function requestEvalBar() {
   evalBar.worker.postMessage({
     type: 'search', seq: ++evalBar.seq, state: st,
     depth: EVAL_BAR.depth, maxMs: EVAL_BAR.maxMs, engine: EVAL_BAR.engine, net: netUrl(championNet()),
-    // The repetition window up to the VIEWED ply (same trimming as repWindow).
-    posHistory: repFens.slice(0, viewIndex + 1).slice(-(st.halfmove + 1)),
+    // The repetition window up to the VIEWED node (same trimming as repWindow).
+    posHistory: pathFens(curNode).slice(-(st.halfmove + 1)),
     wasmUrl: WASM_URL,
   });
   updateStatusText(); // a search is now in flight — show the "thinking…" line
@@ -1600,21 +1735,16 @@ function newGame() {
   syncToggleLabel();
   state = newGameState();
   status = gameStatus(state);
-  history = [startEntry(state)];
-  repFens = [toFen(state)];
-  viewIndex = 0;
-  posCounts = new Map();
-  countPosition(state);
+  rootNode = curNode = liveNode = newRoot(state);
   lastCommitAt = performance.now();
   if (ui.mode === 'editor') { enterEditor(); return; } // reset to an editable start position
   render();
   driveAi();
 }
 
-// Replace the live game with an imported one: reset from `start`, replay `moves`,
-// then show the final position. Keeps the current mode (so you can load a line and
-// let the AIs continue from it), but leaves AI-vs-AI paused until you press Start.
-function loadGame(start, moves) {
+// Shared teardown for replacing the live game (import / editor handoff): stop the AIs,
+// clear a live puzzle, and pause AI-vs-AI until Start.
+function resetForLoad() {
   // Importing a game while in puzzle mode replaces the puzzle — clear it so solver
   // moves on the imported position aren't checked against a stale solution.
   if (ui.mode === 'puzzle') {
@@ -1627,14 +1757,49 @@ function loadGame(start, moves) {
   ui.running = false;
   ui.started = false;
   syncToggleLabel();
+}
+
+// Replace the live game with a linear one: reset from `start`, replay `moves`, then show
+// the final position. Used by the editor handoff (keeps the current mode so you can load
+// a line and let the AIs continue from it), but leaves AI-vs-AI paused until Start.
+function loadGame(start, moves) {
+  resetForLoad();
   state = start;
   status = gameStatus(state);
-  history = [startEntry(state)];
-  repFens = [toFen(state)];
-  posCounts = new Map();
-  countPosition(state);
+  rootNode = curNode = liveNode = newRoot(state);
   for (const mv of moves) recordMove(mv);
-  viewIndex = history.length - 1;
+  curNode = liveNode; // show the final position of the loaded line
+  lastCommitAt = performance.now();
+  render();
+  driveAi();
+}
+
+// pgn.js builds bare import nodes (state/lastMove/parent/children only); fill in the app's
+// per-node fields — a fresh id, display notation + check flag (from the parent position),
+// and empty evals — so the tree behaves like one grown live.
+function finalizeImportedTree(node) {
+  node.id = nextNodeId++;
+  node.evals = { white: null, black: null };
+  if (node.parent) {
+    const st = gameStatus(node.state);
+    node.san = toSan(node.parent.state, node.lastMove, st);
+    node.check = st.check;
+  } else {
+    node.san = null;
+    node.check = false;
+  }
+  for (const c of node.children) finalizeImportedTree(c);
+}
+
+// Replace the live game with a prebuilt move tree (PGN/self-play import, which may carry
+// variations). The live line is the tree's main line; the view starts at its tip.
+function loadTree(root) {
+  resetForLoad();
+  finalizeImportedTree(root);
+  rootNode = root;
+  liveNode = curNode = mainlineTip();
+  state = liveNode.state;
+  status = gameStatus(state);
   lastCommitAt = performance.now();
   render();
   driveAi();
@@ -2172,15 +2337,48 @@ $('flip-board').addEventListener('click', () => {
   render();
 });
 
-// Review navigation: buttons, clicking a move, and arrow/Home/End keys.
-$('nav-first').addEventListener('click', () => goTo(0));
-$('nav-prev').addEventListener('click', () => goTo(viewIndex - 1));
-$('nav-next').addEventListener('click', () => goTo(viewIndex + 1));
-$('nav-last').addEventListener('click', () => goTo(history.length - 1));
+// Review navigation: buttons, clicking a move, and arrow/Home/End keys. Prev/next step
+// along the current line (parent / main child); last jumps to the end of that line.
+$('nav-first').addEventListener('click', () => goTo(rootNode));
+$('nav-prev').addEventListener('click', () => goTo(curNode.parent));
+$('nav-next').addEventListener('click', () => goTo(curNode.children[0]));
+$('nav-last').addEventListener('click', () => goTo(lineTip(curNode)));
 $('moves').addEventListener('click', (e) => {
-  const t = e.target.closest('[data-i]');
-  if (t) goTo(parseInt(t.dataset.i, 10));
+  const t = e.target.closest('[data-id]');
+  if (t) goTo(nodeById(parseInt(t.dataset.id, 10)));
 });
+// Per-move context menu (Promote / Make main line / Copy variation PGN / Delete): desktop
+// right-click, mobile long-press. A menu targets the move under the pointer.
+// Variations can only be edited where they can be created — analysis, or a finished
+// puzzle (the same board-forkable condition onUserMove uses). Elsewhere the line is a
+// live linear game and its tree must not be restructured out from under the running AIs.
+const variationsEditable = () => ui.mode === 'analysis' || (ui.mode === 'puzzle' && puzzleDone());
+const moveNodeAt = (target) => {
+  const t = target.closest && target.closest('[data-id]');
+  return t ? nodeById(parseInt(t.dataset.id, 10)) : null;
+};
+$('moves').addEventListener('contextmenu', (e) => {
+  if (!variationsEditable()) return;
+  const node = moveNodeAt(e.target);
+  if (!node) return;
+  e.preventDefault();
+  showMoveMenu(node, e.clientX, e.clientY);
+});
+// Long-press detector for touch: open the menu after a hold, cancelling on move/lift.
+let longPressTimer = null;
+$('moves').addEventListener('pointerdown', (e) => {
+  if (e.pointerType === 'mouse' || !variationsEditable()) return; // mouse uses contextmenu
+  const node = moveNodeAt(e.target);
+  if (!node) return;
+  longPressTimer = setTimeout(() => { longPressTimer = null; showMoveMenu(node, e.clientX, e.clientY); }, 500);
+});
+const cancelLongPress = () => { if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; } };
+$('moves').addEventListener('pointermove', cancelLongPress);
+$('moves').addEventListener('pointerup', cancelLongPress);
+$('moves').addEventListener('pointercancel', cancelLongPress);
+// Dismiss the menu on any outside interaction or Escape.
+document.addEventListener('pointerdown', (e) => { if (moveMenuEl && !moveMenuEl.contains(e.target)) closeMoveMenu(); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeMoveMenu(); });
 
 // PGN import/export — a save/replay format for sharing games and reproducing bugs
 // (load a line, then let the AIs continue from it). See pgn.js for the format.
@@ -2194,7 +2392,7 @@ function downloadPgn(text) {
   URL.revokeObjectURL(url);
 }
 $('export-pgn').addEventListener('click', async (e) => {
-  const text = exportPgn(history, status, { white: playerName('white'), black: playerName('black') });
+  const text = exportPgn(rootNode, status, { white: playerName('white'), black: playerName('black') });
   const b = e.currentTarget;
   try {
     // Copy to the clipboard — quickest for the debug round-trip (paste it back via
@@ -2208,11 +2406,11 @@ $('export-pgn').addEventListener('click', async (e) => {
 });
 function loadPgnText(text) {
   try {
-    const { start, moves, white, black } = importPgn(text);
+    const { root, white, black } = importPgn(text);
     // Surface the recorded participants (PGN White/Black tags, or a self-play line's
     // engine@depth labels / game id) in the trays. Null when unknown — renderTray hides it.
     importedNames = (white || black) ? { white, black } : null;
-    loadGame(start, moves);
+    loadTree(root);
   } catch (err) {
     alert('Could not import game: ' + err.message);
   }
@@ -2253,10 +2451,12 @@ $('editor-start').addEventListener('click', () => cg.set({ fen: toFen(newGameSta
 document.addEventListener('keydown', (e) => {
   const tag = e.target.tagName;
   if (tag === 'SELECT' || tag === 'INPUT' || tag === 'TEXTAREA') return;
-  if (e.key === 'ArrowLeft') goTo(viewIndex - 1);
-  else if (e.key === 'ArrowRight') goTo(viewIndex + 1);
-  else if (e.key === 'Home') goTo(0);
-  else if (e.key === 'End') goTo(history.length - 1);
+  if (e.key === 'ArrowLeft') goTo(curNode.parent);
+  else if (e.key === 'ArrowRight') goTo(curNode.children[0]);
+  else if (e.key === 'ArrowUp') goToSibling(-1);
+  else if (e.key === 'ArrowDown') goToSibling(1);
+  else if (e.key === 'Home') goTo(rootNode);
+  else if (e.key === 'End') goTo(lineTip(curNode));
   else return;
   e.preventDefault();
 });
