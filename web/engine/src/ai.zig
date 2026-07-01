@@ -538,7 +538,14 @@ pub const Searcher = struct {
             }
             root.len = w;
         }
-        if (root.len == 0) return .{ .move = null, .score = 0, .depth = 0, .nodes = 0 };
+        // No legal moves = terminal. Report the true side-to-move score so a caller
+        // that searches/ponders into this position (e.g. the eval bar) pins to the
+        // result instead of reading a bare 0 as an even position: -MATE when
+        // checkmated, 0 for stalemate. Mirrors the in-tree terminal handling.
+        if (root.len == 0) {
+            const lost = engine.kingAttacked(&state.board, state.turn);
+            return .{ .move = null, .score = if (lost) -MATE else 0, .depth = 0, .nodes = 0 };
+        }
 
         // Shuffle root for variety among equal choices.
         var rnd = self.prng.random();

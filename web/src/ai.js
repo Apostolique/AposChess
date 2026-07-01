@@ -646,7 +646,13 @@ export function chooseMoveDetailed(state, maxDepth = 2, rand = Math.random, maxM
   activeEval = EVALS[realEval] || evalStm;
   evalKey = (EVAL_KEYS[realEval] || 0n) ^ slotKey(nnSlot);
   let root = legalMoves(state);
-  if (root.length === 0) return { move: null, ponder: null, depth: 0 };
+  // No legal moves = terminal. Report the true side-to-move score so a caller that
+  // searches/ponders into this position (e.g. the eval bar) pins to the result
+  // instead of reading a bare 0 as an even position: -MATE when checkmated, 0 for
+  // stalemate. Mirrors the in-tree terminal handling in search().
+  if (root.length === 0) {
+    return { move: null, ponder: null, depth: 0, score: kingAttacked(state.board, state.turn) ? -MATE : 0 };
+  }
 
   // Optional opening-variety filter: drop root moves whose key (from*64+to) is in
   // excludeKeys, so the caller can forbid a few recently-played openings. Only the
