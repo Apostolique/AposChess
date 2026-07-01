@@ -110,15 +110,22 @@ const champion = resolve(webDir, 'src', 'nn-weights.json');
 const engineDir = resolve(webDir, 'engine');
 const matchBin = resolve(engineDir, 'zig-out', 'bin', process.platform === 'win32' ? 'apos-match.exe' : 'apos-match');
 
-// Nice display names from the web UI net catalog (public/nn/manifest.json), keyed by the same
-// 6-char content hash weightsHash() produces — which is exactly a node's version. Best-effort:
-// a version not in the manifest (an unarchived/quantized net, hc, material) simply has no name.
+// Nice display names, keyed by the same 6-char content hash weightsHash() produces (= a node's
+// version). Two sources: the web UI net catalog (public/nn/manifest.json — champions + hand nets)
+// and the loop's sibling registry (training/data/loop/siblings.json — near-even divergent
+// candidates kept as ledger-ranked diversity generators, whose weights live in the champion
+// archive but which never enter the web catalog). Best-effort: a version in neither (an
+// unarchived/quantized net, hc, material) simply has no name.
 const nnNames = (() => {
   const m = new Map();
   try {
     const mani = JSON.parse(readFileSync(resolve(webDir, 'public', 'nn', 'manifest.json'), 'utf8'));
     for (const n of mani.nets || []) if (n.hash && n.name) m.set(n.hash, n.name);
   } catch { /* no manifest -> no nice names */ }
+  try {
+    const sib = JSON.parse(readFileSync(join(loopDir, 'siblings.json'), 'utf8'));
+    for (const s of sib.siblings || []) if (s.hash && s.name) m.set(s.hash, s.name);
+  } catch { /* no sibling registry -> no sibling names */ }
   return m;
 })();
 const niceName = (version) => nnNames.get(version) || null;

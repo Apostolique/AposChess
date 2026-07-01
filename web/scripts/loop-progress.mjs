@@ -244,8 +244,10 @@ function readRun(run) {
       + `from the champion, so it trains from scratch against a strong net. Match the shape to let warm cycles accumulate.`);
   }
   if (run.batch === 0) {
-    out.push('batch 0 — generation is OFF this run; no fresh self-play data, only gate harvest + v-refresh. '
-      + 'Set --batch (e.g. 200) to feed the net new signal.');
+    out.push('batch 0 — no dedicated self-play generation; fresh data comes from the gate harvest '
+      + '(~2000 near-champion games/cycle) + the ranked pool\'s strong-engine --play games. This is a '
+      + 'supported mode (the pool is the generator), not a stall — watch the promotion trend below. '
+      + 'Set --batch (e.g. 200) to add a deep champion self-play batch on top.');
   }
   if (run.start_kind === 'cold→warm') {
     out.push('cold-first start: only cycle 1 is random-init — every later cycle warm-starts from the PREVIOUS '
@@ -266,12 +268,12 @@ function readRun(run) {
   if (run.promotions > 0) {
     out.push('Promoted this run — the champion improved. Expect the next candidates to dip (stronger target) before climbing again.');
   } else if (a < 49 && trend !== 'climbing') {
-    out.push('Verdict: candidates are losing and not climbing — NOT productive. Restart with the champion\'s shape, warm, generation on.');
+    out.push('Verdict: candidates are losing and not climbing — NOT productive. Restart with the champion\'s shape, warm, and a fresh data source (a deep --batch generation, or more strong-engine --rank-minutes pool play).');
   } else if (best >= run.elo1 / 7 + 50 || (anyLineage && trend === 'climbing')) {
     // best% within reach of the gate, or lineage is accumulating upward
     out.push('Verdict: candidates are at/above 50% and accumulating via lineage — productive, let it keep running toward the gate.');
   } else {
-    out.push('Verdict: candidates hover near 50% — marginal. Keep the warm/same-shape chain going a few more cycles, or add fresh generation.');
+    out.push('Verdict: candidates hover near 50% — marginal. Keep the warm/same-shape chain going a few more cycles, or add fresh data (a deep --batch generation, or more strong-engine --rank-minutes pool play).');
   }
   return out;
 }

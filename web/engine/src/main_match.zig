@@ -4,7 +4,9 @@
 // Native match runner behind `npm run match`: plays engine A vs engine B over
 // seeded random openings (color-reversed pairs), in parallel across threads, with
 // optional SPRT early-stopping, and writes the result-file
-// {games,wins,draws,losses,score,elo,llr,sprt} that train:loop reads.
+// {games,wins,draws,losses,score,elo,llr,sprt,div} that train:loop reads. `div` (null unless
+// both sides are nn) reports how differently the two nets JUDGE midgame positions — a
+// diversity signal orthogonal to the score: {positions,confident,confidentRate,meanCp,corr}.
 //
 //   apos-match --games=800 --depth=4 --eval-a=nn --eval-b=nn \
 //     --weights-a=cand.json --weights-b=src/nn-weights.json --sprt --elo1=20 \
@@ -159,6 +161,69 @@ const Opening = struct {
     len: u32 = 0,
 };
 
+// --- Eval-divergence probe (both sides nn) ------------------------------------------
+// When --eval-a=nn --eval-b=nn, we statically evaluate every MIDGAME position with BOTH
+// nets (no search — just the forward pass, ~free) and accumulate how differently they
+// judge it. This is a *diversity* signal, orthogonal to the score: a candidate that gates
+// at ~50% but judges positions differently from the champion is still valuable as a move /
+// data generator (it explores a different slice of the game at equal strength) even though
+// it can't be promoted — see docs/nn-training.md. "Midgame" = past the scripted random
+// opening and not already decided (both nets agree someone is winning by >= `decided` cp),
+// so the signal reflects genuine judgment in contested positions, not forced openings or
+// won/lost endgames (where there's nothing to disagree about).
+const DivAccum = struct {
+    n: u64 = 0,
+    confident: u64 = 0, // both nets past `margin` cp AND opposite sign (disagree on who's winning)
+    sum_abs: f64 = 0, // Σ|eval_a − eval_b|, for the mean absolute eval gap
+    // Streaming sums for the Pearson correlation of the two eval series. Pearson is
+    // affine-invariant, so a pure calibration offset (one net reading systematically bigger)
+    // leaves it unchanged — it measures whether they ORDER positions the same, which is the
+    // question, not whether their magnitudes match.
+    sx: f64 = 0,
+    sy: f64 = 0,
+    sxx: f64 = 0,
+    syy: f64 = 0,
+    sxy: f64 = 0,
+    fn add(self: *DivAccum, o: DivAccum) void {
+        self.n += o.n;
+        self.confident += o.confident;
+        self.sum_abs += o.sum_abs;
+        self.sx += o.sx;
+        self.sy += o.sy;
+        self.sxx += o.sxx;
+        self.syy += o.syy;
+        self.sxy += o.sxy;
+    }
+};
+
+// Static-eval divergence probe, passed into playGame when both sides are nn nets. The nets
+// are read-only, so all workers share the same two pointers (concurrent `nn.evaluate` is safe).
+const DivProbe = struct {
+    net_a: *const nn.Net,
+    net_b: *const nn.Net,
+    margin: f64, // confident-disagreement threshold: both nets past this, opposite sign
+    decided: f64, // both nets agree by >= this (same sign) => decided, carries no signal, skip
+    acc: *DivAccum, // per-game accumulator (merged into Shared.div under the mutex)
+};
+
+// Score one position into the probe's accumulator: both nets' static (side-to-move-relative)
+// eval of the same board, skipping positions both nets agree are already decided.
+fn divProbe(probe: *const DivProbe, st: *const State) void {
+    const ea: f64 = @floatFromInt(nn.evaluate(probe.net_a, &st.board, st.turn));
+    const eb: f64 = @floatFromInt(nn.evaluate(probe.net_b, &st.board, st.turn));
+    const same_sign = (ea >= 0) == (eb >= 0);
+    if (same_sign and @min(@abs(ea), @abs(eb)) >= probe.decided) return; // decided & agreed -> skip
+    const acc = probe.acc;
+    acc.n += 1;
+    acc.sum_abs += @abs(ea - eb);
+    acc.sx += ea;
+    acc.sy += eb;
+    acc.sxx += ea * ea;
+    acc.syy += eb * eb;
+    acc.sxy += ea * eb;
+    if (!same_sign and @abs(ea) >= probe.margin and @abs(eb) >= probe.margin) acc.confident += 1;
+}
+
 // Per-side search budget: a fixed depth (depth > 0) OR a per-move time budget (depth ==
 // 0, search to `movetime` ms). Engine A and B each carry their own, so the rank gauntlet
 // can pit cheap fixed-depth contenders against a deep stable anchor (--depth-b).
@@ -206,6 +271,7 @@ fn playGame(
     alloc: std.mem.Allocator,
     nodes: *u64,
     recs: ?*std.ArrayList(PlyRec),
+    dp: ?*const DivProbe, // static-eval divergence probe (both sides nn); null otherwise
 ) !i32 {
     var seen: std.ArrayList(u64) = .empty;
     defer seen.deinit(alloc);
@@ -219,6 +285,12 @@ fn playGame(
             break;
         }
         if (gs.status != .ongoing) break;
+
+        // Divergence probe: score this position with both nets, but only past the scripted
+        // random opening (the forced plies carry no judgment signal).
+        if (dp) |probe| {
+            if (plies >= opening.len) divProbe(probe, &st);
+        }
 
         const a_to_move = (st.turn == .white) == white_is_a;
         const mover = if (st.turn == .white) white else black;
@@ -264,6 +336,11 @@ const Cfg = struct {
     kind_b: ai.EvalKind,
     net_a: ?*const nn.Net,
     net_b: ?*const nn.Net,
+    // Eval-divergence probe (only when both sides are nn). Static-eval both nets on every
+    // midgame position to measure how differently they judge the game — a diversity signal.
+    div_enabled: bool,
+    div_margin: f64, // --div-margin: confident-disagreement threshold (cp)
+    div_decided: f64, // --div-decided: agreed-decided cutoff, skipped (cp)
     save_games: bool,
     // When set, the heartbeat thread polls this path; once it exists, the match finalizes
     // IMMEDIATELY — it writes the result-file + harvest from the games already COMPLETED and
@@ -291,6 +368,7 @@ const Shared = struct {
     total_pairs: usize,
     scores: *std.ArrayList(f64),
     games: *std.ArrayList(Game), // harvested games (--save-games)
+    div: DivAccum = .{}, // eval-divergence stats (both sides nn), merged per game under the mutex
     alloc: std.mem.Allocator,
     nodes: u64 = 0,
     stop: bool = false,
@@ -454,6 +532,21 @@ fn worker(sh: *Shared) void {
         var recs: std.ArrayList(PlyRec) = .empty;
         const pr: ?*std.ArrayList(PlyRec) = if (sh.cfg.save_games) &recs else null;
 
+        // Fresh per-game divergence accumulator + probe (merged into sh.div under the mutex
+        // below), so a stop keeps every completed game's stats and never races on sh.div.
+        var game_div: DivAccum = .{};
+        var probe_storage: DivProbe = undefined;
+        const dp: ?*const DivProbe = if (sh.cfg.div_enabled) blk: {
+            probe_storage = .{
+                .net_a = sh.cfg.net_a.?,
+                .net_b = sh.cfg.net_b.?,
+                .margin = sh.cfg.div_margin,
+                .decided = sh.cfg.div_decided,
+                .acc = &game_div,
+            };
+            break :blk &probe_storage;
+        } else null;
+
         // Reseed per game so openings/variety are a function of the (pair, color), not thread
         // timing — the same offsets the pair-dispatched version used, so a game's seeding is
         // identical regardless of which worker plays it (the persistent TT still makes exact
@@ -463,12 +556,12 @@ fn worker(sh: *Shared) void {
             sa.reseed(sh.cfg.seed +% pair *% 4 +% 0);
             sb.reseed(sh.cfg.seed +% pair *% 4 +% 1);
             // A = White: White's budget is A's, Black's is B's.
-            r = playGame(&sa, &sb, true, &opening, sh.cfg.budget_a, sh.cfg.budget_b, sh.cfg.max_plies, pa, &nodes, pr) catch 0;
+            r = playGame(&sa, &sb, true, &opening, sh.cfg.budget_a, sh.cfg.budget_b, sh.cfg.max_plies, pa, &nodes, pr, dp) catch 0;
         } else {
             sb.reseed(sh.cfg.seed +% pair *% 4 +% 2);
             sa.reseed(sh.cfg.seed +% pair *% 4 +% 3);
             // A = Black: White's budget is B's, Black's is A's.
-            r = playGame(&sb, &sa, false, &opening, sh.cfg.budget_b, sh.cfg.budget_a, sh.cfg.max_plies, pa, &nodes, pr) catch 0;
+            r = playGame(&sb, &sa, false, &opening, sh.cfg.budget_b, sh.cfg.budget_a, sh.cfg.max_plies, pa, &nodes, pr, dp) catch 0;
         }
 
         // A's score for this game: +1 win / 0.5 draw / 0 loss, from A's color this game.
@@ -480,6 +573,7 @@ fn worker(sh: *Shared) void {
         sh.mutex.lockUncancelable(sh.cfg.io);
         sh.scores.append(sh.alloc, s) catch {};
         sh.nodes += nodes;
+        if (sh.cfg.div_enabled) sh.div.add(game_div);
         if (sh.cfg.save_games) {
             // The game shares its pair's scripted opening line and begins at the standard
             // start (no `start` field), so the record holds the full game. color 'w' = A had
@@ -750,22 +844,42 @@ fn finalizeLocked(sh: *Shared) void {
         n, wins, draws, losses, p * 100, sign, ci.elo, ci.margin, ci.lo, ci.hi, verdict, sh.nodes, sh.nodes * 1000 / ms,
     });
 
+    // Eval-divergence summary + JSON fragment for the result-file (both sides nn only).
+    var div_json_buf: [256]u8 = undefined;
+    var div_json: []const u8 = "null";
+    if (sh.cfg.div_enabled and sh.div.n > 0) {
+        const dn: f64 = @floatFromInt(sh.div.n);
+        const mean_cp = sh.div.sum_abs / dn;
+        const conf_rate = @as(f64, @floatFromInt(sh.div.confident)) / dn;
+        const cov = sh.div.sxy - sh.div.sx * sh.div.sy / dn;
+        const vx = sh.div.sxx - sh.div.sx * sh.div.sx / dn;
+        const vy = sh.div.syy - sh.div.sy * sh.div.sy / dn;
+        const denom = @sqrt(vx * vy);
+        const corr = if (denom > 0) cov / denom else 0;
+        std.debug.print("Divergence (midgame, both nn): {d} positions | confident-disagree {d:.1}% | mean |Δ| {d:.0} cp | corr {d:.3}\n", .{
+            sh.div.n, conf_rate * 100, mean_cp, corr,
+        });
+        div_json = std.fmt.bufPrint(&div_json_buf,
+            \\{{"positions":{d},"confident":{d},"confidentRate":{d:.5},"meanCp":{d:.2},"corr":{d:.5}}}
+        , .{ sh.div.n, sh.div.confident, conf_rate, mean_cp, corr }) catch "null";
+    }
+
     if (sh.cfg.save_games_path) |sg| {
         if (sh.games.items.len > 0)
             writeHarvest(sh, gpa, io, sg, sh.cfg.budget_a.depth, sh.cfg.budget_b.depth, sh.cfg.kind_a, sh.cfg.kind_b, sh.cfg.weights_a, sh.cfg.weights_b) catch {};
     }
 
     if (sh.cfg.result_file) |rf| {
-        var buf: [512]u8 = undefined;
+        var buf: [768]u8 = undefined;
         const sprt_field = if (sh.sprt) sh.decided orelse "inconclusive" else null;
         const json = if (sprt_field) |sf|
             std.fmt.bufPrint(&buf,
-                \\{{"games":{d},"wins":{d},"draws":{d},"losses":{d},"score":{d},"elo":{d},"llr":{d},"sprt":"{s}"}}
-            , .{ n, wins, draws, losses, p, elo, llr(sh.scores.items, sh.elo0, sh.elo1), sf }) catch return
+                \\{{"games":{d},"wins":{d},"draws":{d},"losses":{d},"score":{d},"elo":{d},"llr":{d},"sprt":"{s}","div":{s}}}
+            , .{ n, wins, draws, losses, p, elo, llr(sh.scores.items, sh.elo0, sh.elo1), sf, div_json }) catch return
         else
             std.fmt.bufPrint(&buf,
-                \\{{"games":{d},"wins":{d},"draws":{d},"losses":{d},"score":{d},"elo":{d},"llr":null,"sprt":null}}
-            , .{ n, wins, draws, losses, p, elo }) catch return;
+                \\{{"games":{d},"wins":{d},"draws":{d},"losses":{d},"score":{d},"elo":{d},"llr":null,"sprt":null,"div":{s}}}
+            , .{ n, wins, draws, losses, p, elo, div_json }) catch return;
         std.Io.Dir.cwd().writeFile(io, .{ .sub_path = rf, .data = json }) catch {};
     }
 }
@@ -803,6 +917,9 @@ pub fn main(init: std.process.Init) !void {
     var result_file: ?[]const u8 = null;
     var save_games: ?[]const u8 = null;
     var stop_file: ?[]const u8 = null;
+    // Eval-divergence probe thresholds (active only when both sides are nn).
+    var div_margin: f64 = 75; // both nets past ±this cp, opposite sign = a "confident" disagreement
+    var div_decided: f64 = 600; // both nets agree by >= this cp = decided, skipped (no judgment signal)
 
     const argv = try init.minimal.args.toSlice(gpa);
     for (argv[1..]) |arg| {
@@ -827,6 +944,8 @@ pub fn main(init: std.process.Init) !void {
         if (argStr(arg, "--result-file=")) |v| result_file = v;
         if (argStr(arg, "--save-games=")) |v| save_games = v;
         if (argStr(arg, "--stop-file=")) |v| stop_file = v;
+        if (argStr(arg, "--div-margin=")) |v| div_margin = std.fmt.parseFloat(f64, v) catch div_margin;
+        if (argStr(arg, "--div-decided=")) |v| div_decided = std.fmt.parseFloat(f64, v) catch div_decided;
     }
     if (jobs < 1) jobs = 1;
 
@@ -879,6 +998,10 @@ pub fn main(init: std.process.Init) !void {
             .kind_b = eval_b,
             .net_a = net_a,
             .net_b = net_b,
+            // Divergence probe runs only when BOTH sides are nn (it compares two nets' judgment).
+            .div_enabled = eval_a == .nn and eval_b == .nn,
+            .div_margin = div_margin,
+            .div_decided = div_decided,
             .save_games = save_games != null,
             .stop_file = stop_file,
             .weights_a = weights_a orelse "",
