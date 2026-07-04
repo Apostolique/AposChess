@@ -1,5 +1,5 @@
 {
-  "default": "Jack",
+  "default": "Kara",
   "nets": [
     {
       "name": "Ada",
@@ -137,10 +137,25 @@
         1
       ],
       "loopChampion": true,
-      "current": true,
       "hash": "c76205",
       "gen": 10,
       "note": "train:loop champion Jack (gen 10, c76205, 2026-06-28)."
+    },
+    {
+      "name": "Kara",
+      "file": "kara.json",
+      "arch": [
+        768,
+        64,
+        32,
+        16,
+        1
+      ],
+      "loopChampion": true,
+      "hash": "f2d89e",
+      "gen": 11,
+      "note": "train:loop champion Kara (gen 11, f2d89e, 2026-07-04).",
+      "current": true
     },
     {
       "name": "random-noise",
