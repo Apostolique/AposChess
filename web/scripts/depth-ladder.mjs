@@ -57,6 +57,12 @@
 //   --merge=F[,F]   fold pool stores from other machines in before fitting (pairwise counts are
 //                   additive). Requires the SAME node set and DISTINCT --seed per machine.
 //   --games=N       games per matchup (even; default 100). Re-running accumulates.
+//   --onboard=F     no-one-left-behind floor (default 0.5): while any schedulable node has
+//                   fewer games than F × the schedulable pool's AVERAGE games, the scheduler
+//                   plays the least-played such node (vs the nearest-Elo established node)
+//                   before the ordering objective — so fresh champions get anchored to the
+//                   scale right away instead of waiting to be "ambiguous enough". Relative,
+//                   so a fresh store (everyone at 0) onboards no one. 0 disables.
 //   --prior=P       virtual draws vs an even phantom, per node (regularizer). Default 1.
 //   --jobs=N        parallel game workers (default: CPU cores).
 //   --openings=K    random opening plies per game (default 6).
@@ -112,24 +118,23 @@ const engineDir = resolve(webDir, 'engine');
 const matchBin = resolve(engineDir, 'zig-out', 'bin', process.platform === 'win32' ? 'apos-match.exe' : 'apos-match');
 
 // Nice display names, keyed by the same 6-char content hash weightsHash() produces (= a node's
-// version). Two sources: the web UI net catalog (public/nn/manifest.json — champions + hand nets)
-// and the loop's sibling registry (training/data/loop/siblings.json — near-even divergent
-// candidates kept as ledger-ranked diversity generators, whose weights live in the champion
-// archive but which never enter the web catalog). Best-effort: a version in neither (an
-// unarchived/quantized net, hc, material) simply has no name.
+// version), from the web UI net catalog (public/nn/manifest.json — champions + hand nets).
+// Best-effort: a version not in the catalog (an unarchived/quantized net, hc, material) simply
+// has no name.
 const nnNames = (() => {
   const m = new Map();
   try {
     const mani = JSON.parse(readFileSync(resolve(webDir, 'public', 'nn', 'manifest.json'), 'utf8'));
     for (const n of mani.nets || []) if (n.hash && n.name) m.set(n.hash, n.name);
   } catch { /* no manifest -> no nice names */ }
-  try {
-    const sib = JSON.parse(readFileSync(join(loopDir, 'siblings.json'), 'utf8'));
-    for (const s of sib.siblings || []) if (s.hash && s.name) m.set(s.hash, s.name);
-  } catch { /* no sibling registry -> no sibling names */ }
   return m;
 })();
 const niceName = (version) => nnNames.get(version) || null;
+// A node id with its human name attached — `nn8@9e31ca (Leo)` — so every line that names a
+// competitor reads without a hash→name lookup. Nodes without a catalog name (hc, material,
+// unarchived nets) print as their bare id.
+const nodeLabel = (c) => `${c.id}${niceName(c.version) ? ` (${niceName(c.version)})` : ''}`;
+const fmtSigned = (x) => `${x >= 0 ? '+' : ''}${x.toFixed(0)}`;
 
 const args = Object.fromEntries(process.argv.slice(2).map((a) => {
   const m = a.replace(/^--/, '').split('='); return [m[0], m.length > 1 ? m[1] : true];
@@ -169,6 +174,14 @@ const cfg = {
   minutes: args.minutes !== undefined ? Number(args.minutes) : null,
   matchups: args.matchups !== undefined ? Number(args.matchups) : Infinity,
   games: Math.max(2, Math.round(num(args.games, 100) / 2) * 2),
+  // Onboarding floor, as a FRACTION of the schedulable pool's average game count (relative on
+  // purpose — no magic absolute number: the floor scales with how much the pool has actually
+  // played, and a fresh store where everyone sits at 0 onboards no one). A node below the
+  // floor is "under-played" and gets scheduled first (least-played, vs the nearest-Elo
+  // established node). Without it, fresh nodes sit at the prior (-35 ±600s) where the ordering
+  // objective pairs them with EACH OTHER — two unknowns playing each other stay disconnected
+  // from the scale — while the well-played cluster keeps winning the ambiguity contest. 0 off.
+  onboard: Math.max(0, num(args.onboard, 0.5)),
   prior: num(args.prior, 1),
   jobs: args.jobs !== undefined ? Number(args.jobs) : cpus().length,
   openings: num(args.openings, 6),
@@ -452,7 +465,35 @@ const ncdf = (x) => 0.5 * (1 + erf(x / Math.SQRT2));
 // contrast instead, to keep the graph rigid and catch transitivity errors.
 // Scheduling is restricted to `schedulable` (the --play subset; the whole pool by default) — the
 // elo/varDiff still come from the full fit, so only the chosen engines play new games.
-function pickMatchup(elo, varDiff, iter) {
+//
+// ONBOARDING (no one left behind): before the ordering objective, any schedulable node whose
+// game count is below --onboard × the schedulable pool's average is played first — least-played
+// node vs the nearest-Elo ESTABLISHED node (one at/above the floor; nearest keeps p(1−p)
+// informative, and a bad initial estimate self-corrects as the first matchups move it). Without
+// this, a fresh node sits at the prior where the ordering objective pairs it with the OTHER
+// fresh nodes — two unknowns playing each other stay disconnected from the scale — while the
+// well-played cluster keeps winning the ambiguity contest. Least-played-first cycles through
+// every under-played node, so a new champion (and each of its depths, in a full-pool run) is
+// anchored within a run or two; the floor being relative means everyone graduates as the pool's
+// average rises, and a fresh store (all zeros) onboards no one.
+function pickMatchup(elo, varDiff, iter, gamesOf) {
+  if (cfg.onboard > 0 && schedulable.length > 1) {
+    const avg = schedulable.reduce((s, c) => s + gamesOf(c.id), 0) / schedulable.length;
+    const floor = cfg.onboard * avg;
+    const under = schedulable.filter((c) => gamesOf(c.id) < floor);
+    if (under.length) {
+      under.sort((a, b) => gamesOf(a.id) - gamesOf(b.id));
+      const nov = under[0];
+      const established = schedulable.filter((c) => c !== nov && gamesOf(c.id) >= floor);
+      const pool = established.length ? established : schedulable.filter((c) => c !== nov);
+      let opp = null, best = Infinity;
+      for (const c of pool) {
+        const d = Math.abs(elo.get(c.id) - elo.get(nov.id));
+        if (d < best) { best = d; opp = c; }
+      }
+      if (opp) return { pair: [nov, opp], reason: 'onboard', metric: gamesOf(nov.id), floor };
+    }
+  }
   const sorted = [...schedulable].sort((a, b) => elo.get(a.id) - elo.get(b.id));
   let best = null, bestAmb = -1;
   for (let k = 0; k < sorted.length - 1; k++) {
@@ -506,7 +547,7 @@ function playPair(a, b) {
   // apos-match only honours --save-games=<path> (a bare flag is silently ignored), so cfg.saveGames
   // is always an absolute path (default loop/ladder-games.jsonl) or false.
   if (typeof cfg.saveGames === 'string') argv.push(`--save-games=${cfg.saveGames}`);
-  console.log(`\n=== ${a.id}  vs  ${b.id}  (${cfg.games} games) ===`);
+  console.log(`\n=== ${nodeLabel(a)}  vs  ${nodeLabel(b)}  (${cfg.games} games) ===`);
   return new Promise((done) => {
     const child = spawn(matchBin, argv, { stdio: ['ignore', 'inherit', 'inherit'], cwd: webDir, env: { ...process.env, APOS_CHILD: '1' } });
     child.on('error', (e) => { console.error(`  could not run match: ${e.message}; skipping.`); done(); });
@@ -669,7 +710,8 @@ function printConvergence(rep) {
   console.log(`  depth order: ${s.versionsMonotonic}/${s.versionsWithDepthCurve} versions monotonic  |  ${s.confidentInversions} confident inversion(s)`);
   for (const c of rep.nonMono.slice(0, 4)) {
     const seq = c.nodes.map((n) => `d${n.depth}=${rep.elo.get(n.id) >= 0 ? '+' : ''}${rep.elo.get(n.id).toFixed(0)}`).join(' ');
-    console.log(`    ${c.k.padEnd(12)} ${seq}   (${c.inv} inv${c.confInv ? `, ${c.confInv} confident` : ''})`);
+    const nm = niceName(c.k.split('@')[1]);
+    console.log(`    ${(nm ? `${c.k} (${nm})` : c.k).padEnd(20)} ${seq}   (${c.inv} inv${c.confInv ? `, ${c.confInv} confident` : ''})`);
   }
   console.log(`  verdict: ${s.verdict}`);
 }
@@ -741,8 +783,8 @@ function writeRankLedger(verbose) {
 
 console.log(`Engine ranking pool (active scheduler)`);
 console.log(`  ${competitors.length} node(s): ${competitors.map((c) => `${c.id.split('@')[0]}@${c.version.slice(0, 6)}${niceName(c.version) ? ` (${niceName(c.version)})` : ''}`).join(', ')}`);
-console.log(`  pin ${pinId} | ${cfg.games} games/matchup | ${cfg.jobs} parallel job(s) | store ${cfg.store}`);
-if (playMatch) console.log(`  --play: new games only among ${schedulable.map((c) => c.id.split('@')[0] + '@' + c.version.slice(0, 6)).join(', ')} (rest rated from existing data)`);
+console.log(`  pin ${pinId} | ${cfg.games} games/matchup | onboard ${cfg.onboard ? `${cfg.onboard}×avg` : 'off'} | ${cfg.jobs} parallel job(s) | store ${cfg.store}`);
+if (playMatch) console.log(`  --play: new games only among ${schedulable.map(nodeLabel).join(', ')} (rest rated from existing data)`);
 console.log(`  games -> ${cfg.saveGames || '(not harvested; --no-save-games)'}`);
 if (cfg.rounds !== 0) await scanDataset(); // once up front, so the periodic ledger emit has record counts
 await scanCorpus(); // fold the dataset's game results into the fit (no-op unless --corpus)
@@ -773,17 +815,29 @@ if (cfg.rounds === 0) {
   const deadline = cfg.minutes ? t0 + cfg.minutes * 60000 : Infinity;
   let played = 0;
   while (!stopped && Date.now() < deadline && played < cfg.matchups) {
-    const { elo, varDiff } = fit();
-    const { pair, reason, metric } = pickMatchup(elo, varDiff, played);
+    const { elo, ci, varDiff, gamesOf } = fit();
+    const { pair, reason, metric, floor } = pickMatchup(elo, varDiff, played, gamesOf);
     if (!pair) break;
     const [a, b] = pair;
     const tag = `[${played + 1}${Number.isFinite(cfg.matchups) ? `/${cfg.matchups}` : ''}]`;
-    const why = reason === 'ordering' ? `ordering: P(mis-order) ${(metric * 100).toFixed(0)}%` : `rigidity: ±${metric.toFixed(0)} Elo`;
-    console.log(`\n${tag} ${why} -> ${a.id} vs ${b.id}`);
+    const why = reason === 'ordering' ? `ordering: P(mis-order) ${(metric * 100).toFixed(0)}%`
+      : reason === 'onboard' ? `onboard: ${metric} game(s), below floor ${floor.toFixed(0)} (${cfg.onboard}×pool avg)`
+      : `rigidity: ±${metric.toFixed(0)} Elo`;
+    // Announce with each node's CURRENT fitted Elo ±95 (the ledger's real estimate), so the
+    // matchup reads on the stable hc scale up front — the match runner's own live Elo is only
+    // this matchup's games and always starts at 0 with a huge margin.
+    const lbl = (c) => `${nodeLabel(c)} ${fmtSigned(elo.get(c.id))} ±${(ci.get(c.id) ?? 0).toFixed(0)}`;
+    const pA = 1 / (1 + 10 ** ((elo.get(b.id) - elo.get(a.id)) / 400));
+    console.log(`\n${tag} ${why} -> ${lbl(a)}  vs  ${lbl(b)}  (ledger expects A ${(pA * 100).toFixed(0)}%)`);
     await playPair(a, b);
     // playPair recorded this matchup — a full run, or the completed games if a stop landed
     // mid-matchup. Persist the store either way so the games already played are never lost.
     writeFileSync(cfg.store, JSON.stringify(store, null, 2) + '\n');
+    { // refit so the pair's post-matchup ratings show right away (cheap next to the games)
+      const { elo: e2, ci: c2 } = fit();
+      const upd = (c) => `${nodeLabel(c)} ${fmtSigned(e2.get(c.id))} ±${(c2.get(c.id) ?? 0).toFixed(0)}`;
+      console.log(`  ledger now: ${upd(a)}  |  ${upd(b)}`);
+    }
     played++;
     if (played % EMIT_EVERY === 0) writeRankLedger(false);
     if (stopped) break; // stop requested: the in-flight matchup drained + was saved; finish up.

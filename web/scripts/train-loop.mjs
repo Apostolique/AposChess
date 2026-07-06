@@ -117,6 +117,7 @@ import {
 } from 'node:fs';
 import { dirname, resolve, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { cpus } from 'node:os';
 
 import { fmtDur, fmtMB } from './fmt.mjs';
 import { weightsHash, ephemeralVersion } from './vtag.mjs';
@@ -233,12 +234,6 @@ function archiveChampion(file) {
   if (!existsSync(dest)) copyFileSync(file, dest);
   return hash;
 }
-// Registry of ledger-ranked "siblings" — near-even but divergent candidates kept as diversity
-// generators. Their WEIGHTS live in championsDir by hash (so rank:pool --engines=all enumerates
-// and rates them like any archived net); this file only records the display name + provenance
-// (which champion they matched, its gen, the gate score/divergence). git-ignored (under
-// training/data/loop). depth-ladder reads it to show sibling names in the ledger.
-const siblingsFile = join(loopDir, 'siblings.json');
 const resultFile = join(loopDir, 'match.json');
 // The gate's --save-games harvest is written HERE (a temp), not straight into the dataset,
 // so the loop can rewrite a non-promoted candidate's provenance before folding it in (see
@@ -277,6 +272,11 @@ const args = Object.fromEntries(
   }),
 );
 const num = (v, d) => (v === undefined ? d : Number(v));
+// One full parallel wave of the match runner: apos-match dispatches games one at a time
+// across --jobs workers, so a matchup smaller than the worker count leaves cores idle from
+// the start (not just at the tail). Rounded up to even — games come in color-reversed pairs.
+const effJobs = args.jobs !== undefined ? Number(args.jobs) : cpus().length;
+const defaultRankGames = Math.max(2, Math.ceil(effJobs / 2) * 2);
 const cfg = {
   batch: num(args.batch, 200),
   // Self-play GENERATION depth — the deep label anchor (each generated position's value
@@ -335,11 +335,12 @@ const cfg = {
   // corpus already rates the champion from its gate games and the store accumulates across
   // cycles — each cycle just tightens the most-ambiguous orderings.
   rankMinutes: num(args['rank-minutes'], 5),
-  // Games per scheduled pool matchup. Kept SMALL on purpose: the pool's --minutes budget is
-  // only checked BETWEEN matchups (a matchup always plays to completion), and a depth-8 matchup
-  // is slow — so a big batch would blow far past --rank-minutes. Small batches let the budget
-  // bound the step to ~rank-minutes; the store accumulates the games across cycles regardless.
-  rankGames: num(args['rank-games'], 10),
+  // Games per scheduled pool matchup. Defaults to ONE PARALLEL WAVE (the --jobs count, rounded
+  // up to even): fewer games than workers leaves cores idle for the whole matchup, while a big
+  // batch would blow far past --rank-minutes (the budget is only checked BETWEEN matchups — a
+  // matchup always plays to completion, and depth-8 matchups are slow). One wave keeps every
+  // core busy exactly once per matchup; the store accumulates the games across cycles regardless.
+  rankGames: num(args['rank-games'], defaultRankGames),
   // On each promotion the NEW champion is published into the playable net catalog
   // (web/public/nn) under the next free human name and flagged the current champion, so it's
   // pickable in the app under a real name from the moment it's promoted (past champions stay
@@ -347,19 +348,9 @@ const cfg = {
   // always kept); older ones are pruned (weights file + manifest entry) to bound the deployed
   // bundle (~0.5 MB each). 0 = off.
   keepChampions: num(args['keep-champions'], 12),
-  // Keep a near-even but DIVERGENT non-promoted candidate as a ledger-ranked "sibling": archive
-  // its weights (recoverable, so rank:pool --corpus folds its gate games into the fit and it gets
-  // an Elo right away) under a <champion>-<greek> name — a diversity/generator pool, orthogonal to
-  // promotion (see docs/nn-training.md). Worthy = SPRT not H0 (the gate couldn't call it worse)
-  // AND the gate's `div` block shows real divergence: eval correlation <= --sibling-corr-max OR
-  // confident-disagree rate >= --sibling-disagree-min. --no-siblings disables. (Thresholds are
-  // initial guesses — tune once real per-cycle `div` numbers are in the log.)
-  siblings: !args['no-siblings'],
-  siblingCorrMax: num(args['sibling-corr-max'], 0.90),
-  siblingDisagreeMin: num(args['sibling-disagree-min'], 0.08),
   // Strong-engine ladder play as the generator. With no dedicated generation (--batch=0), the
-  // per-cycle rank step restricts --play to the strongest nn engines (current champion + siblings
-  // + recent champions) at --play-depth, so its harvested games — already folded into the dataset
+  // per-cycle rank step restricts --play to the strongest nn engines (current champion + recent
+  // champions) at --play-depth, so its harvested games — already folded into the dataset
   // — are deep, strong-play training data: the ranked pool IS the generator. On by default when
   // --batch=0; --play-strong / --no-play-strong force it; --rank-play=SPEC pins the play set by
   // hand (goes stale on promotion — prefer the auto set for an unattended loop). See docs.
@@ -369,6 +360,19 @@ const cfg = {
   playTop: num(args['play-top'], 8), // cap the strong set so the round-robin stays fast
   rankPlay: typeof args['rank-play'] === 'string' ? args['rank-play'] : null,
 };
+// The loop's rank-games default is machine-dependent (one parallel wave), so sync the
+// command-echo suppression map to it — the echoed `npm run rank:pool` then shows --games
+// only when an explicit --rank-games differs from this machine's computed default.
+scriptDefaults['npm run rank:pool'].games = String(defaultRankGames);
+
+// hash -> human name (champions from the web catalog manifest), so loop output shows 'Leo'
+// next to 9e31ca wherever a hash appears. Read fresh per call (cheap, ~once a cycle) because
+// a promotion renames the current champion mid-run.
+function nnNames() {
+  const m = new Map();
+  try { for (const n of (JSON.parse(readFileSync(manifestFile, 'utf8')).nets || [])) if (n.hash && n.name) m.set(n.hash, n.name); } catch { /* no manifest yet */ }
+  return m;
+}
 
 function findPython() {
   for (const c of ['python', 'py', 'python3']) {
@@ -547,6 +551,15 @@ function runRankPool(label) {
   // whole pool is still RATED from the corpus + store — --play only bounds which nodes play NEW
   // games). null = schedule unrestricted (too few strong engines yet, or --no-play-strong).
   const play = cfg.playStrong ? strongPlaySpec() : null;
+  // Show the play set with human names — the raw spec is hashes only (it must stay a valid
+  // --play argument), so name the engines here where a reader actually sees the plan.
+  if (play) {
+    const names = nnNames();
+    log(`  Strong play set: ${play.split(',').map((s) => {
+      const m = /@([0-9a-f]+)$/.exec(s); const n = m && names.get(m[1]);
+      return n ? `${s} (${n})` : s;
+    }).join(', ')}`);
+  }
   // With harvesting on (default), rank:pool appends its games to its archive (ladderGames); we
   // then fold everything past the persistent mark into the dataset — the loop's own rank games
   // AND any a standalone rank:pool added between cycles. With --no-harvest, suppress the archive
@@ -651,63 +664,12 @@ function publishChampion(file, arch) {
   return entry.name;
 }
 
-// --- Ledger-ranked siblings (near-even but divergent candidates) --------------------
-// Greek-letter suffixes for the siblings of one champion. α ≈ the champion itself, so siblings
-// start at β; past ω (never in practice) fall back to β2, β3, ….
-const GREEK = ['α', 'β', 'γ', 'δ', 'ε', 'ζ', 'η', 'θ', 'ι', 'κ', 'λ', 'μ',
-  'ν', 'ξ', 'ο', 'π', 'ρ', 'σ', 'τ', 'υ', 'φ', 'χ', 'ψ', 'ω'];
-const greekSuffix = (n) => (n < GREEK.length ? GREEK[n] : `β${n}`); // n=1 -> β, 2 -> γ, …
-
-// The current champion's catalog entry {name, gen, hash} — a sibling is named after the champion
-// it gated ~even against. Falls back to the champion file's hash when the manifest has no current
-// entry yet (a hand-seeded champion before the first promotion).
-function currentChampionEntry() {
-  let man; try { man = JSON.parse(readFileSync(manifestFile, 'utf8')); } catch { man = null; }
-  const cur = man && (man.nets || []).find((n) => n.loopChampion && n.current);
-  const hash = weightsHash(champion);
-  return cur ? { name: cur.name, gen: cur.gen || 0, hash: cur.hash || hash } : { name: `champ-${hash}`, gen: 0, hash };
-}
-
-// Is this non-promoted candidate worth keeping as a sibling? Near-even (SPRT not H0 — the gate
-// couldn't call it worse) AND genuinely divergent per the gate's `div` block (the two nets judge
-// midgame positions differently: low eval correlation OR a real confident-disagreement rate).
-function siblingWorthy(res) {
-  if (!cfg.siblings || res.sprt === 'H1' || res.sprt === 'H0') return false;
-  const d = res.div;
-  if (!d || !d.positions) return false;
-  return d.corr <= cfg.siblingCorrMax || d.confidentRate >= cfg.siblingDisagreeMin;
-}
-
-// Save the current candidate as a ledger-ranked sibling: archive its weights (reusing the
-// by-hash champion archive rank:pool enumerates, so its gate games rate it right away) and
-// register a <champion>-<greek> name. Idempotent by content hash. Returns the name (null on
-// failure — an unreadable candidate).
-function saveSibling(res) {
-  const hash = archiveChampion(candidate);
-  if (hash === '?') return null;
-  let reg; try { reg = JSON.parse(readFileSync(siblingsFile, 'utf8')); } catch { reg = { siblings: [] }; }
-  const existing = reg.siblings.find((s) => s.hash === hash);
-  if (existing) return existing.name; // already saved (idempotent re-run)
-  const champ = currentChampionEntry();
-  // Next Greek letter among siblings of THIS champion (by champion hash): several roughly-equal
-  // candidates in a row get β, γ, δ…, and the sequence resets under the next champion.
-  const nSame = reg.siblings.filter((s) => s.championHash === champ.hash).length;
-  const name = `${champ.name}-${greekSuffix(nSame + 1)}`;
-  reg.siblings.push({
-    hash, name, championName: champ.name, championHash: champ.hash, championGen: champ.gen,
-    score: res.score, corr: res.div.corr, confidentRate: res.div.confidentRate,
-    date: new Date().toISOString().slice(0, 10),
-  });
-  writeFileSync(siblingsFile, JSON.stringify(reg, null, 2) + '\n');
-  return name;
-}
-
 // The --play spec for the per-cycle rank step when the ranked pool is the generator (cfg.playStrong):
-// the strongest nn engines — current champion, its siblings, and recent champions — each at
-// cfg.playDepth, capped to cfg.playTop. All are archived by hash (existence-checked, so every spec
-// resolves in depth-ladder) and near-champion strength, so the pool plays deep, high-quality games
-// among them and harvests them as training data. Returns "nn8@h1,nn8@h2,…", an explicit --rank-play
-// override, or null when < 2 strong engines exist yet (the rank step then schedules unrestricted).
+// the strongest nn engines — current champion and recent champions — each at cfg.playDepth, capped
+// to cfg.playTop. All are archived by hash (existence-checked, so every spec resolves in
+// depth-ladder) and near-champion strength, so the pool plays deep, high-quality games among them
+// and harvests them as training data. Returns "nn8@h1,nn8@h2,…", an explicit --rank-play override,
+// or null when < 2 strong engines exist yet (the rank step then schedules unrestricted).
 function strongPlaySpec() {
   if (cfg.rankPlay) return cfg.rankPlay;
   const seen = new Set();
@@ -716,7 +678,6 @@ function strongPlaySpec() {
     if (h && h !== '?' && !seen.has(h) && existsSync(join(championsDir, `${h}.json`))) { seen.add(h); hashes.push(h); }
   };
   add(weightsHash(champion)); // current champion (strongest)
-  try { const sib = JSON.parse(readFileSync(siblingsFile, 'utf8')); for (const s of sib.siblings || []) add(s.hash); } catch { /* no siblings yet */ }
   try {
     const man = JSON.parse(readFileSync(manifestFile, 'utf8'));
     const champs = (man.nets || []).filter((n) => n.loopChampion && n.hash).sort((a, b) => (b.gen || 0) - (a.gen || 0));
@@ -876,24 +837,16 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
   }
   const pct = (res.score * 100).toFixed(1);
   // Eval-divergence between candidate and champion (only present when both sides are nn,
-  // which the gate always is). A near-50% candidate that judges midgame positions very
-  // differently (low corr / high confident-disagree) is a diversity/generator signal even
-  // when it fails the gate — see docs/nn-training.md.
+  // which the gate always is): how differently the two nets judge midgame positions —
+  // context for reading a near-50% result (a corr-1.00 candidate is a clone of the champion).
   const divNote = res.div
     ? ` | divergence ${(res.div.confidentRate * 100).toFixed(1)}% conf-disagree, ${res.div.meanCp.toFixed(0)}cp mean, corr ${res.div.corr.toFixed(2)} (n=${res.div.positions})`
     : '';
-  // A near-even but divergent non-promoted candidate is kept as a ledger-ranked sibling (a
-  // diversity generator). Decided BEFORE folding the harvest so its gate positions keep their
-  // real, now-recoverable provenance — rank:pool rates the sibling from them — instead of the
-  // ephemeral rewrite a throwaway candidate gets.
-  const siblingName = (res.sprt !== 'H1' && siblingWorthy(res)) ? saveSibling(res) : null;
-  const sibNote = siblingName ? ` Saved as ledger sibling '${siblingName}' (divergence generator).` : '';
   // Fold the gate's harvested games into the dataset, relabeling a non-promoted gate-winning
   // candidate's provenance to a self-describing ephemeral Elo first (foldGateHarvest). Done
   // here, before the promote branch copies the candidate over the champion, so weightsHash
-  // still identifies the candidate that actually played. A saved sibling is recoverable (its
-  // hash is archived + ranked), so — like a promotion — its labels pass through un-rewritten.
-  if (cfg.harvest) foldGateHarvest(res.sprt === 'H1' || !!siblingName, res);
+  // still identifies the candidate that actually played.
+  if (cfg.harvest) foldGateHarvest(res.sprt === 'H1', res);
   if (res.sprt === 'H1') {
     const arch = JSON.parse(readFileSync(candidate, 'utf8')).arch;
     copyFileSync(champion, prevChampion);   // backup for safety
@@ -930,14 +883,14 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
     log(`cycle ${c}: kept champion — candidate ${pct}% / Elo ${res.elo.toFixed(0)} `
       + `(SPRT ${res.sprt}, ${res.games} games, cycle took ${fmtDur((Date.now() - cycleT0) / 1000)}). `
       + 'Below the gate; candidate kept as lineage for the next cycle.'
-      + sibNote + divNote);
+      + divNote);
   } else {
     const hadLineage = existsSync(lineage);
     if (hadLineage) rmSync(lineage);
     log(`cycle ${c}: kept champion — candidate ${pct}% / Elo ${res.elo.toFixed(0)} `
       + `(SPRT ${res.sprt}, ${res.games} games, cycle took ${fmtDur((Date.now() - cycleT0) / 1000)}). `
       + `Not a gain.${hadLineage ? ' Lineage reset to the champion.' : ''}`
-      + sibNote + divNote);
+      + divNote);
   }
 
   // Refit the strength pool now that this cycle's gate games are harvested into the dataset:
