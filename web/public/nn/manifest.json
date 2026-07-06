@@ -142,6 +142,19 @@
       "note": "train:loop champion Jack (gen 10, c76205, 2026-06-28)."
     },
     {
+      "name": "Jacques",
+      "file": "jacques.json",
+      "arch": [
+        768,
+        64,
+        32,
+        16,
+        1
+      ],
+      "hash": "be6ef0",
+      "note": "Unquantized Jack: the float gen-10 loop champion (be6ef0, 2026-06-25) that quantized Jack (c76205) was derived from. Cataloged for the ledger; not part of the loop's champion lineage."
+    },
+    {
       "name": "Kara",
       "file": "kara.json",
       "arch": [
