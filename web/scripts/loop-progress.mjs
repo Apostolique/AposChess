@@ -20,6 +20,7 @@ import { dirname, resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { fmtDur } from './fmt.mjs';
+import { suggestRecipes } from './experiment-registry.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const webDir = resolve(here, '..');
@@ -219,6 +220,23 @@ if (lastPromo) {
   console.log('  No promotions yet in this log.');
 }
 console.log('');
+
+// When the champion has stalled (many cycles since the last promotion, or none yet), point at
+// the experiment registry for concrete next moves: promising-but-stalled recipes worth reviving
+// (they warm-start from a saved best) and architectures with no track yet. Read-only, pulled
+// from training/data/loop/experiments — the full view is `npm run train:experiments`.
+const stalled = totalProm === 0 ? allCycles.length >= 3 : sincePromo >= 6;
+if (stalled) {
+  const sugg = suggestRecipes(loopDir, { champHidden });
+  const resume = sugg.filter((s) => s.kind === 'resume').slice(0, 2);
+  const fresh = sugg.filter((s) => s.kind === 'new').slice(0, 2);
+  if (resume.length || fresh.length) {
+    console.log('=== Stalled? Ideas to try (full list: `npm run train:experiments`) ===');
+    for (const s of resume) console.log(`  • revive ${s.slug} — ${s.reason}\n      ${s.cmd}`);
+    for (const s of fresh) console.log(`  • try ${s.slug} (architecture never tried)\n      ${s.cmd}`);
+    console.log('');
+  }
+}
 
 // Is the latest run still going? The loop appends a "stopped" line on exit; if the run has
 // cycles but no stopped line AND a live pidfile exists, treat it as running.

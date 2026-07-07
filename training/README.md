@@ -186,6 +186,41 @@ The lever that makes the gate actually fire is better *labels* (deeper `--depth`
 self-play from a stronger champion), not more cycles. Matches are slow, so expect a
 handful of cycles per hour.
 
+### Experiment tracks: try recipes without losing them
+
+Each loop run trains one **recipe** — the knobs that shape the candidate net: `--hidden`
+(architecture), `--lambda`, `--quiet-only`, `--float`/`--no-quant` (quantized vs float),
+`--scale`/`--lr`/`--wd`, and a free-form `--recipe-extra=k=v,…` for anything else. The loop
+keeps a **persistent track per recipe** under `training/data/loop/experiments/<id>/`, so trying
+a different architecture (or quiet-games, or any other recipe knob) **doesn't throw away** the
+previous recipe's accumulated progress. Run recipe A for a while, switch to B, come back to A
+later — the loop finds A's track and **resumes its warm-start lineage and best net
+automatically** (same recipe → same track). There's still **one shared champion** (the app's
+net and the generator's teacher): every recipe's candidate gates against it, and whichever
+recipe produces a winner promotes it — so the tracks are diverse *paths* to one champion, and
+the ones that don't win are preserved for later.
+
+```
+npm run train:loop -- --hidden=256,32              # a track for this architecture
+npm run train:loop -- --hidden=128 --quiet-only    # a different, independent track
+npm run train:loop -- --hidden=256,32              # resumes the first track's lineage/best
+```
+
+Browse and get suggestions with **`npm run train:experiments`**:
+
+```
+npm run train:experiments                 # every track: best Elo, cycles, promotions
+npm run train:experiments -- --show=<id>  # one track's recipe + per-cycle history
+npm run train:experiments -- --suggest    # "what to try next" only
+```
+
+The suggestions are the answer to *"the loop is stalling — what now?"*: it points at
+**promising-but-stalled past recipes** worth reviving (they warm-start from their saved best
+net, so it's cheap) and **architectures with no track yet**. `npm run train:progress` shows the
+same ideas inline once it detects a stall (many cycles since the last promotion). As always,
+strength is signal-limited — a bigger net isn't automatically better — so gate every recipe
+head-to-head; the registry just makes the exploration non-destructive.
+
 ## Dataset maintenance
 
 The dataset is the substrate the loop learns from, so it's worth **maintaining**, not

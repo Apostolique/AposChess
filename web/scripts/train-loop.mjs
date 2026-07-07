@@ -101,14 +101,33 @@
 //                   regardless of their values — shorthand for --refresh-cycle=0 with no
 //                   promotion refresh, for when you want the fastest possible cycles and
 //                   accept the staler `v` targets
+//   --float / --no-quant  train a NON-quantized (float) candidate instead of the default
+//                   quantized one. Quant is a recipe knob, so this forks a distinct track.
+//   --scale=S / --lr=L / --wd=W  forwarded to train.py (else its own defaults). Each is part
+//                   of the recipe when set, so it keys a distinct experiment track.
+//   --recipe-extra=k=v,k2=v2  free-form namespace to fork a separate track for a training
+//                   experiment the loop has no first-class flag for yet. Labels/keys the track
+//                   and rides along in its resume command; NOT forwarded to train.py.
+//
+// Experiment tracks (persistent, non-destructive): the training RECIPE — architecture
+// (--hidden), TD mix (--lambda), --quiet-only, quant (--float), and --scale/--lr/--wd/
+// --recipe-extra — keys a per-recipe TRACK under loop/experiments/<id>/ (see
+// experiment-registry.mjs). Each track keeps its OWN warm-start lineage, its strongest net
+// ever (best.json, by estimated absolute Elo), and a per-cycle history. So trying a different
+// architecture (or quiet-games, or any recipe knob) no longer clobbers the previous recipe's
+// accumulated progress: run another recipe in between, come back, and the SAME recipe resumes
+// its lineage/best automatically. The champion stays SHARED and best-wins — any recipe's
+// candidate gates against it, and whichever wins promotes. Browse/suggest with
+// `npm run train:experiments`. (--quiet-only also gets its own featurized file, so alternating
+// quiet/all-positions recipes don't force a re-featurize each switch.)
 //
 // Candidate lineage (automatic): when the gate is inconclusive but
-// the candidate scored >= 50%, the candidate is KEPT (loop/lineage.json) and the next
+// the candidate scored >= 50%, the candidate is KEPT (this recipe's track lineage) and the next
 // cycle's candidate warm-starts from IT instead of the champion — so sub-threshold
 // gains (+10-ish Elo, real but below the SPRT's resolution) accumulate across cycles
 // until the lineage clears the gate, instead of being re-derived and discarded every
 // cycle. The champion is still protected by the gate; a candidate scoring < 50% (or a
-// decided H0) resets the lineage back to the champion.
+// decided H0) resets the lineage, and the next warm-start falls back to this recipe's best net.
 
 import { spawnSync } from 'node:child_process';
 import {
@@ -123,6 +142,9 @@ import { fmtDur, fmtMB } from './fmt.mjs';
 import { weightsHash, ephemeralVersion } from './vtag.mjs';
 import { STOP_EXIT_CODE } from './stop.mjs';
 import { isGameRecord, vsAt, setVsAt, normalizeVs, serializeGameRecord } from './gameRecord.mjs';
+import {
+  buildRecipe, parseRecipeExtra, ensureTrack, beginRun, recordCycle, recipeLabel,
+} from './experiment-registry.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const webDir = resolve(here, '..');
@@ -215,10 +237,23 @@ function friendlyCmd(cmd, argv) {
 }
 
 const rawFile = join(dataDir, 'selfplay.jsonl');
-const featFile = join(dataDir, 'selfplay.features.jsonl');
+// Featurized output is keyed by the featurize-affecting recipe knobs (currently just
+// --quiet-only), so switching between quiet-only and all-positions runs no longer forces a
+// full re-featurize each time — each config keeps its own incrementally-maintained file +
+// meta sidecar. The all-positions file keeps the bare default name (backward-compatible with
+// the existing incremental state and the non-loop tools); quiet-only gets its own file.
+function featurizeFile() {
+  return cfg.quietOnly
+    ? join(dataDir, 'selfplay.features.quiet.jsonl')
+    : join(dataDir, 'selfplay.features.jsonl');
+}
 const champion = resolve(webDir, 'src', 'nn-weights.json');
 const candidate = join(loopDir, 'candidate.json');
-const lineage = join(loopDir, 'lineage.json'); // rejected-but-positive candidate, warm-start source
+// The recipe's warm-start lineage + persistent best now live in this recipe's TRACK directory
+// (see experiment-registry.mjs), assigned once the recipe is resolved at startup — NOT a single
+// global slot, so switching recipes between runs is non-destructive. `lineage`/`trackBest` are
+// the resolved per-track paths; `track` is the track handle.
+let track = null, lineage = null, trackBest = null, runNo = 0;
 const prevChampion = join(loopDir, 'champion-prev.json');
 // Archive of every champion that has labelled data, keyed by its content hash (= the
 // nn `vs` version stamped onto that data). Lets historical v-contributors be
@@ -359,6 +394,21 @@ const cfg = {
   playDepth: num(args['play-depth'], num(args.depth, 8)),
   playTop: num(args['play-top'], 8), // cap the strong set so the round-robin stays fast
   rankPlay: typeof args['rank-play'] === 'string' ? args['rank-play'] : null,
+  // --- Training-recipe knobs (define the experiment TRACK; see experiment-registry.mjs) ---
+  // These are what turn the shared dataset into THIS candidate net, so each distinct
+  // combination is its own persistent, warm-startable track. quant is on by default
+  // (the loop has always trained quantized); --float / --no-quant makes a float track.
+  // scale/lr/wd default to train.py's own defaults unless set (undefined => omitted from
+  // the recipe id, so they never fragment a track while unused).
+  quant: !(args['no-quant'] || args.float),
+  scale: args.scale !== undefined ? Number(args.scale) : undefined,
+  lr: args.lr !== undefined ? Number(args.lr) : undefined,
+  wd: args.wd !== undefined ? Number(args.wd) : undefined,
+  // Free-form namespace for future training-affecting systems: --recipe-extra=key=val,key2=val2.
+  // Purely a track KEY/label (it distinguishes tracks and rides along in the resume command);
+  // it isn't forwarded to train.py. Use it to fork a separate track for an experiment the loop
+  // doesn't yet have a first-class flag for.
+  recipeExtra: parseRecipeExtra(args['recipe-extra']),
 };
 // The loop's rank-games default is machine-dependent (one parallel wave), so sync the
 // command-echo suppression map to it — the echoed `npm run rank:pool` then shows --games
@@ -707,18 +757,37 @@ if (cfg.fresh && existsSync(rawFile)) { rmSync(rawFile); log('Cleared dataset (-
 // reset the fold mark too — otherwise the kept archive wouldn't re-enter the fresh dataset.
 if (cfg.fresh && existsSync(ladderFoldMark)) rmSync(ladderFoldMark);
 
+// Omitting --hidden pins the candidate to the champion's CURRENT shape (resolved here), so
+// the recipe id is a concrete architecture, not a moving target.
 const hidden = championHidden();
-// A leftover lineage only makes sense for the warm path and the current candidate
-// shape; otherwise start the lineage over from the champion.
-if (existsSync(lineage)) {
-  let drop = cfg.cold ? 'cold run' : null;
-  if (!drop) {
-    try {
-      const a = JSON.parse(readFileSync(lineage, 'utf8')).arch;
-      if (!Array.isArray(a) || a.slice(1, -1).join(',') !== hidden) drop = 'shape mismatch';
-    } catch { drop = 'unreadable'; }
-  }
-  if (drop) { rmSync(lineage); log(`Discarded stale lineage (${drop}).`); }
+// Resolve this run's TRAINING RECIPE and its persistent track. The recipe (architecture + TD
+// mix + quiet filter + quant + trainer knobs + any --recipe-extra) is keyed to a directory
+// under loop/experiments/, so its lineage/best/history survive being switched away from and
+// resume automatically when the same recipe runs again — even after other recipes in between.
+const recipe = buildRecipe({
+  hidden, lambda: cfg.lam, quietOnly: cfg.quietOnly, quant: cfg.quant,
+  scale: cfg.scale, lr: cfg.lr, wd: cfg.wd, extra: cfg.recipeExtra,
+});
+track = ensureTrack(loopDir, recipe, stamp());
+lineage = track.paths.lineage;   // this recipe's accumulated sub-threshold warm-start net
+trackBest = track.paths.best;    // this recipe's strongest net ever (by estimated abs Elo)
+runNo = beginRun(track.dir, stamp());
+// No shape-mismatch discard anymore: the track is keyed by the exact recipe (hidden included),
+// so its lineage always matches its own shape and lives in its own directory — a different
+// recipe can't clobber it. A --cold run simply ignores the lineage (it chains from a fresh
+// net), leaving the prior warm progress on disk intact for a later warm resume.
+log(`Recipe ${track.slug} [${track.id}] — ${recipeLabel(recipe)}`
+  + ` (track run #${runNo}${track.isNew ? ', new track' : ''}).`);
+// Featurized file for this recipe (quiet-only gets its own; see featurizeFile).
+const featFile = featurizeFile();
+// Whether the global champion's architecture matches this recipe's — i.e. whether the champion
+// is a usable warm-start seed for the candidate. False when --hidden differs from the champion's
+// shape (a brand-new architecture track that must bootstrap from its own lineage/best or cold).
+function championArchMatches() {
+  try {
+    const a = JSON.parse(readFileSync(champion, 'utf8')).arch;
+    return Array.isArray(a) && a.length >= 3 && a.slice(1, -1).join(',') === hidden;
+  } catch { return false; }
 }
 log(`train:loop start — ${cfg.batch === 0
     ? `no gen (data from gate harvest${cfg.playStrong ? ` + strong --play @ depth ${cfg.playDepth}` : ' + pool'})`
@@ -774,10 +843,11 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
       process.execPath, refreshArgs(cfg.refreshCycle, cfg.refreshCycleDepth))) break;
   }
 
-  // 2. Featurize the raw positions for the current feature set. (After a refresh this
-  //    is a full pass — the in-place rewrite invalidates the incremental prefix.)
+  // 2. Featurize the raw positions for the current feature set, into THIS recipe's featurized
+  //    file (quiet-only keeps its own, so alternating recipes don't re-featurize each switch).
+  //    (After a refresh this is a full pass — the in-place rewrite invalidates the prefix.)
   if (!run('Featurize', process.execPath,
-    [featurizeScript, ...(cfg.quietOnly ? ['--quiet-only'] : [])])) break;
+    [featurizeScript, `--out=${featFile}`, ...(cfg.quietOnly ? ['--quiet-only'] : [])])) break;
 
   // 3. Train a candidate to a side file. --lambda blends the champion's search value into
   //    the target (TD/bootstrap) when < 1. Warm-start source for this cycle's candidate:
@@ -787,22 +857,36 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
   //              cycle's output; init==out is safe — train.py reads --init fully before it
   //              writes --out. This is the source that lets a fresh --hidden shape evolve:
   //              the champion is often a different architecture and so unusable as init.)
-  //      otherwise: the kept lineage (a previous rejected-but-positive candidate) when one
-  //              exists, else the champion — so sub-threshold gains accumulate instead of
-  //              being re-derived every cycle (train.py ignores --init if the shapes differ).
+  //      otherwise: this recipe's track — its accumulated lineage if present, else its saved
+  //              best net (the strongest it ever produced — the safe resume point after a gap),
+  //              else the global champion but ONLY if the champion shares this recipe's shape
+  //              (a foreign-arch champion can't seed it — train.py would fall back to random),
+  //              else cold. So sub-threshold gains accumulate per-recipe and a brand-new
+  //              architecture track bootstraps itself instead of silently starting from scratch.
   const initFile = cfg.cold
     ? (cold ? null : candidate)
-    : (existsSync(lineage) ? lineage : champion);
+    : (existsSync(lineage) ? lineage
+      : existsSync(trackBest) ? trackBest
+      : championArchMatches() ? champion
+      : null);
   const warm = !!initFile && existsSync(initFile);
   const initLabel = !warm ? ' (cold start)'
     : cfg.cold ? ' (warm-start from previous candidate)'
-    : initFile === lineage ? ' (warm-start from lineage)' : '';
-  // --quant: export the candidate as a quantized integer net, so every champion keeps the
-  // incremental-accumulator speedup (~1.5× nodes/sec) in the gate, generation, and the app.
-  // Quantization is bit-exact JS/Zig and faithful to the float net (~1cp); warm_start
-  // dequantizes an int --init so the float fine-tune is unaffected.
+    : initFile === lineage ? ' (warm-start from lineage)'
+    : initFile === trackBest ? ' (warm-start from track best)'
+    : ' (warm-start from champion)';
+  // --quant (recipe knob, on by default): export the candidate as a quantized integer net, so
+  // every champion keeps the incremental-accumulator speedup (~1.5× nodes/sec) in the gate,
+  // generation, and the app. Quantization is bit-exact JS/Zig and faithful to the float net
+  // (~1cp); warm_start dequantizes an int --init so the float fine-tune is unaffected. --float
+  // forks a non-quantized track. --scale/--lr/--wd are passed only when set (else train.py's
+  // defaults). --data points the trainer at this recipe's featurized file.
   if (!run(`Train candidate${initLabel}`, python,
-    [trainPy, `--hidden=${hidden}`, `--out=${candidate}`, `--lambda=${cfg.lam}`, '--quant',
+    [trainPy, `--hidden=${hidden}`, `--data=${featFile}`, `--out=${candidate}`, `--lambda=${cfg.lam}`,
+      ...(cfg.quant ? ['--quant'] : []),
+      ...(cfg.scale !== undefined ? [`--scale=${cfg.scale}`] : []),
+      ...(cfg.lr !== undefined ? [`--lr=${cfg.lr}`] : []),
+      ...(cfg.wd !== undefined ? [`--wd=${cfg.wd}`] : []),
       ...(warm ? [`--init=${initFile}`] : [])])) break;
 
   // 4. Gate: candidate (A) vs champion (B), SPRT(0, elo1). Unless --no-harvest,
@@ -842,6 +926,15 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
   const divNote = res.div
     ? ` | divergence ${(res.div.confidentRate * 100).toFixed(1)}% conf-disagree, ${res.div.meanCp.toFixed(0)}cp mean, corr ${res.div.corr.toFixed(2)} (n=${res.div.positions})`
     : '';
+  // Snapshot the values the track record needs BEFORE the promote branch overwrites the
+  // champion file: the candidate's estimated ABSOLUTE Elo (the champion's current ledger Elo
+  // + this gate's edge over it) stays comparable across cycles as the champion strengthens,
+  // unlike a raw gate score, so it's what "track best" is ranked by. Null until the ledger
+  // rates the champion (from cycle 2 on).
+  const gatedVsChampHash = weightsHash(champion);
+  const champLedgerNow = championLedgerElo();
+  const candAbsElo = champLedgerNow ? champLedgerNow.best + res.elo : null;
+  const candHashForTrack = weightsHash(candidate);
   // Fold the gate's harvested games into the dataset, relabeling a non-promoted gate-winning
   // candidate's provenance to a self-describing ephemeral Elo first (foldGateHarvest). Done
   // here, before the promote branch copies the candidate over the champion, so weightsHash
@@ -889,9 +982,27 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
     if (hadLineage) rmSync(lineage);
     log(`cycle ${c}: kept champion — candidate ${pct}% / Elo ${res.elo.toFixed(0)} `
       + `(SPRT ${res.sprt}, ${res.games} games, cycle took ${fmtDur((Date.now() - cycleT0) / 1000)}). `
-      + `Not a gain.${hadLineage ? ' Lineage reset to the champion.' : ''}`
+      + `Not a gain.${hadLineage ? ' Lineage reset (next warm-start falls back to this recipe\'s best net).' : ''}`
       + divNote);
   }
+
+  // Record this cycle into the recipe's persistent TRACK (history line + rollup in state.json),
+  // and keep the track's `best.json` = the strongest net this recipe ever produced, ranked by
+  // estimated absolute Elo (candAbsElo). This is what a later warm resume of the same recipe
+  // seeds from, and what train:experiments reads to suggest reviving a promising-but-stalled
+  // recipe. Best-effort maintenance, so a write failure logs but never aborts the loop.
+  try {
+    const rc = recordCycle(track.dir, {
+      run: runNo, cycle: c, ts: stamp(),
+      score: res.score, edgeElo: res.elo, absElo: candAbsElo,
+      sprt: res.sprt, promoted: res.sprt === 'H1',
+      div: res.div ? { corr: res.div.corr, meanCp: res.div.meanCp } : null,
+      championHash: gatedVsChampHash,
+      datasetBytes: existsSync(rawFile) ? statSync(rawFile).size : 0,
+      hash: candHashForTrack,
+    });
+    if (rc.isBest) copyFileSync(candidate, trackBest);
+  } catch (e) { log(`  (track record skipped: ${e.message})`); }
 
   // Refit the strength pool now that this cycle's gate games are harvested into the dataset:
   // --corpus folds them into the Bradley-Terry fit (rating the current champion from its own

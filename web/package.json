@@ -21,6 +21,7 @@
     "train:resume": "node scripts/loop-ctl.mjs resume",
     "train:status": "node scripts/loop-ctl.mjs status",
     "train:progress": "node scripts/loop-progress.mjs",
+    "train:experiments": "node scripts/loop-experiments.mjs",
     "train:merge": "node --max-old-space-size=8192 scripts/merge-data.mjs",
     "puzzles:mine": "node scripts/mine-puzzles.mjs",
     "winrate": "node scripts/winrate.mjs",
