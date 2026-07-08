@@ -43,6 +43,24 @@
 //                capture available) — NNUE is queried only on quiet positions at qsearch
 //                leaves, so training on loud ones mismatches that distribution + adds noise.
 //                Recorded in the meta sidecar; toggling it forces a full re-featurize.
+//   --min-elo=E  drop whole GAMES whose weaker player rates below E on the rank:pool
+//                ledger scale (see --ledger). refresh-v can repair a stale `v`, but it can
+//                never repair who PLAYED: a weak engine's trajectories are off-distribution
+//                positions and its blunder-decided game result is label noise stamped on
+//                every position of the game. STRICT: a player that can't be positively
+//                rated — via the ledger, an ephemeral "elo<N>" tag, or the game's own
+//                ephemeral `vs` evidence (historical gate-candidate games whose `players`
+//                kept the raw unrankable hash) — counts as weakest and the game is dropped.
+//                Recorded in the meta sidecar; changing it forces a full re-featurize.
+//   --ledger=F   the Elo ledger --min-elo resolves players against
+//                (default ../training/data/loop/engine-elo.ladder.json, from rank:pool)
+//   --drop-conflicts=CP  drop POSITIONS where the recorded search value contradicts the
+//                game result: |v| >= CP centipawns but the mover did not go on to win
+//                (v >= CP with r <= 0, or v <= -CP with r >= 0). A clearly-winning
+//                position in a lost game means the result label is lying about this
+//                position (the game was decided by a later blunder) — standard
+//                search-vs-result filtering. 0 = off. Recorded in the meta sidecar;
+//                changing it forces a full re-featurize.
 
 import {
   createReadStream, createWriteStream, existsSync, rmSync, renameSync, statSync, writeFileSync,
@@ -57,6 +75,7 @@ import { parseFen } from '../src/board.js';
 import { featureIndices, PIECE_SQUARE_FEATURES, NUM_FEATURES } from '../src/nn.js';
 import { generatePseudoMoves, kingAttacked } from '../src/engine.js';
 import { expandPositions, isGameRecord } from './gameRecord.mjs';
+import { ledgerEloResolver, ephemeralElo, parseVtag } from './vtag.mjs';
 import { fmtDur, fmtNum, fmtMB, liveStatus, everyMs } from './fmt.mjs';
 
 // Rebuild a canonical board from stored feature indices (the legacy fallback when a
@@ -115,11 +134,66 @@ const outFile = typeof args.out === 'string'
 const quietOnly = !!args['quiet-only'];
 const cap = args.cap !== undefined ? Number(args.cap) : 0; // 0 = uncapped
 const seed = args.seed !== undefined ? Number(args.seed) : 1;
+const minElo = args['min-elo'] !== undefined ? Number(args['min-elo']) : null; // null = off
+const dropConflicts = args['drop-conflicts'] !== undefined ? Number(args['drop-conflicts']) : 0; // 0 = off
 
 if (!existsSync(inFile)) {
   console.error(`No dataset at ${inFile}. Generate it first:  npm run train:gen`);
   process.exit(1);
 }
+
+// --- Weak-players game filter (--min-elo) -----------------------------------
+// Resolve each game's players against the rank:pool ledger and drop the whole game when
+// the weaker player rates below the cutoff. STRICT: a player we cannot positively rate
+// counts as weakest (the game is dropped) — mirroring refresh-v's label-side "unknown =
+// -Inf" semantics. One rescue, and it's positive identification, not leniency: a player
+// whose tag the ledger doesn't know (a non-promoted gate candidate's raw content hash —
+// the loop only started relabeling `players` to ephemeral tags at fold time in 2026-07)
+// is judged by the game's own ephemeral `vs` evidence. Only foldGateHarvest ever writes
+// "elo<N>" tags (refresh-v/gen never do), so an ephemeral vs IS that candidate's measured
+// strength at the time it played — never a refresh artifact.
+let playerElo = null;
+if (minElo !== null) {
+  const ledgerPath = typeof args.ledger === 'string'
+    ? resolve(process.cwd(), args.ledger)
+    : resolve(here, '../../training/data/loop/engine-elo.ladder.json');
+  try { playerElo = ledgerEloResolver(ledgerPath); }
+  catch (e) {
+    console.error(`--min-elo needs a readable ledger (${ledgerPath}): ${e.message}. Run 'npm run rank:pool' first.`);
+    process.exit(1);
+  }
+}
+// Weakest ephemeral Elo among the game's vs tags (null if none) — the fold-time strength of
+// a non-promoted gate candidate that played in this game.
+function ephemeralVsElo(rec) {
+  const tags = Array.isArray(rec.vs) ? rec.vs : [rec.vs];
+  let min = null;
+  for (const t of new Set(tags)) {
+    const p = parseVtag(t);
+    if (!p) continue;
+    const e = ephemeralElo(p.version);
+    if (e !== null && (min === null || e < min)) min = e;
+  }
+  return min;
+}
+function isWeakGame(rec) {
+  if (!playerElo || !isGameRecord(rec)) return false;
+  if (!rec.players) return true; // no provenance at all -> weakest, drop
+  let weakest = Infinity;
+  for (const tag of Object.values(rec.players)) {
+    let e = playerElo(tag);
+    if (e == null) e = ephemeralVsElo(rec);
+    if (e == null) return true; // positively unidentifiable -> weakest, drop
+    if (e < weakest) weakest = e;
+  }
+  return weakest < minElo;
+}
+
+// --- Search-vs-result conflict filter (--drop-conflicts) --------------------
+// `v` is side-to-move centipawns and `r` the mover-view result, so a big |v| whose sign
+// the result contradicts marks a position whose result label is noise (a later blunder
+// decided the game, not this position). Draws under a decisive |v| count as conflicts too.
+const conflictsVR = (v, r) => (v >= dropConflicts && r <= 0) || (v <= -dropConflicts && r >= 0);
 
 const tmp = outFile + '.tmp';
 const metaFile = outFile.replace(/\.jsonl$/, '') + '.meta.json';
@@ -167,6 +241,8 @@ const writeMeta = (outBytes, rawBytes, rawTailHash) => writeFileSync(metaFile, J
   num_features: NUM_FEATURES,
   quiet_only: quietOnly,
   cap,
+  min_elo: minElo,
+  drop_conflicts: dropConflicts,
   incremental: { rawBytes, rawTailHash, outBytes },
 }, null, 2) + '\n');
 
@@ -202,7 +278,9 @@ if (cap > 0) {
     for await (const line of rl) {
       if (!line) continue;
       const rec = JSON.parse(line); games++;
+      if (isWeakGame(rec)) continue;
       for (const p of positionsOf(rec)) {
+        if (dropConflicts > 0 && p.v != null && conflictsVR(p.v, p.r)) continue;
         if (quietOnly && !isQuiet(p.board, p.turn)) continue;
         const k = keyOfF(featureIndices(p.board, p.turn));
         counts.set(k, (counts.get(k) || 0) + 1);
@@ -222,7 +300,9 @@ if (cap > 0) {
     for await (const line of rl) {
       if (!line) continue;
       const rec = JSON.parse(line);
+      if (isWeakGame(rec)) continue;
       for (const p of positionsOf(rec)) {
+        if (dropConflicts > 0 && p.v != null && conflictsVR(p.v, p.r)) continue;
         if (quietOnly && !isQuiet(p.board, p.turn)) continue;
         const o = featurize(p);
         scanned++;
@@ -252,6 +332,8 @@ let meta = null;
 try { meta = JSON.parse(readFileSync(metaFile, 'utf8')); } catch { /* no sidecar yet */ }
 const inc = !args.full && meta && meta.num_features === NUM_FEATURES
   && !!meta.quiet_only === quietOnly       // a filter toggle changes output content -> full pass
+  && (meta.min_elo ?? null) === minElo     // (old sidecars lack these keys — read as off,
+  && (meta.drop_conflicts || 0) === dropConflicts //  so they stay valid while the filters are off)
   && (meta.cap || 0) === 0                  // last run was capped -> can't append; full pass
   && meta.incremental
   && meta.incremental.rawBytes <= rawSize
@@ -278,6 +360,7 @@ const tick = everyMs(500);
 const span = rawSize - startAt;
 let bytesDone = 0;
 let games = 0, positions = 0, skippedLoud = 0, fromFeatures = 0;
+let skippedWeakGames = 0, skippedWeakPos = 0, skippedConflict = 0;
 for await (const line of rl) {
   if (!line) continue;
   bytesDone += line.length + 1;
@@ -289,7 +372,9 @@ for await (const line of rl) {
   const rec = JSON.parse(line);
   if (!isGameRecord(rec) && typeof rec.fen !== 'string') fromFeatures++;
   games++;
+  if (isWeakGame(rec)) { skippedWeakGames++; skippedWeakPos += rec.moves.length + 1; continue; }
   for (const p of positionsOf(rec)) {
+    if (dropConflicts > 0 && p.v != null && conflictsVR(p.v, p.r)) { skippedConflict++; continue; }
     if (quietOnly && !isQuiet(p.board, p.turn)) { skippedLoud++; continue; }
     if (!out.write(JSON.stringify(featurize(p)) + '\n')) {
       await new Promise((res) => out.once('drain', res)); // respect backpressure on a big file
@@ -313,6 +398,14 @@ if (quietOnly) {
   const scanned = positions + skippedLoud;
   console.log(`  --quiet-only: dropped ${fmtNum(skippedLoud)} loud positions `
     + `(${scanned ? (100 * skippedLoud / scanned).toFixed(1) : '0.0'}% of ${fmtNum(scanned)} scanned).`);
+}
+if (minElo !== null) {
+  console.log(`  --min-elo=${minElo}: dropped ${fmtNum(skippedWeakGames)} weak-player game(s) `
+    + `(${fmtNum(skippedWeakPos)} positions) of ${fmtNum(games)} scanned.`);
+}
+if (dropConflicts > 0) {
+  console.log(`  --drop-conflicts=${dropConflicts}: dropped ${fmtNum(skippedConflict)} position(s) `
+    + `whose search value contradicts the game result.`);
 }
 if (fromFeatures) {
   console.log(`  ${fmtNum(fromFeatures)} legacy records had no fen — rebuilt from stored features.`);

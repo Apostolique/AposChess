@@ -72,6 +72,27 @@
 //                   called only at quiescence-search leaves, so loud positions mismatch
 //                   that distribution and add label noise. Off by default — gate it
 //                   head-to-head before adopting. Toggling forces a full re-featurize.
+//   --filter-weak=DELTA  featurize-time WEAK-GAMES filter: drop whole games whose weaker
+//                   player rates more than DELTA Elo below the current champion on the
+//                   rank ledger (featurize --min-elo). refresh-v can repair a stale `v`,
+//                   but never who PLAYED: a weak engine's trajectories are off-distribution
+//                   positions and its blunder-decided result is label noise on every
+//                   position of the game. SELF-ADJUSTING: the absolute cutoff is recomputed
+//                   from the champion's ledger Elo each cycle (quantized to 50 Elo so it
+//                   moves — and forces a full re-featurize — only when the champion has
+//                   actually climbed), so improving champions retire old weak cohorts
+//                   automatically. STRICT: a player that can't be positively rated (ledger,
+//                   ephemeral tag, or the game's ephemeral `vs` evidence) counts as weakest
+//                   and the game is dropped. Inactive until the ledger rates the champion
+//                   (cycle 2 on a fresh clone). 0 = off (default). A recipe knob — keys its
+//                   own experiment track.
+//   --drop-conflicts=CP  featurize-time SEARCH-VS-RESULT filter: drop positions whose
+//                   recorded `v` is confident (|v| >= CP centipawns) but contradicts the
+//                   game result — there the result label is lying about the position (a
+//                   later blunder decided the game), which is exactly the noise a pure-
+//                   result target (lambda=1) trains on. Gives refresh-v a second job:
+//                   better `v` labels also mean better noise detection. 0 = off (default).
+//                   A recipe knob — keys its own experiment track.
 //   --fresh         clear the dataset before the first cycle (clean deep-search start)
 //   --refresh-frac=P  after each PROMOTION, recompute `v` on a random fraction P of the
 //                   dataset with the new champion (value iteration; 0 = off, default).
@@ -237,15 +258,19 @@ function friendlyCmd(cmd, argv) {
 }
 
 const rawFile = join(dataDir, 'selfplay.jsonl');
-// Featurized output is keyed by the featurize-affecting recipe knobs (currently just
-// --quiet-only), so switching between quiet-only and all-positions runs no longer forces a
+// Featurized output is keyed by the featurize-affecting recipe knobs (--quiet-only,
+// --filter-weak, --drop-conflicts), so switching between filter configs no longer forces a
 // full re-featurize each time — each config keeps its own incrementally-maintained file +
-// meta sidecar. The all-positions file keeps the bare default name (backward-compatible with
-// the existing incremental state and the non-loop tools); quiet-only gets its own file.
+// meta sidecar. The unfiltered file keeps the bare default name (backward-compatible with
+// the existing incremental state and the non-loop tools). --filter-weak is keyed by its
+// DELTA (stable), not the per-cycle absolute cutoff — when the champion climbs a 50-Elo
+// step the same file is rebuilt in place (the meta sidecar detects the cutoff change).
 function featurizeFile() {
-  return cfg.quietOnly
-    ? join(dataDir, 'selfplay.features.quiet.jsonl')
-    : join(dataDir, 'selfplay.features.jsonl');
+  const parts = [];
+  if (cfg.quietOnly) parts.push('quiet');
+  if (cfg.filterWeak > 0) parts.push(`w${cfg.filterWeak}`);
+  if (cfg.dropConflicts > 0) parts.push(`c${cfg.dropConflicts}`);
+  return join(dataDir, `selfplay.features${parts.length ? `.${parts.join('.')}` : ''}.jsonl`);
 }
 const champion = resolve(webDir, 'src', 'nn-weights.json');
 const candidate = join(loopDir, 'candidate.json');
@@ -334,6 +359,12 @@ const cfg = {
   // qsearch leaves. Off by default (gate it head-to-head before adopting). Toggling it forces
   // the next featurize to be a full pass (the meta sidecar records the filter state).
   quietOnly: !!args['quiet-only'],
+  // Featurize-time dataset filters (recipe knobs — each keys its own experiment track):
+  // --filter-weak=DELTA drops games whose weaker player is > DELTA Elo below the current
+  // champion (cutoff recomputed per cycle from the ledger, so it tracks the champion);
+  // --drop-conflicts=CP drops positions whose |v| >= CP contradicts the game result.
+  filterWeak: num(args['filter-weak'], 0),
+  dropConflicts: num(args['drop-conflicts'], 0),
   hidden: typeof args.hidden === 'string' ? args.hidden : null,
   jobs: args.jobs,
   fresh: !!args.fresh,
@@ -543,6 +574,17 @@ function foldGateHarvest(promoted, res) {
       relabeled++; changed = true;
     }
     if (changed) normalizeVs(rec);
+    // Relabel the candidate's `players` entry the same way: it carries the same unrankable
+    // content hash, and downstream consumers judge a game by who PLAYED it (featurize
+    // --min-elo drops games with unrateable players; merge --drop-unlabeled counts them
+    // unlabeled). The BT corpus fit is indifferent — an ephemeral tag is a non-pool id and
+    // is skipped exactly like the raw hash was.
+    for (const side of ['w', 'b']) {
+      const pm = /^nn(\d+|t)@([0-9a-f]+)$/.exec((rec.players && rec.players[side]) || '');
+      if (!pm || pm[2] !== candHash) continue;
+      const base = champElo.byDepth.has(pm[1]) ? champElo.byDepth.get(pm[1]) : champElo.best;
+      rec.players[side] = `nn${pm[1]}@${ephemeralVersion(base + gateEloLo)}`;
+    }
     out.push(serializeGameRecord(rec));
   }
   if (out.length) appendFileSync(rawFile, out.join('\n') + '\n');
@@ -651,6 +693,27 @@ function foldNewLadderGames() {
     log(`  Folded ${added} new ladder game(s) into the dataset (next featurize trains on them).`);
   } finally { closeSync(fd); }
   writeLadderMark(size); // advance only after a successful append
+}
+
+// Featurize args for this recipe's dataset filters. --drop-conflicts forwards as-is.
+// --filter-weak resolves to an ABSOLUTE ledger-scale cutoff each cycle: the champion's
+// current ledger Elo minus the delta, quantized to 50-Elo steps so the cutoff (recorded in
+// the featurize meta sidecar) moves — and forces a full re-featurize — only when the
+// champion has actually climbed a step, not on every ledger-refit jitter. Until the ledger
+// rates the champion (cycle 1 on a fresh clone) the weak filter is inactive for the cycle.
+function filterArgs() {
+  const a = [];
+  if (cfg.dropConflicts > 0) a.push(`--drop-conflicts=${cfg.dropConflicts}`);
+  if (cfg.filterWeak > 0) {
+    const champElo = championLedgerElo();
+    if (champElo) {
+      const cutoff = Math.round((champElo.best - cfg.filterWeak) / 50) * 50;
+      a.push(`--ledger=${ledgerFile}`, `--min-elo=${cutoff}`);
+    } else {
+      log(`  --filter-weak=${cfg.filterWeak}: the ledger doesn't rate the champion yet — weak-games filter inactive this cycle.`);
+    }
+  }
+  return a;
 }
 
 // Build refresh-v args. With ranking on AND a ledger present, target the WEAKEST cohort
@@ -766,7 +829,10 @@ const hidden = championHidden();
 // resume automatically when the same recipe runs again — even after other recipes in between.
 const recipe = buildRecipe({
   hidden, lambda: cfg.lam, quietOnly: cfg.quietOnly, quant: cfg.quant,
-  scale: cfg.scale, lr: cfg.lr, wd: cfg.wd, extra: cfg.recipeExtra,
+  scale: cfg.scale, lr: cfg.lr, wd: cfg.wd,
+  filterWeak: cfg.filterWeak > 0 ? cfg.filterWeak : undefined,
+  dropConflicts: cfg.dropConflicts > 0 ? cfg.dropConflicts : undefined,
+  extra: cfg.recipeExtra,
 });
 track = ensureTrack(loopDir, recipe, stamp());
 lineage = track.paths.lineage;   // this recipe's accumulated sub-threshold warm-start net
@@ -844,10 +910,13 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
   }
 
   // 2. Featurize the raw positions for the current feature set, into THIS recipe's featurized
-  //    file (quiet-only keeps its own, so alternating recipes don't re-featurize each switch).
-  //    (After a refresh this is a full pass — the in-place rewrite invalidates the prefix.)
+  //    file (each filter config keeps its own, so alternating recipes don't re-featurize each
+  //    switch), applying the recipe's dataset filters (--quiet-only / --filter-weak /
+  //    --drop-conflicts). (After a refresh this is a full pass — the in-place rewrite
+  //    invalidates the prefix.)
   if (!run('Featurize', process.execPath,
-    [featurizeScript, `--out=${featFile}`, ...(cfg.quietOnly ? ['--quiet-only'] : [])])) break;
+    [featurizeScript, `--out=${featFile}`, ...(cfg.quietOnly ? ['--quiet-only'] : []),
+      ...filterArgs()])) break;
 
   // 3. Train a candidate to a side file. --lambda blends the champion's search value into
   //    the target (TD/bootstrap) when < 1. Warm-start source for this cycle's candidate:

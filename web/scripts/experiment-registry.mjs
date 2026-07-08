@@ -38,9 +38,10 @@ export function experimentsDir(loopDir) { return join(loopDir, 'experiments'); }
 // --- Recipe construction & identity --------------------------------------------------
 
 // Canonicalize the raw knobs into a recipe object. hidden/lambda/quietOnly/quant are ALWAYS
-// present (the loop controls their defaults); scale/lr/wd/extra are included only when the
-// caller explicitly set them (pass `undefined` otherwise), so an unset optional never
-// fragments the id or drifts if train.py's own default changes.
+// present (the loop controls their defaults); scale/lr/wd/filterWeak/dropConflicts/extra are
+// included only when the caller explicitly set them (pass `undefined` otherwise), so an unset
+// optional never fragments the id or drifts if a tool's own default changes — and adding a
+// new optional knob never re-keys the existing tracks.
 export function buildRecipe(raw) {
   const r = {
     hidden: String(raw.hidden),
@@ -51,6 +52,10 @@ export function buildRecipe(raw) {
   if (raw.scale !== undefined) r.scale = Number(raw.scale);
   if (raw.lr !== undefined) r.lr = Number(raw.lr);
   if (raw.wd !== undefined) r.wd = Number(raw.wd);
+  // Dataset filters applied at featurize time (train-loop --filter-weak / --drop-conflicts):
+  // they change what the candidate trains on, so they are part of its identity.
+  if (raw.filterWeak !== undefined) r.filterWeak = Number(raw.filterWeak);
+  if (raw.dropConflicts !== undefined) r.dropConflicts = Number(raw.dropConflicts);
   if (raw.extra && Object.keys(raw.extra).length) {
     r.extra = {};
     for (const k of Object.keys(raw.extra).sort()) r.extra[k] = String(raw.extra[k]);
@@ -75,7 +80,7 @@ export function parseRecipeExtra(spec) {
 // Stable serialization (fixed key order) so the same recipe always hashes the same.
 function canonical(recipe) {
   const ordered = {};
-  for (const k of ['hidden', 'lambda', 'quietOnly', 'quant', 'scale', 'lr', 'wd']) {
+  for (const k of ['hidden', 'lambda', 'quietOnly', 'quant', 'scale', 'lr', 'wd', 'filterWeak', 'dropConflicts']) {
     if (recipe[k] !== undefined) ordered[k] = recipe[k];
   }
   if (recipe.extra) ordered.extra = recipe.extra; // buildRecipe already sorted its keys
@@ -95,6 +100,8 @@ export function recipeSlug(recipe) {
   if (recipe.scale !== undefined) parts.push(`s${recipe.scale}`);
   if (recipe.lr !== undefined) parts.push(`lr${recipe.lr}`);
   if (recipe.wd !== undefined) parts.push(`wd${recipe.wd}`);
+  if (recipe.filterWeak !== undefined) parts.push(`fw${recipe.filterWeak}`);
+  if (recipe.dropConflicts !== undefined) parts.push(`dc${recipe.dropConflicts}`);
   if (recipe.extra) for (const [k, v] of Object.entries(recipe.extra)) parts.push(`${k}=${v}`);
   return parts.join('_');
 }
@@ -107,6 +114,8 @@ export function recipeLabel(recipe) {
   if (recipe.scale !== undefined) bits.push(`scale=${recipe.scale}`);
   if (recipe.lr !== undefined) bits.push(`lr=${recipe.lr}`);
   if (recipe.wd !== undefined) bits.push(`wd=${recipe.wd}`);
+  if (recipe.filterWeak !== undefined) bits.push(`filter-weak=${recipe.filterWeak}`);
+  if (recipe.dropConflicts !== undefined) bits.push(`drop-conflicts=${recipe.dropConflicts}`);
   if (recipe.extra) bits.push(...Object.entries(recipe.extra).map(([k, v]) => `${k}=${v}`));
   return bits.join(', ');
 }
@@ -121,6 +130,8 @@ export function recipeToFlags(recipe) {
   if (recipe.scale !== undefined) f.push(`--scale=${recipe.scale}`);
   if (recipe.lr !== undefined) f.push(`--lr=${recipe.lr}`);
   if (recipe.wd !== undefined) f.push(`--wd=${recipe.wd}`);
+  if (recipe.filterWeak !== undefined) f.push(`--filter-weak=${recipe.filterWeak}`);
+  if (recipe.dropConflicts !== undefined) f.push(`--drop-conflicts=${recipe.dropConflicts}`);
   if (recipe.extra) {
     const spec = Object.entries(recipe.extra).map(([k, v]) => `${k}=${v}`).join(',');
     if (spec) f.push(`--recipe-extra=${spec}`);
@@ -279,6 +290,32 @@ export function suggestRecipes(loopDir, opts = {}) {
         + ` — has a saved best to warm-start from`,
       cmd: recipeResumeCmd(t.recipe),
     });
+  }
+
+  // Dataset-filter recipes (see featurize --min-elo / --drop-conflicts) not yet tried on the
+  // reigning shape: refresh-v repairs stale `v` labels, but who PLAYED a game — hence its
+  // position distribution and its result label — is fixed forever, and these filter that at
+  // featurize time. Suggested against the most-promoted track's architecture (else the first).
+  const FILTER_TRIALS = [
+    { knobs: { filterWeak: 700 },
+      reason: 'drop games whose weaker player is ≥700 Elo below the champion — off-distribution positions with blunder-decided result labels' },
+    { knobs: { dropConflicts: 600 },
+      reason: 'drop positions whose recorded search value (≥600cp) contradicts the game result — the result label is noise there' },
+  ];
+  const reigning = tracks.slice().sort((a, b) =>
+    ((b.state && b.state.promotions) || 0) - ((a.state && a.state.promotions) || 0))[0];
+  if (reigning) {
+    const ids = new Set(tracks.map((t) => t.id));
+    for (const trial of FILTER_TRIALS) {
+      if (out.filter((o) => o.kind === 'new').length >= 4) break;
+      const recipe = buildRecipe({ ...reigning.recipe, ...trial.knobs });
+      if (ids.has(recipeId(recipe))) continue;
+      out.push({
+        kind: 'new', slug: recipeSlug(recipe), recipe,
+        reason: trial.reason,
+        cmd: recipeResumeCmd(recipe),
+      });
+    }
   }
 
   // Never-tried architectures from the ladder (keep near-champion knobs otherwise).

@@ -44,6 +44,40 @@ export function vtag(evalName, depth, weightsPath) {
   return `${eng}${depth != null ? depth : 't'}@${ver}`;
 }
 
+// Parse a "<engine><depth>@<version>" tag into its parts (null if not a valid tag).
+export function parseVtag(tag) {
+  const m = /^(nn|hc)(\d+|t)@(.+)$/.exec(tag || '');
+  return m ? { eng: m[1], depth: m[2], version: m[3] } : null;
+}
+
+// PLAYER-strength resolver over a rank:pool ledger (engine-elo.ladder.json): returns a
+// function tag -> Elo, or null when the ledger doesn't know the engine. This is for judging
+// how strong a game's PLAYERS were (featurize --min-elo), which differs from refresh-v's
+// label-side semantics in two ways: an unknown tag is null ("can't judge, keep the game"),
+// not -Inf "relabel on sight"; and the material floor ('?' versions) IS resolved by exact
+// tag — hc1@? etc. are real rated pool nodes, and games they played are exactly the weak
+// games the filter exists to catch. Version-level fallback (max Elo across ranked depths)
+// still excludes '?' — it would smear the floor across all hc depths.
+export function ledgerEloResolver(ledgerPath) {
+  const ledger = JSON.parse(readFileSync(ledgerPath, 'utf8')); // caller handles a missing file
+  const byTag = new Map(), byVersion = new Map();
+  for (const e of ledger.ranking || []) {
+    if (e.elo == null) continue;
+    if (e.tag) byTag.set(e.tag, e.elo);
+    if (e.version === '?') continue;
+    const prev = byVersion.has(e.version) ? byVersion.get(e.version) : -Infinity;
+    byVersion.set(e.version, Math.max(prev, e.elo));
+  }
+  return (tag) => {
+    const t = parseVtag(tag);
+    if (!t) return null;
+    const eph = ephemeralElo(t.version);
+    if (eph !== null) return eph;
+    if (byTag.has(tag)) return byTag.get(tag);
+    return byVersion.has(t.version) ? byVersion.get(t.version) : null;
+  };
+}
+
 // Ephemeral-engine version marker. A non-promoted gate candidate is never archived and
 // can't be re-instantiated, so a content-hash version would be UNRECOVERABLE — refresh-v
 // and merge-data would read it as -Inf "weakest, relabel on sight". Instead its `vs`
