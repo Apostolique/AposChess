@@ -126,6 +126,9 @@
 //                   quantized one. Quant is a recipe knob, so this forks a distinct track.
 //   --scale=S / --lr=L / --wd=W  forwarded to train.py (else its own defaults). Each is part
 //                   of the recipe when set, so it keys a distinct experiment track.
+//   --epochs=N / --patience=P  forwarded to train.py (else its defaults: 200 / 8; patience 0
+//                   disables early stopping). NOT recipe keys — a training-length tuning knob,
+//                   so changing them refines the same track's net rather than forking a track.
 //   --recipe-extra=k=v,k2=v2  free-form namespace to fork a separate track for a training
 //                   experiment the loop has no first-class flag for yet. Labels/keys the track
 //                   and rides along in its resume command; NOT forwarded to train.py.
@@ -435,6 +438,12 @@ const cfg = {
   scale: args.scale !== undefined ? Number(args.scale) : undefined,
   lr: args.lr !== undefined ? Number(args.lr) : undefined,
   wd: args.wd !== undefined ? Number(args.wd) : undefined,
+  // --epochs/--patience forward to train.py too, but are NOT recipe keys: tuning how long a
+  // net trains refines the SAME recipe's net rather than forking a track (unlike scale/lr/wd,
+  // which change the trained weights' identity). Undefined => train.py's own defaults
+  // (epochs 200, patience 8; patience 0 disables early stopping).
+  epochs: args.epochs !== undefined ? Number(args.epochs) : undefined,
+  patience: args.patience !== undefined ? Number(args.patience) : undefined,
   // Free-form namespace for future training-affecting systems: --recipe-extra=key=val,key2=val2.
   // Purely a track KEY/label (it distinguishes tracks and rides along in the resume command);
   // it isn't forwarded to train.py. Use it to fork a separate track for an experiment the loop
@@ -868,10 +877,10 @@ log('Pause/resume from another terminal: `npm run train:pause` / `npm run train:
 
 const jobArg = cfg.jobs !== undefined ? [`--jobs=${cfg.jobs}`] : [];
 
-// No startup ranking: the pool is refit at the END of each cycle (runRankPool), after that
-// cycle's gate games have been harvested into the dataset. So cycle 1 still refreshes with
-// the classic random fraction (no ledger yet); from cycle 2 on the ledger exists and the
-// refreshes go weakest-first.
+// No startup ranking: the pool is refit near the END of each cycle (runRankPool), after that
+// cycle's gate games have been harvested into the dataset, and the per-cycle v-refresh runs
+// right after it — so every cycle (including the first) refreshes against a ledger that was
+// just refit, going weakest-first as soon as the pool rates anything.
 
 const loopT0 = Date.now();
 let promotions = 0;
@@ -899,15 +908,6 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
       ...(cfg.openings !== null ? [`--openings=${cfg.openings}`] : []),
       ...(cfg.openingTopk > 0 ? [`--opening-topk=${cfg.openingTopk}`] : []),
       `--seed=${Date.now()}`, ...jobArg])) break;
-
-  // 1b. Per-cycle value refresh: re-label a small random slice of the dataset with the
-  //     current champion. Most records carry `v` from older champions or shallower
-  //     searches, so this upgrades targets even between promotions. The seed varies per
-  //     cycle so coverage spreads across the set instead of re-picking the same slice.
-  if (cfg.refreshCycle > 0) {
-    if (!run(`Refresh v (${(cfg.refreshCycle * 100).toFixed(1)}% ${refreshMode()} @ depth ${cfg.refreshCycleDepth})`,
-      process.execPath, refreshArgs(cfg.refreshCycle, cfg.refreshCycleDepth))) break;
-  }
 
   // 2. Featurize the raw positions for the current feature set, into THIS recipe's featurized
   //    file (each filter config keeps its own, so alternating recipes don't re-featurize each
@@ -956,6 +956,8 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
       ...(cfg.scale !== undefined ? [`--scale=${cfg.scale}`] : []),
       ...(cfg.lr !== undefined ? [`--lr=${cfg.lr}`] : []),
       ...(cfg.wd !== undefined ? [`--wd=${cfg.wd}`] : []),
+      ...(cfg.epochs !== undefined ? [`--epochs=${cfg.epochs}`] : []),
+      ...(cfg.patience !== undefined ? [`--patience=${cfg.patience}`] : []),
       ...(warm ? [`--init=${initFile}`] : [])])) break;
 
   // 4. Gate: candidate (A) vs champion (B), SPRT(0, elo1). Unless --no-harvest,
@@ -1076,9 +1078,26 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
   // Refit the strength pool now that this cycle's gate games are harvested into the dataset:
   // --corpus folds them into the Bradley-Terry fit (rating the current champion from its own
   // gate matches) plus a short play budget tightens the most-ambiguous orderings. Runs every
-  // cycle so the next cycle's weakest-first refresh reads a current ledger. Maintenance: a
-  // failure logs but doesn't abort the run (Ctrl-C still ends it via the `stopping` flag).
+  // cycle so this cycle's own weakest-first refresh (the last step, just below) reads a
+  // current ledger. Maintenance: a failure logs but doesn't abort the run (Ctrl-C still ends
+  // it via the `stopping` flag).
   if (!stopping) runRankPool('Rank pool (Bradley-Terry, corpus + scheduled play)');
+
+  // Per-cycle value refresh — the LAST step of the cycle. Re-label a small slice of the
+  // dataset with the current champion (most records carry `v` from older champions or
+  // shallower searches, so this upgrades targets even between promotions). Deliberately
+  // placed here rather than before training so a fresh loop start goes STRAIGHT into
+  // featurize→train (no upfront depth-8 refresh to sit through) — the point being to iterate
+  // quickly on training knobs. Running it after runRankPool also means it reads THIS cycle's
+  // freshly-refit ledger (weakest-first targets the current worst cohort) and uses the
+  // post-gate champion. The in-place `v` rewrite invalidates the featurize prefix, so the
+  // NEXT cycle's featurize is a full pass (same total cost as before, shifted half a cycle).
+  // Seeded per cycle so coverage spreads across the set. Maintenance: don't start a long
+  // refresh if we're already stopping.
+  if (cfg.refreshCycle > 0 && !stopping) {
+    run(`Refresh v (${(cfg.refreshCycle * 100).toFixed(1)}% ${refreshMode()} @ depth ${cfg.refreshCycleDepth})`,
+      process.execPath, refreshArgs(cfg.refreshCycle, cfg.refreshCycleDepth));
+  }
 }
 
 log(`train:loop stopped after ${promotions} promotion(s) in ${fmtDur((Date.now() - loopT0) / 1000)}. `
