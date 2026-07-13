@@ -130,6 +130,11 @@
 //                   placeholder floor (the "best across depths" absElo the loop steers by then
 //                   rests on real games at each depth, not just the gate/play depths).
 //   --no-calibrate  disable that post-promotion depth calibration (M=0).
+//   --no-adaptive   disable the adaptive maintenance budget (ON by default): revert to the FIXED
+//                   --rank-minutes / --refresh-cycle every cycle. On, each is bounded-scaled per
+//                   cycle from a signal — rank-minutes ↑ when the champion's ledger margin (the CI
+//                   on its absElo) is wide, refresh ↑ in the cycles right after a promotion (stalest
+//                   `v`) — anchored so a neutral signal == today's fixed values (can't starve a step).
 //   --float / --no-quant  train a NON-quantized (float) candidate instead of the default
 //                   quantized one. Quant is a recipe knob, so this forks a distinct track.
 //   --scale=S / --lr=L / --wd=W  forwarded to train.py (else its own defaults). Each is part
@@ -424,6 +429,15 @@ const cfg = {
   // placeholder floor for every other depth, so the "best across depths" absElo the loop steers by
   // (see loop-progress) rests on one or two thin bands. 0 / --no-calibrate disables it.
   calibrateMinutes: args['no-calibrate'] ? 0 : num(args['calibrate-minutes'], 10),
+  // Adaptive maintenance budget (ON by default; --no-adaptive reverts to fixed knobs). Each
+  // per-cycle maintenance knob starts at its configured value and shifts only within a bounded
+  // band around it, driven by a robust signal — so a neutral signal reproduces today's fixed
+  // behaviour exactly and a strong signal can't starve a step (the reallocation is bounded, not
+  // free). Signals: rank-minutes scales with the champion's ledger-margin (measure more when the
+  // absElo the loop steers by is uncertain), refresh fraction scales with post-promotion staleness
+  // (relabel more right after the champion — hence every `v` target — changed, then taper). See
+  // adaptiveMaintenance().
+  adaptive: !args['no-adaptive'],
   // Games per scheduled pool matchup. Defaults to ONE PARALLEL WAVE (the --jobs count, rounded
   // up to even): fewer games than workers leaves cores idle for the whole matchup, while a big
   // batch would blow far past --rank-minutes (the budget is only checked BETWEEN matchups — a
@@ -553,6 +567,61 @@ function championLedgerElo() {
     best = Math.max(best, e.elo);
   }
   return byDepth.size ? { byDepth, best } : null;
+}
+
+// The champion's rating CONFIDENCE from the ledger: the margin (±Elo CI) and game count at the
+// depth that defines its best Elo (hence its absElo — the number the loop steers by). Returns null
+// unless it is meaningfully rated there (enough games), so adaptive sizing falls back to the
+// baseline instead of reacting to a noisy margin — a freshly promoted champion with thin games is
+// handled by the calibration pass, not by inflating the routine rank budget.
+function championLedgerConfidence() {
+  if (!existsSync(ledgerFile)) return null;
+  let ledger; try { ledger = JSON.parse(readFileSync(ledgerFile, 'utf8')); } catch { return null; }
+  const champHash = weightsHash(champion);
+  let best = null;
+  for (const e of ledger.ranking || []) {
+    if (e.eng !== 'nn' || e.version !== champHash || e.elo == null) continue;
+    if (!best || e.elo > best.elo) best = { elo: e.elo, margin: e.margin ?? null, games: e.games ?? 0, depth: e.depth };
+  }
+  if (!best || best.margin == null || best.games < 30) return null;
+  return best; // { elo, margin, games, depth }
+}
+
+// Baseline-anchored, BOUNDED adaptive sizing of this cycle's maintenance budget. Each knob starts
+// at its configured value and moves only within [floor, ceil] on a robust signal, so a neutral or
+// absent signal reproduces today's fixed behaviour and a strong signal shifts — never starves —
+// the step. The two downsides of a mis-read are both just "a slightly slower cycle" (more rank
+// games are still harvested as training data; more refresh means fresher labels), never worse data.
+//   rank-minutes ← ledger confidence: play MORE when the champion's best-depth margin (the CI on
+//                  its absElo) is wide, LESS when it's already tight. (Unrated → baseline.)
+//   refresh-frac ← post-promotion staleness: relabel MORE in the cycles right after a promotion
+//                  (the whole dataset's `v` came from the OLD champion), tapering as the
+//                  weakest-first refresh chips the staleness down with the champion unchanged.
+function adaptiveMaintenance(cyclesSincePromo) {
+  const base = { rankMinutes: cfg.rankMinutes, refreshFrac: cfg.refreshCycle, notes: null };
+  if (!cfg.adaptive) return base;
+  const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
+
+  let rankMinutes = cfg.rankMinutes, rankWhy = 'baseline (champion not yet confidently rated)';
+  const conf = championLedgerConfidence();
+  if (conf) {
+    // Nominal margin ≈ 40 Elo ⇒ 1× (baseline). Wider ⇒ up to 3×, tighter ⇒ down to 0.5×.
+    const factor = clamp(conf.margin / 40, 0.5, 3);
+    rankMinutes = Math.round(clamp(cfg.rankMinutes * factor, 2, Math.max(20, cfg.rankMinutes * 3)));
+    rankWhy = `champion d${conf.depth} margin ±${Math.round(conf.margin)} → ${factor.toFixed(2)}×`;
+  }
+
+  let refreshFrac = cfg.refreshCycle, refreshWhy = 'baseline';
+  if (cfg.refreshCycle > 0) {
+    // 2.2× right after a promotion (cyclesSincePromo 0), tapering ~0.3×/cycle to a 0.7× floor.
+    const factor = clamp(2.2 - 0.3 * cyclesSincePromo, 0.7, 2.5);
+    refreshFrac = clamp(cfg.refreshCycle * factor, cfg.refreshCycle * 0.5, Math.min(0.05, cfg.refreshCycle * 3));
+    refreshWhy = `${cyclesSincePromo} cycle(s) since promo → ${factor.toFixed(2)}×`;
+  }
+  return {
+    rankMinutes, refreshFrac,
+    notes: `rank ${rankMinutes}m (${rankWhy}); refresh ${(refreshFrac * 100).toFixed(1)}% (${refreshWhy})`,
+  };
 }
 
 // Fold the gate's harvested games (in the temp file) into the dataset. The match runner
@@ -688,12 +757,14 @@ function runRankPool(label, opts = {}) {
     }).join(', ')}`);
   }
   if (calib) log(`  Calibrating champion ${calib} across all depths (+${cfg.calibrateMinutes}m, onboard floor fills its 0-game depth nodes).`);
+  // Base play budget: the adaptive per-cycle value when given (opts.minutes), else the fixed knob.
+  const baseMinutes = opts.minutes ?? cfg.rankMinutes;
   // With harvesting on (default), rank:pool appends its games to its archive (ladderGames); we
   // then fold everything past the persistent mark into the dataset — the loop's own rank games
   // AND any a standalone rank:pool added between cycles. With --no-harvest, suppress the archive
   // too (--no-save-games), consistent with the gate.
   run(label, process.execPath,
-    [rankScript, '--corpus', `--minutes=${cfg.rankMinutes + (calib ? cfg.calibrateMinutes : 0)}`,
+    [rankScript, '--corpus', `--minutes=${baseMinutes + (calib ? cfg.calibrateMinutes : 0)}`,
       `--anchor-depth=${cfg.rankDepth}`,
       ...(playSet ? [`--play=${playSet}`] : []),
       ...(calib ? ['--onboard=1'] : []), // fill the champion's under-played depths before the ordering objective
@@ -899,7 +970,7 @@ log(`train:loop start — ${cfg.batch === 0
   + `${existsSync(lineage) ? ' (resuming lineage)' : ''} | `
   + `refresh/cycle ${cfg.refreshCycle > 0 ? `${(cfg.refreshCycle * 100).toFixed(1)}% @ depth ${cfg.refreshCycleDepth}` : 'off'} | `
   + `refresh on promotion ${cfg.refreshFrac > 0 ? `${(cfg.refreshFrac * 100).toFixed(0)}% @ depth ${cfg.refreshDepth}` : 'off'} | `
-  + `rank ${cfg.rank ? `full pool every cycle (hc${cfg.rankDepth} pin, all depths, corpus + ${cfg.rankMinutes}m play)` : 'off'} | `
+  + `rank ${cfg.rank ? `full pool every cycle (hc${cfg.rankDepth} pin, all depths, corpus + ${cfg.rankMinutes}m play${cfg.adaptive ? ', adaptive' : ''})` : 'off'} | `
   + `cycles ${cfg.cycles === Infinity ? '∞' : cfg.cycles}`);
 log('Pause/resume from another terminal: `npm run train:pause` / `npm run train:resume` (frees all CPU, no work lost).');
 
@@ -912,8 +983,13 @@ const jobArg = cfg.jobs !== undefined ? [`--jobs=${cfg.jobs}`] : [];
 
 const loopT0 = Date.now();
 let promotions = 0;
+// Cycles since the champion last changed (reset to 0 on promotion). Drives the adaptive refresh
+// fraction — the whole dataset's `v` targets are stalest right after a promotion. Starts at 0 so
+// the first cycles treat the loaded champion's inherited labels as worth refreshing.
+let cyclesSincePromo = 0;
 for (let c = 1; c <= cfg.cycles && !stopping; c++) {
   const cycleT0 = Date.now();
+  cyclesSincePromo++;
   const dataset = existsSync(rawFile) ? ` — dataset ${fmtMB(statSync(rawFile).size)}` : '';
   banner(`CYCLE ${c}${cfg.cycles === Infinity ? '' : `/${cfg.cycles}`}${dataset}`);
   // --cold trains from random init on the FIRST cycle only: bootstrap a fresh net once,
@@ -1051,6 +1127,7 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
     copyFileSync(candidate, champion);      // candidate becomes champion
     const champHash = archiveChampion(champion); // keep it reconstructable by its vs version
     promotedChampHash = champHash;               // calibrate this champion's depths at end-of-cycle rank
+    cyclesSincePromo = 0;                        // champion (hence every `v` target) just changed — refresh more
     if (existsSync(lineage)) rmSync(lineage); // lineage cleared the gate; next start = new champion
     // Publish the new champion into the catalog under its own human name right away, flagged
     // the current champion (so the app shows a real name during its reign, not a generic id).
@@ -1120,7 +1197,13 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
   // cycle so this cycle's own weakest-first refresh (the last step, just below) reads a
   // current ledger. Maintenance: a failure logs but doesn't abort the run (Ctrl-C still ends
   // it via the `stopping` flag).
-  if (!stopping) runRankPool('Rank pool (Bradley-Terry, corpus + scheduled play)', { calibrateChamp: promotedChampHash });
+  // Size this cycle's maintenance budget (rank-minutes + refresh fraction) from the current
+  // signals, bounded around the configured values (see adaptiveMaintenance). Computed once here so
+  // the rank pass and the refresh below use one consistent, logged decision.
+  const budget = adaptiveMaintenance(cyclesSincePromo);
+  if (budget.notes) log(`  Adaptive maintenance: ${budget.notes}.`);
+  if (!stopping) runRankPool('Rank pool (Bradley-Terry, corpus + scheduled play)',
+    { calibrateChamp: promotedChampHash, minutes: budget.rankMinutes });
 
   // Per-cycle value refresh — the LAST step of the cycle. Re-label a small slice of the
   // dataset with the current champion (most records carry `v` from older champions or
@@ -1134,8 +1217,8 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
   // Seeded per cycle so coverage spreads across the set. Maintenance: don't start a long
   // refresh if we're already stopping.
   if (cfg.refreshCycle > 0 && !stopping) {
-    run(`Refresh v (${(cfg.refreshCycle * 100).toFixed(1)}% ${refreshMode()} @ depth ${cfg.refreshCycleDepth})`,
-      process.execPath, refreshArgs(cfg.refreshCycle, cfg.refreshCycleDepth));
+    run(`Refresh v (${(budget.refreshFrac * 100).toFixed(1)}% ${refreshMode()} @ depth ${cfg.refreshCycleDepth})`,
+      process.execPath, refreshArgs(budget.refreshFrac, cfg.refreshCycleDepth));
   }
 }
 
