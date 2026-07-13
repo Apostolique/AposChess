@@ -409,9 +409,9 @@ const cfg = {
   // refresh"; only records the current champion already labeled at this depth are no-ops.
   refreshCycle: args['no-refresh'] ? 0 : num(args['refresh-cycle'], 1),
   refreshCycleDepth: num(args['refresh-cycle-depth'], num(args.depth, 8)),
-  // Engine ranking for smart weakest-first v refresh. On by default, now driven by the
-  // self-relative Bradley-Terry POOL (rank:pool / depth-ladder.mjs), not the old anchor
-  // gauntlet. EVERY cycle the loop refits the pool: it folds the whole dataset's harvested
+  // Engine ranking for smart weakest-first v refresh. On by default, driven by the
+  // self-relative Bradley-Terry POOL (rank:pool / depth-ladder.mjs).
+  // EVERY cycle the loop refits the pool: it folds the whole dataset's harvested
   // games into the fit (--corpus — so the new champion is rated automatically from its gate
   // matches, no dedicated gauntlet) and plays a short --rank-minutes budget of the most-
   // ambiguous matchups to tighten ratings. The refreshes below read the resulting parallel

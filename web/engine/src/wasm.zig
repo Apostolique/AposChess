@@ -85,7 +85,8 @@ export fn setEval(kind: u32) void {
 }
 
 /// Parse the weights JSON in [ptr, ptr+len) and make it the active net. Returns 1 on
-/// success, 0 on parse/load failure (the eval then stays on its material fallback).
+/// success, 0 on parse/load failure (net stays null; an nn search then traps —
+/// deliberate, so a missing-weights bug surfaces instead of degrading silently).
 export fn loadWeights(ptr: [*]const u8, len: usize) u32 {
     const parsed = std.json.parseFromSlice(std.json.Value, gpa, ptr[0..len], .{}) catch return 0;
     defer parsed.deinit();

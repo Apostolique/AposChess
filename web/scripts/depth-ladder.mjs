@@ -3,14 +3,12 @@
 //
 // Self-relative engine ranking — ONE Bradley-Terry / BayesElo rating pool (no modes).
 //
-// The old anchor-gauntlet approach (since retired) measured every engine against ONE fixed reference.
-// That floors the far end of a wide range: a contender >~400 Elo from the anchor scores
-// ~0%/100%, which carries no information no matter how many games you play (and the champions
-// are now far above the hc anchor, so the gauntlet saturates). The fix: stop measuring against
-// a fixed point — let engines play EACH OTHER near their own strength, then recover all ratings
-// with one joint fit. Every node only ever plays near-strength opponents (scores stay in the
-// informative 30-70% band), and the whole range is stitched onto one scale by transitivity. As
-// games accumulate, EVERY rating tightens.
+// Measuring every engine against one fixed reference floors the far end of a wide range: a
+// contender >~400 Elo from the anchor scores ~0%/100%, which carries no information no matter
+// how many games you play. So engines play EACH OTHER near their own strength and one joint
+// fit recovers all ratings: every node only plays near-strength opponents (scores stay in the
+// informative 30-70% band), the whole range is stitched onto one scale by transitivity, and as
+// games accumulate EVERY rating tightens.
 //
 // A node is an (engine, depth) pair: apos-match plays one weights file against another (or
 // itself) via --depth/--depth-b. hc<anchor-depth> (hc6) is ALWAYS a node and is the pin
@@ -408,8 +406,7 @@ function fit() {
   // self-anchor + Σ_j N_ij·p_ij(1−p_ij), H_ij = −N_ij·p_ij(1−p_ij). The prior on the diagonal
   // makes H positive-definite (invertible) even on a sparse/tree graph, so we can read off the
   // variance of ANY rating contrast — exactly what the active scheduler needs to find the
-  // least-resolved ordering. (The old diagonal-only approximation ignored correlations.)
-  const n = ids.length;
+  // least-resolved ordering.  const n = ids.length;
   const pos = new Map(ids.map((id, k) => [id, k]));
   const H = Array.from({ length: n }, () => new Float64Array(n));
   for (let k = 0; k < n; k++) H[k][k] = cfg.prior * 0.25; // phantom self-anchor (p(1−p)=0.25 at parity)
@@ -523,9 +520,8 @@ function buildEngine() {
 }
 // Stop request via a stop-file (loop/ladder-stop) that apos-match polls ~1×/s. On seeing it,
 // the match stops RIGHT AWAY: it writes its result + harvest from the games already COMPLETED
-// and exits 0, abandoning the games still in flight. So the finished games are RECORDED (no
-// more round-multiple-of-100 counts) while the stop is near-instant. The old behavior killed
-// the child outright, discarding the whole matchup. The file is cleared at startup and on exit.
+// and exits 0, abandoning the games still in flight — finished games are recorded, the stop is
+// near-instant. The file is cleared at startup and on exit.
 const stopFile = join(loopDir, 'ladder-stop');
 function requestMatchStop() { try { writeFileSync(stopFile, ''); } catch { /* best effort */ } }
 

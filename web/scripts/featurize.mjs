@@ -24,7 +24,7 @@
 // only the appended tail is featurized and appended. Anything else (refresh-v rewrites, a
 // feature-set/quiet/cap change, an interrupted append) falls back to the full pass.
 //
-// --cap=N folds in the old dedup-cap: count-cap how many times any single training input
+// --cap=N: count-cap how many times any single training input
 // (canonical feature set) appears, to undo the heavy duplication of common positions (the
 // start position occurs once per game). It needs a global count, so it forces a full
 // TWO-pass run (count, then Bernoulli-thin to ~cap copies preserving the win/draw/loss
@@ -214,7 +214,7 @@ function* positionsOf(rec) {
 
 // 64-bit key over the sorted feature indices (for --cap counting), so the count map holds
 // compact keys instead of full feature lists. Collisions across a few million keys are
-// negligible. (Same hashing the old dedup-cap used.)
+// negligible.
 function keyOfF(f) {
   const s = f.slice().sort((a, b) => a - b);
   let h = 0x811c9dc5 >>> 0, g = 0x9e3779b1 >>> 0;

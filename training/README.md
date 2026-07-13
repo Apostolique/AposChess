@@ -81,39 +81,41 @@ roll back by hand). `npm run train:loop` automates the **safe** version — gate
 expert-iteration that can run all day and **never regresses**:
 
 ```
-npm run train:loop -- --batch=200 --depth=6 --lambda=0.5
+npm run train:loop -- --lambda=0.5
 ```
 
-Each cycle: generate games with the **champion** (deep search → better labels) →
-featurize (incremental — only the new games) → train a **candidate** (same shape as
-the champion, **warm-started from the champion's weights** so it fine-tunes on the
-grown dataset in a few epochs; `--cold` restores from-scratch training) → play
-**candidate vs champion** as an SPRT → **promote the candidate only if it wins**
-(accepts H1). Otherwise the champion is kept. So the champion only ever moves uphill.
-On promotion it can also **refresh the value targets** (`--refresh-frac`, below), and
-every cycle it refreshes a small slice regardless (`--refresh-cycle`, below).
+Each cycle: gather fresh data (by default `--batch=0` — the gate harvest plus the
+ranked pool's strong-engine play at depth 8 are the generators; set `--batch=N` to add
+a dedicated champion self-play batch at `--depth`, default 8) → featurize (incremental
+— only the new games) → train a **candidate** (**warm-started** from its track's
+lineage/best or the champion so it fine-tunes in a few epochs; `--cold` restores
+from-scratch training) → play **candidate vs champion** as an SPRT → **promote the
+candidate only if it wins** (accepts H1). Otherwise the champion is kept. So the
+champion only ever moves uphill. Every cycle it also refreshes the weakest value
+labels (`--refresh-cycle`, below), and on promotion it can run a bigger refresh
+(`--refresh-frac`, below).
 
 **Candidate lineage (sub-threshold gains accumulate).** A mature champion's real
 per-cycle gains are often +10-ish Elo — genuinely positive but below what the SPRT can
 certify, so cycle after cycle would train a slightly-better candidate and throw it
 away, then re-derive roughly the same candidate from the same champion on a dataset
 that grew only ~2%. Instead, when the gate is **inconclusive but the candidate scored
-≥ 50%**, the candidate is kept (`loop/lineage.json`) and the next cycle's candidate
-warm-starts **from it** rather than from the champion — so those small gains compound
-across cycles until the lineage clears the gate in one decided match. The champion
-stays protected (only an H1 promotes); a candidate that scores < 50% (or a decided H0)
-resets the lineage back to the champion. The lineage survives a `Ctrl-C` restart and
-is discarded automatically on `--cold` or a `--hidden` shape change.
+≥ 50%**, the candidate is kept as the recipe's **lineage** (per experiment track —
+see "Experiment tracks" below) and the next cycle's candidate warm-starts **from it**
+rather than from the champion — so those small gains compound across cycles until the
+lineage clears the gate in one decided match. The champion stays protected (only an
+H1 promotes); a candidate that scores < 50% (or a decided H0) resets the lineage. The
+lineage survives a `Ctrl-C` restart, and switching `--hidden` just switches to that
+shape's own track (the previous shape's lineage is preserved and resumes later).
 
 The gate's games are themselves **harvested into the dataset** (`--no-harvest` to
 disable): up to `--gate-games` per cycle — comparable volume to generation, already
 paid for. Each position keeps the search value `v` from the engine that actually
 searched it (the mover), tagged with that engine×depth provenance — so the dataset's
 own machinery (merge dedup prefers the stronger engine, `v`-refresh relabels the
-weakest cohort first) judges label quality, not who won the game. Note gate games are played at
-`--gate-depth` (shallower labels than generation's `--depth`), which is why
-harvesting supplements generation rather than replacing it — generation stays the
-deep-label anchor and guarantees fixed data volume even when the SPRT stops early.
+weakest cohort first) judges label quality, not who won the game. Gate games are
+played at `--gate-depth` (default 6); the deep-label anchor is the ranked pool's
+strong-engine play at depth 8 (plus `--batch` generation when enabled).
 
 - The champion is `web/src/nn-weights.json`. On each promotion it's also published to
   the catalog under its **own human name** (Ada, Boris, …) and flagged the current
@@ -137,7 +139,8 @@ deep-label anchor and guarantees fixed data volume even when the SPRT stops earl
   generation and gate the dataset as it stands — resume after a Ctrl-C mid-generation
   without regenerating; completed games were already flushed), `--no-harvest` (don't
   save gate games into the dataset), `--refresh-cycle` / `--refresh-cycle-depth`
-  (per-cycle value refresh, default 1% at the generation depth) and `--refresh-frac` /
+  (per-cycle value refresh — in ledger mode it drains the weakest label cohort under a
+  10-minute budget) and `--refresh-frac` /
   `--refresh-depth` (on-promotion refresh — see "Dataset maintenance"), `--no-refresh`
   (skip both refreshes for the fastest cycles, at the cost of staler `v` targets),
   `--jobs`.
@@ -224,12 +227,11 @@ head-to-head; the registry just makes the exploration non-destructive.
 ## Dataset maintenance
 
 The dataset is the substrate the loop learns from, so it's worth **maintaining**, not
-just appending to. Each record is `{fen, r, g, v}`: the result `r` is the actual game
-outcome and **never goes stale**, but the value `v` is the champion's search value *at
-the time it was recorded* — a weaker net's opinion that drifts out of date as the
-champion improves. Two maintenance passes keep the data healthy; both rewrite
-`selfplay.jsonl` in place (atomic), so **re-featurize afterward** (`npm run
-train:featurize`).
+just appending to. Each game record's result `r` is the actual outcome and **never
+goes stale**, but the per-position values `v` are the champion's search values *at
+the time they were recorded* — a weaker net's opinion that drifts out of date as the
+champion improves. `refresh-v` rewrites `selfplay.jsonl` in place (atomic), so
+**re-featurize afterward** (`npm run train:featurize`).
 
 ### Refreshing `v` (value iteration) — `refresh-v.mjs`
 
@@ -246,7 +248,7 @@ the current champion already labeled at the same depth are true no-ops.
 # fill v only where it's missing (e.g. legacy/opening records):
 node scripts/refresh-v.mjs
 # refresh a random 20% of existing v with the current champion (parallel, seeded):
-node scripts/refresh-v.mjs --refresh --frac=0.2 --depth=3
+node scripts/refresh-v.mjs --refresh --frac=0.2 --depth=6
 ```
 
 **Partial (`--frac`) is the right default.** A full refresh of millions of positions is
@@ -255,26 +257,22 @@ hours; refreshing a fraction `P` each time amortizes that cost and keeps the *av
 synchronized all-stale→all-fresh lurch. (Pure-random `P` has a coupon-collector tail; a
 future champion-version stamp would enable exact oldest-first coverage.)
 
-**Wired into the loop, two ways.** `train:loop --refresh-cycle=P` (default **0.01**)
-refreshes a small slice **every cycle** between generation and featurize, at
-`--refresh-cycle-depth` (default = the generation `--depth`, so re-labels match the
-deep-label anchor) — the steady drip that keeps average staleness bounded. Rule of
-thumb: 1% of a ~2.5M-position set at depth 6 costs about as much as generating a
-200-game batch. Separately, `--refresh-frac=P` runs a bigger pass **after each
-promotion** (using the just-promoted champion) at `--refresh-depth` (default **3** —
-cheap, like the backfilled majority; a depth-6 refresh of a large fraction is many
-hours). Both seed the slice differently each run, so successive refreshes cover
-different parts of the set. Typical:
+**Wired into the loop, two ways.** `train:loop --refresh-cycle=P` (default **1**)
+refreshes **every cycle** between generation and featurize, at `--refresh-cycle-depth`
+(default = the generation `--depth`). In ledger mode (the loop's default) refresh-v
+restricts itself to the **weakest label cohort** under a 10-minute wall-clock budget,
+so `P=1` just drains the weakest labels first; the adaptive maintenance budget scales
+the effective fraction per cycle. Separately, `--refresh-frac=P` (default 0 = off)
+runs a bigger pass **after each promotion** (using the just-promoted champion) at
+`--refresh-depth` (default **8**, matching generation — a big fraction at depth 8 is
+many hours). Both seed the slice differently each run, so successive refreshes cover
+different parts of the set.
 
-```
-npm run train:loop -- --batch=200 --depth=6 --lambda=0.5 --refresh-frac=0.2
-```
-
-### Capping duplicate positions (de-bias) — `dedup-cap.mjs`
+### Capping duplicate positions (de-bias) — `featurize --cap=N`
 
 Common positions are wildly over-represented: the **start position occurs once per
 game** (tens of thousands of times), so the net sees the opening orders of magnitude
-more than any midgame position. `dedup-cap` caps how many copies of any single
+more than any midgame position. `featurize --cap=N` caps how many copies of any single
 *training input* (canonical feature set `f`, what the net actually sees) survive, by
 **Bernoulli thinning** (keep each copy with probability `cap/count`) — which preserves
 the win/draw/loss ratio across the copies rather than collapsing them to one (the same
@@ -282,10 +280,10 @@ position carries different `r` across games, and averaging those is how the net 
 its value).
 
 ```
-node scripts/dedup-cap.mjs --cap=64 --dry-run   # preview the reduction
-node scripts/dedup-cap.mjs --cap=64             # apply (atomic), then re-featurize
+npm run train:featurize -- --cap=64
 ```
 
+It needs a global count, so it forces a full two-pass featurize (no incremental path).
 In practice the dataset is mostly unique (the duplication is concentrated in a handful
 of opening positions), so this removes only a couple percent by volume — but it cuts the
 start position's training weight from tens-of-thousands× down to ~`cap`, which is the
@@ -407,19 +405,20 @@ best-provenance `v` (see `docs/tools.md`).
 
 ## How it fits together
 
-- **Position-primary data.** `npm run train:gen` writes the **raw** dataset
-  `selfplay.jsonl` = `{fen, r, g, v}` — board position, result (side-to-move view), game
-  id, and the search value `v` of the position (cp, side-to-move-relative) for TD
-  targets. `v` is recorded for **every** position, openings included: the opening move
-  is random (for variety), but the position is still searched for its value, so the TD
-  target is uniform across the dataset. A separate step turns positions into net inputs:
+- **Game-primary data.** `npm run train:gen` appends to the **raw** dataset
+  `selfplay.jsonl` — one record per **game** (`web/scripts/gameRecord.mjs`): the move
+  list, who played, the result, and a per-position search value `v` (cp,
+  side-to-move-relative) for TD targets. `v` is recorded for **every** position,
+  openings included: the opening move is random (for variety), but the position is
+  still searched for its value, so the TD target is uniform across the dataset. A
+  separate step replays each game into positions and turns them into net inputs:
   `npm run train:featurize` applies the **current** `featureIndices` and writes
   `selfplay.features.jsonl` = `{f, r, g, v}`, which the trainer reads (`v` carried
-  through unchanged; positions that genuinely lack one fall back to the pure result). So
-  changing the
-  feature set is a quick `featurize` pass, never a self-play regen — and the trainer
-  still needs no chess logic (it only sees `f`). Run order: `train:gen` →
-  `train:featurize` → `train:fit` (the full `npm run train` does all three).
+  through unchanged; positions that genuinely lack one fall back to the pure result).
+  So changing the feature set is a quick `featurize` pass, never a self-play regen —
+  and the trainer still needs no chess logic (it only sees `f`). Run order:
+  `train:gen` → `train:featurize` → `train:fit` (the full `npm run train` does all
+  three).
 - **Feature definition is single-sourced** in `web/src/nn.js` (`featureIndices`):
   12 piece-kinds × 64 squares (768 inputs) in canonical side-to-move orientation (no
   separate side-to-move bit — the board is flipped for Black). `featurize` takes each
@@ -448,18 +447,16 @@ best-provenance `v` (see `docs/tools.md`).
 
 ## Notes / future work
 
-- If a net's weights fail to load (or none is selected), the NN engine falls back to
-  a material-only eval so it always plays. `loadWeights` also refuses a file whose
-  input size doesn't match the current `featureIndices` layout (so an old net after a
-  feature change can't silently produce garbage) — re-featurize and re-train.
-- For real NNUE speed, the first-layer accumulator could be updated incrementally
-  through `applyMove` (currently pure-functional); recomputing from scratch is fine
-  to start, but watch the fixed-time matches.
-- **Strength is currently signal-limited, not capacity-limited.** Adding width,
-  depth, or features tends to *overfit* the game-result-only target (measured: a
-  64-wide net is at parity with handcrafted; wider and king-relative-feature variants
-  both lost Elo). The unbiased lever is better *labels*, not a bigger net: generate
-  with deeper search (`--depth`), bootstrap from the net's own play (`--eval=nn`), and
-  blend the net's **own search value** into the target via `--lambda` (TD targets,
-  above) — that densifies the signal without the handcrafted bias. Blending the
-  *handcrafted* eval would reintroduce that bias, so it's deliberately avoided.
+- In the **Node tools**, a net with no weights falls back to a material-only eval so
+  it can play (it's also the ranking pool's floor engine); `loadWeights` refuses a
+  file whose input size doesn't match the current `featureIndices` layout (so an old
+  net after a feature change can't silently produce garbage) — re-featurize and
+  re-train. The **browser app** deliberately has no such fallback: a failed weights
+  fetch throws, so caller bugs surface instead of degrading silently.
+- **Labels first, capacity second.** The unbiased levers are better *labels*: deeper
+  search, bootstrapping from the net's own play (`--eval=nn`), and blending the net's
+  own search value into the target via `--lambda` (blending the *handcrafted* eval
+  would reintroduce its bias, so it's deliberately avoided). Capacity pays only once
+  labels are good — early width/feature additions overfit and lost Elo, while a
+  larger architecture later won through the gated loop on matured labels. Gate every
+  capacity change head-to-head; never judge by validation loss.

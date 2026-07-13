@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2019-2026 Jean-David Moisan
 #
-# Trainer for the AposChess neural-net evaluation. Reads the self-play data
-# produced by web/scripts/gen-selfplay.mjs (JSONL: {"f":[feature indices],"r":
-# result,"g":game id}) and fits a small MLP, then writes the weights to
+# Trainer for the AposChess neural-net evaluation. Reads the featurized self-play
+# data from web/scripts/featurize.mjs (JSONL: {"f":[feature indices],"r":result,
+# "g":game id,"v":search value}) and fits a small MLP, then writes the weights to
 # web/src/nn-weights.json in the exact layout web/src/nn.js expects.
 #
 # The train/val split is by GAME ("g"), not by position: every position in a game
@@ -165,8 +165,8 @@ def load_data(path, np):
     int32 matrix padded with a dedicated padding index (= num_features, filled in
     by the caller); the model's EmbeddingBag uses padding_idx so the padding
     contributes exactly zero. A whole batch is then a single tensor indexing op
-    instead of a pure-Python packing loop — the old per-batch make_batch loop
-    dominated CPU training time on a millions-of-rows dataset.
+    instead of a pure-Python packing loop, which would dominate CPU training time
+    on a millions-of-rows dataset.
     """
     if not os.path.exists(path):
         sys.exit(f"No training data at {path}. Generate raw positions, then featurize:\n"
@@ -449,9 +449,7 @@ def main():
     mat_t = torch.from_numpy(mat).to(device)
     targets_t = torch.from_numpy(blended).to(device)
 
-    # AdamW so --wd is decoupled weight decay (with wd=0 this is identical to the
-    # previous plain Adam). Weight decay is the regularizer the 2026-06 capacity
-    # experiments lacked — see docs/first-layer-strategy.md.
+    # AdamW so --wd is decoupled weight decay (wd=0 == plain Adam).
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
     loss_fn = nn.MSELoss()
     print(f"Training on {device}: {len(train_idx):,} train / {n_val:,} val, "

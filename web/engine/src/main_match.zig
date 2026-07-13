@@ -237,8 +237,7 @@ fn searchBudget(s: *ai.Searcher, st: *const State, b: Budget, seen: []const u64,
 
 // Build a random opening as a MOVE SEQUENCE from the standard start. Returned (not applied)
 // so both color-reversed games of a pair replay the identical line. If a random ply ends the
-// game, the whole opening is abandoned (len 0) and the pair plays from the standard start —
-// mirroring the old fast-forward behavior, which discarded such openings.
+// game, the whole opening is abandoned (len 0) and the pair plays from the standard start.
 fn randomOpening(rng: std.Random, plies: u32) Opening {
     var op = Opening{};
     var st = board.newGameState();

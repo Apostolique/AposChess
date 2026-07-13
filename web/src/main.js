@@ -132,8 +132,7 @@ let importedNames = null;
 
 // --- tree navigation & path helpers ---
 // Root→node path (inclusive). Repetition and "the positions before this one" are
-// inherently per-line, and a line is exactly the path from the root to a node — so
-// these replace the old `repFens` array that was lock-stepped with a flat history.
+// inherently per-line, and a line is exactly the path from the root to a node.
 function pathTo(node) {
   const out = [];
   for (let n = node; n; n = n.parent) out.push(n);
@@ -171,7 +170,7 @@ function cloneTree(root) {
 // the given position `s`) can recur, so the engine's lookup set stays tiny. Older
 // positions can never match (material/pawns differ), so dropping them changes nothing
 // but speed. `s` may be a hypothetical position one move past the tip (a ponder state),
-// which isn't itself in the path — same approximation as the old flat-array version.
+// which isn't itself in the path — a deliberate approximation.
 const repWindow = (s) => pathFens(liveNode).slice(-(s.halfmove + 1));
 
 // Board-editor mode: which side is to move once you leave the editor. The edited

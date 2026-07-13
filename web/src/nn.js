@@ -35,22 +35,15 @@
 // encoded by the orientation itself, so there is no separate STM bit.
 const PIECE_INDEX = { p: 0, n: 1, b: 2, r: 3, q: 4, k: 5 };
 // One piece-square block: 12 piece-kinds (6 roles × 2 sides) × 64 squares, in
-// canonical side-to-move orientation. Exported so tools (refeaturize) can identify
+// canonical side-to-move orientation. Exported so tools (featurize) can identify
 // the plain block when reconstructing a board from feature indices, and so the
 // multi-block king-relative layout below can be sized off it.
 export const PIECE_SQUARE_FEATURES = 12 * 64; // 768
 
-// King-relative ("HalfK-quadrant") blocks (OFF by default — KING_BUCKETS = 0): every
-// piece is ALSO indexed by the side-to-move king's board quadrant, so the net can
-// value a piece by its relation to the (safety-zone-bearing) king. This is ADDITIVE —
-// the plain block stays active as the king-independent shared factor, which is
-// training-equivalent to Stockfish-style feature factorization with the plain feature
-// as the virtual one. Tried 2026-06-09 (outcome-only data) AND re-tried 2026-06-13 on
-// the denser λ-blended 3.74M-position signal with a weight-decay sweep: it lost ~33
-// Elo cold-vs-cold (king features OFF won), so king safety appears to be low-signal in
-// this variant — the net learns the variant's values fine from the plain block alone.
-// Scaffolding kept, dormant and verified, behind this switch for future feature work;
-// set KING_BUCKETS = 4 (and re-featurize) to revisit. See first-layer-strategy memo.
+// King-relative ("HalfK-quadrant") blocks, OFF by default: every piece is ALSO indexed
+// by the side-to-move king's board quadrant, additively on top of the always-active
+// plain block. Measured to lose Elo (king safety is low-signal in this variant — see
+// docs/first-layer-strategy.md); set KING_BUCKETS = 4 (and re-featurize) to revisit.
 const KING_BUCKETS = 0;
 export const NUM_FEATURES = PIECE_SQUARE_FEATURES * (1 + KING_BUCKETS); // 768
 

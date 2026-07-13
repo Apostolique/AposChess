@@ -3,9 +3,8 @@
 //
 // Game-primary self-play record: the shared boundary every offline tool reads/writes.
 //
-// One JSONL line per GAME (not per position) — far smaller than the old position-primary
-// {fen,r,g,v,vs} (a ~60 B FEN repeated every ply) and it records WHO PLAYED, not only who
-// labeled each position:
+// One JSONL line per GAME (not per position) — far smaller than one line per ply (no ~60 B
+// FEN repeated every position) and it records WHO PLAYED, not only who labeled each position:
 //
 //   { "g":"m5l-27",
 //     "players":{"w":"nn8@a14d52","b":"nn8@a14d52"},  // engine×depth vtag per colour

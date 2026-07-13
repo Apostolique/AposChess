@@ -75,3 +75,18 @@ regenerated, when the champion net changes.
 - **Not done**: bitboard move generation (a large rewrite; the parity harness would make it
   safe), and the representational HalfKP feature set (two-perspective *concat* + king-square
   indexing) — deferred, since the prior king-feature experiment regressed.
+
+## Zig 0.16 API notes
+
+Pre-1.0 stdlib churn; the patterns this codebase relies on:
+
+- **Entry point:** `pub fn main(init: std.process.Init)` — gives `init.gpa`, `init.io`, and
+  args via `init.minimal.args.toSlice(arena)` (no `argsAlloc`). Otherwise build an `Io` with
+  `var t: std.Io.Threaded = .init(gpa, .{}); const io = t.io();`.
+- **Filesystem:** `std.Io.Dir` (not `std.fs`) — `std.Io.Dir.cwd()`,
+  `readFileAlloc(io, path, gpa, .unlimited)`, `writeFile(io, .{ .sub_path, .data })`.
+- **Time:** `std.Io.Clock.now(.awake, io).nanoseconds` (no `std.time.milliTimestamp`/`Timer`).
+- **Threads:** `std.Thread.spawn(.{}, fn, args)` works; mutex is `std.Io.Mutex` (takes `io`;
+  `lockUncancelable(io)` / `unlock(io)`).
+- **Build:** `b.addExecutable(.{ .root_module = b.createModule(.{ ... }) })`.
+- **Misc:** array fill via `@splat`; `ArrayList` is unmanaged (`.empty`, `append(alloc, x)`).
