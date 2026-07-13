@@ -22,7 +22,9 @@
 // Usage (run from web/):
 //   npm run train:loop -- [options]
 // Options:
-//   --batch=N       games generated per cycle (default 200)
+//   --batch=N       dedicated champion self-play games per cycle (default 0 = none; the
+//                   ranked pool's strong --play games are the generator). Set N>0 to add a
+//                   deep champion self-play batch on top.
 //   --depth=D       search depth while generating (default 8 — deeper = better labels)
 //   --openings=K    forwarded to gen: starting plies to vary (default: gen's 8)
 //   --opening-topk=N  forwarded to gen: 0 (default) = uniform-random openings; N>=1
@@ -122,6 +124,12 @@
 //                   regardless of their values — shorthand for --refresh-cycle=0 with no
 //                   promotion refresh, for when you want the fastest possible cycles and
 //                   accept the staler `v` targets
+//   --calibrate-minutes=M  after a PROMOTION, extend that cycle's rank pass by M minutes
+//                   (default 10) with the new champion schedulable at EVERY depth, so the pool's
+//                   onboard floor rates its 0-game depth bands instead of leaving them at the
+//                   placeholder floor (the "best across depths" absElo the loop steers by then
+//                   rests on real games at each depth, not just the gate/play depths).
+//   --no-calibrate  disable that post-promotion depth calibration (M=0).
 //   --float / --no-quant  train a NON-quantized (float) candidate instead of the default
 //                   quantized one. Quant is a recipe knob, so this forks a distinct track.
 //   --scale=S / --lr=L / --wd=W  forwarded to train.py (else its own defaults). Each is part
@@ -341,7 +349,12 @@ const num = (v, d) => (v === undefined ? d : Number(v));
 const effJobs = args.jobs !== undefined ? Number(args.jobs) : cpus().length;
 const defaultRankGames = Math.max(2, Math.ceil(effJobs / 2) * 2);
 const cfg = {
-  batch: num(args.batch, 200),
+  // Dedicated champion self-play generation per cycle. Defaults to 0: the ranked pool's strong
+  // --play games (cfg.playStrong, auto-on when batch is 0) are the generator, so a bare
+  // `npm run train:loop` needs no --batch. Set --batch=N to add a deep champion self-play batch
+  // on top (then --play-strong to keep the pool generating too). --skip-gen still gates an
+  // already-flushed dataset on cycle 1 without generating.
+  batch: num(args.batch, 0),
   // Self-play GENERATION depth — the deep label anchor (each generated position's value
   // target is its search value at this depth). Raised 6 -> 8 (2026-06-27): deeper labels
   // are the NN's real lever (first-layer width is a dead end — docs/first-layer-strategy.md),
@@ -404,6 +417,13 @@ const cfg = {
   // corpus already rates the champion from its gate games and the store accumulates across
   // cycles — each cycle just tightens the most-ambiguous orderings.
   rankMinutes: num(args['rank-minutes'], 5),
+  // After a PROMOTION, extend that cycle's rank pass by this many minutes with the NEW champion
+  // schedulable at EVERY depth (a bare-hash --play spec), so the ladder's onboard floor anchors
+  // its 0-game depth nodes to the scale. Without it a fresh champion is rated only at the depths
+  // it actually played — the gate depth and the strong-play depth — leaving its ledger Elo at the
+  // placeholder floor for every other depth, so the "best across depths" absElo the loop steers by
+  // (see loop-progress) rests on one or two thin bands. 0 / --no-calibrate disables it.
+  calibrateMinutes: args['no-calibrate'] ? 0 : num(args['calibrate-minutes'], 10),
   // Games per scheduled pool matchup. Defaults to ONE PARALLEL WAVE (the --jobs count, rounded
   // up to even): fewer games than workers leaves cores idle for the whole matchup, while a big
   // batch would blow far past --rank-minutes (the budget is only checked BETWEEN matchups — a
@@ -424,7 +444,7 @@ const cfg = {
   // --batch=0; --play-strong / --no-play-strong force it; --rank-play=SPEC pins the play set by
   // hand (goes stale on promotion — prefer the auto set for an unattended loop). See docs.
   playStrong: args['no-play-strong'] ? false
-    : (args['play-strong'] !== undefined ? !!args['play-strong'] : num(args.batch, 200) === 0),
+    : (args['play-strong'] !== undefined ? !!args['play-strong'] : num(args.batch, 0) === 0),
   playDepth: num(args['play-depth'], num(args.depth, 8)),
   playTop: num(args['play-top'], 8), // cap the strong set so the round-robin stays fast
   rankPlay: typeof args['rank-play'] === 'string' ? args['rank-play'] : null,
@@ -645,13 +665,19 @@ function run(label, cmd, argv, cwd = webDir) {
 //   persists every game into the store so ratings tighten cumulatively across cycles.
 // The fitted ledger (engine-elo.ladder.json) is what the weakest-first refreshes read.
 // Maintenance, like the refreshes — a failure logs but doesn't stop the loop.
-function runRankPool(label) {
+function runRankPool(label, opts = {}) {
   if (!cfg.rank) return;
   // When the ranked pool is the generator (cfg.playStrong), restrict --play to the strongest nn
   // engines at cfg.playDepth so this step's harvested games are deep, strong training data (the
   // whole pool is still RATED from the corpus + store — --play only bounds which nodes play NEW
   // games). null = schedule unrestricted (too few strong engines yet, or --no-play-strong).
   const play = cfg.playStrong ? strongPlaySpec() : null;
+  // On the cycle that just promoted, ALSO make the new champion schedulable at every depth: a
+  // bare-hash spec (no nn<d>@ prefix) means "every --depths of this engine". Combined with an
+  // aggressive onboard floor the ladder fills the champion's 0-game depth nodes first, anchoring
+  // each depth band to the scale instead of leaving it at the placeholder floor (see cfg.calibrateMinutes).
+  const calib = opts.calibrateChamp && cfg.calibrateMinutes > 0 ? opts.calibrateChamp : null;
+  const playSet = [play, calib].filter(Boolean).join(',') || null;
   // Show the play set with human names — the raw spec is hashes only (it must stay a valid
   // --play argument), so name the engines here where a reader actually sees the plan.
   if (play) {
@@ -661,14 +687,16 @@ function runRankPool(label) {
       return n ? `${s} (${n})` : s;
     }).join(', ')}`);
   }
+  if (calib) log(`  Calibrating champion ${calib} across all depths (+${cfg.calibrateMinutes}m, onboard floor fills its 0-game depth nodes).`);
   // With harvesting on (default), rank:pool appends its games to its archive (ladderGames); we
   // then fold everything past the persistent mark into the dataset — the loop's own rank games
   // AND any a standalone rank:pool added between cycles. With --no-harvest, suppress the archive
   // too (--no-save-games), consistent with the gate.
   run(label, process.execPath,
-    [rankScript, '--corpus', `--minutes=${cfg.rankMinutes}`,
+    [rankScript, '--corpus', `--minutes=${cfg.rankMinutes + (calib ? cfg.calibrateMinutes : 0)}`,
       `--anchor-depth=${cfg.rankDepth}`,
-      ...(play ? [`--play=${play}`] : []),
+      ...(playSet ? [`--play=${playSet}`] : []),
+      ...(calib ? ['--onboard=1'] : []), // fill the champion's under-played depths before the ordering objective
       `--games=${cfg.rankGames}`, `--store=${ladderStore}`, `--ledger=${ledgerFile}`,
       ...(cfg.harvest ? [] : ['--no-save-games']),
       '--no-scan', `--seed=${Date.now()}`, ...jobArg]);
@@ -928,21 +956,26 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
   //              the champion is often a different architecture and so unusable as init.)
   //      otherwise: this recipe's track — its accumulated lineage if present, else its saved
   //              best net (the strongest it ever produced — the safe resume point after a gap),
-  //              else the global champion but ONLY if the champion shares this recipe's shape
-  //              (a foreign-arch champion can't seed it — train.py would fall back to random),
-  //              else cold. So sub-threshold gains accumulate per-recipe and a brand-new
-  //              architecture track bootstraps itself instead of silently starting from scratch.
+  //              else the global champion. The champion seeds the candidate even when its shape
+  //              DIFFERS: train.py's --init now GRAFTS a foreign-arch net into this shape
+  //              (function-preserving widening when every layer grows, a lossy sub-block copy
+  //              otherwise) instead of falling back to random. So a brand-new architecture track
+  //              starts from the champion's learned function on its first cycle — no more 50-cycle
+  //              bootstrap from scratch — then warm-starts from its own track best/lineage after.
   const initFile = cfg.cold
     ? (cold ? null : candidate)
     : (existsSync(lineage) ? lineage
       : existsSync(trackBest) ? trackBest
-      : championArchMatches() ? champion
-      : null);
+      : champion);
   const warm = !!initFile && existsSync(initFile);
+  // A champion seed whose arch differs from this recipe's is a GRAFT, not a plain warm-start
+  // (train.py logs the exact graft mode). Flagged here for the label + track provenance.
+  const grafting = warm && !cfg.cold && initFile === champion && !championArchMatches();
   const initLabel = !warm ? ' (cold start)'
     : cfg.cold ? ' (warm-start from previous candidate)'
     : initFile === lineage ? ' (warm-start from lineage)'
     : initFile === trackBest ? ' (warm-start from track best)'
+    : grafting ? ' (graft from champion — different arch)'
     : ' (warm-start from champion)';
   // --quant (recipe knob, on by default): export the candidate as a quantized integer net, so
   // every champion keeps the incremental-accumulator speedup (~1.5× nodes/sec) in the gate,
@@ -1011,11 +1044,13 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
   // here, before the promote branch copies the candidate over the champion, so weightsHash
   // still identifies the candidate that actually played.
   if (cfg.harvest) foldGateHarvest(res.sprt === 'H1', res);
+  let promotedChampHash = null; // set on promotion, so the end-of-cycle rank calibrates all its depths
   if (res.sprt === 'H1') {
     const arch = JSON.parse(readFileSync(candidate, 'utf8')).arch;
     copyFileSync(champion, prevChampion);   // backup for safety
     copyFileSync(candidate, champion);      // candidate becomes champion
     const champHash = archiveChampion(champion); // keep it reconstructable by its vs version
+    promotedChampHash = champHash;               // calibrate this champion's depths at end-of-cycle rank
     if (existsSync(lineage)) rmSync(lineage); // lineage cleared the gate; next start = new champion
     // Publish the new champion into the catalog under its own human name right away, flagged
     // the current champion (so the app shows a real name during its reign, not a generic id).
@@ -1025,9 +1060,10 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
       + `(${res.games} games, cycle took ${fmtDur((Date.now() - cycleT0) / 1000)}). `
       + `New champion named '${champName}' in the catalog (archived ${champHash}.json). Total promotions: ${promotions}.`
       + divNote);
-    // (The strength pool is refit at the end of every cycle — runRankPool below — so the
-    // just-promoted champion is rated automatically from its harvested gate games via
-    // --corpus; no per-promotion ranking step is needed here.)
+    // (The strength pool is refit at the end of every cycle — runRankPool below. --corpus rates
+    // the just-promoted champion from its harvested gate games, but only at the gate/strong-play
+    // depths it actually played; the end-of-cycle rank is passed promotedChampHash so it also
+    // calibrates every OTHER depth — see runRankPool / cfg.calibrateMinutes.)
     // The champion (hence the `v` target) just changed: value-iterate by recomputing
     // `v` on a fraction of the dataset with the NEW champion. Optional maintenance —
     // a failure shouldn't kill the loop, so we don't gate on its result (a Ctrl-C
@@ -1069,6 +1105,9 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
       sprt: res.sprt, promoted: res.sprt === 'H1',
       div: res.div ? { corr: res.div.corr, meanCp: res.div.meanCp } : null,
       championHash: gatedVsChampHash,
+      // Provenance: when this candidate was grafted from a foreign-arch champion (a new-arch
+      // track's bootstrap cycle), record which net it grafted from. null on a normal warm-start.
+      graftParent: grafting ? gatedVsChampHash : null,
       datasetBytes: existsSync(rawFile) ? statSync(rawFile).size : 0,
       hash: candHashForTrack,
     });
@@ -1081,7 +1120,7 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
   // cycle so this cycle's own weakest-first refresh (the last step, just below) reads a
   // current ledger. Maintenance: a failure logs but doesn't abort the run (Ctrl-C still ends
   // it via the `stopping` flag).
-  if (!stopping) runRankPool('Rank pool (Bradley-Terry, corpus + scheduled play)');
+  if (!stopping) runRankPool('Rank pool (Bradley-Terry, corpus + scheduled play)', { calibrateChamp: promotedChampHash });
 
   // Per-cycle value refresh — the LAST step of the cycle. Re-label a small slice of the
   // dataset with the current champion (most records carry `v` from older champions or

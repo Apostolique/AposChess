@@ -110,8 +110,22 @@ def parse_args():
     p.add_argument("--init", default=None,
                    help="warm-start from an existing weights file (e.g. the current "
                         "champion) instead of random init — converges in far fewer "
-                        "epochs on a mostly-unchanged dataset. The file's arch must "
-                        "match --hidden/the feature layout, else it is ignored.")
+                        "epochs on a mostly-unchanged dataset. If the file's arch "
+                        "matches --hidden it is copied exactly; if it differs (but the "
+                        "feature layout matches) the weights are GRAFTED into the new "
+                        "shape (function-preserving widening when every layer grows, a "
+                        "lossy sub-block copy when shrinking) — see --graft-noise / "
+                        "--no-graft. Ignored only if the feature layout differs.")
+    p.add_argument("--graft-noise", type=float, default=0.02,
+                   help="when --init grafts across a WIDER shape, the duplicated units "
+                        "are function-preserving but start tied (identical gradients, so "
+                        "the extra capacity never trains). This adds N(0, graft-noise * "
+                        "std) to the new units' outgoing weights to break that symmetry — "
+                        "tiny, so the graft stays ~function-preserving. 0 = exact (units "
+                        "stay tied until other noise breaks them; use for verification).")
+    p.add_argument("--no-graft", action="store_true",
+                   help="disable grafting: an --init whose arch differs from --hidden is "
+                        "ignored (train from random init), the pre-graft behaviour.")
     p.add_argument("--epochs", type=int, default=200,
                    help="max epochs; early stopping usually ends sooner")
     p.add_argument("--patience", type=int, default=8,
@@ -181,12 +195,106 @@ def load_data(path, np):
             games, max_f)
 
 
-def warm_start(model, path, arch, np, torch):
+def _widen_map(p, c):
+    """Map c child units to p parent units for a grafted layer.
+
+    Widen (c >= p): keep the p originals, then round-robin-replicate them into the
+    c-p new slots. Shrink (c < p): keep the first c parents (a lossy truncation).
+    Returns (sel, count): sel[k] is the parent unit child unit k copies; count[u]
+    is how many child units map to parent u (its replication factor, 0 if dropped).
+    """
+    sel = list(range(p)) + [k % p for k in range(max(0, c - p))] if c >= p else list(range(c))
+    count = [0] * p
+    for s in sel:
+        count[s] += 1
+    return sel, count
+
+
+def _dense(layers, p_arch, np):
+    """Parse the (dequantized) JSON layer list into parent float arrays:
+    emb [feats, h0], b0 [h0], and per dense layer W [in,out] + b [out]."""
+    p_hidden = p_arch[1:-1]
+    p_dims = list(p_hidden) + [1]
+    emb = np.asarray(layers[0]["w"], np.float32).reshape(p_arch[0], p_hidden[0])
+    b0 = np.asarray(layers[0]["b"], np.float32)
+    W, B = [], []
+    for m in range(len(p_hidden)):
+        W.append(np.asarray(layers[m + 1]["w"], np.float32).reshape(p_dims[m], p_dims[m + 1]))
+        B.append(np.asarray(layers[m + 1]["b"], np.float32))
+    return emb, b0, W, B
+
+
+def _graft(model, layers, p_arch, c_arch, np, torch, noise, seed):
+    """Graft parent weights (float `layers`, parent arch `p_arch`) into `model`
+    (child arch `c_arch`), reusing what transfers instead of starting from random.
+
+    Net2WiderNet function-preserving widening: to widen an activation layer, we
+    REPLICATE existing units (so their activations are unchanged) and divide each
+    replicated unit's OUTGOING weights by its replication count (so the sum into the
+    next layer is unchanged) — the child computes the same function as the parent,
+    then fine-tunes. Only the input (feature) layer must line up; a same-depth child
+    grafts every layer, a different-depth child grafts just the big embedding layer
+    (the feature detector — the most expensive and most transferable part) and leaves
+    the dense stack at random init. Shrinking a layer truncates it (lossy — no longer
+    function-preserving, but still a far better start than random). Returns a short
+    mode string for the log. `noise` breaks the tied-duplicate symmetry (see argparse).
+    """
+    rng = np.random.default_rng(seed)
+    feats = c_arch[0]
+    p_hidden, c_hidden = p_arch[1:-1], c_arch[1:-1]
+    emb, b0, Pw, Pb = _dense(layers, p_arch, np)
+
+    with torch.no_grad():
+        # Embedding (layer 0): copy/replicate/truncate its output columns to width c_hidden[0].
+        # It is the INCOMING side of activation a[0], so no outgoing division here.
+        sel0, _ = _widen_map(p_hidden[0], c_hidden[0])
+        model.emb.weight[:feats] = torch.tensor(emb[:, sel0])
+        model.b0.copy_(torch.tensor(b0[sel0]))
+
+        if len(p_hidden) != len(c_hidden):
+            return f"emb-only graft (depth {len(p_hidden)}->{len(c_hidden)}; dense stack random-init)"
+
+        L = len(c_hidden)
+        sels = [_widen_map(p_hidden[m], c_hidden[m])[0] for m in range(L)]
+        counts = [np.asarray(_widen_map(p_hidden[m], c_hidden[m])[1], np.float32) for m in range(L)]
+        grew = shrank = False
+        for m, lin in enumerate(model.lins):
+            # Expand the INPUT dim (a[m]) with the outgoing split: divide each source unit's
+            # row by how many child units share it, so the copies sum back to the original.
+            div = counts[m][sels[m]][:, None]
+            M = Pw[m][sels[m], :] / div                    # [c_in, p_out]
+            if m < L - 1:                                  # expand OUTPUT dim (a[m+1]) by copy
+                M = M[:, sels[m + 1]]                      # [c_in, c_out]
+                b = Pb[m][sels[m + 1]]
+            else:                                          # scalar head — output width stays 1
+                b = Pb[m]
+            # Break the duplicate-unit symmetry: perturb the NEW units' outgoing weights only,
+            # so activations stay ~unchanged but the copies get distinct gradients and train.
+            if noise and c_hidden[m] > p_hidden[m]:
+                k0 = p_hidden[m]
+                sigma = noise * float(np.std(Pw[m])) or noise
+                M = M.copy()
+                M[k0:, :] += rng.normal(0, sigma, size=M[k0:, :].shape).astype(np.float32)
+            lin.weight.copy_(torch.tensor(M.T))            # [in,out] -> [out,in]
+            lin.bias.copy_(torch.tensor(b))
+            grew |= c_hidden[m] > p_hidden[m]
+            shrank |= c_hidden[m] < p_hidden[m]
+
+    if shrank:
+        return "lossy graft (some layers truncated)"
+    if grew:
+        return f"function-preserving widen ({'exact' if not noise else '+symmetry noise'})"
+    return "graft"  # same widths, different arch elsewhere — shouldn't reach here
+
+
+def warm_start(model, path, arch, np, torch, graft_noise=0.02, allow_graft=True, seed=0):
     """Initialize the model from an existing weights file (the champion).
 
-    Returns the file's scale on success (the caller adopts it so the squash
-    matches the init), or None if the file is missing/placeholder/wrong shape —
-    then training proceeds from random init exactly as without --init.
+    Exact copy when the file's arch matches `arch`; otherwise GRAFT it into the new
+    shape (unless --no-graft) as long as the feature layout matches. Returns the
+    file's scale on success (the caller adopts it so the squash matches the init), or
+    None if the file is missing/placeholder/ungraftable — then training proceeds from
+    random init exactly as without --init.
     """
     try:
         with open(path) as f:
@@ -197,10 +305,10 @@ def warm_start(model, path, arch, np, torch):
     layers = obj.get("layers")
     if not layers and obj.get("w0"):  # legacy single-hidden-layer layout
         layers = [{"w": obj["w0"], "b": obj["b0"]}, {"w": obj["w1"], "b": obj["b1"]}]
-    if not obj.get("arch") or not layers or list(obj["arch"]) != arch:
-        print(f"--init: {os.path.basename(path)} arch {obj.get('arch')} != {arch}; "
-              "training from scratch.")
+    if not obj.get("arch") or not layers:
+        print(f"--init: {os.path.basename(path)} has no usable arch/layers; training from scratch.")
         return None
+    p_arch = list(obj["arch"])
     # An integer (quantized) champion stores int weights at scales QA/QW — dequantize
     # back to float so warm-starting works in either direction (float<->quant), so the
     # loop keeps fine-tuning even after a quantized net becomes champion.
@@ -211,16 +319,30 @@ def warm_start(model, path, arch, np, torch):
         for L in layers[1:]:
             deq.append({"w": [x / qw for x in L["w"]], "b": [x / (qw * qa) for x in L["b"]]})
         layers = deq
-    with torch.no_grad():
-        h0 = arch[1]
-        model.emb.weight[:arch[0]] = torch.tensor(
-            np.asarray(layers[0]["w"], np.float32).reshape(arch[0], h0))
-        model.b0.copy_(torch.tensor(np.asarray(layers[0]["b"], np.float32)))
-        for i, lin in enumerate(model.lins):
-            w = np.asarray(layers[i + 1]["w"], np.float32).reshape(arch[i + 1], arch[i + 2])
-            lin.weight.copy_(torch.tensor(w.T))  # [in,out] -> [out,in]
-            lin.bias.copy_(torch.tensor(np.asarray(layers[i + 1]["b"], np.float32)))
-    print(f"Warm start: initialized from {os.path.basename(path)}.")
+
+    if p_arch == arch:
+        with torch.no_grad():
+            h0 = arch[1]
+            model.emb.weight[:arch[0]] = torch.tensor(
+                np.asarray(layers[0]["w"], np.float32).reshape(arch[0], h0))
+            model.b0.copy_(torch.tensor(np.asarray(layers[0]["b"], np.float32)))
+            for i, lin in enumerate(model.lins):
+                w = np.asarray(layers[i + 1]["w"], np.float32).reshape(arch[i + 1], arch[i + 2])
+                lin.weight.copy_(torch.tensor(w.T))  # [in,out] -> [out,in]
+                lin.bias.copy_(torch.tensor(np.asarray(layers[i + 1]["b"], np.float32)))
+        print(f"Warm start: initialized from {os.path.basename(path)}.")
+        return obj.get("scale")
+
+    # Arch mismatch: graft (unless disabled) as long as the feature layout lines up.
+    if not allow_graft:
+        print(f"--init: {os.path.basename(path)} arch {p_arch} != {arch} and --no-graft; training from scratch.")
+        return None
+    if p_arch[0] != arch[0]:
+        print(f"--init: {os.path.basename(path)} feature layout {p_arch[0]} != {arch[0]}; "
+              "training from scratch.")
+        return None
+    mode = _graft(model, layers, p_arch, arch, np, torch, graft_noise, seed)
+    print(f"Graft warm start from {os.path.basename(path)}: arch {p_arch} -> {arch} — {mode}.")
     return obj.get("scale")
 
 
@@ -302,7 +424,9 @@ def main():
     # everything from scratch. The init file's scale is adopted (the net's output
     # is calibrated to it), overriding --scale if they differ.
     if args.init:
-        init_scale = warm_start(model, args.init, [num_features, *hidden, 1], np, torch)
+        init_scale = warm_start(model, args.init, [num_features, *hidden, 1], np, torch,
+                                graft_noise=args.graft_noise, allow_graft=not args.no_graft,
+                                seed=args.seed)
         if init_scale is not None and init_scale != args.scale:
             print(f"Adopting scale {init_scale} from --init (was {args.scale}).")
             args.scale = init_scale
