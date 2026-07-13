@@ -33,7 +33,7 @@ Run from `web/engine/`:
 
 ```sh
 zig build parity                       # all engine layers vs the JS oracle
-zig build bench  -Doptimize=ReleaseFast -- --depth=8 [--nn]
+zig build bench  -Doptimize=ReleaseFast -- --depth=8 [--nn | --weights=PATH]  # reports nps + ns/node
 zig build match  -Doptimize=ReleaseFast -- --games=20 --depth=6 [--nn]
 zig build gen    -Doptimize=ReleaseFast -- --games=200 --depth=6 --eval=nn
 zig build wasm                         # -> zig-out/bin/apos.wasm

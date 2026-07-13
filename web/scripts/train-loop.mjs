@@ -202,6 +202,7 @@ const engineDir = resolve(webDir, 'engine');
 const isWin = process.platform === 'win32';
 const genBin = resolve(engineDir, 'zig-out', 'bin', isWin ? 'apos-gen.exe' : 'apos-gen');
 const matchBin = resolve(engineDir, 'zig-out', 'bin', isWin ? 'apos-match.exe' : 'apos-match');
+const benchBin = resolve(engineDir, 'zig-out', 'bin', isWin ? 'apos-bench.exe' : 'apos-bench');
 function buildEngine() {
   // String form (not args-array) with shell:true so Windows resolves `zig` on PATH
   // without the DEP0190 arg-concatenation warning.
@@ -516,6 +517,32 @@ function championHidden() {
     if (Array.isArray(a) && a.length >= 3) return a.slice(1, -1).join(',');
   } catch { /* fall through */ }
   return '64';
+}
+
+// A net's architecture (layer widths, e.g. [768,128,64,32,1]) as a compact string for logs,
+// or null if unreadable. The input/output dims are fixed, so the hidden shape is what varies.
+function archOf(file) {
+  try { const a = JSON.parse(readFileSync(file, 'utf8')).arch; return Array.isArray(a) ? a.join(',') : null; }
+  catch { return null; }
+}
+
+// Per-node SEARCH TIME of a net — its eval "frame time". For a given arch+quant this is a
+// property of the shape, not the weights (a fixed-MAC NNUE forward + branchless clamps), so a
+// quick shallow search reads it stably. Returned in nanoseconds/node (null if the bench binary
+// or its output is unavailable — this is a pure readout, never fatal). The point of surfacing
+// it: live browser play is fixed-TIME, so nodes/move ≈ budget_ms / (ns_per_node/1e6); a shape
+// whose ns/node climbs searches shallower in the browser no matter how well it wins a
+// fixed-DEPTH gate. Read it like a frame-time meter (absolute), not against another net.
+function benchNsPerNode(weightsFile, depth = 6) {
+  if (!existsSync(benchBin) || !existsSync(weightsFile)) return null;
+  try {
+    // cwd = engineDir so the binary starts where its build left it; --weights is absolute so the
+    // relative default (../src/nn-weights.json) never applies. depth 6 = a sub-second reading.
+    const r = spawnSync(benchBin, [`--depth=${depth}`, `--weights=${weightsFile}`],
+      { cwd: engineDir, encoding: 'utf8' });
+    const m = /ns\/node=([\d.]+)/.exec(`${r.stdout || ''}${r.stderr || ''}`); // print goes to stderr
+    return m ? Number(m[1]) : null;
+  } catch { return null; }
 }
 
 const stamp = () => new Date().toISOString().replace('T', ' ').slice(0, 19);
@@ -1068,6 +1095,16 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
       ...(cfg.epochs !== undefined ? [`--epochs=${cfg.epochs}`] : []),
       ...(cfg.patience !== undefined ? [`--patience=${cfg.patience}`] : []),
       ...(warm ? [`--init=${initFile}`] : [])])) break;
+
+  // Candidate "frame time": its per-node search cost (an arch property, not a strength claim and
+  // not part of the gate decision). Live browser play is fixed-TIME, so a shape whose ns/node
+  // climbs reaches fewer nodes/move there even when it wins the fixed-DEPTH gate below — surface
+  // the number so that trade-off is visible when growing/reshaping the arch. Absolute; no compare.
+  const candNs = benchNsPerNode(candidate);
+  if (candNs != null) {
+    const nps = 1e9 / candNs;
+    log(`  Candidate speed: ${candNs.toFixed(0)} ns/node (~${Math.round(nps / 1000)}k nps) — arch [${archOf(candidate) ?? '?'}].`);
+  }
 
   // 4. Gate: candidate (A) vs champion (B), SPRT(0, elo1). Unless --no-harvest,
   //    the gate's games are appended to the dataset (they're already paid for;
