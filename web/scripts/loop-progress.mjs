@@ -6,6 +6,17 @@
 // writes into a trend you can act on: is the latest run's candidate climbing toward the
 // gate (let it run) or stuck below 50% (restart with different values)?
 //
+// LESSON FROM 'Mona' (the [128,64,32] champion, promoted 2026-07-12). A new/larger
+// architecture can't warm-start from a differently-shaped champion, so its GATE EDGE sits
+// below 50% for DOZENS of cycles even while the net is genuinely, steadily getting stronger.
+// Mona's experiment track climbed ~434 → 547 in *absolute* Elo across 50 cycles / 3 runs,
+// yet lost the gate (negative edge) on 48 of them — right up until the accumulating net
+// finally overtook the champion and promoted at +41. So a below-50% run is NOT automatically
+// a failed one: for an experiment track it's the expected early shape of a bootstrapping net.
+// The real progress signal is the TRACK's absolute-Elo trajectory (experiment-registry.mjs,
+// `npm run train:experiments`), which this report now folds in — not the gate score alone,
+// which is measured against a moving (strengthening) champion opponent.
+//
 //   npm run train:progress           # latest run in detail + a one-line history + a read
 //   npm run train:progress -- --runs=12   # show that many runs in the compact history
 //   npm run train:progress -- --all  # detail EVERY run's cycles, not just the latest
@@ -20,7 +31,7 @@ import { dirname, resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { fmtDur } from './fmt.mjs';
-import { suggestRecipes } from './experiment-registry.mjs';
+import { suggestRecipes, readHistory, trackDir } from './experiment-registry.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const webDir = resolve(here, '..');
@@ -51,18 +62,28 @@ if (!existsSync(logFile)) {
 //   [ts] cycle N: kept champion — candidate P% / Elo E (SPRT V, G games, cycle took T). <tail>
 //   [ts] train:loop stopped after K promotion(s) in T...
 //   [ts] Discarded stale lineage (reason).
+// The registry writes a `Recipe <slug> [<id>] — … (track run #N…)` line just before the
+// matching `train:loop start` (train-loop.mjs beginRun). Capture it so each run knows which
+// experiment TRACK it belongs to — that's how we reach the track's cross-run absolute-Elo
+// trajectory (the real progress signal). Runs before the registry existed have no such line.
+const RECIPE = /^Recipe (\S+) \[([0-9a-f]+)\].*\(track run #(\d+)/;
 const TS = /^\[([\d-]+ [\d:]+)\] (.*)$/;
 const runs = [];
 let cur = null;
+let pendingTrack = null; // {slug, id, run} awaiting the next `train:loop start`
 
 for (const raw of readFileSync(logFile, 'utf8').split('\n')) {
   const tm = raw.match(TS);
   if (!tm) continue;
   const [, ts, body] = tm;
 
+  const rm = body.match(RECIPE);
+  if (rm) { pendingTrack = { slug: rm[1], id: rm[2], run: Number(rm[3]) }; continue; }
+
   if (body.startsWith('train:loop start')) {
     cur = {
       start: ts, end: null, stopped: null, promotions: 0, cycles: [],
+      track: pendingTrack, // null for pre-registry runs
       hidden: (body.match(/hidden=\[([^\]]*)\]/) || [, '?'])[1],
       batch: num(body.match(/batch (\d+)/)),
       gateGames: num(body.match(/gate (\d+)g/)),
@@ -76,6 +97,7 @@ for (const raw of readFileSync(logFile, 'utf8').split('\n')) {
       lineageDiscarded: null,
     };
     runs.push(cur);
+    pendingTrack = null;
     continue;
   }
   if (!cur) continue;
@@ -137,6 +159,31 @@ function slope(ys) {
   return sxx ? sxy / sxx : 0;
 }
 const avg = (a) => a.reduce((x, y) => x + y, 0) / a.length;
+
+// The cross-run absolute-Elo trajectory for a run's experiment track. Unlike the gate score
+// (which is measured against a champion that strengthens over time, so it can't be compared
+// cycle-to-cycle), the track's per-cycle `absElo` — championLedgerElo + gate edge — is a stable
+// yardstick: a candidate can be steadily improving in absolute Elo while still losing the gate,
+// which is exactly the shape of a new-architecture bootstrap (the 'Mona' story). Returns null
+// when the run predates the registry or the track has no absElo yet.
+function trackTrajectory(run) {
+  if (!run.track) return null;
+  const hist = readHistory(trackDir(loopDir, run.track.id));
+  const abs = hist.map((h) => h.absElo).filter(Number.isFinite);
+  if (abs.length < 2) return null;
+  return {
+    slug: run.track.slug,
+    id: run.track.id,
+    cycles: hist.length,
+    runs: new Set(hist.map((h) => h.run)).size,
+    promotions: hist.filter((h) => h.promoted).length,
+    firstAbs: abs[0],
+    latestAbs: abs[abs.length - 1],
+    bestAbs: Math.max(...abs),
+    absSlope: slope(abs), // whole-track Elo/cycle
+    recentAbsSlope: slope(abs.slice(-8)), // recent-window Elo/cycle
+  };
+}
 // Log timestamps are written in UTC (train-loop's stamp() uses toISOString). Date.parse on a
 // no-offset datetime treats it as LOCAL, which on a machine behind UTC pushes the time into the
 // future (negative "ago") — so parse it explicitly as UTC, then render local for display.
@@ -178,6 +225,20 @@ console.log(`  config: hidden=[${latest.hidden}]  gate ${latest.gateGames}g@d${l
 if (latest.lineageDiscarded) console.log(`  note: lineage discarded at start (${latest.lineageDiscarded}) — accumulation restarted from scratch.`);
 console.log('');
 printCycles(latest);
+
+// Track trajectory: the cross-run absolute-Elo climb this run is contributing to. This is the
+// real progress yardstick (see the 'Mona' note at the top) — a run can look flat/losing at the
+// gate while its track's absolute Elo climbs steadily toward overtaking the champion.
+const latestTraj = trackTrajectory(latest);
+if (latestTraj) {
+  const t = latestTraj;
+  const dir = t.absSlope > 1.0 ? 'climbing' : t.absSlope < -1.0 ? 'falling' : 'flat';
+  console.log(`\n  Track [${t.id}] ${t.slug} — ${t.runs} run(s), ${t.cycles} cycle(s) accumulated:`);
+  console.log(`    absolute Elo ${t.firstAbs.toFixed(0)} → ${t.latestAbs.toFixed(0)} `
+    + `(best ${t.bestAbs.toFixed(0)}), ${signed(+t.absSlope.toFixed(1))} Elo/cycle overall, ${dir}.`);
+  console.log('    Absolute Elo is the real signal for a warm-starting track — the gate edge above can stay');
+  console.log('    negative for dozens of cycles while this climbs (that is how \'Mona\' promoted).');
+}
 
 // Per-run read: is the candidate trending toward the gate, and can it even warm-start?
 const reads = readRun(latest);
@@ -254,12 +315,32 @@ function readRun(run) {
   const out = [];
   const scores = run.cycles.map((c) => c.score).filter(Number.isFinite);
   const elos = run.cycles.map((c) => c.elo).filter(Number.isFinite);
+  const traj = trackTrajectory(run);
+  // Is the track's absolute Elo climbing? That's the productivity signal for a below-50% run.
+  const trackClimbing = traj && traj.absSlope > 1.0;
 
-  // Shape mismatch: a candidate whose hidden ≠ champion's can't warm-start from the champion,
-  // so it relearns from scratch every cycle and tends to sit well below 50%. (Bit us before.)
+  // Shape mismatch: a candidate whose hidden ≠ champion's can't warm-start FROM THE CHAMPION.
+  // Pre-registry that meant relearning from scratch every cycle (a real stall). With the
+  // experiment registry it instead warm-starts from its OWN track's lineage/best and accumulates
+  // — so sub-50% is the EXPECTED early shape of a bootstrapping new-arch track, not a failure.
+  // (This exact case produced 'Mona': [128,64,32] bootstrapped over 50 cycles vs a [64,32,16]
+  // champion, losing the gate throughout until its absolute Elo finally overtook.)
   if (champHidden && run.hidden !== '?' && run.hidden !== champHidden) {
-    out.push(`Candidate hidden=[${run.hidden}] ≠ champion hidden=[${champHidden}]: it can't warm-start `
-      + `from the champion, so it trains from scratch against a strong net. Match the shape to let warm cycles accumulate.`);
+    if (traj) {
+      out.push(`Candidate hidden=[${run.hidden}] ≠ champion hidden=[${champHidden}]: it can't warm-start from the `
+        + `champion, but this is a registered experiment track warm-starting from its own lineage/best — so a `
+        + `below-50% gate is expected while it bootstraps. Judge it by the track's absolute-Elo trend, not the gate edge.`);
+    } else {
+      out.push(`Candidate hidden=[${run.hidden}] ≠ champion hidden=[${champHidden}]: it can't warm-start from the `
+        + `champion and has no experiment track to accumulate from, so it relearns from scratch and tends to sit well `
+        + `below 50%. Run it via train:loop (which keys a track) so warm cycles accumulate, or match the champion's shape.`);
+    }
+  }
+  if (traj) {
+    const dir = traj.absSlope > 1.0 ? 'climbing' : traj.absSlope < -1.0 ? 'falling' : 'flat';
+    out.push(`Track [${traj.id}]: absolute Elo ${traj.firstAbs.toFixed(0)} → ${traj.latestAbs.toFixed(0)} `
+      + `(best ${traj.bestAbs.toFixed(0)}) over ${traj.cycles} cycle(s) / ${traj.runs} run(s), `
+      + `${signed(+traj.absSlope.toFixed(1))} Elo/cycle — ${dir}. This, not the gate score, is the progress signal.`);
   }
   if (run.batch === 0) {
     out.push('batch 0 — no dedicated self-play generation; fresh data comes from the gate harvest '
@@ -285,8 +366,18 @@ function readRun(run) {
   const anyLineage = run.cycles.some((c) => c.tail === 'lineage+');
   if (run.promotions > 0) {
     out.push('Promoted this run — the champion improved. Expect the next candidates to dip (stronger target) before climbing again.');
-  } else if (a < 49 && trend !== 'climbing') {
+  } else if (trackClimbing && a < 49) {
+    // Below 50% at the gate BUT the track's absolute Elo is climbing — the 'Mona' pattern. Do
+    // NOT call this a failed run: a bootstrapping new-arch track loses the gate for dozens of
+    // cycles before overtaking. Keep it running (across restarts — the track resumes its lineage).
+    out.push(`Verdict: losing the gate but the track's absolute Elo is CLIMBING (${signed(+traj.absSlope.toFixed(1))} Elo/cycle) `
+      + '— productive. This is the new-architecture bootstrap pattern that produced \'Mona\'; keep it running (it '
+      + 'resumes its lineage across restarts) — it overtakes the champion only once its absolute Elo passes the champion\'s.');
+  } else if (a < 49 && trend !== 'climbing' && !traj) {
     out.push('Verdict: candidates are losing and not climbing — NOT productive. Restart with the champion\'s shape, warm, and a fresh data source (a deep --batch generation, or more strong-engine --rank-minutes pool play).');
+  } else if (a < 49 && !trackClimbing && traj) {
+    out.push(`Verdict: below 50% AND the track's absolute Elo is flat/falling (${signed(+traj.absSlope.toFixed(1))} Elo/cycle) — `
+      + 'this track has stopped improving, not just losing a strong gate. Consider a different recipe (see the ideas below) or fresh data.');
   } else if (best >= run.elo1 / 7 + 50 || (anyLineage && trend === 'climbing')) {
     // best% within reach of the gate, or lineage is accumulating upward
     out.push('Verdict: candidates are at/above 50% and accumulating via lineage — productive, let it keep running toward the gate.');
