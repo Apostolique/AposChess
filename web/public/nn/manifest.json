@@ -1,5 +1,5 @@
 {
-  "default": "Leo",
+  "default": "Mona",
   "nets": [
     {
       "name": "Ada",
@@ -182,7 +182,22 @@
       "loopChampion": true,
       "hash": "9e31ca",
       "gen": 12,
-      "note": "train:loop champion Leo (gen 12, 9e31ca, 2026-07-05).",
+      "note": "train:loop champion Leo (gen 12, 9e31ca, 2026-07-05)."
+    },
+    {
+      "name": "Mona",
+      "file": "mona.json",
+      "arch": [
+        768,
+        128,
+        64,
+        32,
+        1
+      ],
+      "loopChampion": true,
+      "hash": "78ae24",
+      "gen": 13,
+      "note": "train:loop champion Mona (gen 13, 78ae24, 2026-07-12).",
       "current": true
     },
     {
