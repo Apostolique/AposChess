@@ -406,7 +406,8 @@ function fit() {
   // self-anchor + Σ_j N_ij·p_ij(1−p_ij), H_ij = −N_ij·p_ij(1−p_ij). The prior on the diagonal
   // makes H positive-definite (invertible) even on a sparse/tree graph, so we can read off the
   // variance of ANY rating contrast — exactly what the active scheduler needs to find the
-  // least-resolved ordering.  const n = ids.length;
+  // least-resolved ordering.
+  const n = ids.length;
   const pos = new Map(ids.map((id, k) => [id, k]));
   const H = Array.from({ length: n }, () => new Float64Array(n));
   for (let k = 0; k < n; k++) H[k][k] = cfg.prior * 0.25; // phantom self-anchor (p(1−p)=0.25 at parity)
