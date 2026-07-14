@@ -1,19 +1,6 @@
 {
-  "default": "Mona",
+  "default": "Nash",
   "nets": [
-    {
-      "name": "Ada",
-      "file": "ada.json",
-      "arch": [
-        768,
-        64,
-        1
-      ],
-      "loopChampion": true,
-      "hash": "94c88e",
-      "gen": 1,
-      "note": "Retired train:loop champion (94c88e, 2026-06-12)."
-    },
     {
       "name": "Boris",
       "file": "boris.json",
@@ -197,7 +184,24 @@
       "loopChampion": true,
       "hash": "78ae24",
       "gen": 13,
-      "note": "train:loop champion Mona (gen 13, 78ae24, 2026-07-12).",
+      "note": "train:loop champion Mona (gen 13, 78ae24, 2026-07-12)."
+    },
+    {
+      "name": "Nash",
+      "file": "nash.json",
+      "arch": [
+        768,
+        64,
+        64,
+        64,
+        16,
+        16,
+        1
+      ],
+      "loopChampion": true,
+      "hash": "0bdf07",
+      "gen": 14,
+      "note": "train:loop champion Nash (gen 14, 0bdf07, 2026-07-14).",
       "current": true
     },
     {
