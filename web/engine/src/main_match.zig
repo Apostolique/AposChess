@@ -4,9 +4,17 @@
 // Native match runner behind `npm run match`: plays engine A vs engine B over
 // seeded random openings (color-reversed pairs), in parallel across threads, with
 // optional SPRT early-stopping, and writes the result-file
-// {games,wins,draws,losses,score,elo,llr,sprt,div} that train:loop reads. `div` (null unless
-// both sides are nn) reports how differently the two nets JUDGE midgame positions — a
-// diversity signal orthogonal to the score: {positions,confident,confidentRate,meanCp,corr}.
+// {games,wins,draws,losses,score,elo,llr,sprt,futility,div} that train:loop reads. `div`
+// (null unless both sides are nn) reports how differently the two nets JUDGE midgame
+// positions — a diversity signal orthogonal to the score:
+// {positions,confident,confidentRate,meanCp,corr}.
+//
+// --sprt-futility=G adds a third stopping rule to --sprt (0 = off, the default): stop as
+// "inconclusive" once the chance of still reaching the promotion bound before the --games
+// cap drops below G (see promoteChance below). SPRT decides fast at the extremes but burns
+// the whole cap when the true strength sits between elo0 and elo1 — a candidate that can't
+// promote anyway — so this reclaims exactly those games. The `futility` result field records
+// whether the stop fired (the verdict stays "inconclusive", same as running out the cap).
 //
 //   apos-match --games=800 --depth=4 --eval-a=nn --eval-b=nn \
 //     --weights-a=cand.json --weights-b=src/nn-weights.json --sprt --elo1=20 \
@@ -102,6 +110,57 @@ fn llr(scores: []const f64, elo0: f64, elo1: f64) f64 {
     for (scores) |x| var_sum += (x - mean) * (x - mean);
     const variance = @max(var_sum / fn_, 1e-3);
     return ((mu1 - mu0) / variance) * (s - (fn_ * (mu0 + mu1)) / 2.0);
+}
+
+// Standard normal CDF (Abramowitz–Stegun 26.2.17 polynomial, |err| < 7.5e-8 — plenty for
+// comparing against a stop-probability threshold).
+fn phi(x: f64) f64 {
+    const ax = @abs(x);
+    const k = 1.0 / (1.0 + 0.2316419 * ax);
+    const poly = k * (0.319381530 + k * (-0.356563782 + k * (1.781477937 + k * (-1.821255978 + k * 1.330274429))));
+    const tail = 0.3989422804014327 * @exp(-0.5 * ax * ax) * poly;
+    return if (x >= 0) 1.0 - tail else tail;
+}
+
+// Futility stop (stochastic curtailment) for the GSPRT: the probability that the LLR walk
+// still reaches the promotion bound (`upper`) within `remaining` games. SPRT's expected game
+// count peaks when the true strength sits BETWEEN elo0 and elo1 — so a roughly-even match
+// burns the whole --games cap to say "inconclusive", a verdict that was knowable long before.
+// Modeled as Brownian motion with drift: per-game LLR increments have mean c·(p − mid) and
+// variance c²·var (c = (mu1−mu0)/var, mid = (mu0+mu1)/2 — the same scaling llr() uses), and
+// the probability of a drifted walk crossing barrier `a = upper − LLR` within m games is
+//   P = Φ((μm − a)/(σ√m)) + e^(2μa/σ²)·Φ((−a − μm)/(σ√m)).
+// Two deliberate conservatisms, both erring toward PLAYING ON: the drift uses an OPTIMISTIC
+// score — the observed mean + 1 standard error, capped at mu1 — and ignoring the lower (H0)
+// absorbing bound overestimates the crossing chance. Monte-Carlo'd against the exact
+// discrete walk (2026-07-14, draw rates 0.05–0.5): at gamma 0.05 with a 30%-of-cap floor
+// this cuts a true-even candidate's mean games ~20-25% while costing under 2 points of
+// promotion probability for a true-elo1 candidate (which the train loop's lineage recovers:
+// a futility-stopped gainer is kept, fine-tuned, and re-gated next cycle).
+fn promoteChance(scores: []const f64, elo0: f64, elo1: f64, upper: f64, remaining: usize) f64 {
+    const n = scores.len;
+    if (n < 2 or remaining == 0) return 1;
+    const fn_: f64 = @floatFromInt(n);
+    const mu0 = scoreFromElo(elo0);
+    const mu1 = scoreFromElo(elo1);
+    var s: f64 = 0;
+    for (scores) |x| s += x;
+    const mean = s / fn_;
+    var var_sum: f64 = 0;
+    for (scores) |x| var_sum += (x - mean) * (x - mean);
+    const variance = @max(var_sum / fn_, 1e-3);
+    const c = (mu1 - mu0) / variance;
+    const a = upper - llr(scores, elo0, elo1);
+    if (a <= 0) return 1; // already across — the H1 branch handles it
+    const optimistic = @min(mean + @sqrt(variance / fn_), mu1);
+    const mu = c * (optimistic - (mu0 + mu1) / 2.0); // per-game LLR drift
+    if (mu >= 0) return 1; // drifting toward the bound — never stop
+    const sig2 = c * c * variance;
+    const m: f64 = @floatFromInt(remaining);
+    const sd = @sqrt(sig2 * m); // > 0: variance is floored and m >= 1
+    const t1 = phi((mu * m - a) / sd);
+    const t2 = @exp(@max(-700.0, 2.0 * mu * a / sig2)) * phi((-a - mu * m) / sd);
+    return t1 + t2;
 }
 
 // The reported Elo with its 95% confidence interval:
@@ -377,6 +436,8 @@ const Shared = struct {
     elo1: f64,
     upper: f64,
     lower: f64,
+    futility: f64, // --sprt-futility threshold (0 = off)
+    futility_fired: bool = false, // the inconclusive verdict came from the futility stop
     cfg: Cfg,
     t0_ns: i128 = 0, // match start, for live elapsed/ETA
     live_len: usize = 0, // chars in the current in-place status line (for repaint padding)
@@ -588,6 +649,20 @@ fn worker(sh: *Shared) void {
             } else if (l <= sh.lower) {
                 sh.decided = "H0";
                 sh.stop = true;
+            } else if (sh.futility > 0) {
+                // Futility: from 30% of the cap on (earlier, the score estimate is too noisy
+                // to write a candidate off), stop once even an optimistic read of the observed
+                // rate leaves < --sprt-futility chance of reaching the promotion bound in the
+                // games left. Same verdict the cap would have produced, reached early.
+                const total_g = sh.total_pairs * 2;
+                const played = sh.scores.items.len;
+                if (played >= @max(100, total_g * 3 / 10) and played < total_g and
+                    promoteChance(sh.scores.items, sh.elo0, sh.elo1, sh.upper, total_g - played) < sh.futility)
+                {
+                    sh.decided = "inconclusive";
+                    sh.futility_fired = true;
+                    sh.stop = true;
+                }
             }
         }
         // Two-tier progress. Printed under the mutex so the
@@ -838,6 +913,11 @@ fn finalizeLocked(sh: *Shared) void {
     if (sh.stop and sh.decided == null) {
         std.debug.print("Stopped early: kept {d} completed game(s), abandoned those in flight.\n", .{n});
     }
+    if (sh.futility_fired) {
+        std.debug.print("Futility stop at {d}/{d} games: < {d:.0}% chance of reaching the promotion bound in the games left.\n", .{
+            n, sh.total_pairs * 2, sh.futility * 100,
+        });
+    }
     const verdict = if (sh.sprt) (sh.decided orelse "inconclusive") else "n/a";
     std.debug.print("A vs B: {d} games | +{d} ={d} -{d} | score {d:.1}% | Elo {s}{d:.0} ± {d:.0} (95% CI [{d:.0}, {d:.0}]) | SPRT {s} | nodes {d} nps {d}\n", .{
         n, wins, draws, losses, p * 100, sign, ci.elo, ci.margin, ci.lo, ci.hi, verdict, sh.nodes, sh.nodes * 1000 / ms,
@@ -871,10 +951,11 @@ fn finalizeLocked(sh: *Shared) void {
     if (sh.cfg.result_file) |rf| {
         var buf: [768]u8 = undefined;
         const sprt_field = if (sh.sprt) sh.decided orelse "inconclusive" else null;
+        const fut_field: []const u8 = if (sh.futility_fired) "true" else "false";
         const json = if (sprt_field) |sf|
             std.fmt.bufPrint(&buf,
-                \\{{"games":{d},"wins":{d},"draws":{d},"losses":{d},"score":{d},"elo":{d},"llr":{d},"sprt":"{s}","div":{s}}}
-            , .{ n, wins, draws, losses, p, elo, llr(sh.scores.items, sh.elo0, sh.elo1), sf, div_json }) catch return
+                \\{{"games":{d},"wins":{d},"draws":{d},"losses":{d},"score":{d},"elo":{d},"llr":{d},"sprt":"{s}","futility":{s},"div":{s}}}
+            , .{ n, wins, draws, losses, p, elo, llr(sh.scores.items, sh.elo0, sh.elo1), sf, fut_field, div_json }) catch return
         else
             std.fmt.bufPrint(&buf,
                 \\{{"games":{d},"wins":{d},"draws":{d},"losses":{d},"score":{d},"elo":{d},"llr":null,"sprt":null,"div":{s}}}
@@ -913,6 +994,7 @@ pub fn main(init: std.process.Init) !void {
     var elo1: f64 = 15;
     var alpha: f64 = 0.05;
     var beta: f64 = 0.05;
+    var sprt_futility: f64 = 0; // 0 = off; e.g. 0.05 = stop below a 5% promotion chance
     var result_file: ?[]const u8 = null;
     var save_games: ?[]const u8 = null;
     var stop_file: ?[]const u8 = null;
@@ -940,6 +1022,7 @@ pub fn main(init: std.process.Init) !void {
         if (argStr(arg, "--elo1=")) |v| elo1 = std.fmt.parseFloat(f64, v) catch elo1;
         if (argStr(arg, "--alpha=")) |v| alpha = std.fmt.parseFloat(f64, v) catch alpha;
         if (argStr(arg, "--beta=")) |v| beta = std.fmt.parseFloat(f64, v) catch beta;
+        if (argStr(arg, "--sprt-futility=")) |v| sprt_futility = std.fmt.parseFloat(f64, v) catch sprt_futility;
         if (argStr(arg, "--result-file=")) |v| result_file = v;
         if (argStr(arg, "--save-games=")) |v| save_games = v;
         if (argStr(arg, "--stop-file=")) |v| stop_file = v;
@@ -987,6 +1070,7 @@ pub fn main(init: std.process.Init) !void {
         .elo1 = elo1,
         .upper = @log((1 - beta) / alpha),
         .lower = @log(beta / (1 - alpha)),
+        .futility = sprt_futility,
         .cfg = .{
             .budget_a = budget_a,
             .budget_b = budget_b,

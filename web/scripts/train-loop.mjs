@@ -41,6 +41,18 @@
 //                   the SPRT can actually decide within --gate-games. A too-small band
 //                   (e.g. [0,5] over 400 games) needs a candidate ~+170 Elo to fire,
 //                   so real improvements get rejected — keep elo1 vs gate-games sane.
+//   --gate-futility=G  SPRT futility stop (default 0.05; 0 = off), forwarded to the
+//                   match runner as --sprt-futility. SPRT decides fast at the extremes
+//                   but burns the whole --gate-games cap when the candidate is roughly
+//                   EVEN with the champion (true edge between 0 and elo1 — exactly where
+//                   warm-started near-clones live), on a verdict ("inconclusive") that
+//                   was knowable at halfway. From 30% of the cap on, the runner stops
+//                   once even an optimistic read of the score leaves < G chance of
+//                   reaching the promotion bound in the games left. Monte-Carlo'd
+//                   (2026-07-14): ~20-25% fewer games on even candidates, < 2 points of
+//                   promotion probability lost on a true +20 (and a futility-stopped
+//                   gainer survives as lineage and re-gates next cycle). The verdict
+//                   stays "inconclusive"; the log line notes the early stop.
 //   --lambda=L      TD/bootstrap target mix for training the candidate (default 1 =
 //                   pure game result; <1 leans on the champion's own search value,
 //                   an unbiased bootstrap — recorded because generation uses the net)
@@ -375,6 +387,10 @@ const cfg = {
   gateGames: num(args['gate-games'], 2000),
   gateDepth: num(args['gate-depth'], 6),
   elo1: num(args.elo1, 20), // wide enough that SPRT can decide within --gate-games
+  // Futility stop for the gate SPRT (0 = off). See the flag doc above; the measured trade
+  // (Monte Carlo vs the exact walk) is ~20-25% fewer games on even candidates for < 2 points
+  // of promotion probability on a true +elo1 — which the lineage recovers next cycle.
+  gateFutility: num(args['gate-futility'], 0.05),
   lam: num(args.lambda, 1), // TD target mix passed to train.py (1 = pure result)
   // Drop tactically loud positions (in check / winning capture available) at featurize time
   // so the static net trains on the quiet-position distribution it's actually queried on at
@@ -993,7 +1009,7 @@ function championArchMatches() {
 log(`train:loop start — ${cfg.batch === 0
     ? `no gen (data from gate harvest${cfg.playStrong ? ` + strong --play @ depth ${cfg.playDepth}` : ' + pool'})`
     : `batch ${cfg.batch} @ depth ${cfg.depth}`} | gate ${cfg.gateGames}g @ depth ${cfg.gateDepth} `
-  + `SPRT(0,${cfg.elo1}) | candidate hidden=[${hidden}] λ=${cfg.lam} ${cfg.cold ? 'cold first cycle, warm after' : 'warm'} start`
+  + `SPRT(0,${cfg.elo1})${cfg.gateFutility > 0 ? ` futility<${cfg.gateFutility}` : ''} | candidate hidden=[${hidden}] λ=${cfg.lam} ${cfg.cold ? 'cold first cycle, warm after' : 'warm'} start`
   + `${existsSync(lineage) ? ' (resuming lineage)' : ''} | `
   + `refresh/cycle ${cfg.refreshCycle > 0 ? `${(cfg.refreshCycle * 100).toFixed(1)}% @ depth ${cfg.refreshCycleDepth}` : 'off'} | `
   + `refresh on promotion ${cfg.refreshFrac > 0 ? `${(cfg.refreshFrac * 100).toFixed(0)}% @ depth ${cfg.refreshDepth}` : 'off'} | `
@@ -1116,6 +1132,7 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
   if (!run('Gate: candidate vs champion', matchBin,
     ['--eval-a=nn', `--weights-a=${candidate}`, '--eval-b=nn', `--weights-b=${champion}`,
       `--depth=${cfg.gateDepth}`, '--sprt', '--elo0=0', `--elo1=${cfg.elo1}`,
+      ...(cfg.gateFutility > 0 ? [`--sprt-futility=${cfg.gateFutility}`] : []),
       `--games=${cfg.gateGames}`, `--result-file=${resultFile}`,
       ...(cfg.harvest ? [`--save-games=${gateHarvest}`, `--seed=${Date.now()}`] : []), ...jobArg])) {
     // Ctrl-C / failure mid-gate: the runner still drained its played games to the harvest
@@ -1195,14 +1212,14 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
     // the gate still protects it.
     copyFileSync(candidate, lineage);
     log(`cycle ${c}: kept champion — candidate ${pct}% / Elo ${res.elo.toFixed(0)} `
-      + `(SPRT ${res.sprt}, ${res.games} games, cycle took ${fmtDur((Date.now() - cycleT0) / 1000)}). `
+      + `(SPRT ${res.sprt}${res.futility ? ' by futility stop' : ''}, ${res.games} games, cycle took ${fmtDur((Date.now() - cycleT0) / 1000)}). `
       + 'Below the gate; candidate kept as lineage for the next cycle.'
       + divNote);
   } else {
     const hadLineage = existsSync(lineage);
     if (hadLineage) rmSync(lineage);
     log(`cycle ${c}: kept champion — candidate ${pct}% / Elo ${res.elo.toFixed(0)} `
-      + `(SPRT ${res.sprt}, ${res.games} games, cycle took ${fmtDur((Date.now() - cycleT0) / 1000)}). `
+      + `(SPRT ${res.sprt}${res.futility ? ' by futility stop' : ''}, ${res.games} games, cycle took ${fmtDur((Date.now() - cycleT0) / 1000)}). `
       + `Not a gain.${hadLineage ? ' Lineage reset (next warm-start falls back to this recipe\'s best net).' : ''}`
       + divNote);
   }
@@ -1216,7 +1233,7 @@ for (let c = 1; c <= cfg.cycles && !stopping; c++) {
     const rc = recordCycle(track.dir, {
       run: runNo, cycle: c, ts: stamp(),
       score: res.score, edgeElo: res.elo, absElo: candAbsElo,
-      sprt: res.sprt, promoted: res.sprt === 'H1',
+      sprt: res.sprt, futility: !!res.futility, promoted: res.sprt === 'H1',
       div: res.div ? { corr: res.div.corr, meanCp: res.div.meanCp } : null,
       championHash: gatedVsChampHash,
       // Provenance: when this candidate was grafted from a foreign-arch champion (a new-arch
