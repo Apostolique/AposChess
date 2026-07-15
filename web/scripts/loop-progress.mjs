@@ -17,8 +17,16 @@
 // `npm run train:experiments`), which this report now folds in — not the gate score alone,
 // which is measured against a moving (strengthening) champion opponent.
 //
+// RESTARTS ARE MERGED. Ctrl-C'ing the loop and relaunching it later with the same recipe
+// writes a fresh `train:loop start` line and restarts the loop's cycle numbering at 1, but
+// it is NOT a new experiment: a warm relaunch resumes the same track's lineage and keeps
+// refining the same candidate chain. This report therefore groups consecutive log runs into
+// one logical run when the newer one warm-starts the same recipe (same track id; for
+// pre-registry logs, same hidden+λ), renumbering cycles cumulatively — so stopping the loop
+// overnight no longer makes the trend/read start over from "cycle 1".
+//
 //   npm run train:progress           # latest run in detail + a one-line history + a read
-//   npm run train:progress -- --runs=12   # show that many runs in the compact history
+//   npm run train:progress -- --runs=12   # show that many (merged) runs in the history
 //   npm run train:progress -- --all  # detail EVERY run's cycles, not just the latest
 //   npm run train:progress -- --log=PATH  # point at a different loop.log
 //
@@ -141,6 +149,44 @@ if (!runs.length) {
   process.exit(0);
 }
 
+// --- Merge warm same-recipe relaunches into logical runs. --------------------------------
+// A relaunch continues the previous run's chain when it warm-starts (a cold/cold-first
+// relaunch deliberately begins a fresh chain) and trains the same recipe: same experiment
+// track id when both runs have one; across the registry boundary we don't guess; for two
+// pre-registry runs the best available key is hidden+λ. A legacy lineage-discard note means
+// accumulation restarted from scratch, so it breaks the chain too.
+function continuesChain(prev, run) {
+  if (!run.start_kind.startsWith('warm')) return false;
+  if (run.lineageDiscarded) return false;
+  if (prev.track && run.track) return prev.track.id === run.track.id;
+  if (prev.track || run.track) return false;
+  return prev.hidden === run.hidden && prev.lambda === run.lambda;
+}
+const chains = [];
+for (const run of runs) {
+  const tail = chains.length ? chains[chains.length - 1] : null;
+  if (tail && continuesChain(tail[tail.length - 1], run)) tail.push(run);
+  else chains.push([run]);
+}
+// Flatten a chain to the shape printCycles/readRun consume: cycles concatenated across the
+// segments; start/start_kind from the FIRST launch (how the chain began); config + stopped
+// state from the LATEST launch (what's on disk/running now).
+function chainView(segs) {
+  const first = segs[0], last = segs[segs.length - 1];
+  return {
+    segs,
+    cycles: segs.flatMap((r) => r.cycles),
+    start: first.start, end: last.end, stopped: last.stopped,
+    promotions: segs.reduce((a, r) => a + r.promotions, 0),
+    track: last.track || first.track,
+    hidden: last.hidden, batch: last.batch, gateGames: last.gateGames,
+    gateDepth: last.gateDepth, elo1: last.elo1, lambda: last.lambda,
+    start_kind: first.start_kind,
+    lineageDiscarded: first.lineageDiscarded,
+  };
+}
+const views = chains.map(chainView);
+
 // --- Champion shape, to flag a candidate that can't warm-start from it. -----------------
 let champHidden = null, champArch = null;
 try {
@@ -196,32 +242,44 @@ const pad = (s, w) => String(s).padEnd(w);
 const padL = (s, w) => String(s).padStart(w);
 const signed = (n) => (n >= 0 ? '+' : '') + n;
 
-// --- Detailed cycle table for a run. ----------------------------------------------------
-function printCycles(run) {
-  if (!run.cycles.length) { console.log('  (no completed cycles)'); return; }
+// --- Detailed cycle table for a (merged) run. --------------------------------------------
+// Cycle numbers are CUMULATIVE across the chain's launches (the loop itself restarts at 1
+// on every relaunch); a separator marks where each warm relaunch picked the chain back up.
+function printCycles(view) {
+  if (!view.cycles.length) { console.log('  (no completed cycles)'); return; }
   console.log(`  ${pad('cyc', 5)}${pad('score', 8)}${pad('Elo', 6)}${pad('SPRT', 14)}${pad('games', 7)}${pad('took', 9)}lineage`);
-  for (const c of run.cycles) {
-    const mark = c.promoted ? '✓ ' : '  ';
-    console.log('  ' + mark + pad(c.n, 3)
-      + pad(Number.isFinite(c.score) ? c.score.toFixed(1) + '%' : '?', 8)
-      + pad(Number.isFinite(c.elo) ? signed(c.elo) : '?', 6)
-      + pad(c.sprt, 14)
-      + pad(c.games ?? '?', 7)
-      + pad(c.dur, 9)
-      + c.tail);
-  }
+  let k = 0;
+  view.segs.forEach((run, i) => {
+    if (i > 0) console.log(`  ── resumed ${fmtLocal(parseLogTs(run.start))}${run.cycles.length ? '' : ' (no completed cycles)'} ──`);
+    for (const c of run.cycles) {
+      k++;
+      const mark = c.promoted ? '✓ ' : '  ';
+      console.log('  ' + mark + pad(k, 3)
+        + pad(Number.isFinite(c.score) ? c.score.toFixed(1) + '%' : '?', 8)
+        + pad(Number.isFinite(c.elo) ? signed(c.elo) : '?', 6)
+        + pad(c.sprt, 14)
+        + pad(c.games ?? '?', 7)
+        + pad(c.dur, 9)
+        + c.tail);
+    }
+  });
 }
 
 // --- Output. ----------------------------------------------------------------------------
 console.log(`\nAposChess train:loop progress — ${relish(logFile)}`);
 if (champHidden) console.log(`Current champion: arch [${champArch.join(',')}]  (hidden [${champHidden}])`);
 
-const latest = runs[runs.length - 1];
-const running = isLatestRunning(latest);
+const latest = views[views.length - 1];
+const running = isLatestRunning(latest.segs[latest.segs.length - 1]);
 
-console.log(`\n=== Latest run — started ${fmtLocal(parseLogTs(latest.start))}${running ? '  (RUNNING / not yet stopped)' : `  (stopped: ${latest.stopped} promotion(s))`} ===`);
+console.log(`\n=== Latest run — started ${fmtLocal(parseLogTs(latest.start))}`
+  + `${latest.segs.length > 1 ? `, resumed ${latest.segs.length - 1}× (warm same-recipe relaunches merged)` : ''}`
+  + `${running ? '  (RUNNING / not yet stopped)' : `  (stopped: ${latest.promotions} promotion(s))`} ===`);
 console.log(`  config: hidden=[${latest.hidden}]  gate ${latest.gateGames}g@d${latest.gateDepth} SPRT(0,${latest.elo1})`
   + `  λ=${latest.lambda ?? '?'}  batch ${latest.batch ?? '?'}  ${latest.start_kind} start`);
+const drifted = ['batch', 'gateGames', 'gateDepth', 'elo1']
+  .filter((key) => new Set(latest.segs.map((r) => String(r[key]))).size > 1);
+if (drifted.length) console.log(`  note: ${drifted.join(', ')} changed between relaunches — config above is the latest launch's.`);
 if (latest.lineageDiscarded) console.log(`  note: lineage discarded at start (${latest.lineageDiscarded}) — accumulation restarted from scratch.`);
 console.log('');
 printCycles(latest);
@@ -245,20 +303,23 @@ const reads = readRun(latest);
 console.log('\n  Read:');
 for (const r of reads) console.log(`    • ${r}`);
 
-// --- Compact history of recent runs. ----------------------------------------------------
-if (runs.length > 1) {
-  console.log(`\n=== Run history (last ${Math.min(histN, runs.length)} of ${runs.length}) ===`);
-  for (const run of runs.slice(-histN)) {
-    const scores = run.cycles.map((c) => c.score).filter(Number.isFinite);
+// --- Compact history of recent (merged) runs. --------------------------------------------
+if (views.length > 1) {
+  console.log(`\n=== Run history (last ${Math.min(histN, views.length)} of ${views.length}; warm same-recipe relaunches merged) ===`);
+  const shown = views.slice(-histN);
+  const hiddenW = Math.max(9, ...shown.map((v) => String(v.hidden).length));
+  for (const view of shown) {
+    const scores = view.cycles.map((c) => c.score).filter(Number.isFinite);
     const best = scores.length ? Math.max(...scores).toFixed(1) + '%' : '—';
-    const tag = run === latest && running ? 'RUN' : (run.stopped ?? '·');
-    console.log(`  ${pad(fmtLocal(parseLogTs(run.start)), 20)} h[${pad(run.hidden, 9)}] ${pad(run.start_kind, 22)} `
-      + `${padL(run.cycles.length, 2)}cyc  best ${padL(best, 6)}  prom ${run.promotions}  ${tag === 'RUN' ? 'running' : tag + ' prom'}`);
+    const state = view === latest && running ? 'running' : `${view.promotions} prom`;
+    console.log(`  ${pad(fmtLocal(parseLogTs(view.start)), 20)} h[${pad(view.hidden, hiddenW)}] ${pad(view.start_kind, 22)} `
+      + `${padL(view.segs.length, 2)}×  ${padL(view.cycles.length, 3)}cyc  best ${padL(best, 6)}  ${state}`);
   }
   if (detailAll) {
-    for (const run of runs.slice(0, -1)) {
-      console.log(`\n--- run ${fmtLocal(parseLogTs(run.start))} (hidden=[${run.hidden}], ${run.start_kind}) ---`);
-      printCycles(run);
+    for (const view of views.slice(0, -1)) {
+      console.log(`\n--- run ${fmtLocal(parseLogTs(view.start))} (hidden=[${view.hidden}], ${view.start_kind}`
+        + `${view.segs.length > 1 ? `, ${view.segs.length} launches` : ''}) ---`);
+      printCycles(view);
     }
   }
 }
@@ -272,7 +333,8 @@ for (let i = allCycles.length - 1; i >= 0; i--) {
   sincePromo++;
 }
 console.log('\n=== Overall ===');
-console.log(`  ${allCycles.length} cycle(s) across ${runs.length} run(s);  ${totalProm} promotion(s).`);
+console.log(`  ${allCycles.length} cycle(s) across ${views.length} run(s)`
+  + `${runs.length !== views.length ? ` (${runs.length} loop launches — warm same-recipe relaunches merged)` : ''};  ${totalProm} promotion(s).`);
 if (lastPromo) {
   const promoAt = parseLogTs(lastPromo.ts);
   const ago = (Date.now() - promoAt.getTime()) / 1000;
@@ -326,7 +388,7 @@ function readRun(run) {
   // (This exact case produced 'Mona': [128,64,32] bootstrapped over 50 cycles vs a [64,32,16]
   // champion, losing the gate throughout until its absolute Elo finally overtook.)
   if (champHidden && run.hidden !== '?' && run.hidden !== champHidden) {
-    if (traj) {
+    if (run.track) {
       out.push(`Candidate hidden=[${run.hidden}] ≠ champion hidden=[${champHidden}]: it can't warm-start from the `
         + `champion, but this is a registered experiment track warm-starting from its own lineage/best — so a `
         + `below-50% gate is expected while it bootstraps. Judge it by the track's absolute-Elo trend, not the gate edge.`);
