@@ -192,7 +192,7 @@ import { weightsHash, ephemeralVersion } from './vtag.mjs';
 import { STOP_EXIT_CODE } from './stop.mjs';
 import { isGameRecord, vsAt, setVsAt, normalizeVs, serializeGameRecord } from './gameRecord.mjs';
 import {
-  buildRecipe, parseRecipeExtra, ensureTrack, beginRun, recordCycle, recipeLabel,
+  buildRecipe, parseRecipeExtra, ensureTrack, beginRun, recordCycle, recipeLabel, readState,
 } from './experiment-registry.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -989,6 +989,12 @@ track = ensureTrack(loopDir, recipe, stamp());
 lineage = track.paths.lineage;   // this recipe's accumulated sub-threshold warm-start net
 trackBest = track.paths.best;    // this recipe's strongest net ever (by estimated abs Elo)
 runNo = beginRun(track.dir, stamp());
+// Cycle numbering CONTINUES across warm relaunches of the same recipe: the track's state
+// already counts every cycle it has recorded, so a warm (re)start picks up at prior+1 instead
+// of announcing "CYCLE 1" again after a Ctrl-C + relaunch (train:progress merges those
+// launches into one run the same way). A --cold run chains from a fresh net, so it starts
+// over at 1 — its cycles still accrue to the track for the next warm resume to continue from.
+const cycleBase = cfg.cold ? 0 : (readState(track.dir)?.cycles || 0);
 // No shape-mismatch discard anymore: the track is keyed by the exact recipe (hidden included),
 // so its lineage always matches its own shape and lives in its own directory — a different
 // recipe can't clobber it. A --cold run simply ignores the lineage (it chains from a fresh
@@ -1015,6 +1021,7 @@ log(`train:loop start — ${cfg.batch === 0
   + `refresh on promotion ${cfg.refreshFrac > 0 ? `${(cfg.refreshFrac * 100).toFixed(0)}% @ depth ${cfg.refreshDepth}` : 'off'} | `
   + `rank ${cfg.rank ? `full pool every cycle (hc${cfg.rankDepth} pin, all depths, corpus + ${cfg.rankMinutes}m play${cfg.adaptive ? ', adaptive' : ''})` : 'off'} | `
   + `cycles ${cfg.cycles === Infinity ? '∞' : cfg.cycles}`);
+if (cycleBase > 0) log(`Continuing cycle numbering at ${cycleBase + 1} — this recipe's track already has ${cycleBase} recorded cycle(s).`);
 log('Pause/resume from another terminal: `npm run train:pause` / `npm run train:resume` (frees all CPU, no work lost).');
 
 const jobArg = cfg.jobs !== undefined ? [`--jobs=${cfg.jobs}`] : [];
@@ -1030,25 +1037,29 @@ let promotions = 0;
 // fraction — the whole dataset's `v` targets are stalest right after a promotion. Starts at 0 so
 // the first cycles treat the loaded champion's inherited labels as worth refreshing.
 let cyclesSincePromo = 0;
-for (let c = 1; c <= cfg.cycles && !stopping; c++) {
+// `i` counts THIS launch's cycles (what --cycles bounds and the first-cycle behaviours key
+// on); `c` is the track-cumulative cycle number shown in banners/logs and recorded in the
+// track history — they differ when a warm relaunch continues an earlier run's numbering.
+for (let i = 1; i <= cfg.cycles && !stopping; i++) {
+  const c = cycleBase + i;
   const cycleT0 = Date.now();
   cyclesSincePromo++;
   const dataset = existsSync(rawFile) ? ` — dataset ${fmtMB(statSync(rawFile).size)}` : '';
-  banner(`CYCLE ${c}${cfg.cycles === Infinity ? '' : `/${cfg.cycles}`}${dataset}`);
+  banner(`CYCLE ${c}${cfg.cycles === Infinity ? '' : (cycleBase ? ` (${i}/${cfg.cycles} this run)` : `/${cfg.cycles}`)}${dataset}`);
   // --cold trains from random init on the FIRST cycle only: bootstrap a fresh net once,
   // then keep refining THAT net by warm-starting every later cycle from the previous
   // cycle's candidate (see the init resolution below) instead of relearning from scratch.
-  const cold = cfg.cold && c === 1;
+  const cold = cfg.cold && i === 1;
 
   // 1. Generate games with the champion (deeper search than the eval sees).
   //    --skip-gen: on the first cycle only, gate the games an interrupted earlier
   //    run already flushed to the dataset instead of generating a new batch.
-  if (c === 1 && cfg.skipGen) {
+  if (i === 1 && cfg.skipGen) {
     log('Skipping generation (--skip-gen): gating the existing dataset.');
   } else if (cfg.batch === 0) {
     // No dedicated self-play generation: the ranked pool produces training data instead (the
     // gate harvest + strong-engine --play games below). Announced once, then silent per cycle.
-    if (c === 1) log(`No dedicated generation (--batch=0): fresh data comes from the gate harvest`
+    if (i === 1) log(`No dedicated generation (--batch=0): fresh data comes from the gate harvest`
       + (cfg.playStrong ? ` + strong-engine ladder --play (depth ${cfg.playDepth}).` : ' + ranked-pool play.'));
   } else if (!run('Generate (champion self-play)', genBin,
     [`--games=${cfg.batch}`, `--depth=${cfg.depth}`, '--eval=nn',

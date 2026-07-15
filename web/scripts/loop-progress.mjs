@@ -243,8 +243,11 @@ const padL = (s, w) => String(s).padStart(w);
 const signed = (n) => (n >= 0 ? '+' : '') + n;
 
 // --- Detailed cycle table for a (merged) run. --------------------------------------------
-// Cycle numbers are CUMULATIVE across the chain's launches (the loop itself restarts at 1
-// on every relaunch); a separator marks where each warm relaunch picked the chain back up.
+// Cycle numbers are CUMULATIVE across the chain's launches; a separator marks where each
+// warm relaunch picked the chain back up. The loop now logs track-cumulative numbers itself
+// (a warm relaunch continues where the track left off), so a logged number that moves FORWARD
+// is trusted as-is — matching what the console showed live — while a launch that resets to 1
+// (logs from before the change) is renumbered to continue the chain.
 function printCycles(view) {
   if (!view.cycles.length) { console.log('  (no completed cycles)'); return; }
   console.log(`  ${pad('cyc', 5)}${pad('score', 8)}${pad('Elo', 6)}${pad('SPRT', 14)}${pad('games', 7)}${pad('took', 9)}lineage`);
@@ -252,7 +255,7 @@ function printCycles(view) {
   view.segs.forEach((run, i) => {
     if (i > 0) console.log(`  ── resumed ${fmtLocal(parseLogTs(run.start))}${run.cycles.length ? '' : ' (no completed cycles)'} ──`);
     for (const c of run.cycles) {
-      k++;
+      k = Math.max(k + 1, c.n);
       const mark = c.promoted ? '✓ ' : '  ';
       console.log('  ' + mark + pad(k, 3)
         + pad(Number.isFinite(c.score) ? c.score.toFixed(1) + '%' : '?', 8)
