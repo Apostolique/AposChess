@@ -3,6 +3,20 @@ name: Deploy to GitHub Pages
 on:
   push:
     branches: [main]
+    # Only deploy when something the built site uses changes. Zig engine source
+    # (web/engine/) is deliberately excluded: the browser runs the committed
+    # web/public/apos.wasm, so engine changes deploy when `npm run build:wasm`
+    # commits the new wasm (covered by web/public/**). Tooling (web/scripts/,
+    # parity files) never affects the site. workflow_dispatch remains the
+    # manual escape hatch.
+    paths:
+      - web/index.html
+      - web/src/**
+      - web/public/**
+      - web/vite.config.js
+      - web/package.json
+      - web/package-lock.json
+      - .github/workflows/deploy.yml
   workflow_dispatch:
 
 # The job pushes the built site to the gh-pages branch.
