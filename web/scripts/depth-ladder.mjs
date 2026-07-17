@@ -18,9 +18,12 @@
 //
 // Output is the ledger (engine-elo.*.json), the schema refresh-v/merge already read, so
 // refresh-v/merge can read it. The ACTIVE scheduler targets the RANKING objective — each step
-// it plays the matchup whose ORDERING is currently most ambiguous (P(mis-order) from the full
-// Bradley-Terry covariance), with periodic rigidity cross-links. Runs until stopped (q/Ctrl-C),
-// --minutes, or --matchups; persists every matchup (lossless overnight stop/start).
+// it plays the matchup with the highest VALUE OF INFORMATION: the reduction in expected
+// mis-order cost |Δ|·P(mis-order) (from the full Bradley-Terry covariance) that one matchup
+// buys. Games go to meaningful gaps that are still uncertain — a strong engine stuck under a
+// weaker one — not to near-ties whose order changes nothing. Periodic rigidity cross-links.
+// Runs until stopped (q/Ctrl-C), --minutes, or --matchups; persists every matchup (lossless
+// overnight stop/start).
 //
 // Method: Bradley-Terry, fit by the MM algorithm (Hunter 2004) — monotone, no matrix inversion.
 // Draws score as half a point each side (consistent with the codebase's eloFromScore logistic
@@ -372,6 +375,7 @@ function record(idA, idB, gamesPlayed, scoreA) {
 }
 
 // --- Bradley-Terry fit (MM algorithm) ------------------------------------------
+const ELO_VAR = (400 / Math.LN10) ** 2; // beta-variance -> Elo-variance (Elo = (400/ln10)·beta)
 function fit() {
   const ids = competitors.map((c) => c.id);
   const gamma = new Map(ids.map((id) => [id, 1]));
@@ -420,11 +424,10 @@ function fit() {
     H[a][a] += w; H[b][b] += w; H[a][b] -= w; H[b][a] -= w;
   }
   const S = invSym(H, n);
-  const C = (400 / Math.LN10) ** 2; // beta-variance -> Elo-variance
   const cov = (a, b) => S[pos.get(a)][pos.get(b)];
   // Var of the Elo difference between two nodes (Elo²) — the scheduler's currency.
-  const varDiff = (a, b) => (a === b ? 0 : C * (cov(a, a) + cov(b, b) - 2 * cov(a, b)));
-  const ci = new Map(ids.map((id) => [id, 1.96 * Math.sqrt(Math.max(0, pinId ? varDiff(id, pinId) : C * cov(id, id)))]));
+  const varDiff = (a, b) => (a === b ? 0 : ELO_VAR * (cov(a, a) + cov(b, b) - 2 * cov(a, b)));
+  const ci = new Map(ids.map((id) => [id, 1.96 * Math.sqrt(Math.max(0, pinId ? varDiff(id, pinId) : ELO_VAR * cov(id, id)))]));
   return { elo, ci, varDiff, gamesOf: (id) => adj.get(id).reduce((s, e) => s + e.N, 0) };
 }
 
@@ -457,10 +460,19 @@ function erf(x) {
 }
 const ncdf = (x) => 0.5 * (1 + erf(x / Math.SQRT2));
 
-// Active scheduler for the RANKING objective: pick the matchup that most reduces ordering
-// uncertainty. Score each rank-adjacent pair by P(mis-ordered) = Φ(−|Δ|/σ_Δ); play the worst.
-// Every 6th pick (or once all orderings are sharp) play the least-constrained near-strength
-// contrast instead, to keep the graph rigid and catch transitivity errors.
+// Active scheduler for the RANKING objective: pick the matchup with the highest VALUE OF
+// INFORMATION for the ordering. Each rank-adjacent pair carries an expected mis-order cost
+// |Δ|·Φ(−|Δ|/σ_Δ) — the Elo misplacement if the pair is really swapped, weighted by the
+// probability it is. Raw P(mis-order) alone chases near-ties forever (a true ~5 Elo gap keeps
+// Φ near 0.5 until thousands of games shrink σ below it, and resolving it changes nothing);
+// weighting by the gap sends games where a mis-order actually misplaces an engine — e.g. a
+// strong engine still sitting under a weaker one on a wide margin. The score is the COST
+// REDUCTION one matchup buys: G games between a and b add Fisher information w = G·p(1−p) on
+// exactly that edge, and by Sherman-Morrison the pair's contrast variance drops to
+// v' = 1/(1/v + w) (exact), so  VOI = |Δ|·[Φ(−|Δ|/σ) − Φ(−|Δ|/σ')].  A resolved pair (Φ≈0)
+// and a dead tie (|Δ|≈0) both score ~0, so the budget flows to gaps games can still sharpen.
+// Every 6th pick (or when no matchup buys ≥ MIN_VOI_PER_GAME·games) play the least-constrained
+// near-strength contrast instead, to keep the graph rigid and catch transitivity errors.
 // Scheduling is restricted to `schedulable` (the --play subset; the whole pool by default) — the
 // elo/varDiff still come from the full fit, so only the chosen engines play new games.
 //
@@ -474,6 +486,7 @@ const ncdf = (x) => 0.5 * (1 + erf(x / Math.SQRT2));
 // every under-played node, so a new champion (and each of its depths, in a full-pool run) is
 // anchored within a run or two; the floor being relative means everyone graduates as the pool's
 // average rises, and a fresh store (all zeros) onboards no one.
+const MIN_VOI_PER_GAME = 0.0025; // Elo of expected mis-order cost a game must buy back to be worth scheduling
 function pickMatchup(elo, varDiff, iter, gamesOf) {
   if (cfg.onboard > 0 && schedulable.length > 1) {
     const avg = schedulable.reduce((s, c) => s + gamesOf(c.id), 0) / schedulable.length;
@@ -493,15 +506,19 @@ function pickMatchup(elo, varDiff, iter, gamesOf) {
     }
   }
   const sorted = [...schedulable].sort((a, b) => elo.get(a.id) - elo.get(b.id));
-  let best = null, bestAmb = -1;
+  let best = null, bestVoi = 0, bestGap = 0, bestAmb = 0;
   for (let k = 0; k < sorted.length - 1; k++) {
     const a = sorted[k], b = sorted[k + 1];
     const d = Math.abs(elo.get(a.id) - elo.get(b.id));
-    const sd = Math.sqrt(Math.max(varDiff(a.id, b.id), 1e-9));
-    const amb = ncdf(-d / sd);
-    if (amb > bestAmb) { bestAmb = amb; best = [a, b]; }
+    const v = Math.max(varDiff(a.id, b.id), 1e-9);
+    const amb = ncdf(-d / Math.sqrt(v));
+    const p = 1 / (1 + 10 ** (-d / 400));                  // expected score of the stronger side
+    const w = cfg.games * p * (1 - p);                     // Fisher info this matchup adds (beta units)
+    const v2 = ELO_VAR / (ELO_VAR / v + w);                // Sherman-Morrison: exact post-matchup contrast variance
+    const voi = d * (amb - ncdf(-d / Math.sqrt(v2)));      // expected mis-order cost bought back
+    if (voi > bestVoi) { bestVoi = voi; best = [a, b]; bestGap = d; bestAmb = amb; }
   }
-  if (iter % 6 === 5 || bestAmb < 0.02) {
+  if (iter % 6 === 5 || bestVoi < MIN_VOI_PER_GAME * cfg.games) {
     let rb = null, rv = -1;
     for (let i = 0; i < schedulable.length; i++) for (let j = i + 1; j < schedulable.length; j++) {
       const a = schedulable[i], b = schedulable[j];
@@ -511,7 +528,7 @@ function pickMatchup(elo, varDiff, iter, gamesOf) {
     }
     if (rb) return { pair: rb, reason: 'rigidity', metric: Math.sqrt(Math.max(0, rv)) };
   }
-  return { pair: best, reason: 'ordering', metric: bestAmb };
+  return { pair: best, reason: 'ordering', metric: bestVoi, gap: bestGap, amb: bestAmb };
 }
 
 // --- one matchup on apos-match -------------------------------------------------
@@ -650,20 +667,32 @@ const parseTag = (tag) => { const m = /^(nn|hc)(\d+|t)@(.+)$/.exec(tag); return 
 const median = (xs) => { if (!xs.length) return null; const s = [...xs].sort((a, b) => a - b); const m = s.length >> 1; return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2; };
 
 // Is the pool actually trustworthy yet? Two orthogonal signals that "100 games each" misses:
-//  1) RESOLUTION — median ±95 margin vs the median gap between rank-adjacent engines. While the
-//     bootstrap pairs leave the graph under-connected, margins (±600) dwarf the gaps they must
-//     distinguish, so the whole order sits inside the noise. Converged ⇒ ratio drops toward ~1.
+//  1) MIS-ORDER COST — the same currency the scheduler optimizes: each rank-adjacent pair risks
+//     |Δ|·Φ(−|Δ|/σ_Δ) Elo of misplacement, with σ_Δ from the PAIRWISE contrast variance — not
+//     the ±95-vs-pin margins, which are floored by the shared path to the anchor and overstate
+//     how unknown the ORDER is (two neighbors that played each other directly can have their
+//     difference pinned to ±15 while both still read ±50 vs the pin). Near-ties pass on gap
+//     (mis-ordering engines ~5 Elo apart changes no downstream decision); real gaps pass on
+//     sharpness. Converged ⇒ no pair risks ≥ RESOLVED_COST.
 //  2) DEPTH ORDER — deeper search MUST be monotonically stronger, so each engine's depth curve is
 //     a free ground truth. Strict inversions (a deeper node estimated weaker) are the visible
-//     non-monotonicity; a "confident" inversion (gap exceeds the pair's combined CI) is a real
-//     transitivity/bug alarm that should never survive convergence.
-function convergenceReport(elo, ci) {
+//     non-monotonicity; a "confident" inversion (drop exceeding the pair's contrast ±95) is a
+//     real transitivity/bug alarm that should never survive convergence.
+const RESOLVED_COST = 5; // Elo; mis-order risk below this is beneath the ledger's decision granularity
+function convergenceReport(elo, varDiff) {
   const sorted = [...competitors].sort((a, b) => elo.get(a.id) - elo.get(b.id));
-  const gaps = [];
-  for (let i = 1; i < sorted.length; i++) gaps.push(elo.get(sorted[i].id) - elo.get(sorted[i - 1].id));
-  const margins = competitors.map((c) => ci.get(c.id)).filter((m) => m != null && m > 0 && isFinite(m));
-  const medMargin = median(margins), medGap = median(gaps);
-  const ratio = (medMargin != null && medGap > 0) ? medMargin / medGap : null;
+  const pairs = [];
+  for (let i = 1; i < sorted.length; i++) {
+    const a = sorted[i - 1], b = sorted[i];
+    const gap = elo.get(b.id) - elo.get(a.id);
+    const sd = Math.sqrt(Math.max(varDiff(a.id, b.id), 1e-9));
+    const amb = ncdf(-gap / sd);
+    pairs.push({ a: a.id, b: b.id, gap, margin: 1.96 * sd, amb, cost: gap * amb });
+  }
+  const medGap = median(pairs.map((p) => p.gap));
+  const medPairMargin = median(pairs.map((p) => p.margin));
+  const misorderCost = pairs.reduce((s, p) => s + p.cost, 0);
+  const worstPair = pairs.reduce((w, p) => (p.cost > (w?.cost ?? -1) ? p : w), null);
 
   // Per-version depth curves (need ≥2 depths to say anything about monotonicity).
   const byVersion = new Map();
@@ -677,7 +706,7 @@ function convergenceReport(elo, ci) {
       const drop = elo.get(nodes[i].id) - elo.get(nodes[j].id); // shallower minus deeper; >0 = inverted
       if (drop > 1e-9) {
         inv++; worst = Math.max(worst, drop);
-        const comb = Math.hypot(ci.get(nodes[i].id) || 0, ci.get(nodes[j].id) || 0);
+        const comb = 1.96 * Math.sqrt(Math.max(varDiff(nodes[i].id, nodes[j].id), 0));
         if (drop > comb) confInv++;
       }
     }
@@ -687,23 +716,26 @@ function convergenceReport(elo, ci) {
   const confInvTotal = curves.reduce((s, c) => s + c.confInv, 0);
   const nonMono = curves.filter((c) => c.inv > 0).sort((a, b) => b.worst - a.worst);
 
-  const resolved = ratio != null && ratio < 1.5;
+  const resolved = worstPair == null || worstPair.cost < RESOLVED_COST;
   const ordered = confInvTotal === 0;
   let verdict;
-  if (!resolved) verdict = `NOT converged — under-resolved (ratio ${ratio == null ? 'n/a' : ratio.toFixed(1)} ≥ 1.5). Keep running.`;
+  if (!resolved) verdict = `NOT converged — worst adjacent pair risks ${worstPair.cost.toFixed(1)} Elo of mis-order (want < ${RESOLVED_COST}). Keep running.`;
   else if (!ordered) verdict = `RESOLVED but ${confInvTotal} confident depth inversion(s) — possible non-transitivity/bug, inspect.`;
-  else verdict = `converged ✓ — margins resolved and every depth curve monotonic.`;
+  else verdict = `converged ✓ — no adjacent pair risks ≥ ${RESOLVED_COST} Elo of mis-order and every depth curve is monotonic.`;
 
   return {
-    summary: { medMargin, medGap, ratio, versionsMonotonic: monotonic, versionsWithDepthCurve: curves.length, confidentInversions: confInvTotal, resolved, ordered, converged: resolved && ordered, verdict },
+    summary: { pairs: pairs.length, medPairMargin, medGap, misorderCost, worstPair, versionsMonotonic: monotonic, versionsWithDepthCurve: curves.length, confidentInversions: confInvTotal, resolved, ordered, converged: resolved && ordered, verdict },
     nonMono, elo,
   };
 }
 
 function printConvergence(rep) {
   const s = rep.summary;
+  const wp = s.worstPair;
+  const pairLbl = (id) => { const c = byId.get(id); return c ? nodeLabel(c) : id; };
   console.log(`\n===== Convergence check =====`);
-  console.log(`  resolution:  median ±95 = ${s.medMargin == null ? 'n/a' : s.medMargin.toFixed(0)}  |  median neighbor gap = ${s.medGap == null ? 'n/a' : s.medGap.toFixed(0)}  |  ratio ${s.ratio == null ? 'n/a' : s.ratio.toFixed(1)}  (want < ~1.5)`);
+  console.log(`  mis-order risk: ${s.misorderCost == null ? 'n/a' : s.misorderCost.toFixed(0)} Elo total over ${s.pairs} adjacent pair(s)  |  worst ${wp == null ? 'n/a' : `${wp.cost.toFixed(1)} Elo — ${pairLbl(wp.a)} vs ${pairLbl(wp.b)} (gap ${wp.gap.toFixed(0)}, ±${wp.margin.toFixed(0)} pairwise)`}  (want worst < ${RESOLVED_COST})`);
+  console.log(`  resolution:  median adjacent ±95 = ${s.medPairMargin == null ? 'n/a' : s.medPairMargin.toFixed(0)} (pairwise contrast, not vs-pin)  |  median neighbor gap = ${s.medGap == null ? 'n/a' : s.medGap.toFixed(0)}`);
   console.log(`  depth order: ${s.versionsMonotonic}/${s.versionsWithDepthCurve} versions monotonic  |  ${s.confidentInversions} confident inversion(s)`);
   for (const c of rep.nonMono.slice(0, 4)) {
     const seq = c.nodes.map((n) => `d${n.depth}=${rep.elo.get(n.id) >= 0 ? '+' : ''}${rep.elo.get(n.id).toFixed(0)}`).join(' ');
@@ -717,7 +749,7 @@ function printConvergence(rep) {
 // periodically (verbose=false) during a long run and once at the end (verbose=true), so the
 // ledger is always reasonably fresh even if the run is killed hard.
 function writeRankLedger(verbose) {
-  const { elo, ci, gamesOf } = fit();
+  const { elo, ci, varDiff, gamesOf } = fit();
   const ranked = [...competitors].sort((a, b) => elo.get(a.id) - elo.get(b.id));
   const recordsByVersion = new Map();
   for (const [tag, n] of tagCounts) { const t = parseTag(tag); if (!t) continue; const k = `${t.eng}@${t.version}`; recordsByVersion.set(k, (recordsByVersion.get(k) || 0) + n); }
@@ -743,7 +775,7 @@ function writeRankLedger(verbose) {
     }
     unrecoverable.sort((a, b) => b.records - a.records);
   }
-  const conv = convergenceReport(elo, ci);
+  const conv = convergenceReport(elo, varDiff);
   const ledger = {
     generated: new Date().toISOString(), anchor: pinId, method: 'bradley-terry-pool',
     depths: cfg.depths, games: cfg.games, seed: cfg.seed,
@@ -813,11 +845,11 @@ if (cfg.rounds === 0) {
   let played = 0;
   while (!stopped && Date.now() < deadline && played < cfg.matchups) {
     const { elo, ci, varDiff, gamesOf } = fit();
-    const { pair, reason, metric, floor } = pickMatchup(elo, varDiff, played, gamesOf);
+    const { pair, reason, metric, floor, gap, amb } = pickMatchup(elo, varDiff, played, gamesOf);
     if (!pair) break;
     const [a, b] = pair;
     const tag = `[${played + 1}${Number.isFinite(cfg.matchups) ? `/${cfg.matchups}` : ''}]`;
-    const why = reason === 'ordering' ? `ordering: P(mis-order) ${(metric * 100).toFixed(0)}%`
+    const why = reason === 'ordering' ? `ordering: gap ${gap.toFixed(0)} Elo at P(mis-order) ${(amb * 100).toFixed(0)}% — matchup buys ${metric.toFixed(2)} Elo`
       : reason === 'onboard' ? `onboard: ${metric} game(s), below floor ${floor.toFixed(0)} (${cfg.onboard}×pool avg)`
       : `rigidity: ±${metric.toFixed(0)} Elo`;
     // Announce with each node's CURRENT fitted Elo ±95 (the ledger's real estimate), so the
