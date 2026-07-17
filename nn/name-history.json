@@ -1,0 +1,16 @@
+{
+  "note": "Champions pruned from manifest.json live on here: the ledger labels their hash by name forever, and these names are never reused for future champions. Append-only; maintained by train:loop (publishChampion).",
+  "names": [
+    {
+      "name": "Ada",
+      "hash": "94c88e",
+      "gen": 1,
+      "arch": [
+        768,
+        64,
+        1
+      ],
+      "note": "Retired train:loop champion (94c88e, 2026-06-12); pruned from the catalog 2026-07-14."
+    }
+  ]
+}
