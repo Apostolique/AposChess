@@ -353,6 +353,9 @@ const pidFile = join(loopDir, 'loop.pid');
 const pauseFlag = join(loopDir, 'PAUSED'); // marker loop-ctl writes while suspended
 const publicNN = resolve(webDir, 'public', 'nn');
 const manifestFile = join(publicNN, 'manifest.json');
+// Champions pruned from the manifest keep their identity here (hash -> name for ledger labels,
+// and their names are never handed out again). Append-only, written by publishChampion.
+const nameHistoryFile = join(publicNN, 'name-history.json');
 
 const args = Object.fromEntries(
   process.argv.slice(2).map((a) => {
@@ -466,7 +469,8 @@ const cfg = {
   // pickable in the app under a real name from the moment it's promoted (past champions stay
   // too). Only the most recent --keep-champions retired nets are kept (the current champion is
   // always kept); older ones are pruned (weights file + manifest entry) to bound the deployed
-  // bundle (~0.5 MB each). 0 = off.
+  // bundle (~0.5 MB each), but their name+hash move to name-history.json so ledger labels
+  // survive and names are never reused. 0 = off.
   keepChampions: num(args['keep-champions'], 12),
   // Strong-engine ladder play as the generator. With no dedicated generation (--batch=0), the
   // per-cycle rank step restricts --play to the strongest nn engines (current champion + recent
@@ -506,11 +510,18 @@ const cfg = {
 // only when an explicit --rank-games differs from this machine's computed default.
 scriptDefaults['npm run rank:pool'].games = String(defaultRankGames);
 
-// hash -> human name (champions from the web catalog manifest), so loop output shows 'Leo'
-// next to 9e31ca wherever a hash appears. Read fresh per call (cheap, ~once a cycle) because
-// a promotion renames the current champion mid-run.
+// The name-history entries (champions pruned from the manifest), or [] if none yet.
+function nameHistory() {
+  try { return JSON.parse(readFileSync(nameHistoryFile, 'utf8')).names || []; } catch { return []; }
+}
+
+// hash -> human name (champions from the web catalog manifest, plus pruned ones from the
+// name history — manifest wins), so loop output shows 'Leo' next to 9e31ca wherever a hash
+// appears. Read fresh per call (cheap, ~once a cycle) because a promotion renames the
+// current champion mid-run.
 function nnNames() {
   const m = new Map();
+  for (const n of nameHistory()) if (n.hash && n.name) m.set(n.hash, n.name);
   try { for (const n of (JSON.parse(readFileSync(manifestFile, 'utf8')).nets || [])) if (n.hash && n.name) m.set(n.hash, n.name); } catch { /* no manifest yet */ }
   return m;
 }
@@ -880,7 +891,9 @@ function refreshArgs(frac, depth) {
 const refreshMode = () => (cfg.rank && existsSync(ledgerFile)) ? 'weakest-first' : 'random';
 
 // Human names for champions, handed out in order (the first eight — Ada..Hugo — were the
-// initial hand-published lineage). A name freed by pruning becomes reusable.
+// initial hand-published lineage). Names are permanent: a pruned champion's name moves to
+// name-history.json and is never handed out again (a hash is a hash, a name is a net). When
+// all 26 are spent the fallback is champ-<hash>.
 const CHAMPION_NAMES = ['Ada', 'Boris', 'Clara', 'Dexter', 'Elena', 'Felix', 'Greta', 'Hugo',
   'Ivy', 'Jack', 'Kara', 'Leo', 'Mona', 'Nash', 'Olga', 'Pia', 'Quinn', 'Rosa', 'Sven',
   'Tara', 'Uma', 'Victor', 'Wren', 'Xena', 'Yuri', 'Zara'];
@@ -901,7 +914,8 @@ function publishChampion(file, arch) {
   const hash = weightsHash(file);
   let entry = hash !== '?' ? champs().find((n) => n.hash === hash) : null;
   if (!entry) {
-    const used = new Set(man.nets.map((n) => n.name));
+    // Names in the pruned-champion history are spent too — never reassign them.
+    const used = new Set([...man.nets.map((n) => n.name), ...nameHistory().map((h) => h.name)]);
     const name = CHAMPION_NAMES.find((n) => !used.has(n)) || `champ-${hash}`;
     const out = `${name.toLowerCase()}.json`;
     const gen = Math.max(0, ...champs().map((n) => n.gen || 0)) + 1;
@@ -915,12 +929,30 @@ function publishChampion(file, arch) {
   entry.current = true;
   man.default = entry.name;
   // Keep only the most recent cfg.keepChampions retired champions; never prune the current one.
+  // A pruned champion's identity (name+hash) is appended to name-history.json so the ledger
+  // keeps labeling its hash and the name stays spent; only the deployed weights go away.
   if (cfg.keepChampions > 0) {
     const byAge = champs().filter((n) => !n.current).sort((a, b) => (a.gen || 0) - (b.gen || 0));
-    for (const e of byAge.slice(0, Math.max(0, byAge.length - cfg.keepChampions))) {
+    const pruned = byAge.slice(0, Math.max(0, byAge.length - cfg.keepChampions));
+    for (const e of pruned) {
       const p = join(publicNN, e.file);
       if (existsSync(p)) rmSync(p);
       man.nets = man.nets.filter((n) => n !== e);
+    }
+    if (pruned.length) {
+      const names = nameHistory();
+      const today = new Date().toISOString().slice(0, 10);
+      for (const e of pruned) {
+        if (names.some((h) => h.hash === e.hash)) continue;
+        names.push({ name: e.name, hash: e.hash, gen: e.gen, arch: e.arch,
+          note: `${(e.note || `Retired train:loop champion (${e.hash}).`).replace(/\.$/, '')}; pruned from the catalog ${today}.` });
+      }
+      writeFileSync(nameHistoryFile, JSON.stringify({
+        note: 'Champions pruned from manifest.json live on here: the ledger labels their hash by'
+          + ' name forever, and these names are never reused for future champions. Append-only;'
+          + ' maintained by train:loop (publishChampion).',
+        names,
+      }, null, 2) + '\n');
     }
   }
   man.nets.sort((a, b) => a.name.localeCompare(b.name));

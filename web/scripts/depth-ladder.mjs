@@ -119,11 +119,16 @@ const engineDir = resolve(webDir, 'engine');
 const matchBin = resolve(engineDir, 'zig-out', 'bin', process.platform === 'win32' ? 'apos-match.exe' : 'apos-match');
 
 // Nice display names, keyed by the same 6-char content hash weightsHash() produces (= a node's
-// version), from the web UI net catalog (public/nn/manifest.json — champions + hand nets).
-// Best-effort: a version not in the catalog (an unarchived/quantized net, hc, material) simply
-// has no name.
+// version), from the web UI net catalog (public/nn/manifest.json — champions + hand nets) plus
+// name-history.json (champions pruned from the catalog keep their name forever; manifest wins
+// on conflict). Best-effort: a version in neither (an unarchived/quantized net, hc, material)
+// simply has no name.
 const nnNames = (() => {
   const m = new Map();
+  try {
+    const hist = JSON.parse(readFileSync(resolve(webDir, 'public', 'nn', 'name-history.json'), 'utf8'));
+    for (const n of hist.names || []) if (n.hash && n.name) m.set(n.hash, n.name);
+  } catch { /* no history -> manifest names only */ }
   try {
     const mani = JSON.parse(readFileSync(resolve(webDir, 'public', 'nn', 'manifest.json'), 'utf8'));
     for (const n of mani.nets || []) if (n.hash && n.name) m.set(n.hash, n.name);
