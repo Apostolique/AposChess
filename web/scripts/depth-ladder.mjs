@@ -12,8 +12,8 @@
 //
 // A node is an (engine, depth) pair: apos-match plays one weights file against another (or
 // itself) via --depth/--depth-b. hc<anchor-depth> (hc6) is ALWAYS a node and is the pin
-// (Elo := 0), so every pool — all engines, or one net's depth sweep — lands on the SAME stable
-// scale. So there is no separate "depth curve" mode: a curve is just the ledger filtered to one
+// (Elo := 1500, so the whole pool sits on a familiar all-positive scale), so every pool — all
+// engines, or one net's depth sweep — lands on the SAME stable scale. So there is no separate "depth curve" mode: a curve is just the ledger filtered to one
 // net's nodes. The store persists pairwise results, so re-running ACCUMULATES games.
 //
 // Output is the ledger (engine-elo.*.json), the schema refresh-v/merge already read, so
@@ -41,7 +41,7 @@
 //                   regardless. --net=X is shorthand for --engines=X (one net's depth sweep).
 //   --depths=LIST   depths to rate each engine at: range (1-8) or list (6,8). Default 1-8
 //                   (the whole spectrum). Narrow it (e.g. --depths=6,8) for a quick run.
-//   --anchor-depth=D  the hc depth that is the pin / Elo 0 (default 6). Always present as a node.
+//   --anchor-depth=D  the hc depth that is the pin / Elo 1500 (default 6). Always present as a node.
 //   --play=SPEC     restrict NEW scheduled games to matchups among these specs only (comma list).
 //                   Each is EITHER a bare engine spec (same forms as --engines) — every --depths
 //                   of it is schedulable — OR a depth-qualified NODE id `<eng><depth>@<spec>` (the
@@ -140,7 +140,6 @@ const niceName = (version) => nnNames.get(version) || null;
 // competitor reads without a hash→name lookup. Nodes without a catalog name (hc, material,
 // unarchived nets) print as their bare id.
 const nodeLabel = (c) => `${c.id}${niceName(c.version) ? ` (${niceName(c.version)})` : ''}`;
-const fmtSigned = (x) => `${x >= 0 ? '+' : ''}${x.toFixed(0)}`;
 
 const args = Object.fromEntries(process.argv.slice(2).map((a) => {
   const m = a.replace(/^--/, '').split('='); return [m[0], m.length > 1 ? m[1] : true];
@@ -155,7 +154,7 @@ function parseDepths(spec, dflt) {
 }
 
 // ONE rating pool — no modes. Nodes are (engine, depth) pairs; hc<anchor-depth> (hc6 by
-// default) is ALWAYS a node and is the pin (Elo := 0), so every pool — all engines, or one
+// default) is ALWAYS a node and is the pin (Elo := 1500), so every pool — all engines, or one
 // net's depth sweep — lands on the same stable scale. Pick the engines with --engines (default
 // 'all') or --net=X (one net); --depths sets the depths. The ledger is the single artifact: a
 // "depth curve" is just the ledger filtered to one net, so there's no separate mode to maintain.
@@ -165,7 +164,7 @@ const cfg = {
   // --net=X is shorthand for --engines=X.
   engines: typeof args.net === 'string' ? args.net : (typeof args.engines === 'string' ? args.engines : 'all'),
   depths: parseDepths(args.depths, [1, 2, 3, 4, 5, 6, 7, 8]),
-  anchorDepth: num(args['anchor-depth'], 6), // the hc depth that is the pin (Elo := 0)
+  anchorDepth: num(args['anchor-depth'], 6), // the hc depth that is the pin (Elo := PIN_ELO)
   // --play: restrict NEW scheduled games to matchups among these engines (comma list of specs).
   // The pin + the rest of the pool are still rated from already-played store/--corpus games;
   // they just don't play new games. null = schedule across the whole pool (default).
@@ -182,9 +181,9 @@ const cfg = {
   games: Math.max(2, Math.round(num(args.games, 100) / 2) * 2),
   // Onboarding floor, as a FRACTION of the schedulable pool's average game count (relative on
   // purpose — no magic absolute number: the floor scales with how much the pool has actually
-  // played, and a fresh store where everyone sits at 0 onboards no one). A node below the
+  // played, and a fresh store where everyone sits at 0 games onboards no one). A node below the
   // floor is "under-played" and gets scheduled first (least-played, vs the nearest-Elo
-  // established node). Without it, fresh nodes sit at the prior (-35 ±600s) where the ordering
+  // established node). Without it, fresh nodes sit at the prior (~35 below the pin, ±600s) where the ordering
   // objective pairs them with EACH OTHER — two unknowns playing each other stay disconnected
   // from the scale — while the well-played cluster keeps winning the ambiguity contest. 0 off.
   onboard: Math.max(0, num(args.onboard, 0.5)),
@@ -277,6 +276,11 @@ const node = (e, d) => ({ id: `${e.eng}${d}@${e.version}`, eng: e.eng, eval: e.e
 const competitors = [];
 for (const e of engines) for (const d of cfg.depths) competitors.push(node(e, d));
 // The pin node hc<anchor-depth> is ALWAYS present, even if anchor-depth ∉ --depths.
+// Its rating is fixed at PIN_ELO — 1500 rather than 0 so the whole pool reads on a familiar
+// all-positive scale. Every persisted ABSOLUTE Elo (the ledger, the dataset's ephemeral
+// `elo<N>` provenance tags, the experiment tracks' absElo) lives on this scale; changing
+// PIN_ELO requires migrating all of them together.
+const PIN_ELO = 1500;
 const pinId = `hc${cfg.anchorDepth}@${HC_VERSION}`;
 if (!competitors.some((c) => c.id === pinId)) competitors.push(node(makeEngine('hc'), cfg.anchorDepth));
 // A depth-qualified --play node may name a depth outside --depths; force that exact node in
@@ -410,7 +414,7 @@ function fit() {
     if (maxd < 1e-10) break;
   }
   const elo = new Map(ids.map((id) => [id, 400 * Math.log10(gamma.get(id))]));
-  if (pinId) { const off = elo.get(pinId); for (const id of ids) elo.set(id, elo.get(id) - off); }
+  if (pinId) { const off = elo.get(pinId); for (const id of ids) elo.set(id, elo.get(id) - off + PIN_ELO); }
   // Full covariance from the Fisher information matrix H (beta = ln gamma): H_ii = phantom
   // self-anchor + Σ_j N_ij·p_ij(1−p_ij), H_ij = −N_ij·p_ij(1−p_ij). The prior on the diagonal
   // makes H positive-definite (invertible) even on a sparse/tree graph, so we can read off the
@@ -743,7 +747,7 @@ function printConvergence(rep) {
   console.log(`  resolution:  median adjacent ±95 = ${s.medPairMargin == null ? 'n/a' : s.medPairMargin.toFixed(0)} (pairwise contrast, not vs-pin)  |  median neighbor gap = ${s.medGap == null ? 'n/a' : s.medGap.toFixed(0)}`);
   console.log(`  depth order: ${s.versionsMonotonic}/${s.versionsWithDepthCurve} versions monotonic  |  ${s.confidentInversions} confident inversion(s)`);
   for (const c of rep.nonMono.slice(0, 4)) {
-    const seq = c.nodes.map((n) => `d${n.depth}=${rep.elo.get(n.id) >= 0 ? '+' : ''}${rep.elo.get(n.id).toFixed(0)}`).join(' ');
+    const seq = c.nodes.map((n) => `d${n.depth}=${rep.elo.get(n.id).toFixed(0)}`).join(' ');
     const nm = niceName(c.k.split('@')[1]);
     console.log(`    ${(nm ? `${c.k} (${nm})` : c.k).padEnd(20)} ${seq}   (${c.inv} inv${c.confInv ? `, ${c.confInv} confident` : ''})`);
   }
@@ -791,11 +795,11 @@ function writeRankLedger(verbose) {
   mkdirSync(dirname(cfg.ledger), { recursive: true });
   writeFileSync(cfg.ledger, JSON.stringify(ledger, null, 2) + '\n');
   if (!verbose) return;
-  console.log(`\n===== Elo ladder (${pinId} := 0) — weakest first =====`);
+  console.log(`\n===== Elo ladder (${pinId} := ${PIN_ELO}) — weakest first =====`);
   console.log(`  ${'#'.padStart(3)} ${'engine'.padEnd(16)} ${'name'.padEnd(12)} ${'Elo'.padStart(8)} ${'±95'.padStart(6)} ${'games'.padStart(7)}`);
   for (const [i, c] of ranked.entries()) {
     const rank = ranked.length - i; // ranked is weakest-first, so #1 = strongest
-    console.log(`  ${String(rank).padStart(3)} ${c.id.padEnd(16)} ${(niceName(c.version) || '').padEnd(12)} ${(`${elo.get(c.id) >= 0 ? '+' : ''}${elo.get(c.id).toFixed(0)}`).padStart(8)} ${(ci.get(c.id) == null ? '' : ci.get(c.id).toFixed(0)).padStart(6)} ${String(gamesOf(c.id)).padStart(7)}${c.id === pinId ? '  (pin)' : ''}`);
+    console.log(`  ${String(rank).padStart(3)} ${c.id.padEnd(16)} ${(niceName(c.version) || '').padEnd(12)} ${elo.get(c.id).toFixed(0).padStart(8)} ${(ci.get(c.id) == null ? '' : ci.get(c.id).toFixed(0)).padStart(6)} ${String(gamesOf(c.id)).padStart(7)}${c.id === pinId ? '  (pin)' : ''}`);
   }
   if (unrecoverable.length) {
     console.log(`\n  Unrecoverable contributors (no Elo -> weakest, refresh on sight):`);
@@ -860,7 +864,7 @@ if (cfg.rounds === 0) {
     // Announce with each node's CURRENT fitted Elo ±95 (the ledger's real estimate), so the
     // matchup reads on the stable hc scale up front — the match runner's own live Elo is only
     // this matchup's games and always starts at 0 with a huge margin.
-    const lbl = (c) => `${nodeLabel(c)} ${fmtSigned(elo.get(c.id))} ±${(ci.get(c.id) ?? 0).toFixed(0)}`;
+    const lbl = (c) => `${nodeLabel(c)} ${elo.get(c.id).toFixed(0)} ±${(ci.get(c.id) ?? 0).toFixed(0)}`;
     const pA = 1 / (1 + 10 ** ((elo.get(b.id) - elo.get(a.id)) / 400));
     console.log(`\n${tag} ${why} -> ${lbl(a)}  vs  ${lbl(b)}  (ledger expects A ${(pA * 100).toFixed(0)}%)`);
     await playPair(a, b);
@@ -869,7 +873,7 @@ if (cfg.rounds === 0) {
     writeFileSync(cfg.store, JSON.stringify(store, null, 2) + '\n');
     { // refit so the pair's post-matchup ratings show right away (cheap next to the games)
       const { elo: e2, ci: c2 } = fit();
-      const upd = (c) => `${nodeLabel(c)} ${fmtSigned(e2.get(c.id))} ±${(c2.get(c.id) ?? 0).toFixed(0)}`;
+      const upd = (c) => `${nodeLabel(c)} ${e2.get(c.id).toFixed(0)} ±${(c2.get(c.id) ?? 0).toFixed(0)}`;
       console.log(`  ledger now: ${upd(a)}  |  ${upd(b)}`);
     }
     played++;

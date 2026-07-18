@@ -436,7 +436,7 @@ const cfg = {
   // ambiguous matchups to tighten ratings. The refreshes below read the resulting parallel
   // ledger (engine-elo.ladder.json) to relabel the WEAKEST engine's `v` first. --no-rank reverts.
   rank: !args['no-rank'],
-  // hc pin depth for the pool (Elo 0) — every rating lands on this stable scale.
+  // hc pin depth for the pool (Elo 1500) — every rating lands on this stable scale.
   rankDepth: num(args['rank-depth'], 6),
   // Wall-clock the pool plays per cycle, on top of the (free) corpus fold. Short, because the
   // corpus already rates the champion from its gate games and the store accumulates across
@@ -684,8 +684,8 @@ function adaptiveMaintenance(cyclesSincePromo) {
 // so refresh-v/merge would read it as −∞ "unrecoverable" and relabel it on sight (the
 // champion's plies already carry a ranked tag and pass through). When the candidate WASN'T
 // promoted (the common lineage / sub-threshold case), we rewrite its lines' vs to a
-// self-describing ephemeral tag "nn<d>@elo<E>", where E is the candidate's strength vs the hc
-// anchor: the champion's ledger Elo at that depth plus the LOWER bound of the gate's measured
+// self-describing ephemeral tag "nn<d>@elo<E>", where E is the candidate's absolute Elo on the
+// hc-anchored ledger scale: the champion's ledger Elo at that depth plus the LOWER bound of the gate's measured
 // edge (so a short or early-stopped gate is treated cautiously — weaker, hence refreshed
 // sooner — rather than over-credited on thin evidence). A promoted candidate (its hash is
 // archived + ranked) or a champion-won gate is already tagged with a ranked engine, so it
@@ -774,7 +774,7 @@ function run(label, cmd, argv, cwd = webDir) {
 
 // The loop rates the SAME full pool as a standalone `npm run rank:pool` — every engine across
 // depth-ladder's default depth spectrum (1-8), not a narrowed slice — so its ledger is the one
-// unified pool, not a loop-specific variant. hc<rankDepth> stays the pinned Elo-0 node (via
+// unified pool, not a loop-specific variant. hc<rankDepth> stays the pinned Elo-1500 node (via
 // --anchor-depth below), so all ratings land on the same stable scale. (The two depths positions
 // are LABELED at, nn6@/nn8@, are just a subset of that spectrum — foldGateHarvest still finds
 // them in the ledger.)

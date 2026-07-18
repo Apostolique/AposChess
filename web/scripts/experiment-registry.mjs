@@ -285,7 +285,7 @@ export function suggestRecipes(loopDir, opts = {}) {
     if (!stalled) continue;
     out.push({
       kind: 'resume', id: t.id, slug: t.slug, recipe: t.recipe, bestElo: elo,
-      reason: `past best ≈ ${elo >= 0 ? '+' : ''}${elo.toFixed(0)} Elo`
+      reason: `past best ≈ ${elo.toFixed(0)} Elo`
         + ` over ${st.cycles || 0} cycle(s), ${promoted} promotion(s)`
         + ` — has a saved best to warm-start from`,
       cmd: recipeResumeCmd(t.recipe),

@@ -103,7 +103,7 @@ if (args.show) {
   console.log(`  runs ${st.runs ?? 0} · cycles ${st.cycles ?? 0} · promotions ${st.promotions ?? 0}`
     + ` · created ${fmtLocal(parseTs(st.createdTs))} · last run ${fmtLocal(parseTs(st.lastRunTs))}`);
   if (st.best) {
-    console.log(`  best net: abs Elo ${signed(st.best.absElo)}  (gate ${(st.best.score * 100).toFixed(1)}%,`
+    console.log(`  best net: abs Elo ${Number.isFinite(st.best.absElo) ? st.best.absElo.toFixed(0) : '—'}  (gate ${(st.best.score * 100).toFixed(1)}%,`
       + ` edge ${signed(st.best.edgeElo)}, ${st.best.sprt}, run ${st.best.run} cycle ${st.best.cycle})`
       + `  → ${existsSync(trackPaths(t.dir).best) ? 'best.json saved' : 'best.json missing'}`);
   }
@@ -118,7 +118,7 @@ if (args.show) {
       console.log('    ' + pad(`${h.run ?? '?'}/${h.cycle ?? '?'}`, 9)
         + pad(Number.isFinite(h.score) ? (h.score * 100).toFixed(1) + '%' : '?', 8)
         + pad(signed(h.edgeElo), 7)
-        + pad(h.absElo != null ? signed(h.absElo) : '—', 8)
+        + pad(Number.isFinite(h.absElo) ? h.absElo.toFixed(0) : '—', 8)
         + pad(h.promoted ? 'H1 PROMOTED' : h.sprt, 14)
         + pad(fmtLocal(parseTs(h.ts)), 18));
     }
@@ -153,7 +153,7 @@ for (const t of rows) {
   const star = producedChampion(t.dir) ? ' ★' : '';
   console.log('  ' + pad(t.slug, 24) + pad(t.id, 10)
     + padL(st.runs ?? 0, 5) + ' ' + padL(st.cycles ?? 0, 4) + ' ' + padL(st.promotions ?? 0, 5) + ' '
-    + padL(st.best ? signed(st.best.absElo) : '—', 12) + ' '
+    + padL(st.best && Number.isFinite(st.best.absElo) ? st.best.absElo.toFixed(0) : '—', 12) + ' '
     + padL(st.best && Number.isFinite(st.best.score) ? (st.best.score * 100).toFixed(1) + '%' : '—', 7)
     + '  ' + pad(fmtLocal(parseTs(st.lastRunTs)), 18) + star);
 }

@@ -81,8 +81,8 @@ export function ledgerEloResolver(ledgerPath) {
 // Ephemeral-engine version marker. A non-promoted gate candidate is never archived and
 // can't be re-instantiated, so a content-hash version would be UNRECOVERABLE — refresh-v
 // and merge-data would read it as -Inf "weakest, relabel on sight". Instead its `vs`
-// version encodes the candidate's measured strength directly: "elo<N>", an integer Elo
-// relative to the SAME stable hc anchor the rank ledger uses. Consumers read the strength
+// version encodes the candidate's measured strength directly: "elo<N>", an integer absolute
+// Elo on the SAME hc-anchored scale the rank ledger uses (pin hc6 := 1500). Consumers read the strength
 // straight off the tag — no ledger lookup, no archived weights needed. The 'elo' prefix is
 // collision-proof against a real nn version (a sha1 hex hash can't contain 'l' or 'o') and
 // against the integer hc version.
