@@ -1,19 +1,6 @@
 {
-  "default": "Olga",
+  "default": "Pia",
   "nets": [
-    {
-      "name": "Clara",
-      "file": "clara.json",
-      "arch": [
-        768,
-        64,
-        1
-      ],
-      "loopChampion": true,
-      "hash": "932b7c",
-      "gen": 3,
-      "note": "Retired train:loop champion (932b7c, 2026-06-15)."
-    },
     {
       "name": "Dexter",
       "file": "dexter.json",
@@ -207,7 +194,29 @@
       "loopChampion": true,
       "hash": "8d9b7c",
       "gen": 15,
-      "note": "train:loop champion Olga (gen 15, 8d9b7c, 2026-07-21).",
+      "note": "train:loop champion Olga (gen 15, 8d9b7c, 2026-07-21)."
+    },
+    {
+      "name": "Pia",
+      "file": "pia.json",
+      "arch": [
+        768,
+        128,
+        64,
+        32,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        1
+      ],
+      "loopChampion": true,
+      "hash": "fabe06",
+      "gen": 16,
+      "note": "train:loop champion Pia (gen 16, fabe06, 2026-07-21).",
       "current": true
     },
     {

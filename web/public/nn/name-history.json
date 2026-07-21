@@ -22,6 +22,17 @@
         1
       ],
       "note": "Retired train:loop champion (a14d52, 2026-06-14); pruned from the catalog 2026-07-21."
+    },
+    {
+      "name": "Clara",
+      "hash": "932b7c",
+      "gen": 3,
+      "arch": [
+        768,
+        64,
+        1
+      ],
+      "note": "Retired train:loop champion (932b7c, 2026-06-15); pruned from the catalog 2026-07-21."
     }
   ]
 }
