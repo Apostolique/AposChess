@@ -1,19 +1,6 @@
 {
-  "default": "Nash",
+  "default": "Olga",
   "nets": [
-    {
-      "name": "Boris",
-      "file": "boris.json",
-      "arch": [
-        768,
-        64,
-        1
-      ],
-      "loopChampion": true,
-      "hash": "a14d52",
-      "gen": 2,
-      "note": "Retired train:loop champion (a14d52, 2026-06-14)."
-    },
     {
       "name": "Clara",
       "file": "clara.json",
@@ -201,7 +188,26 @@
       "loopChampion": true,
       "hash": "0bdf07",
       "gen": 14,
-      "note": "train:loop champion Nash (gen 14, 0bdf07, 2026-07-14).",
+      "note": "train:loop champion Nash (gen 14, 0bdf07, 2026-07-14)."
+    },
+    {
+      "name": "Olga",
+      "file": "olga.json",
+      "arch": [
+        768,
+        64,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        1
+      ],
+      "loopChampion": true,
+      "hash": "8d9b7c",
+      "gen": 15,
+      "note": "train:loop champion Olga (gen 15, 8d9b7c, 2026-07-21).",
       "current": true
     },
     {

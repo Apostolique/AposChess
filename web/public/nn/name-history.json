@@ -11,6 +11,17 @@
         1
       ],
       "note": "Retired train:loop champion (94c88e, 2026-06-12); pruned from the catalog 2026-07-14."
+    },
+    {
+      "name": "Boris",
+      "hash": "a14d52",
+      "gen": 2,
+      "arch": [
+        768,
+        64,
+        1
+      ],
+      "note": "Retired train:loop champion (a14d52, 2026-06-14); pruned from the catalog 2026-07-21."
     }
   ]
 }
