@@ -40,6 +40,7 @@ import { fileURLToPath } from 'node:url';
 
 import { fmtDur } from './fmt.mjs';
 import { suggestRecipes, readHistory, trackDir } from './experiment-registry.mjs';
+import { weightsHash } from './vtag.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const webDir = resolve(here, '..');
@@ -194,6 +195,57 @@ try {
   if (Array.isArray(champArch) && champArch.length >= 3) champHidden = champArch.slice(1, -1).join(',');
 } catch { /* placeholder/material champion — no arch */ }
 
+// --- The anchor that makes a stored absElo comparable to "how it would score vs the -------
+// champion RIGHT NOW". A cycle's absElo (championLedgerElo + gate edge) was recorded against
+// the champion of THAT cycle; the current champion's ledger Elo is on the same hc-anchored
+// scale, so the two combine into an estimated head-to-head score with no replay. Read-only
+// mirror of train-loop's championLedgerElo(); null when the ledger doesn't rate the champion.
+const ledgerFile = join(loopDir, 'engine-elo.ladder.json');
+function currentChampionElo() {
+  if (!existsSync(ledgerFile)) return null;
+  let ledger;
+  try { ledger = JSON.parse(readFileSync(ledgerFile, 'utf8')); } catch { return null; }
+  const champHash = weightsHash(championFile);
+  if (champHash === '?') return null;
+  let best = -Infinity;
+  for (const e of ledger.ranking || []) {
+    if (e.eng !== 'nn' || e.version !== champHash || e.elo == null) continue;
+    best = Math.max(best, e.elo);
+  }
+  return Number.isFinite(best) ? best : null;
+}
+const champEloNow = currentChampionElo();
+
+// Expected score (0..1) of a candidate at absolute Elo `absElo` vs the CURRENT champion — the
+// standard logistic curve, so it reads in win-rate units like a gate score but stays comparable
+// across cycles (the moving-champion staleness is gone: both sides sit on the ledger scale).
+// Null when the champion isn't placed on the ledger or the candidate has no absElo.
+function estScoreVsChamp(absElo) {
+  if (champEloNow == null || !Number.isFinite(absElo)) return null;
+  return 1 / (1 + 10 ** ((champEloNow - absElo) / 400));
+}
+const estPct = (absElo) => {
+  const s = estScoreVsChamp(absElo);
+  return s == null ? null : `${(s * 100).toFixed(0)}%`;
+};
+
+// The highest-absElo cycle a merged run produced, from its experiment track's history restricted
+// to this run's own launch(es) via the per-track run number the recipe line recorded. absElo —
+// unlike the gate score — is comparable across cycles, so it's the "best" worth ranking runs by.
+// Returns the history entry ({ absElo, score, run, cycle, … }) or null (pre-registry / no absElo).
+function bestAbsCycle(view) {
+  const id = view.track?.id;
+  if (!id) return null;
+  const runNos = new Set(view.segs.map((s) => s.track?.run).filter(Number.isFinite));
+  if (!runNos.size) return null;
+  let best = null;
+  for (const h of readHistory(trackDir(loopDir, id))) {
+    if (!runNos.has(h.run) || !Number.isFinite(h.absElo)) continue;
+    if (!best || h.absElo > best.absElo) best = h;
+  }
+  return best;
+}
+
 // Least-squares slope of a numeric series (Elo points per cycle), for "climbing vs flat".
 function slope(ys) {
   const n = ys.length;
@@ -270,7 +322,8 @@ function printCycles(view) {
 
 // --- Output. ----------------------------------------------------------------------------
 console.log(`\nAposChess train:loop progress — ${relish(logFile)}`);
-if (champHidden) console.log(`Current champion: arch [${champArch.join(',')}]  (hidden [${champHidden}])`);
+if (champHidden) console.log(`Current champion: arch [${champArch.join(',')}]  (hidden [${champHidden}])`
+  + (champEloNow != null ? `  — ledger Elo ${champEloNow.toFixed(0)} (the anchor for “% vs champ” below)` : ''));
 
 const latest = views[views.length - 1];
 const running = isLatestRunning(latest.segs[latest.segs.length - 1]);
@@ -294,9 +347,11 @@ const latestTraj = trackTrajectory(latest);
 if (latestTraj) {
   const t = latestTraj;
   const dir = t.absSlope > 1.0 ? 'climbing' : t.absSlope < -1.0 ? 'falling' : 'flat';
+  const estBest = estPct(t.bestAbs);
   console.log(`\n  Track [${t.id}] ${t.slug} — ${t.runs} run(s), ${t.cycles} cycle(s) accumulated:`);
   console.log(`    absolute Elo ${t.firstAbs.toFixed(0)} → ${t.latestAbs.toFixed(0)} `
-    + `(best ${t.bestAbs.toFixed(0)}), ${signed(+t.absSlope.toFixed(1))} Elo/cycle overall, ${dir}.`);
+    + `(best ${t.bestAbs.toFixed(0)}${estBest ? `, ~${estBest} vs current champion` : ''}), `
+    + `${signed(+t.absSlope.toFixed(1))} Elo/cycle overall, ${dir}.`);
   console.log('    Absolute Elo is the real signal for a warm-starting track — the gate edge above can stay');
   console.log('    negative for dozens of cycles while this climbs (that is how \'Mona\' promoted).');
 }
@@ -311,12 +366,25 @@ if (views.length > 1) {
   console.log(`\n=== Run history (last ${Math.min(histN, views.length)} of ${views.length}; warm same-recipe relaunches merged) ===`);
   const shown = views.slice(-histN);
   const hiddenW = Math.max(9, ...shown.map((v) => String(v.hidden).length));
-  for (const view of shown) {
+  // Rank by best absolute Elo (comparable across cycles) and gloss it as an estimated score vs the
+  // CURRENT champion (the champion line above spells out what the % is against, so keep it terse
+  // here). Pre-registry runs have no absElo — fall back to the era-local gate %, flagged stale so
+  // it isn't read against today's stronger champion.
+  const bestCol = (view) => {
+    const bc = bestAbsCycle(view);
+    if (bc) {
+      const est = estPct(bc.absElo);
+      return `best ${bc.absElo.toFixed(0)}E${est ? ` ~${est}` : ''}`;
+    }
     const scores = view.cycles.map((c) => c.score).filter(Number.isFinite);
-    const best = scores.length ? Math.max(...scores).toFixed(1) + '%' : '—';
+    return 'best ' + (scores.length ? Math.max(...scores).toFixed(1) + '% stale' : '—');
+  };
+  const bestW = Math.max(...shown.map((v) => bestCol(v).length));
+  const kindW = Math.max(...shown.map((v) => String(v.start_kind).length));
+  for (const view of shown) {
     const state = view === latest && running ? 'running' : `${view.promotions} prom`;
-    console.log(`  ${pad(fmtLocal(parseLogTs(view.start)), 20)} h[${pad(view.hidden, hiddenW)}] ${pad(view.start_kind, 22)} `
-      + `${padL(view.segs.length, 2)}×  ${padL(view.cycles.length, 3)}cyc  best ${padL(best, 6)}  ${state}`);
+    console.log(`  ${pad(fmtLocal(parseLogTs(view.start)), 20)} h[${pad(view.hidden, hiddenW)}] ${pad(view.start_kind, kindW)} `
+      + `${padL(view.segs.length, 2)}×  ${padL(view.cycles.length, 3)}cyc  ${pad(bestCol(view), bestW)}  ${state}`);
   }
   if (detailAll) {
     for (const view of views.slice(0, -1)) {
