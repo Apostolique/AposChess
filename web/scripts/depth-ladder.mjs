@@ -105,6 +105,7 @@ import { cpus } from 'node:os';
 
 import { weightsHash } from './vtag.mjs';
 import { installStop, printStopHint } from './stop.mjs';
+import { fmtDur } from './fmt.mjs';
 import { HC_VERSION } from '../src/ai.js';
 import { isGameRecord, tallyVs } from './gameRecord.mjs';
 
@@ -852,6 +853,21 @@ if (cfg.rounds === 0) {
   const t0 = Date.now();
   const deadline = cfg.minutes ? t0 + cfg.minutes * 60000 : Infinity;
   let played = 0;
+  // Per-matchup wall-times, for the overall ranking ETA. A recent-window mean (not lifetime) so a
+  // switch to a slower depth band mid-run is reflected quickly; the per-match line inside each
+  // matchup already has its own tail-aware ETA (apos-match), this is the whole-run clock.
+  const matchSecs = [];
+  const rankEta = () => {
+    if (!matchSecs.length) return '';
+    const recent = matchSecs.slice(-8);
+    const per = recent.reduce((s, x) => s + x, 0) / recent.length;
+    const byBudget = Number.isFinite(deadline) ? Math.max(0, (deadline - Date.now()) / 1000) : Infinity;
+    const byCount = Number.isFinite(cfg.matchups) ? Math.max(0, cfg.matchups - played) * per : Infinity;
+    const eta = Math.min(byBudget, byCount);
+    if (!Number.isFinite(eta)) return `  (~${fmtDur(per)}/matchup, open-ended — stop with q/Ctrl-C)`;
+    const more = Math.floor(eta / per);
+    return `  ETA ~${fmtDur(eta)} (~${more} more matchup(s) at ${fmtDur(per)} each)`;
+  };
   while (!stopped && Date.now() < deadline && played < cfg.matchups) {
     const { elo, ci, varDiff, gamesOf } = fit();
     const { pair, reason, metric, floor, gap, amb } = pickMatchup(elo, varDiff, played, gamesOf);
@@ -867,7 +883,9 @@ if (cfg.rounds === 0) {
     const lbl = (c) => `${nodeLabel(c)} ${elo.get(c.id).toFixed(0)} ±${(ci.get(c.id) ?? 0).toFixed(0)}`;
     const pA = 1 / (1 + 10 ** ((elo.get(b.id) - elo.get(a.id)) / 400));
     console.log(`\n${tag} ${why} -> ${lbl(a)}  vs  ${lbl(b)}  (ledger expects A ${(pA * 100).toFixed(0)}%)`);
+    const matchT0 = Date.now();
     await playPair(a, b);
+    matchSecs.push((Date.now() - matchT0) / 1000);
     // playPair recorded this matchup — a full run, or the completed games if a stop landed
     // mid-matchup. Persist the store either way so the games already played are never lost.
     writeFileSync(cfg.store, JSON.stringify(store, null, 2) + '\n');
@@ -877,6 +895,7 @@ if (cfg.rounds === 0) {
       console.log(`  ledger now: ${upd(a)}  |  ${upd(b)}`);
     }
     played++;
+    console.log(`  ${played} matchup(s) in ${fmtDur((Date.now() - t0) / 1000)}${rankEta()}`);
     if (played % EMIT_EVERY === 0) writeRankLedger(false);
     if (stopped) break; // stop requested: the in-flight matchup drained + was saved; finish up.
   }

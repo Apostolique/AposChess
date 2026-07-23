@@ -163,6 +163,34 @@ fn promoteChance(scores: []const f64, elo0: f64, elo1: f64, upper: f64, remainin
     return t1 + t2;
 }
 
+// Expected number of ADDITIONAL games until the LLR walk hits a decision bound, from its
+// current drift — the same Brownian model promoteChance uses, read the other way (time-to-
+// barrier instead of crossing-probability). It lets the live ETA time the match to its likely
+// SPRT decision instead of always to the --games cap (which SPRT rarely reaches). Uses the
+// OBSERVED mean drift (not the optimistic one) so it's an expectation, not a bound. null when
+// there aren't enough games yet or the drift is ~flat (no clear bound to head toward — let the
+// cap govern). The caller clamps the result to [0, cap − played].
+fn sprtRemainingGames(scores: []const f64, elo0: f64, elo1: f64, upper: f64, lower: f64) ?f64 {
+    const n = scores.len;
+    if (n < 16) return null;
+    const fn_: f64 = @floatFromInt(n);
+    const mu0 = scoreFromElo(elo0);
+    const mu1 = scoreFromElo(elo1);
+    var s: f64 = 0;
+    for (scores) |x| s += x;
+    const mean = s / fn_;
+    var var_sum: f64 = 0;
+    for (scores) |x| var_sum += (x - mean) * (x - mean);
+    const variance = @max(var_sum / fn_, 1e-3);
+    const c = (mu1 - mu0) / variance; // beta-units per unit score, as in llr()
+    const l = llr(scores, elo0, elo1);
+    const mu = c * (mean - (mu0 + mu1) / 2.0); // per-game LLR drift
+    const eps = 1e-6;
+    if (mu > eps) return @max(0, (upper - l) / mu); // drifting up -> time to the promotion bound
+    if (mu < -eps) return @max(0, (lower - l) / mu); // drifting down (both terms < 0 -> positive)
+    return null; // ~no drift: unknowable from drift alone; the cap/futility will govern
+}
+
 // The reported Elo with its 95% confidence interval:
 // the ± error bar comes from the standard error of the mean score, mapped through the
 // Elo curve. z = 1.96 is the 95% two-sided multiplier.
@@ -412,8 +440,17 @@ const Cfg = struct {
     weights_b: []const u8,
     result_file: ?[]const u8,
     save_games_path: ?[]const u8,
+    // Cross-run timing store (live-ETA prior). `timing_file` is a JSON map keyed by matchup
+    // signature (`timing_key`) → {g: sec/game, nps, n}. Read at startup to seed the ETA's
+    // per-game-time prior; updated at finalize. Empty path disables it. See loadPriorG/updateTiming.
+    timing_file: []const u8,
+    timing_key: []const u8,
     io: std.Io,
 };
+
+// Recent-per-game-duration window for the live ETA: enough to smooth the heavy tail of game
+// lengths (quick draws vs 200-move grinds) without lagging a real speed change.
+const DUR_WIN: usize = 32;
 
 const Shared = struct {
     mutex: std.Io.Mutex = .init,
@@ -443,7 +480,48 @@ const Shared = struct {
     live_len: usize = 0, // chars in the current in-place status line (for repaint padding)
     heartbeat_stop: bool = false, // workers done -> the heartbeat thread should exit
     finalized: bool = false, // report/harvest/result-file written once (normal end OR stop)
+    // --- live-ETA timing (all read/written under sh.mutex, so no extra locking) -------------
+    // A game's WALL time is dominated by how many long searches it runs, which varies wildly, so
+    // the old ETA (lifetime elapsed/game × games-left) both drifted and collapsed at the tail:
+    // when only the final concurrency wave of long games is left, games-left→0 but those games
+    // still take minutes ("1 minute left" that lasts ten). This models it properly: per-game
+    // durations (windowed), the ages of the in-flight games, and a cross-run prior.
+    jobs: usize = 1, // worker count — the parallelism the throughput term divides by
+    slot_start: []i128 = &.{}, // per-worker ns timestamp of the game it's mid-search on (0 = idle)
+    dur_ring: [DUR_WIN]f64 = [_]f64{0} ** DUR_WIN, // recent per-game durations, seconds (ring buffer)
+    dur_n: usize = 0, // total games timed (ring fill count + write cursor)
+    dur_sum_all: f64 = 0, // Σ all per-game durations this run, for the finalize store update
+    prior_g: f64 = 0, // sec/game seed from the timing store for this matchup (0 = none)
 };
+
+// Recent-window mean and max per-game duration (seconds). The max is the tail proxy: a game
+// still running is more likely a long one, so it shouldn't be predicted to finish at the mean.
+fn recentDurStats(sh: *Shared) struct { mean: f64, hi: f64, n: usize } {
+    const cnt = @min(sh.dur_n, DUR_WIN);
+    if (cnt == 0) return .{ .mean = 0, .hi = 0, .n = 0 };
+    var sum: f64 = 0;
+    var hi: f64 = 0;
+    var i: usize = 0;
+    while (i < cnt) : (i += 1) {
+        const d = sh.dur_ring[i];
+        sum += d;
+        if (d > hi) hi = d;
+    }
+    return .{ .mean = sum / @as(f64, @floatFromInt(cnt)), .hi = hi, .n = cnt };
+}
+
+// Per-game seconds for the ETA: the recent window blended with the cross-run prior (worth
+// PRIOR_W games of evidence), so the very first games already have a sane estimate and a brief
+// streak of fast games can't yank it around. 0 only when there's neither a completed game nor a
+// prior — the caller then shows no ETA (as before).
+fn blendedG(sh: *Shared) f64 {
+    const st = recentDurStats(sh);
+    if (st.n == 0) return sh.prior_g;
+    if (sh.prior_g <= 0) return st.mean;
+    const PRIOR_W: f64 = 6;
+    const rn: f64 = @floatFromInt(st.n);
+    return (st.mean * rn + sh.prior_g * PRIOR_W) / (rn + PRIOR_W);
+}
 
 // In-place status line on stderr (carriage-return repaint), mirroring fmt.mjs's
 // liveStatus: write `\r` + text, padding over any longer previous content so stale
@@ -510,8 +588,41 @@ fn paintLive(sh: *Shared) void {
 
     var etaseg: []const u8 = "";
     var etastore: [40]u8 = undefined;
-    if (ng > 0) {
-        const eta_s = elapsed_s / @as(f64, @floatFromInt(ng)) * @as(f64, @floatFromInt(total - ng));
+    const g = blendedG(sh); // per-game seconds (windowed + prior)
+    if (g > 0 and ng < total) {
+        const jobs_f: f64 = @floatFromInt(@max(@as(usize, 1), sh.jobs));
+        const st = recentDurStats(sh);
+        const g_hi = @max(st.hi, g); // tail proxy: a running game is probably a long one
+
+        // Drain time of the CURRENT in-flight wave: the games dispatched but not yet scored run
+        // in parallel, so the wave finishes in ~max(g_hi − age) more. This is the floor that
+        // stops the tail collapse — when the queue is empty it's the whole remaining time, and
+        // it never reads near-zero just because games-left is small.
+        var drain: f64 = 0;
+        for (sh.slot_start) |sstart| {
+            if (sstart == 0) continue; // idle worker
+            const age: f64 = @max(0, @as(f64, @floatFromInt(now_ns - sstart)) / 1e9);
+            const rem_i = @max(g_hi - age, 0);
+            if (rem_i > drain) drain = rem_i;
+        }
+
+        // Structural ETA (run the cap out): not-yet-started games flow jobs-parallel at g each;
+        // the in-flight wave needs `drain` more. max(): mid-run the throughput term dominates
+        // (drain ≤ one game-time); at the tail queued→0 so drain governs.
+        const queued_f: f64 = @floatFromInt(if (total > sh.next_game) total - sh.next_game else 0);
+        var eta_s = @max(queued_f * g / jobs_f, drain);
+
+        // SPRT ends the match at a decision, usually well before the cap — take the earlier of
+        // the two clocks. Floor the decision ETA at the soonest possible completion so it never
+        // predicts a stop faster than a game can finish and register it.
+        if (sh.sprt) {
+            if (sprtRemainingGames(sh.scores.items, sh.elo0, sh.elo1, sh.upper, sh.lower)) |rg| {
+                const cap_rem: f64 = @floatFromInt(total - ng);
+                const sprt_eta = @max(@min(rg, cap_rem) * g / jobs_f, @min(drain, g));
+                if (sprt_eta < eta_s) eta_s = sprt_eta;
+            }
+        }
+
         var b2: [16]u8 = undefined;
         etaseg = std.fmt.bufPrint(&etastore, " | ETA {s}", .{fmtDur(&b2, eta_s)}) catch "";
     }
@@ -566,7 +677,7 @@ fn heartbeat(sh: *Shared) void {
     }
 }
 
-fn worker(sh: *Shared) void {
+fn worker(sh: *Shared, idx: usize) void {
     const pa = std.heap.page_allocator;
     var sa = ai.Searcher.init(pa, sh.cfg.io, sh.cfg.kind_a, sh.cfg.net_a, 1) catch return;
     defer sa.deinit();
@@ -577,7 +688,11 @@ fn worker(sh: *Shared) void {
         sh.mutex.lockUncancelable(sh.cfg.io);
         const done = sh.stop or sh.next_game >= sh.total_pairs * 2;
         const gi = sh.next_game; // game index: pair = gi >> 1, color = gi & 1
-        if (!done) sh.next_game += 1;
+        if (!done) {
+            sh.next_game += 1;
+            // Mark this worker busy from now: the live ETA reads slot ages to time the tail.
+            sh.slot_start[idx] = @intCast(std.Io.Clock.now(.awake, sh.cfg.io).nanoseconds);
+        }
         sh.mutex.unlock(sh.cfg.io);
         if (done) break;
 
@@ -631,6 +746,14 @@ fn worker(sh: *Shared) void {
             (if (r < 0) @as(f64, 1) else if (r > 0) @as(f64, 0) else @as(f64, 0.5));
 
         sh.mutex.lockUncancelable(sh.cfg.io);
+        // Record how long this game took (worker wall-time) and free the slot, so the ETA sees
+        // the freshly-idle worker and a new duration sample immediately.
+        const fin_ns: i128 = @intCast(std.Io.Clock.now(.awake, sh.cfg.io).nanoseconds);
+        const dur_s: f64 = @max(0, @as(f64, @floatFromInt(fin_ns - sh.slot_start[idx])) / 1e9);
+        sh.dur_ring[sh.dur_n % DUR_WIN] = dur_s;
+        sh.dur_n += 1;
+        sh.dur_sum_all += dur_s;
+        sh.slot_start[idx] = 0; // idle until the next game is dispatched
         sh.scores.append(sh.alloc, s) catch {};
         sh.nodes += nodes;
         if (sh.cfg.div_enabled) sh.div.add(game_div);
@@ -700,6 +823,144 @@ fn worker(sh: *Shared) void {
         }
         sh.mutex.unlock(sh.cfg.io);
     }
+}
+
+// --- cross-run timing store (live-ETA prior) ---------------------------------------
+// A tiny JSON map, matchup-key → {g: mean sec/game, nps, n: games of evidence}, shared by every
+// apos-match invocation (default ../training/data/loop/match-timing.json, cwd = web/). It seeds
+// the ETA's per-game-time prior so game 1 already estimates well and the number is stable across
+// the loop's and rank:pool's many matchups. nps depends on the ARCH, not the specific weights, so
+// the key carries the layer widths — every champion of a shape shares one prior.
+fn evalTag(k: ai.EvalKind) []const u8 {
+    return switch (k) {
+        .nn => "nn",
+        .handcrafted => "hc",
+        .handcrafted3 => "hc3",
+        .material => "mat",
+    };
+}
+
+// One side's key signature: eval tag, nn layer widths (if any), and the search budget (depth dN
+// or movetime tN). Written into `buf`.
+fn sideSig(buf: []u8, k: ai.EvalKind, b: Budget, net: ?*const nn.Net) []const u8 {
+    var n: usize = 0;
+    const tag = evalTag(k);
+    @memcpy(buf[n .. n + tag.len], tag);
+    n += tag.len;
+    if (net) |ne| {
+        buf[n] = '[';
+        n += 1;
+        const nl = if (ne.ilayers.len > 0) ne.ilayers.len else ne.layers.len;
+        var li: usize = 0;
+        while (li < nl) : (li += 1) {
+            const outw = if (ne.ilayers.len > 0) ne.ilayers[li].out else ne.layers[li].out;
+            if (li > 0) {
+                buf[n] = ',';
+                n += 1;
+            }
+            const w = std.fmt.bufPrint(buf[n..], "{d}", .{outw}) catch break;
+            n += w.len;
+        }
+        buf[n] = ']';
+        n += 1;
+    }
+    const bud = if (b.depth > 0)
+        std.fmt.bufPrint(buf[n..], "d{d}", .{b.depth}) catch buf[n..n]
+    else
+        std.fmt.bufPrint(buf[n..], "t{d}", .{b.movetime}) catch buf[n..n];
+    n += bud.len;
+    return buf[0..n];
+}
+
+fn buildTimingKey(buf: []u8, ka: ai.EvalKind, kb: ai.EvalKind, ba: Budget, bb: Budget, na: ?*const nn.Net, nb: ?*const nn.Net, maxmoves: u32) []const u8 {
+    var sa_buf: [56]u8 = undefined;
+    var sb_buf: [56]u8 = undefined;
+    const sa = sideSig(&sa_buf, ka, ba, na);
+    const sb = sideSig(&sb_buf, kb, bb, nb);
+    return std.fmt.bufPrint(buf, "{s}-{s}-mm{d}", .{ sa, sb, maxmoves }) catch buf[0..0];
+}
+
+// A numeric field of a JSON object value (0 if absent / not a number), tolerating int or float.
+fn jsonF(v: std.json.Value, field: []const u8) f64 {
+    if (v != .object) return 0;
+    const fv = v.object.get(field) orelse return 0;
+    return switch (fv) {
+        .float => |f| f,
+        .integer => |i| @floatFromInt(i),
+        else => 0,
+    };
+}
+
+// Prior sec/game for this matchup, or 0 when the store/key is missing or unreadable.
+fn loadPriorG(io: std.Io, gpa: std.mem.Allocator, path: []const u8, key: []const u8) f64 {
+    if (path.len == 0) return 0;
+    const data = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited) catch return 0;
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, data, .{}) catch return 0;
+    if (parsed.value != .object) return 0;
+    const entry = parsed.value.object.get(key) orelse return 0;
+    return jsonF(entry, "g");
+}
+
+fn appendTimingEntry(out: *std.ArrayList(u8), gpa: std.mem.Allocator, key: []const u8, g: f64, nps: f64, n: f64, wrote: *bool) void {
+    var buf: [192]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, "{s}\"{s}\":{{\"g\":{d:.4},\"nps\":{d:.0},\"n\":{d:.0}}}", .{
+        if (wrote.*) "," else "", key, g, nps, n,
+    }) catch return;
+    out.appendSlice(gpa, s) catch return;
+    wrote.* = true;
+}
+
+// Fold this run's timing into the store (game-weighted running mean g + nps, evidence count
+// capped at 5000 games so it still adapts to a hardware change). Best-effort: no-op if the path
+// is empty or its directory doesn't exist, so a bare `npm run match` never creates training/.
+fn updateTiming(sh: *Shared, run_secs: f64, run_nodes: u64, run_games: usize) void {
+    const path = sh.cfg.timing_file;
+    if (path.len == 0 or run_games == 0 or run_secs <= 0) return;
+    const io = sh.cfg.io;
+    const gpa = sh.alloc;
+    const key = sh.cfg.timing_key;
+    if (std.fs.path.dirname(path)) |dir| {
+        std.Io.Dir.cwd().access(io, dir, .{}) catch return; // don't create the training tree
+    }
+
+    var old_g: f64 = 0;
+    var old_nps: f64 = 0;
+    var old_n: f64 = 0;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    out.append(gpa, '{') catch return;
+    var wrote = false;
+
+    if (std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited)) |data| {
+        if (std.json.parseFromSlice(std.json.Value, gpa, data, .{})) |parsed| {
+            if (parsed.value == .object) {
+                var it = parsed.value.object.iterator();
+                while (it.next()) |kv| {
+                    const ek = kv.key_ptr.*;
+                    const ev = kv.value_ptr.*;
+                    if (std.mem.eql(u8, ek, key)) {
+                        old_g = jsonF(ev, "g");
+                        old_nps = jsonF(ev, "nps");
+                        old_n = jsonF(ev, "n");
+                        continue; // ours is re-emitted (merged) at the end
+                    }
+                    appendTimingEntry(&out, gpa, ek, jsonF(ev, "g"), jsonF(ev, "nps"), jsonF(ev, "n"), &wrote);
+                }
+            }
+        } else |_| {}
+    } else |_| {}
+
+    const run_g = run_secs / @as(f64, @floatFromInt(run_games));
+    const run_nps = @as(f64, @floatFromInt(run_nodes)) / run_secs;
+    const rn: f64 = @floatFromInt(run_games);
+    const tot = old_n + rn;
+    const new_g = if (tot > 0) (old_g * old_n + run_g * rn) / tot else run_g;
+    const new_nps = if (tot > 0) (old_nps * old_n + run_nps * rn) / tot else run_nps;
+    appendTimingEntry(&out, gpa, key, new_g, new_nps, @min(tot, 5000), &wrote);
+
+    out.append(gpa, '}') catch return;
+    out.append(gpa, '\n') catch {};
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = out.items }) catch {};
 }
 
 fn loadNet(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !nn.Net {
@@ -962,6 +1223,11 @@ fn finalizeLocked(sh: *Shared) void {
             , .{ n, wins, draws, losses, p, elo, div_json }) catch return;
         std.Io.Dir.cwd().writeFile(io, .{ .sub_path = rf, .data = json }) catch {};
     }
+
+    // Fold this matchup's timing into the cross-run store so future matches start with a prior.
+    // dur_sum_all is Σ per-game worker-seconds (so nps here is per-thread search speed, matching
+    // how the ETA predicts a single game's time); n = completed games.
+    updateTiming(sh, sh.dur_sum_all, sh.nodes, n);
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -1001,6 +1267,10 @@ pub fn main(init: std.process.Init) !void {
     // Eval-divergence probe thresholds (active only when both sides are nn).
     var div_margin: f64 = 75; // both nets past ±this cp, opposite sign = a "confident" disagreement
     var div_decided: f64 = 600; // both nets agree by >= this cp = decided, skipped (no judgment signal)
+    // Cross-run timing store for the live ETA (see updateTiming). Default resolves to the loop dir
+    // (cwd = web/); persistence is skipped when that dir is absent. `--timing-file=` overrides or,
+    // set empty, disables it.
+    var timing_file: []const u8 = "../training/data/loop/match-timing.json";
 
     const argv = try init.minimal.args.toSlice(gpa);
     for (argv[1..]) |arg| {
@@ -1028,6 +1298,7 @@ pub fn main(init: std.process.Init) !void {
         if (argStr(arg, "--stop-file=")) |v| stop_file = v;
         if (argStr(arg, "--div-margin=")) |v| div_margin = std.fmt.parseFloat(f64, v) catch div_margin;
         if (argStr(arg, "--div-decided=")) |v| div_decided = std.fmt.parseFloat(f64, v) catch div_decided;
+        if (argStr(arg, "--timing-file=")) |v| timing_file = v;
     }
     if (jobs < 1) jobs = 1;
 
@@ -1057,6 +1328,12 @@ pub fn main(init: std.process.Init) !void {
         n.* = try loadNet(io, gpa, weights_b.?);
         break :blk n;
     } else null;
+
+    // Matchup signature for the cross-run timing store (arch-aware, so nps carries across the
+    // loop's many candidates of one shape). keybuf lives for all of main(), which outlives every
+    // worker/heartbeat that reads it.
+    var keybuf: [128]u8 = undefined;
+    const timing_key = buildTimingKey(&keybuf, eval_a, eval_b, budget_a, budget_b, net_a, net_b, maxmoves);
 
     var scores: std.ArrayList(f64) = .empty;
     var harvest: std.ArrayList(Game) = .empty;
@@ -1091,16 +1368,24 @@ pub fn main(init: std.process.Init) !void {
             .weights_b = weights_b orelse "",
             .result_file = result_file,
             .save_games_path = save_games,
+            .timing_file = timing_file,
+            .timing_key = timing_key,
             .io = io,
         },
     };
+    // Live-ETA state: worker count, per-worker in-flight slots, and the cross-run per-game-time
+    // prior for this matchup (0 if the store has nothing for it yet).
+    shared.jobs = jobs;
+    shared.slot_start = try gpa.alloc(i128, jobs);
+    @memset(shared.slot_start, 0);
+    shared.prior_g = loadPriorG(io, gpa, timing_file, timing_key);
 
     std.debug.print("Playing {d} games | openings {d} | jobs {d} | seed {d}\n", .{ games, openings, jobs, seed });
 
     const t0 = std.Io.Clock.now(.awake, io).nanoseconds;
     shared.t0_ns = @intCast(t0); // so the live progress line can show elapsed/ETA
     const threads = try gpa.alloc(std.Thread, jobs);
-    for (threads) |*t| t.* = try std.Thread.spawn(.{}, worker, .{&shared});
+    for (threads, 0..) |*t, i| t.* = try std.Thread.spawn(.{}, worker, .{ &shared, i });
     // Heartbeat repaints the live line ~1×/s so a slow matchup never looks frozen between
     // pair completions. Signal it to stop once the workers are done, then join it.
     const hb = try std.Thread.spawn(.{}, heartbeat, .{&shared});
