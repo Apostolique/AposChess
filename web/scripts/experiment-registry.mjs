@@ -250,6 +250,61 @@ export function readHistory(dir) {
   return out;
 }
 
+// --- Re-anchoring a stored absElo onto today's ledger --------------------------------
+// A cycle's stored absElo = (champion's ledger Elo THAT cycle) + gate edge. But the BT pool is
+// re-fit every cycle, so a FIXED champion's ledger rating drifts over time (observed ~40 Elo across
+// two days, champion unchanged) — which means an old stored absElo is not comparable to today's
+// scale, and a cycle that scored 49% at the gate against the CURRENT champion can carry a stale
+// absElo that reads as 55% "vs current champion". Re-anchor at read time by placing the candidate on
+// TODAY's ledger via the champion it actually played: currentLedgerElo(itsChampion) + gate edge. For
+// a cycle gated against the current champion this collapses to champEloNow + edge — exactly the gate
+// score, no drift. These helpers are the single source of truth for the reports (loop-progress /
+// loop-experiments / suggestRecipes), so the fix can't drift back apart across them.
+
+// Best CURRENT ledger Elo per engine version (nn weights hash), across depths. Read once, passed in.
+export function ledgerBestByVersion(loopDir) {
+  const map = new Map();
+  const file = join(loopDir, 'engine-elo.ladder.json');
+  if (!existsSync(file)) return map;
+  let ledger;
+  try { ledger = JSON.parse(readFileSync(file, 'utf8')); } catch { return map; }
+  for (const e of ledger.ranking || []) {
+    if (e.eng !== 'nn' || e.version == null || e.elo == null) continue;
+    const cur = map.get(e.version);
+    if (cur == null || e.elo > cur) map.set(e.version, e.elo);
+  }
+  return map;
+}
+
+// Re-anchor one history entry's absElo onto today's ledger (see block comment). Falls back to the
+// stored absElo only when that cycle's champion is no longer rated (old, dropped-off tracks).
+export function reAnchoredAbsElo(h, ledgerElo) {
+  if (h && h.championHash && Number.isFinite(h.edgeElo) && ledgerElo && ledgerElo.has(h.championHash)) {
+    return ledgerElo.get(h.championHash) + h.edgeElo;
+  }
+  return Number.isFinite(h?.absElo) ? h.absElo : NaN;
+}
+
+// The strongest cycle a track ever produced, ranked by RE-ANCHORED absElo (comparable across cycles,
+// unlike the drift-prone snapshot in state.best). Returns a best-shaped object
+// { absElo, score, edgeElo, sprt, run, cycle, ts, hash } (absElo is the re-anchored value), or null.
+// `runFilter`, when given, restricts to those per-track run numbers (loop-progress scopes a merged
+// run to its own launches).
+export function trackBestAbs(dir, ledgerElo, runFilter = null) {
+  let best = null, bestElo = -Infinity;
+  for (const h of readHistory(dir)) {
+    if (runFilter && !runFilter.has(h.run)) continue;
+    const a = reAnchoredAbsElo(h, ledgerElo);
+    if (!Number.isFinite(a) || a <= bestElo) continue;
+    bestElo = a;
+    best = {
+      absElo: a, score: h.score, edgeElo: h.edgeElo ?? null, sprt: h.sprt,
+      run: h.run, cycle: h.cycle, ts: h.ts, hash: h.hash ?? null,
+    };
+  }
+  return best;
+}
+
 // --- Suggestions ---------------------------------------------------------------------
 
 // A small ladder of architectures worth exploring, roughly increasing capacity. Used to
@@ -266,18 +321,20 @@ const ARCH_LADDER = ['32', '64', '128', '256', '128,32', '256,32', '256,64', '25
 export function suggestRecipes(loopDir, opts = {}) {
   const tracks = readAllTracks(loopDir);
   const triedHidden = new Set(tracks.map((t) => t.recipe.hidden));
+  const ledgerElo = ledgerBestByVersion(loopDir);
   const out = [];
 
-  // Promising-but-stalled past recipes: rank by best estimated absolute Elo, prefer ones that
-  // never promoted (their gains never landed) and haven't been touched recently.
+  // Promising-but-stalled past recipes: rank by best RE-ANCHORED absolute Elo (today's-ledger scale,
+  // not the drift-prone stored snapshot), prefer ones that never promoted (their gains never landed)
+  // and haven't been touched recently.
   const promising = tracks
-    .filter((t) => t.state && t.state.best)
-    .map((t) => ({ t, elo: t.state.best.absElo }))
-    .filter((x) => x.elo != null)
+    .map((t) => ({ t, best: trackBestAbs(t.dir, ledgerElo) }))
+    .filter((x) => x.best && Number.isFinite(x.best.absElo))
+    .map((x) => ({ t: x.t, elo: x.best.absElo }))
     .sort((a, b) => b.elo - a.elo);
   for (const { t, elo } of promising) {
     if (out.filter((o) => o.kind === 'resume').length >= 3) break;
-    const st = t.state;
+    const st = t.state || {};
     const promoted = st.promotions || 0;
     // Skip a recipe that's clearly the reigning line (recently promoted a lot) — it's not
     // "stalled". Everything else with a decent best is a candidate to revive.

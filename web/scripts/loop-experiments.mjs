@@ -21,6 +21,7 @@ import { fileURLToPath } from 'node:url';
 import { weightsHash } from './vtag.mjs';
 import {
   readAllTracks, readHistory, recipeLabel, recipeResumeCmd, suggestRecipes, trackPaths,
+  ledgerBestByVersion, reAnchoredAbsElo, trackBestAbs,
 } from './experiment-registry.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -57,6 +58,12 @@ function producedChampion(dir) {
 }
 
 const tracks = readAllTracks(loopDir);
+
+// Re-anchor every track's stored absElo onto today's ledger (the BT pool re-fits each cycle, so a
+// fixed champion's rating — hence an old stored absElo — drifts; see experiment-registry.mjs). Ranked
+// "best" per track is recomputed from history via that same re-anchoring, not read from state.best.
+const ledgerElo = ledgerBestByVersion(loopDir);
+const bestByTrack = new Map(tracks.map((t) => [t.id, trackBestAbs(t.dir, ledgerElo)]));
 
 // --- Suggestions block (shared by default view and --suggest). --------------------------
 function printSuggestions() {
@@ -102,9 +109,10 @@ if (args.show) {
   console.log(`  recipe: ${recipeLabel(t.recipe)}`);
   console.log(`  runs ${st.runs ?? 0} · cycles ${st.cycles ?? 0} · promotions ${st.promotions ?? 0}`
     + ` · created ${fmtLocal(parseTs(st.createdTs))} · last run ${fmtLocal(parseTs(st.lastRunTs))}`);
-  if (st.best) {
-    console.log(`  best net: abs Elo ${Number.isFinite(st.best.absElo) ? st.best.absElo.toFixed(0) : '—'}  (gate ${(st.best.score * 100).toFixed(1)}%,`
-      + ` edge ${signed(st.best.edgeElo)}, ${st.best.sprt}, run ${st.best.run} cycle ${st.best.cycle})`
+  const best = bestByTrack.get(t.id); // re-anchored best, not the drift-prone state.best snapshot
+  if (best) {
+    console.log(`  best net: abs Elo ${Number.isFinite(best.absElo) ? best.absElo.toFixed(0) : '—'}  (gate ${(best.score * 100).toFixed(1)}%,`
+      + ` edge ${signed(best.edgeElo)}, ${best.sprt}, run ${best.run} cycle ${best.cycle})`
       + `  → ${existsSync(trackPaths(t.dir).best) ? 'best.json saved' : 'best.json missing'}`);
   }
   console.log(`  resume: ${recipeResumeCmd(t.recipe)}`);
@@ -118,7 +126,7 @@ if (args.show) {
       console.log('    ' + pad(`${h.run ?? '?'}/${h.cycle ?? '?'}`, 9)
         + pad(Number.isFinite(h.score) ? (h.score * 100).toFixed(1) + '%' : '?', 8)
         + pad(signed(h.edgeElo), 7)
-        + pad(Number.isFinite(h.absElo) ? h.absElo.toFixed(0) : '—', 8)
+        + pad((() => { const a = reAnchoredAbsElo(h, ledgerElo); return Number.isFinite(a) ? a.toFixed(0) : '—'; })(), 8)
         + pad(h.promoted ? 'H1 PROMOTED' : h.sprt, 14)
         + pad(fmtLocal(parseTs(h.ts)), 18));
     }
@@ -138,9 +146,9 @@ if (!tracks.length) {
   process.exit(0);
 }
 
-// Sort by best abs Elo desc (unknown last), then by cycles.
+// Sort by best RE-ANCHORED abs Elo desc (unknown last), then by cycles.
 const rows = tracks.slice().sort((a, b) => {
-  const ea = a.state?.best?.absElo ?? -Infinity, eb = b.state?.best?.absElo ?? -Infinity;
+  const ea = bestByTrack.get(a.id)?.absElo ?? -Infinity, eb = bestByTrack.get(b.id)?.absElo ?? -Infinity;
   if (eb !== ea) return eb - ea;
   return (b.state?.cycles ?? 0) - (a.state?.cycles ?? 0);
 });
@@ -150,11 +158,12 @@ console.log(`  ${pad('recipe', 24)}${pad('id', 10)}${padL('runs', 5)} ${padL('cy
   + `${padL('best-absElo', 12)} ${padL('best%', 7)}  ${pad('last run', 18)}`);
 for (const t of rows) {
   const st = t.state || {};
+  const best = bestByTrack.get(t.id); // re-anchored, not the drift-prone state.best snapshot
   const star = producedChampion(t.dir) ? ' ★' : '';
   console.log('  ' + pad(t.slug, 24) + pad(t.id, 10)
     + padL(st.runs ?? 0, 5) + ' ' + padL(st.cycles ?? 0, 4) + ' ' + padL(st.promotions ?? 0, 5) + ' '
-    + padL(st.best && Number.isFinite(st.best.absElo) ? st.best.absElo.toFixed(0) : '—', 12) + ' '
-    + padL(st.best && Number.isFinite(st.best.score) ? (st.best.score * 100).toFixed(1) + '%' : '—', 7)
+    + padL(best && Number.isFinite(best.absElo) ? best.absElo.toFixed(0) : '—', 12) + ' '
+    + padL(best && Number.isFinite(best.score) ? (best.score * 100).toFixed(1) + '%' : '—', 7)
     + '  ' + pad(fmtLocal(parseTs(st.lastRunTs)), 18) + star);
 }
 console.log('\n  ★ = produced the current champion.  Detail one: `npm run train:experiments -- --show=<id>`.');

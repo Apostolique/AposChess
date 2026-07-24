@@ -39,7 +39,10 @@ import { dirname, resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { fmtDur } from './fmt.mjs';
-import { suggestRecipes, readHistory, trackDir } from './experiment-registry.mjs';
+import {
+  suggestRecipes, readHistory, trackDir,
+  ledgerBestByVersion, reAnchoredAbsElo, trackBestAbs,
+} from './experiment-registry.mjs';
 import { weightsHash } from './vtag.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -196,25 +199,15 @@ try {
 } catch { /* placeholder/material champion — no arch */ }
 
 // --- The anchor that makes a stored absElo comparable to "how it would score vs the -------
-// champion RIGHT NOW". A cycle's absElo (championLedgerElo + gate edge) was recorded against
-// the champion of THAT cycle; the current champion's ledger Elo is on the same hc-anchored
-// scale, so the two combine into an estimated head-to-head score with no replay. Read-only
-// mirror of train-loop's championLedgerElo(); null when the ledger doesn't rate the champion.
-const ledgerFile = join(loopDir, 'engine-elo.ladder.json');
-function currentChampionElo() {
-  if (!existsSync(ledgerFile)) return null;
-  let ledger;
-  try { ledger = JSON.parse(readFileSync(ledgerFile, 'utf8')); } catch { return null; }
-  const champHash = weightsHash(championFile);
-  if (champHash === '?') return null;
-  let best = -Infinity;
-  for (const e of ledger.ranking || []) {
-    if (e.eng !== 'nn' || e.version !== champHash || e.elo == null) continue;
-    best = Math.max(best, e.elo);
-  }
-  return Number.isFinite(best) ? best : null;
-}
-const champEloNow = currentChampionElo();
+// champion RIGHT NOW". A cycle's absElo (championLedgerElo + gate edge) was recorded against the
+// champion of THAT cycle, but the BT pool is re-fit every cycle so a FIXED champion's ledger rating
+// drifts over time (observed ~40 Elo across two days, champion unchanged) — so the stored absElo is
+// not comparable across cycles and is re-anchored onto today's ledger at read time. The ledger map,
+// the re-anchoring, and the per-track "best cycle" all live in experiment-registry.mjs, shared with
+// train:experiments/suggestRecipes so the fix stays in lockstep across the reports.
+const ledgerElo = ledgerBestByVersion(loopDir);
+const champHashNow = weightsHash(championFile);
+const champEloNow = champHashNow !== '?' && ledgerElo.has(champHashNow) ? ledgerElo.get(champHashNow) : null;
 
 // Expected score (0..1) of a candidate at absolute Elo `absElo` vs the CURRENT champion — the
 // standard logistic curve, so it reads in win-rate units like a gate score but stays comparable
@@ -229,21 +222,16 @@ const estPct = (absElo) => {
   return s == null ? null : `${(s * 100).toFixed(0)}%`;
 };
 
-// The highest-absElo cycle a merged run produced, from its experiment track's history restricted
-// to this run's own launch(es) via the per-track run number the recipe line recorded. absElo —
-// unlike the gate score — is comparable across cycles, so it's the "best" worth ranking runs by.
-// Returns the history entry ({ absElo, score, run, cycle, … }) or null (pre-registry / no absElo).
+// The highest-absElo cycle a merged run produced, from its experiment track's history restricted to
+// this run's own launch(es) via the per-track run number the recipe line recorded. Ranked by
+// RE-ANCHORED absElo (today's-ledger scale, not the drift-prone stored snapshot), so it's comparable
+// across cycles. Returns a best-shaped object (absElo re-anchored) or null (pre-registry / no absElo).
 function bestAbsCycle(view) {
   const id = view.track?.id;
   if (!id) return null;
   const runNos = new Set(view.segs.map((s) => s.track?.run).filter(Number.isFinite));
   if (!runNos.size) return null;
-  let best = null;
-  for (const h of readHistory(trackDir(loopDir, id))) {
-    if (!runNos.has(h.run) || !Number.isFinite(h.absElo)) continue;
-    if (!best || h.absElo > best.absElo) best = h;
-  }
-  return best;
+  return trackBestAbs(trackDir(loopDir, id), ledgerElo, runNos);
 }
 
 // Least-squares slope of a numeric series (Elo points per cycle), for "climbing vs flat".
@@ -267,7 +255,7 @@ const avg = (a) => a.reduce((x, y) => x + y, 0) / a.length;
 function trackTrajectory(run) {
   if (!run.track) return null;
   const hist = readHistory(trackDir(loopDir, run.track.id));
-  const abs = hist.map((h) => h.absElo).filter(Number.isFinite);
+  const abs = hist.map((h) => reAnchoredAbsElo(h, ledgerElo)).filter(Number.isFinite); // drift removed
   if (abs.length < 2) return null;
   return {
     slug: run.track.slug,
