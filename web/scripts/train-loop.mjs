@@ -135,6 +135,21 @@
 //   --no-refresh    skip ALL value refreshing (both --refresh-cycle and --refresh-frac),
 //                   regardless of their values. Both default to 0 now, so this only matters
 //                   as a hard override on a command line that also passes a fraction.
+//   --rotate=N      AUTO-ROTATE the architecture: after N cycles on the current track with no
+//                   promotion, ask the experiment registry what to try next (suggestRecipes) and
+//                   switch to it, creating/resuming that recipe's track. 0 = off (default), which
+//                   is the old behaviour of running one recipe until Ctrl-C. This is what makes an
+//                   unattended multi-day run useful: measured over 120 cycles, a NEW track's first
+//                   cycle promoted ~29% of the time versus ~1.8% for a continuation cycle, so a
+//                   loop that keeps grinding one shape after it stalls is spending ~2h a cycle to
+//                   re-test a net that correlates 0.99 with the champion. A PROMOTION resets the
+//                   counter — a shape that just won has earned more cycles. `--rotate=8` is a
+//                   reasonable default; the registry's suggestions are a space-filling design over
+//                   architecture space until it has enough tracks to rank on predicted Elo
+//                   (`npm run train:experiments` shows which mode it's in).
+//                   The counter starts at 0 on every launch, so relaunching does NOT immediately
+//                   re-rotate a track that was already stale — the recipe you launch with always
+//                   gets its full N cycles.
 //   --rank-cycle=N  refit the Bradley-Terry pool every N cycles instead of EVERY cycle
 //                   (default 1 = every cycle, the historical behaviour). The corpus fold is
 //                   free, but the --rank-minutes play budget is not — measured 2026-07-26 it
@@ -205,6 +220,7 @@ import { STOP_EXIT_CODE } from './stop.mjs';
 import { isGameRecord, vsAt, setVsAt, normalizeVs, serializeGameRecord } from './gameRecord.mjs';
 import {
   buildRecipe, parseRecipeExtra, ensureTrack, beginRun, recordCycle, recipeLabel, readState,
+  suggestRecipes, recipeToFlags, recipeId,
 } from './experiment-registry.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -465,6 +481,11 @@ const cfg = {
   // true, which would silently disable the refit for the whole run instead of erroring.
   rankCycle: Number.isFinite(Math.round(num(args['rank-cycle'], 1)))
     ? Math.max(1, Math.round(num(args['rank-cycle'], 1))) : 1,
+  // Auto-rotate the architecture after this many non-promoting cycles on the current track.
+  // 0 = off (run one recipe forever, the historical behaviour). See the --rotate help above for
+  // why rotation beats grinding: promotions overwhelmingly land on a NEW track's early cycles.
+  rotate: Number.isFinite(Math.round(num(args.rotate, 0)))
+    ? Math.max(0, Math.round(num(args.rotate, 0))) : 0,
   // After a PROMOTION, extend that cycle's rank pass by this many minutes with the NEW champion
   // schedulable at EVERY depth (a bare-hash --play spec), so the ladder's onboard floor anchors
   // its 0-game depth nodes to the scale. Without it a fresh champion is rated only at the depths
@@ -1032,12 +1053,12 @@ if (cfg.fresh && existsSync(ladderFoldMark)) rmSync(ladderFoldMark);
 
 // Omitting --hidden pins the candidate to the champion's CURRENT shape (resolved here), so
 // the recipe id is a concrete architecture, not a moving target.
-const hidden = championHidden();
+let hidden = championHidden();
 // Resolve this run's TRAINING RECIPE and its persistent track. The recipe (architecture + TD
 // mix + quiet filter + quant + trainer knobs + any --recipe-extra) is keyed to a directory
 // under loop/experiments/, so its lineage/best/history survive being switched away from and
 // resume automatically when the same recipe runs again — even after other recipes in between.
-const recipe = buildRecipe({
+let recipe = buildRecipe({
   hidden, lambda: cfg.lam, quietOnly: cfg.quietOnly, quant: cfg.quant,
   scale: cfg.scale, lr: cfg.lr, wd: cfg.wd,
   filterWeak: cfg.filterWeak > 0 ? cfg.filterWeak : undefined,
@@ -1048,12 +1069,74 @@ track = ensureTrack(loopDir, recipe, stamp());
 lineage = track.paths.lineage;   // this recipe's accumulated sub-threshold warm-start net
 trackBest = track.paths.best;    // this recipe's strongest net ever (by estimated abs Elo)
 runNo = beginRun(track.dir, stamp());
+
+// Switch the loop onto a different recipe mid-run (--rotate). Everything downstream of the recipe
+// has to move together: the architecture passed to train.py, the dataset filters (which decide
+// WHICH featurized file this recipe reads — each filter config keeps its own incrementally
+// maintained one), and the track paths that hold the lineage/best used as the warm-start source.
+// The filter knobs live on `cfg` because the featurize/train invocations read them there, so the
+// adopted recipe is written back onto cfg rather than threaded through every call site.
+// Returns false (and changes nothing) if the recipe is already the active one.
+function adoptRecipe(next, why) {
+  if (recipeId(next) === recipeId(recipe)) return false;
+  recipe = next;
+  hidden = next.hidden;
+  cfg.lam = next.lambda;
+  cfg.quietOnly = !!next.quietOnly;
+  cfg.quant = !!next.quant;
+  cfg.scale = next.scale;
+  cfg.lr = next.lr;
+  cfg.wd = next.wd;
+  cfg.filterWeak = next.filterWeak ?? 0;
+  cfg.dropConflicts = next.dropConflicts ?? 0;
+  cfg.recipeExtra = next.extra;
+  featFile = featurizeFile();      // filters changed => a different features file
+  track = ensureTrack(loopDir, recipe, stamp());
+  lineage = track.paths.lineage;
+  trackBest = track.paths.best;
+  runNo = beginRun(track.dir, stamp());
+  // Continue THIS track's numbering, not the old one's — the banner and history must agree.
+  trackCycleNo = readState(track.dir)?.cycles || 0;
+  cyclesSinceAdopt = 0;
+  rotations++;
+  log('');
+  log(`  ↻ Rotating recipe (${why}) → ${recipeLabel(recipe)}`);
+  log(`    track ${track.id}${trackCycleNo ? ` (resuming at cycle ${trackCycleNo + 1})` : ' (new)'}`
+    + ` · features ${featFile.split(/[\\/]/).pop()}`);
+  log(`    equivalent to: npm run train:loop -- ${recipeToFlags(recipe)}`);
+  return true;
+}
+
+// Pick the next recipe to rotate onto. Prefers an untried one ('new' — the registry's
+// space-filling / UCB design over architecture space), falling back to reviving a past track
+// ('resume') when the candidate pool is exhausted. suggestRecipes already excludes every recipe
+// that has a track, so it never hands back the shape we're rotating away from. Returns null when
+// there's nothing to switch to, which leaves the loop on its current recipe.
+function nextRotationRecipe() {
+  try {
+    const sugg = suggestRecipes(loopDir, {});
+    const pick = sugg.find((s) => s.kind === 'new') || sugg.find((s) => s.kind === 'resume');
+    return pick ? pick.recipe : null;
+  } catch (e) {
+    log(`  (rotation skipped — suggester failed: ${e.message})`);
+    return null;
+  }
+}
 // Cycle numbering CONTINUES across warm relaunches of the same recipe: the track's state
 // already counts every cycle it has recorded, so a warm (re)start picks up at prior+1 instead
 // of announcing "CYCLE 1" again after a Ctrl-C + relaunch (train:progress merges those
 // launches into one run the same way). A --cold run chains from a fresh net, so it starts
 // over at 1 — its cycles still accrue to the track for the next warm resume to continue from.
 const cycleBase = cfg.cold ? 0 : (readState(track.dir)?.cycles || 0);
+// Cycle number ON THE CURRENT TRACK. Mutable because --rotate can move the loop to a different
+// track mid-run, and the banner/history have to follow the track they're actually writing to.
+let trackCycleNo = cycleBase;
+// Cycles run on the current track since the loop adopted it, reset by a promotion. This — not
+// the global cyclesSincePromo — is what --rotate triggers on: it asks "has THIS shape had its
+// fair shot", which is the question the rotation is answering. It starts at 0 on every launch so
+// the recipe you explicitly asked for always gets its full N cycles before being rotated away.
+let cyclesSinceAdopt = 0;
+let rotations = 0;
 // No shape-mismatch discard anymore: the track is keyed by the exact recipe (hidden included),
 // so its lineage always matches its own shape and lives in its own directory — a different
 // recipe can't clobber it. A --cold run simply ignores the lineage (it chains from a fresh
@@ -1061,7 +1144,7 @@ const cycleBase = cfg.cold ? 0 : (readState(track.dir)?.cycles || 0);
 log(`Recipe ${track.slug} [${track.id}] — ${recipeLabel(recipe)}`
   + ` (track run #${runNo}${track.isNew ? ', new track' : ''}).`);
 // Featurized file for this recipe (quiet-only gets its own; see featurizeFile).
-const featFile = featurizeFile();
+let featFile = featurizeFile();
 // Whether the global champion's architecture matches this recipe's — i.e. whether the champion
 // is a usable warm-start seed for the candidate. False when --hidden differs from the champion's
 // shape (a brand-new architecture track that must bootstrap from its own lineage/best or cold).
@@ -1079,6 +1162,7 @@ log(`train:loop start — ${cfg.batch === 0
   + `refresh/cycle ${cfg.refreshCycle > 0 ? `${(cfg.refreshCycle * 100).toFixed(1)}% @ depth ${cfg.refreshCycleDepth}` : 'off'} | `
   + `refresh on promotion ${cfg.refreshFrac > 0 ? `${(cfg.refreshFrac * 100).toFixed(0)}% @ depth ${cfg.refreshDepth}` : 'off'} | `
   + `rank ${cfg.rank ? `full pool every ${cfg.rankCycle > 1 ? `${cfg.rankCycle} cycles` : 'cycle'} (hc${cfg.rankDepth} pin, all depths, corpus + ${cfg.rankMinutes}m play${cfg.adaptive ? ', adaptive' : ''}${cfg.rankCycle > 1 ? ', always on promotion' : ''})` : 'off'} | `
+  + `rotate ${cfg.rotate > 0 ? `after ${cfg.rotate} cycle(s) without a promotion` : 'off'} | `
   + `cycles ${cfg.cycles === Infinity ? '∞' : cfg.cycles}`);
 if (cycleBase > 0) log(`Continuing cycle numbering at ${cycleBase + 1} — this recipe's track already has ${cycleBase} recorded cycle(s).`);
 log('Pause/resume from another terminal: `npm run train:pause` / `npm run train:resume` (frees all CPU, no work lost).');
@@ -1100,7 +1184,20 @@ let cyclesSincePromo = 0;
 // on); `c` is the track-cumulative cycle number shown in banners/logs and recorded in the
 // track history — they differ when a warm relaunch continues an earlier run's numbering.
 for (let i = 1; i <= cfg.cycles && !stopping; i++) {
-  const c = cycleBase + i;
+  // Rotate BEFORE doing any work this cycle, so a stalled shape never costs another full
+  // featurize/train/gate. Rotation is best-effort maintenance: if the suggester has nothing to
+  // offer (or throws), the loop simply carries on with the current recipe rather than stopping.
+  if (cfg.rotate > 0 && cyclesSinceAdopt >= cfg.rotate) {
+    const next = nextRotationRecipe();
+    if (next && adoptRecipe(next, `${cyclesSinceAdopt} cycle(s) without a promotion`)) {
+      // adoptRecipe reset the counters; nothing else to do.
+    } else {
+      log(`  (rotation due after ${cyclesSinceAdopt} cycle(s), but the registry had no untried recipe to switch to — continuing.)`);
+      cyclesSinceAdopt = 0; // don't re-ask every cycle once the pool is exhausted
+    }
+  }
+  const c = ++trackCycleNo;
+  cyclesSinceAdopt++;
   const cycleT0 = Date.now();
   cyclesSincePromo++;
   const dataset = existsSync(rawFile) ? ` — dataset ${fmtMB(statSync(rawFile).size)}` : '';
@@ -1252,6 +1349,7 @@ for (let i = 1; i <= cfg.cycles && !stopping; i++) {
     const champHash = archiveChampion(champion); // keep it reconstructable by its vs version
     promotedChampHash = champHash;               // calibrate this champion's depths at end-of-cycle rank
     cyclesSincePromo = 0;                        // champion (hence every `v` target) just changed — refresh more
+    cyclesSinceAdopt = 0;                        // this shape just won the gate — it earns another --rotate window
     if (existsSync(lineage)) rmSync(lineage); // lineage cleared the gate; next start = new champion
     // Publish the new champion into the catalog under its own human name right away, flagged
     // the current champion (so the app shows a real name during its reign, not a generic id).
@@ -1353,6 +1451,6 @@ for (let i = 1; i <= cfg.cycles && !stopping; i++) {
   }
 }
 
-log(`train:loop stopped after ${promotions} promotion(s) in ${fmtDur((Date.now() - loopT0) / 1000)}. `
+log(`train:loop stopped after ${promotions} promotion(s)${rotations ? `, ${rotations} rotation(s)` : ''} in ${fmtDur((Date.now() - loopT0) / 1000)}. `
   + `Champion: web/src/nn-weights.json${promotions ? ' (also published in the net catalog under its name)' : ''}.`);
 if (promotions) console.log('Run `npm run build` to ship the new champion in the production bundle.');

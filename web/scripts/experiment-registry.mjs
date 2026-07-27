@@ -551,10 +551,18 @@ export function coverageKey(hidden) {
 // maximally unbuildable (a 12-layer 256-wide stack is ~60x the champion's per-node work, which
 // the fixed-depth gate would never reward). Bounding by dense cost relative to the reigning shape
 // keeps exploration inside the region where a candidate could actually win.
-export function candidateArchitectures(maxDepth = 12, costBudget = Infinity) {
+// `w0Floor` bounds the region from BELOW, and it matters as much as the cost ceiling. The first
+// layer is the feature detector for a 768-dim sparse input, and every champion this engine has
+// produced used 64 or 128 there. Without a floor the coverage design walks straight into the
+// narrow corner — a simulated week of rotations spent six consecutive tracks on 16-wide first
+// layers, because those cells are unmeasured — which is true but not worth a week to confirm.
+// Half the reigning width keeps the plausible range open (a smaller net is a real question) while
+// refusing the severe-bottleneck end.
+export function candidateArchitectures(maxDepth = 12, costBudget = Infinity, w0Floor = 0) {
   const out = new Set();
   const keep = (spec) => { if (denseCost(spec) <= costBudget) out.add(spec); };
   for (const w0 of WIDTHS) {
+    if (w0 < w0Floor) continue;
     keep(String(w0));
     for (const tail of WIDTHS) {
       if (tail > w0) continue;
@@ -652,8 +660,9 @@ export function suggestRecipes(loopDir, opts = {}) {
   // (a separate experiment — a smaller net's payoff is nps, which fixed depth doesn't measure).
   const costMult = Number(opts.costMult) || 3;
   const budget = reigning ? denseCost(reigning.recipe.hidden) * costMult : Infinity;
+  const w0Floor = reigning ? (hiddenWidths(reigning.recipe.hidden)[0] || 0) / 2 : 0;
   const pool = [];
-  for (const hidden of candidateArchitectures(12, budget)) {
+  for (const hidden of candidateArchitectures(12, budget, w0Floor)) {
     if (triedHidden.has(hidden)) continue;
     pool.push(buildRecipe({ ...knobs, hidden }));
   }
@@ -663,12 +672,24 @@ export function suggestRecipes(loopDir, opts = {}) {
   // Keeping the two mechanisms separate means the arch axis gets a real design and the knob axis
   // keeps its explicit trials, instead of the two quietly cancelling out.
 
-  // How many tracks already sit in each coverage bucket — the emptiness signal for explore mode.
-  const occupancy = new Map();
+  // Coverage counted MARGINALLY (per axis), not per joint cell. With a handful of tracks the joint
+  // cells are almost all empty, so joint-cell emptiness barely discriminates and the design happily
+  // suggests five shapes that differ on one axis — a simulated rotation sequence went depth
+  // 1/2/4/7/9/11 all at the same width, because each was its own untouched cell. Marginal counts
+  // say instead "you have measured depth-1 already, go look at a depth you haven't", which is the
+  // question worth answering at this sample size. The joint cell stays in as a weak tiebreak.
+  const occD = new Map(), occW = new Map(), occC = new Map(), occCell = new Map();
+  const bump = (m, k) => m.set(k, (m.get(k) || 0) + 1);
   for (const t of tracks) {
-    const k = coverageKey(t.recipe.hidden);
-    occupancy.set(k, (occupancy.get(k) || 0) + 1);
+    const key = coverageKey(t.recipe.hidden);
+    const [d, w, c] = key.split('/').map(Number);
+    bump(occD, d); bump(occW, w); bump(occC, c); bump(occCell, key);
   }
+  const coverageCost = (key) => {
+    const [d, w, c] = key.split('/').map(Number);
+    return 3 * (occD.get(d) || 0) + 2 * (occW.get(w) || 0) + (occC.get(c) || 0)
+      + 0.5 * (occCell.get(key) || 0);
+  };
 
   const known = new Set(tracks.map((t) => t.id));
   const scored = [];
@@ -678,7 +699,7 @@ export function suggestRecipes(loopDir, opts = {}) {
     known.add(id); // the pool can generate the same recipe twice (taper == block at some depths)
     const p = rep.model ? rep.model.predict(recipe, probe) : null;
     const bucket = coverageKey(recipe.hidden);
-    const occupied = occupancy.get(bucket) || 0;
+    const occupied = coverageCost(bucket);
     // With a trusted model, rank by UCB (promise + uncertainty). Without one, rank by how unmeasured
     // the candidate's REGION is, tie-broken by feature distance so the pick sits in the middle of
     // the empty bucket rather than on its edge.
