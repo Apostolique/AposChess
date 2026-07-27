@@ -38,9 +38,9 @@ import { existsSync, readFileSync } from 'node:fs';
 import { dirname, resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { fmtDur } from './fmt.mjs';
+import { fmtDur, printWrapped } from './fmt.mjs';
 import {
-  suggestRecipes, readHistory, trackDir,
+  suggestRecipes, readHistory, trackDir, compactSlug,
   ledgerBestByVersion, reAnchoredAbsElo, trackBestAbs,
 } from './experiment-registry.mjs';
 import { weightsHash } from './vtag.mjs';
@@ -336,7 +336,7 @@ if (latestTraj) {
   const t = latestTraj;
   const dir = t.absSlope > 1.0 ? 'climbing' : t.absSlope < -1.0 ? 'falling' : 'flat';
   const estBest = estPct(t.bestAbs);
-  console.log(`\n  Track [${t.id}] ${t.slug} — ${t.runs} run(s), ${t.cycles} cycle(s) accumulated:`);
+  console.log(`\n  Track [${t.id}] ${compactSlug(t.slug)} — ${t.runs} run(s), ${t.cycles} cycle(s) accumulated:`);
   console.log(`    absolute Elo ${t.firstAbs.toFixed(0)} → ${t.latestAbs.toFixed(0)} `
     + `(best ${t.bestAbs.toFixed(0)}${estBest ? `, ~${estBest} vs current champion` : ''}), `
     + `${signed(+t.absSlope.toFixed(1))} Elo/cycle overall, ${dir}.`);
@@ -414,8 +414,13 @@ if (stalled) {
   const fresh = sugg.filter((s) => s.kind === 'new').slice(0, 2);
   if (resume.length || fresh.length) {
     console.log('=== Stalled? Ideas to try (full list: `npm run train:experiments`) ===');
-    for (const s of resume) console.log(`  • revive ${s.slug} — ${s.reason}\n      ${s.cmd}`);
-    for (const s of fresh) console.log(`  • try ${s.slug} — ${s.reason}\n      ${s.cmd}`);
+    // Same shape as `npm run train:experiments`: compacted slug, reason wrapped rather than
+    // padded, command on its own line so it stays copy-pasteable.
+    for (const s of [...resume, ...fresh]) {
+      const verb = s.kind === 'resume' ? 'revive' : 'try';
+      printWrapped(s.reason, `  • ${verb} ${compactSlug(s.slug)} ·`, '    ');
+      console.log(`      ${s.cmd}`);
+    }
     console.log('');
   }
 }

@@ -106,6 +106,22 @@ export function recipeSlug(recipe) {
   return parts.join('_');
 }
 
+// Display-only shortening of a slug's architecture: a run of identical layer sizes collapses to
+// `<size>×<count>`, so `h64-64-32-16-16-16-16-16-16-16-8-8-8-8-8` reads as `h64×2-32-16×7-8×5`.
+// Deep-but-repetitive shapes are most of what the design proposes now, and their slugs are long
+// enough to wreck any column they sit in. Only for display — the registry keys off the full slug.
+export function compactSlug(slug) {
+  return String(slug).replace(/^h[\d,-]+/, (arch) => {
+    const runs = [];
+    for (const n of arch.slice(1).split('-')) {
+      const last = runs[runs.length - 1];
+      if (last && last.n === n) last.k += 1;
+      else runs.push({ n, k: 1 });
+    }
+    return 'h' + runs.map(({ n, k }) => (k > 1 ? `${n}×${k}` : n)).join('-');
+  });
+}
+
 // Pretty one-line human description.
 export function recipeLabel(recipe) {
   const bits = [`hidden=[${recipe.hidden}]`, `λ=${recipe.lambda}`];
@@ -383,8 +399,12 @@ export function recipeFeatures(recipe, cycles = 1) {
     lambda: Number(recipe.lambda ?? 1),
     quiet: recipe.quietOnly ? 1 : 0,
     quant: recipe.quant === false ? 0 : 1,
-    filterWeak: recipe.filterWeak === undefined ? 0 : 1,
-    dropConflicts: recipe.dropConflicts === undefined ? 0 : 1,
+    // MAGNITUDE, not a 0/1 flag. The design proposes several cutoffs per filter now, and
+    // --filter-weak=400 and =1000 are different experiments — an indicator would tell the
+    // surrogate they're the same one. Divided by 1000 so the raw value doesn't tower over the
+    // log2 axes (z-scoring rescales it anyway; a column nobody has varied stays inert).
+    filterWeak: Number(recipe.filterWeak ?? 0) / 1000,
+    dropConflicts: Number(recipe.dropConflicts ?? 0) / 1000,
     logCycles: Math.log2(Math.max(1, cycles)),
   };
 }
@@ -536,6 +556,76 @@ const W0_BUCKETS = [[0, 32], [33, 64], [65, 128], [129, 9999]];
 const COST_BUCKETS = [[0, 2e3], [2e3, 8e3], [8e3, 32e3], [32e3, Infinity]];
 const bucketOf = (v, buckets) => Math.max(0, buckets.findIndex(([lo, hi]) => v >= lo && v <= hi));
 
+// --- The knob axes, and the design over them -----------------------------------------
+//
+// The dataset/target knobs are as much of an experiment as the shape, and they were this
+// registry's blind spot: across its first 9 tracks the architecture moved 8 times while λ never
+// left 0.5 and --quiet-only was never once turned off, because the only knob suggestions were
+// two hard-coded filter trials that expired the moment they'd been run. So the knobs get a
+// generated design of their own, the same way architectures do.
+//
+// A knob candidate is always a ONE-AXIS variation of the reigning recipe — same shape, same
+// everything else, one knob moved — so its result reads as an ablation of what's currently
+// working rather than a jump to an unrelated corner of the space. That also keeps the featurized
+// file churn bounded: each filter combination maintains its own incremental features file, and
+// moving one axis at a time adds one file rather than a fresh one per suggestion.
+//
+// `dflt` is the loop's own default for the knob, and it breaks ties: on an axis nobody has moved
+// every candidate value is equally unsampled, and without a tie-break the pick is decided by
+// array order — which handed back λ=0 (pure bootstrap, no game outcome in the target at all,
+// the degenerate corner) as the first λ experiment ever run. Trying the DEFAULT first makes the
+// result an ablation against the configuration the rest of the loop is tuned around, and the
+// remaining ties go to the value nearest the reigning one, so the design steps outward from
+// what works instead of starting at the corner.
+export const KNOB_AXES = [
+  {
+    key: 'lambda',
+    values: [0, 0.25, 0.5, 0.75, 1],
+    dflt: 1,
+    label: (v) => `λ=${v}`,
+    why: (v) => (v === 1 ? 'pure game result'
+      : v === 0 ? "pure bootstrap on the champion's own search value"
+      : `${Math.round(v * 100)}% game result / ${Math.round((1 - v) * 100)}% champion search value`),
+  },
+  {
+    key: 'quietOnly',
+    values: [false, true],
+    dflt: false,
+    label: (v) => (v ? 'quiet-only' : 'all-positions'),
+    why: (v) => (v
+      ? 'train only on quiet positions — the distribution a static eval is actually queried on at qsearch leaves'
+      : 'train on every position, loud ones included — a larger but noisier set'),
+  },
+  {
+    key: 'filterWeak',
+    values: [0, 400, 700, 1000],
+    dflt: 0,
+    label: (v) => (v ? `filter-weak=${v}` : 'no weak-game filter'),
+    why: (v) => (v
+      ? `drop games whose weaker player rates >${v} Elo below the champion — off-distribution positions carrying a blunder-decided result label`
+      : 'keep every game, whoever played it'),
+  },
+  {
+    key: 'dropConflicts',
+    values: [0, 400, 600, 800],
+    dflt: 0,
+    label: (v) => (v ? `drop-conflicts=${v}` : 'no conflict filter'),
+    why: (v) => (v
+      ? `drop positions whose |v| ≥ ${v}cp contradicts the game result — a later blunder decided that game, so the result label is lying about the position`
+      : 'keep positions whose search value contradicts the result'),
+  },
+];
+
+// The loop records an unset filter as ABSENT, not as 0 (buildRecipe keys on presence), so a
+// "turn this filter off" trial has to canonicalize the same way — otherwise it hashes to a
+// phantom track that the loop, building its recipe from flags, could never land on or resume.
+const knobValue = (key, v) =>
+  ((key === 'filterWeak' || key === 'dropConflicts') && !v ? undefined : v);
+// A recipe's value on one axis, in that same canonical form.
+const knobOf = (recipe, key) => knobValue(key, recipe[key] ?? (key === 'quietOnly' ? false : 0));
+// Stable map key that keeps `false`, `0` and `undefined` distinguishable.
+const knobKey = (v) => JSON.stringify(v ?? null);
+
 export function coverageKey(hidden) {
   const w = hiddenWidths(hidden);
   return [
@@ -582,6 +672,67 @@ export function candidateArchitectures(maxDepth = 12, costBudget = Infinity, w0F
   return [...out];
 }
 
+// Rank one-axis knob variations of the reigning recipe. Scored by how UNSAMPLED the axis is,
+// which is the whole point: with λ pinned at one value across every track, ANY λ trial teaches
+// more than a fourth magnitude of a filter that's already been probed twice — so the count of
+// DISTINCT values the registry has tried on an axis dominates the score, and the count of tracks
+// sitting on the exact proposed value only breaks ties within it. With a trusted surrogate the
+// ranking switches to UCB, same as the architecture pool.
+// At most one pick per AXIS: two magnitudes of the same filter teach far less than one λ trial
+// plus one filter trial.
+function knobSuggestions(tracks, reigning, rep, { probe, kappa, limit = 2 }) {
+  if (!reigning) return [];
+  const ids = new Set(tracks.map((t) => t.id));
+  const seen = new Map(KNOB_AXES.map((ax) => [ax.key, new Map()]));
+  for (const t of tracks) {
+    for (const ax of KNOB_AXES) {
+      const m = seen.get(ax.key), k = knobKey(knobOf(t.recipe, ax.key));
+      m.set(k, (m.get(k) || 0) + 1);
+    }
+  }
+  const scored = [];
+  for (const ax of KNOB_AXES) {
+    const m = seen.get(ax.key);
+    for (const raw of ax.values) {
+      const v = knobValue(ax.key, raw);
+      if (knobKey(v) === knobKey(knobOf(reigning.recipe, ax.key))) continue; // not a variation
+      const recipe = buildRecipe({ ...reigning.recipe, [ax.key]: v });
+      const id = recipeId(recipe);
+      if (ids.has(id)) continue; // already has a track
+      const p = rep.model ? rep.model.predict(recipe, probe) : null;
+      const occupied = 3 * m.size + (m.get(knobKey(v)) || 0);
+      // Tie-break inside an equally-unsampled axis: the loop's default first (the ablation
+      // baseline), then the value nearest the reigning one. Scaled so coverage still decides
+      // first and the default bonus still outranks proximity.
+      const span = Math.max(...ax.values.map(Number)) - Math.min(...ax.values.map(Number)) || 1;
+      const step = Math.abs(Number(v ?? 0) - Number(knobOf(reigning.recipe, ax.key) ?? 0)) / span;
+      const isDefault = knobKey(v) === knobKey(knobValue(ax.key, ax.dflt));
+      scored.push({
+        ax, v, recipe, id, pred: p, occupied,
+        score: rep.useful && p
+          ? p.mean + kappa * p.sigma
+          : -(occupied * 1e6 + (isDefault ? 0 : 1e3) + step),
+      });
+    }
+  }
+  scored.sort((a, b) => b.score - a.score);
+  const picked = [], usedAxis = new Set();
+  for (const c of scored) {
+    if (picked.length >= limit) break;
+    if (usedAxis.has(c.ax.key)) continue;
+    usedAxis.add(c.ax.key);
+    picked.push(c);
+  }
+  return picked.map((c) => ({
+    kind: 'new', family: 'knob', axis: c.ax.key, slug: recipeSlug(c.recipe), recipe: c.recipe,
+    predElo: c.pred ? c.pred.mean : null, sigma: c.pred ? c.pred.sigma : null,
+    mode: rep.useful ? 'ucb' : 'explore',
+    reason: `${c.ax.label(c.v)} on the reigning shape — ${c.ax.why(c.v)}`
+      + (rep.useful && c.pred ? `; predicts ≈ ${c.pred.mean.toFixed(0)} ±${c.pred.sigma.toFixed(0)} Elo` : ''),
+    cmd: recipeResumeCmd(c.recipe),
+  }));
+}
+
 // Suggest what to try next, drawing on the registry:
 //   kind 'resume' — a PAST recipe whose best net was promising (high estimated abs Elo) but
 //                   that stalled (few promotions); resuming warm-starts from its saved best.
@@ -618,31 +769,9 @@ export function suggestRecipes(loopDir, opts = {}) {
     });
   }
 
-  // Dataset-filter recipes (see featurize --min-elo / --drop-conflicts) not yet tried on the
-  // reigning shape: refresh-v repairs stale `v` labels, but who PLAYED a game — hence its
-  // position distribution and its result label — is fixed forever, and these filter that at
-  // featurize time. Suggested against the most-promoted track's architecture (else the first).
-  const FILTER_TRIALS = [
-    { knobs: { filterWeak: 700 },
-      reason: 'drop games whose weaker player is ≥700 Elo below the champion — off-distribution positions with blunder-decided result labels' },
-    { knobs: { dropConflicts: 600 },
-      reason: 'drop positions whose recorded search value (≥600cp) contradicts the game result — the result label is noise there' },
-  ];
+  // The reigning recipe — most promotions — is the base both designs vary from.
   const reigning = tracks.slice().sort((a, b) =>
     ((b.state && b.state.promotions) || 0) - ((a.state && a.state.promotions) || 0))[0];
-  if (reigning) {
-    const ids = new Set(tracks.map((t) => t.id));
-    for (const trial of FILTER_TRIALS) {
-      if (out.filter((o) => o.kind === 'new').length >= 4) break;
-      const recipe = buildRecipe({ ...reigning.recipe, ...trial.knobs });
-      if (ids.has(recipeId(recipe))) continue;
-      out.push({
-        kind: 'new', slug: recipeSlug(recipe), recipe,
-        reason: trial.reason,
-        cmd: recipeResumeCmd(recipe),
-      });
-    }
-  }
 
   // Untried recipes, scored by the surrogate. The pool is generated (candidateArchitectures)
   // rather than listed, and inherits the reigning track's knobs so a suggestion differs from
@@ -764,7 +893,7 @@ export function suggestRecipes(loopDir, opts = {}) {
     picked.push(c);
   }
 
-  for (const c of picked) {
+  const archPicks = picked.map((c) => {
     const parts = [];
     if (rep.useful && c.pred) parts.push(`predicts ≈ ${c.pred.mean.toFixed(0)} ±${c.pred.sigma.toFixed(0)} Elo after ${probe} cycles`);
     else if (c.bucket !== undefined) {
@@ -772,15 +901,29 @@ export function suggestRecipes(loopDir, opts = {}) {
       parts.push(`${c.occupied === 0 ? 'no track yet' : `only ${c.occupied} track(s)`} at depth ${w.length}`
         + ` / first layer ${w[0]} / ${denseCost(c.recipe.hidden).toLocaleString('en-US')} mults per node`);
     }
-    out.push({
-      kind: 'new', slug: recipeSlug(c.recipe), recipe: c.recipe,
+    return {
+      kind: 'new', family: 'arch', slug: recipeSlug(c.recipe), recipe: c.recipe,
       predElo: c.pred ? c.pred.mean : null,
       sigma: c.pred ? c.pred.sigma : null,
       novelty: c.novelty,
       mode: rep.useful ? 'ucb' : 'explore',
       reason: parts.join(', '),
       cmd: recipeResumeCmd(c.recipe),
-    });
-  }
+    };
+  });
+
+  // Which family leads — and so which one --rotate and the loop's auto-pick take first. Compare
+  // how many cells of each the registry has actually sampled: distinct architectures against
+  // distinct knob settings. The first 9 tracks were 8 shapes against 3 knob settings, so the
+  // knob axes lead until they're as well sampled as the shapes, then architectures take the lead
+  // back. It's the same emptiest-cell-first argument the coverage design makes inside each
+  // family, applied between them — and it self-corrects, so neither axis can starve the other.
+  const knobPicks = knobSuggestions(tracks, reigning, rep, { probe, kappa });
+  const distinctArchs = new Set(tracks.map((t) => t.recipe.hidden)).size;
+  const distinctKnobs = new Set(tracks.map((t) =>
+    knobKey(KNOB_AXES.map((ax) => knobOf(t.recipe, ax.key))))).size;
+  out.push(...(distinctKnobs < distinctArchs
+    ? [...knobPicks, ...archPicks]
+    : [...archPicks, ...knobPicks]));
   return out;
 }

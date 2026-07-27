@@ -56,7 +56,8 @@
 //   --lambda=L      TD/bootstrap target mix for training the candidate (default 1 =
 //                   pure game result; <1 leans on the champion's own search value,
 //                   an unbiased bootstrap — recorded because generation uses the net)
-//   --hidden=H      candidate architecture (default: same shape as the champion)
+//   --hidden=H      candidate architecture. OMIT IT and the loop picks one itself — see
+//                   "Choosing the recipe" below, along with the knobs it can also choose.
 //   --cold          train the FIRST cycle's candidate from random init instead of
 //                   warm-starting from the champion (warm start fine-tunes in a few
 //                   epochs and starts at champion strength; a cold start occasionally
@@ -150,6 +151,11 @@
 //                   The counter starts at 0 on every launch, so relaunching does NOT immediately
 //                   re-rotate a track that was already stale — the recipe you launch with always
 //                   gets its full N cycles.
+//                   A rotation adopts the suggested recipe WHOLE — architecture and knobs — even
+//                   the parts you pinned on the command line. That's the point of asking for it:
+//                   flags decide where the run STARTS, --rotate is you telling the loop to move
+//                   on from there, and a rotation that honoured --hidden could never change the
+//                   architecture. Leave --rotate off to stay on the recipe you launched with.
 //   --rank-cycle=N  refit the Bradley-Terry pool every N cycles instead of EVERY cycle
 //                   (default 1 = every cycle, the historical behaviour). The corpus fold is
 //                   free, but the --rank-minutes play budget is not — measured 2026-07-26 it
@@ -184,6 +190,24 @@
 //   --recipe-extra=k=v,k2=v2  free-form namespace to fork a separate track for a training
 //                   experiment the loop has no first-class flag for yet. Labels/keys the track
 //                   and rides along in its resume command; NOT forwarded to train.py.
+//
+// Choosing the recipe (what you don't pass, the loop picks): the registry designs experiments
+// over two families — the ARCHITECTURE (--hidden) and the training KNOBS (--lambda,
+// --quiet-only, --filter-weak, --drop-conflicts) — and fills in whichever you left off the
+// command line, so `npm run train:loop -- --rotate=8` is a complete instruction:
+//   * omit --hidden and it picks a shape;
+//   * omit ALL FOUR knobs and it picks those too. All-or-nothing on purpose: omitting a flag
+//     that defaults to off is the ordinary way to write a command, so pin any one knob and the
+//     rest keep their documented defaults — every command line that used to work still means
+//     exactly what it meant.
+// Suggestions are one-axis variations of the REIGNING recipe (the most-promoted track), so a
+// result reads as an ablation of what's working rather than a jump to an unrelated corner, and
+// the family the registry has sampled less goes first — the first 9 tracks covered 8 distinct
+// shapes but only 3 knob settings, with λ never once off 0.5, so the knob axes lead until they
+// catch up. On a fresh clone with no tracks, the loop falls back to the champion's shape and
+// your flags as given: the suggester bounds its design region relative to an existing track, so
+// with none its "most novel" pick is the widest, deepest net in the grid. Startup logs what it
+// chose, why, and the exact command that pins it. --rotate then keeps this going unattended.
 //
 // Experiment tracks (persistent, non-destructive): the training RECIPE — architecture
 // (--hidden), TD mix (--lambda), --quiet-only, quant (--float), and --scale/--lr/--wd/
@@ -220,7 +244,7 @@ import { STOP_EXIT_CODE } from './stop.mjs';
 import { isGameRecord, vsAt, setVsAt, normalizeVs, serializeGameRecord } from './gameRecord.mjs';
 import {
   buildRecipe, parseRecipeExtra, ensureTrack, beginRun, recordCycle, recipeLabel, readState,
-  suggestRecipes, recipeToFlags, recipeId,
+  suggestRecipes, recipeToFlags, recipeId, readAllTracks,
 } from './experiment-registry.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -392,6 +416,11 @@ const args = Object.fromEntries(
   }),
 );
 const num = (v, d) => (v === undefined ? d : Number(v));
+// A boolean flag: `--x` is on, `--x=false|0|off|no` is off, absent takes the default. A bare
+// `!!args.x` reads `--quiet-only=false` as ON, which matters now that OMITTING the flag hands
+// the choice to the registry — turning a knob off explicitly has to be sayable.
+const flag = (v, d = false) =>
+  (v === undefined ? d : !(v === 'false' || v === '0' || v === 'off' || v === 'no'));
 // One full parallel wave of the match runner: apos-match dispatches games one at a time
 // across --jobs workers, so a matchup smaller than the worker count leaves cores idle from
 // the start (not just at the tail). Rounded up to even — games come in color-reversed pairs.
@@ -427,7 +456,7 @@ const cfg = {
   // so the static net trains on the quiet-position distribution it's actually queried on at
   // qsearch leaves. Off by default (gate it head-to-head before adopting). Toggling it forces
   // the next featurize to be a full pass (the meta sidecar records the filter state).
-  quietOnly: !!args['quiet-only'],
+  quietOnly: flag(args['quiet-only']),
   // Featurize-time dataset filters (recipe knobs — each keys its own experiment track):
   // --filter-weak=DELTA drops games whose weaker player is > DELTA Elo below the current
   // champion (cutoff recomputed per cycle from the ledger, so it tracks the champion);
@@ -579,15 +608,116 @@ function findPython() {
 }
 const python = findPython();
 
-// The candidate keeps the champion's shape unless overridden, so the gate measures
-// "did the new data help?", not "is a different net bigger?".
+// The champion's CURRENT hidden shape ("128,16,16,16"), or '64' if it can't be read. The
+// architecture floor: the one shape the champion seeds with no graft, and the answer when
+// there's nothing in the registry to pick from.
 function championHidden() {
-  if (cfg.hidden) return cfg.hidden;
   try {
     const a = JSON.parse(readFileSync(champion, 'utf8')).arch;
     if (Array.isArray(a) && a.length >= 3) return a.slice(1, -1).join(',');
   } catch { /* fall through */ }
   return '64';
+}
+
+// Which RECIPE knobs the command line PINNED. Everything else is the loop's to choose
+// (autoRecipe below): what you passed wins, the registry fills in the rest — so
+// `npm run train:loop -- --rotate=8` with no recipe flags at all is a complete instruction.
+// Quantization is deliberately absent: it's free at fixed depth and worth ~1.5x the nps, so
+// --float is a diagnostic fork you ask for, not an experiment worth spending rotations on.
+// Same for --scale/--lr/--wd (trainer tuning) and --recipe-extra (yours by definition).
+const pinned = {
+  hidden: typeof args.hidden === 'string',
+  // The knob set is ALL-OR-NOTHING on purpose, unlike the architecture. Omitting a flag that
+  // defaults to off is the ordinary way to write a command — `--lambda=0.5 --quiet-only
+  // --drop-conflicts=700` means "and no weak-game filter", not "surprise me on filter-weak" —
+  // so reading a single omission as an invitation would silently fork a new track out of every
+  // command line that used to work. Pin any one knob and the rest keep their documented
+  // defaults; pin none and the registry designs the whole set.
+  knobs: ['lambda', 'quiet-only', 'filter-weak', 'drop-conflicts'].some((f) => args[f] !== undefined),
+};
+
+// Resolve the candidate's RECIPE — architecture and knobs — from the experiment registry, for
+// every knob the command line didn't pin. The suggester is the same one --rotate consults, so a
+// launch and a rotation explore the same design: one-axis knob variations of the reigning recipe
+// (λ, --quiet-only, --filter-weak, --drop-conflicts) and untried architectures, whichever family
+// the registry has sampled less. That's what the first 9 tracks needed: 8 distinct shapes, but λ
+// never once off 0.5 and --quiet-only never once off.
+//
+// A pinned knob always wins, which is also what keeps the pick safe: a suggestion is guaranteed
+// untried as a WHOLE recipe, but pinning parts of it can collapse the merge back onto a track
+// you already have — so merges that land on an existing recipe id are skipped and the next
+// suggestion is tried instead.
+//
+// Falls back to the command line as given (champion's shape for the architecture) when the
+// registry is empty. That matters on a fresh clone: the suggester bounds its design region
+// RELATIVE to a reigning track (a dense-cost ceiling and a first-layer floor), so with no tracks
+// its space-filling pick walks to the far corner of the grid — a 12-layer 256-wide net no
+// fixed-depth gate would ever reward.
+// Returns { picks, why }; `why` is null when the command line pinned everything.
+function autoRecipe() {
+  // The knobs exactly as the command line left them: the fallback, and the values that override
+  // a suggestion wherever they were pinned.
+  const current = {
+    hidden: cfg.hidden || championHidden(),
+    lambda: cfg.lam,
+    quietOnly: cfg.quietOnly,
+    filterWeak: cfg.filterWeak,
+    dropConflicts: cfg.dropConflicts,
+  };
+  if (pinned.hidden && pinned.knobs) return { picks: current, why: null };
+
+  // A suggestion, with everything you pinned restored to what you asked for.
+  const merge = (r) => ({
+    hidden: pinned.hidden ? current.hidden : r.hidden,
+    lambda: pinned.knobs ? current.lambda : Number(r.lambda),
+    quietOnly: pinned.knobs ? current.quietOnly : !!r.quietOnly,
+    filterWeak: pinned.knobs ? current.filterWeak : (r.filterWeak ?? 0),
+    dropConflicts: pinned.knobs ? current.dropConflicts : (r.dropConflicts ?? 0),
+  });
+  // Canonicalized the same way the call site builds the run's recipe, so the ids compare.
+  const asRecipe = (p) => buildRecipe({
+    hidden: p.hidden, lambda: p.lambda, quietOnly: p.quietOnly, quant: cfg.quant,
+    scale: cfg.scale, lr: cfg.lr, wd: cfg.wd,
+    filterWeak: p.filterWeak > 0 ? p.filterWeak : undefined,
+    dropConflicts: p.dropConflicts > 0 ? p.dropConflicts : undefined,
+    extra: cfg.recipeExtra,
+  });
+
+  const tracks = readAllTracks(loopDir);
+  if (!tracks.length) {
+    return { picks: current, why: "registry is empty — the champion's shape, and your flags as given" };
+  }
+  let sugg = [];
+  try { sugg = suggestRecipes(loopDir, {}); }
+  catch (e) {
+    log(`(recipe suggester failed — ${e.message})`);
+    return { picks: current, why: "suggester unavailable — the champion's shape, and your flags as given" };
+  }
+  const tracked = new Set(tracks.map((t) => t.id));
+  // A suggestion only helps if it varies an axis that's actually FREE. Every knob trial sits on
+  // the reigning shape, so with the knobs pinned it would hand back that shape and call it a
+  // choice; every architecture pick carries the reigning knobs, so with the shape pinned it's
+  // just as empty. Drop whichever family can't contribute here. ('resume' picks vary both and
+  // carry no family, so they always survive as the fallback.)
+  const contributes = (s) => (s.family === 'knob' ? !pinned.knobs
+    : s.family === 'arch' ? !pinned.hidden
+    : true);
+  const ranked = sugg.filter(contributes);
+  // 'new' before 'resume' — an untried recipe is the point; reviving a past one is the fallback.
+  for (const s of [...ranked.filter((x) => x.kind === 'new'), ...ranked.filter((x) => x.kind === 'resume')]) {
+    const picks = merge(s.recipe);
+    const id = recipeId(asRecipe(picks));
+    if (tracked.has(id)) continue; // pinning collapsed this suggestion onto an existing track
+    const src = s.family === 'knob' ? 'knob trial'
+      : s.kind === 'resume' ? 'reviving a past recipe'
+      : 'untried architecture';
+    // The suggestion survives a merge unchanged only when nothing you pinned contradicted it —
+    // say so, because a 'resume' reason ("has a saved best to warm-start from") is only true of
+    // the verbatim recipe, not of an adapted one.
+    const verbatim = id === recipeId(s.recipe);
+    return { picks, why: `${src}${verbatim ? '' : ' (adapted — your pinned flags kept)'} — ${s.reason}` };
+  }
+  return { picks: current, why: 'every suggestion collapses onto a track you already have — your flags as given' };
 }
 
 // A net's architecture (layer widths, e.g. [768,128,64,32,1]) as a compact string for logs,
@@ -1051,9 +1181,16 @@ if (cfg.fresh && existsSync(rawFile)) { rmSync(rawFile); log('Cleared dataset (-
 // reset the fold mark too — otherwise the kept archive wouldn't re-enter the fresh dataset.
 if (cfg.fresh && existsSync(ladderFoldMark)) rmSync(ladderFoldMark);
 
-// Omitting --hidden pins the candidate to the champion's CURRENT shape (resolved here), so
-// the recipe id is a concrete architecture, not a moving target.
-let hidden = championHidden();
+// The recipe is resolved to concrete values HERE — whether they came from flags or the registry
+// picked them (autoRecipe) — so the recipe id is fixed for the run rather than a moving target
+// ("whatever the champion happens to be this cycle"). The chosen knobs are written back onto cfg
+// because that's where the featurize/train call sites read them from.
+const autoPick = autoRecipe();
+let hidden = autoPick.picks.hidden;
+cfg.lam = autoPick.picks.lambda;
+cfg.quietOnly = autoPick.picks.quietOnly;
+cfg.filterWeak = autoPick.picks.filterWeak;
+cfg.dropConflicts = autoPick.picks.dropConflicts;
 // Resolve this run's TRAINING RECIPE and its persistent track. The recipe (architecture + TD
 // mix + quiet filter + quant + trainer knobs + any --recipe-extra) is keyed to a directory
 // under loop/experiments/, so its lineage/best/history survive being switched away from and
@@ -1143,6 +1280,12 @@ let rotations = 0;
 // net), leaving the prior warm progress on disk intact for a later warm resume.
 log(`Recipe ${track.slug} [${track.id}] — ${recipeLabel(recipe)}`
   + ` (track run #${runNo}${track.isNew ? ', new track' : ''}).`);
+// Part of the recipe wasn't given, so the loop chose it. Say what and why, and print the command
+// that pins this exact recipe — the run is otherwise unreproducible from its own log.
+if (autoPick.why) {
+  log(`  ↳ recipe chosen automatically — ${autoPick.why}.`);
+  log(`    to pin it: npm run train:loop -- ${recipeToFlags(recipe)}`);
+}
 // Featurized file for this recipe (quiet-only gets its own; see featurizeFile).
 let featFile = featurizeFile();
 // Whether the global champion's architecture matches this recipe's — i.e. whether the champion

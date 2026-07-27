@@ -18,6 +18,28 @@ export const fmtNum = (n) => Math.round(n).toLocaleString('en-US');
 
 export const fmtMB = (bytes) => (bytes / 1e6).toFixed(1) + ' MB';
 
+// Usable line width, falling back to 100 columns when stdout isn't a TTY (piped into a pager,
+// redirected to a log). Floored so a very narrow terminal can't wrap prose to shreds.
+export const termWidth = () => Math.max(72, process.stdout.columns || 100);
+
+// Word-wrap `text`, opening the first line with `first` and indenting continuations by `hang`.
+// For a label followed by prose of unpredictable length — padding it into a fixed column only
+// aligns until one entry outgrows the column, and then nothing lines up at all.
+export function printWrapped(text, first = '', hang = '', width = termWidth()) {
+  let line = first;
+  let empty = first.trim() === '';
+  for (const word of String(text).split(/\s+/).filter(Boolean)) {
+    if (!empty && line.length + 1 + word.length > width) {
+      console.log(line);
+      line = hang;
+      empty = true;
+    }
+    line += (empty ? '' : ' ') + word;
+    empty = false;
+  }
+  if (!empty) console.log(line);
+}
+
 // A single in-place status line (carriage-return repaint). update() redraws the
 // line (padding over any longer previous content), clear() erases it so permanent
 // lines can be printed without leftover characters.

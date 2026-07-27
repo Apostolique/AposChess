@@ -25,10 +25,11 @@ import { existsSync, readFileSync } from 'node:fs';
 import { dirname, resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { printWrapped } from './fmt.mjs';
 import { weightsHash } from './vtag.mjs';
 import {
   readAllTracks, readHistory, recipeLabel, recipeResumeCmd, suggestRecipes, trackPaths,
-  ledgerBestByVersion, reAnchoredAbsElo, trackBestAbs, surrogateReport,
+  ledgerBestByVersion, reAnchoredAbsElo, trackBestAbs, surrogateReport, compactSlug,
 } from './experiment-registry.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -44,8 +45,6 @@ const args = Object.fromEntries(
   }),
 );
 
-const pad = (s, w) => String(s).padEnd(w);
-const padL = (s, w) => String(s).padStart(w);
 const signed = (n) => (Number.isFinite(n) ? (n >= 0 ? '+' : '') + n.toFixed(0) : '—');
 const parseTs = (ts) => (ts ? new Date(String(ts).replace(' ', 'T') + 'Z') : null);
 const fmtLocal = (d) => {
@@ -53,6 +52,37 @@ const fmtLocal = (d) => {
   const p = (n) => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 };
+// "40m ago" / "22h ago" / "5d ago" — scannable at a glance in the track table, which is all the
+// column is for ("which of these did I touch last?"). `--show` still prints the exact stamp.
+const fmtAge = (d) => {
+  if (!d) return '—';
+  const mins = Math.max(0, (Date.now() - d.getTime()) / 60000);
+  if (mins < 60) return `${Math.round(mins)}m ago`;
+  if (mins < 48 * 60) return `${Math.round(mins / 60)}h ago`;
+  return `${Math.round(mins / 1440)}d ago`;
+};
+
+// Print a table with every column sized to its own widest cell. Hard-coded widths were the bug
+// this replaces: a recipe slug is 20-40 characters depending on the architecture, so any fixed
+// guess either wastes a screen of padding or lets the slug run into the next column — which is
+// how a slug ending in `dc700` and an id `05e87dda` printed as one untypeable `dc70005e87dda`.
+// `cols` is [{ header, align }]; a row is an array of cells. Lines are right-trimmed, so a short
+// last column (the ★) leaves no trailing whitespace.
+function printTable(cols, rows, indent = '  ') {
+  const width = cols.map((c, i) =>
+    Math.max(c.header.length, ...rows.map((r) => String(r[i] ?? '').length)));
+  const line = (cells) => (indent + cells
+    .map((cell, i) => (cols[i].align === 'right'
+      ? String(cell ?? '').padStart(width[i])
+      : String(cell ?? '').padEnd(width[i])))
+    .join('  ')).trimEnd();
+  console.log(line(cols.map((c) => c.header)));
+  // Rule under the headers only — a header-less column (the ★) is an annotation, not something
+  // to underline.
+  console.log((indent + width.map((w, i) => (cols[i].header ? '─'.repeat(w) : ' '.repeat(w)))
+    .join('  ')).trimEnd());
+  for (const r of rows) console.log(line(r));
+}
 
 const champHash = weightsHash(championFile);
 
@@ -88,26 +118,28 @@ function printSuggestions() {
   console.log('\n=== What to try next ===');
   // Say what the suggester actually knows before it makes a claim — the ranking means something
   // different in each mode (predicted Elo vs pure information gain).
-  console.log(`  Model: ${rep.verdict}`);
+  printWrapped(rep.verdict, '  Model:', '    ');
   if (!sugg.length) {
-    console.log('  (no suggestions — no registry yet; just run `npm run train:loop -- --hidden=…`).');
+    console.log('  (no suggestions — no registry yet; just run `npm run train:loop`, which needs no');
+    console.log('   recipe flags: it picks the champion\'s shape here, and designs from cycle 2 on).');
     return;
   }
   const resume = sugg.filter((s) => s.kind === 'resume');
   const fresh = sugg.filter((s) => s.kind === 'new');
+  const printOne = (s, i) => {
+    if (i) console.log('');
+    // `·`, not `—`: several reasons carry their own em-dash, and two of them in one line reads
+    // as a run-on rather than as recipe-then-rationale.
+    printWrapped(s.reason, `    • ${compactSlug(s.slug)} ·`, '      ');
+    console.log(`        ${s.cmd}`);
+  };
   if (resume.length) {
-    console.log('\n  Revive a promising-but-stalled recipe (warm-starts from its saved best):');
-    for (const s of resume) {
-      console.log(`    • ${pad(s.slug, 22)} ${s.reason}`);
-      console.log(`        ${s.cmd}`);
-    }
+    console.log('\n  Revive a promising-but-stalled recipe (warm-starts from its saved best):\n');
+    resume.forEach(printOne);
   }
   if (fresh.length) {
-    console.log(`\n  ${rep.useful ? 'Highest upper-confidence bound (predicted Elo + uncertainty)' : 'Most informative untried recipes (space-filling)'}:`);
-    for (const s of fresh) {
-      console.log(`    • ${pad(s.slug, 22)} ${s.reason}`);
-      console.log(`        ${s.cmd}`);
-    }
+    console.log(`\n  ${rep.useful ? 'Highest upper-confidence bound (predicted Elo + uncertainty)' : 'Most informative untried recipes (space-filling)'}:\n`);
+    fresh.forEach(printOne);
   }
   console.log('\n  Probe a suggestion for a few cycles, then stop — a track that hasn\'t promoted by');
   console.log('  ~8-10 cycles is far less likely to than a fresh shape is on its first (see the');
@@ -125,7 +157,11 @@ if (args.suggest && !args.show) {
 // --- Detail one track (--show=<id|slug>). ----------------------------------------------
 if (args.show) {
   const key = String(args.show);
+  // Accept the compacted slug too — that's the form the table prints, so it's the form that gets
+  // copied. `x` stands in for `×` so the shape is typeable without hunting for the character.
+  const norm = (s) => String(s).toLowerCase().replace(/x/g, '×');
   const t = tracks.find((x) => x.id === key || x.slug === key)
+    || tracks.find((x) => norm(compactSlug(x.slug)) === norm(key))
     || tracks.find((x) => x.id.startsWith(key));
   if (!t) {
     console.error(`No track matching '${key}'. Run \`npm run train:experiments\` to list them.`);
@@ -145,18 +181,27 @@ if (args.show) {
   console.log(`  resume: ${recipeResumeCmd(t.recipe)}`);
 
   const hist = readHistory(t.dir);
-  console.log(`\n  History (${hist.length} cycle(s)):`);
+  console.log(`\n  History (${hist.length} cycle(s)):\n`);
   if (!hist.length) console.log('    (none yet)');
   else {
-    console.log(`    ${pad('run/cyc', 9)}${pad('score', 8)}${pad('edge', 7)}${pad('absElo', 8)}${pad('SPRT', 14)}${pad('when', 18)}`);
-    for (const h of hist) {
-      console.log('    ' + pad(`${h.run ?? '?'}/${h.cycle ?? '?'}`, 9)
-        + pad(Number.isFinite(h.score) ? (h.score * 100).toFixed(1) + '%' : '?', 8)
-        + pad(signed(h.edgeElo), 7)
-        + pad((() => { const a = reAnchoredAbsElo(h, ledgerElo); return Number.isFinite(a) ? a.toFixed(0) : '—'; })(), 8)
-        + pad(h.promoted ? 'H1 PROMOTED' : h.sprt, 14)
-        + pad(fmtLocal(parseTs(h.ts)), 18));
-    }
+    printTable([
+      { header: 'run/cyc' },
+      { header: 'score', align: 'right' },
+      { header: 'edge', align: 'right' },
+      { header: 'absElo', align: 'right' },
+      { header: 'SPRT' },
+      { header: 'when' },
+    ], hist.map((h) => {
+      const abs = reAnchoredAbsElo(h, ledgerElo);
+      return [
+        `${h.run ?? '?'}/${h.cycle ?? '?'}`,
+        Number.isFinite(h.score) ? (h.score * 100).toFixed(1) + '%' : '?',
+        signed(h.edgeElo),
+        Number.isFinite(abs) ? abs.toFixed(0) : '—',
+        h.promoted ? 'H1 PROMOTED' : h.sprt,
+        fmtLocal(parseTs(h.ts)),
+      ];
+    }), '    ');
   }
   process.exit(0);
 }
@@ -181,18 +226,28 @@ const rows = tracks.slice().sort((a, b) => {
 });
 
 console.log('');
-console.log(`  ${pad('recipe', 24)}${pad('id', 10)}${padL('runs', 5)} ${padL('cyc', 4)} ${padL('prom', 5)} `
-  + `${padL('best-absElo', 12)} ${padL('best%', 7)}  ${pad('last run', 18)}`);
-for (const t of rows) {
+printTable([
+  { header: 'recipe' },
+  { header: 'id' },
+  { header: 'runs', align: 'right' },
+  { header: 'cyc', align: 'right' },
+  { header: 'prom', align: 'right' },
+  { header: 'absElo', align: 'right' },
+  { header: 'gate%', align: 'right' },
+  { header: 'last run', align: 'right' },
+  { header: '' }, // ★ marker; empty header so it reads as an annotation, not a column
+], rows.map((t) => {
   const st = t.state || {};
   const best = bestByTrack.get(t.id); // re-anchored, not the drift-prone state.best snapshot
-  const star = producedChampion(t.dir) ? ' ★' : '';
-  console.log('  ' + pad(t.slug, 24) + pad(t.id, 10)
-    + padL(st.runs ?? 0, 5) + ' ' + padL(st.cycles ?? 0, 4) + ' ' + padL(st.promotions ?? 0, 5) + ' '
-    + padL(best && Number.isFinite(best.absElo) ? best.absElo.toFixed(0) : '—', 12) + ' '
-    + padL(best && Number.isFinite(best.score) ? (best.score * 100).toFixed(1) + '%' : '—', 7)
-    + '  ' + pad(fmtLocal(parseTs(st.lastRunTs)), 18) + star);
-}
-console.log('\n  ★ = produced the current champion.  Detail one: `npm run train:experiments -- --show=<id>`.');
+  return [
+    compactSlug(t.slug), t.id, st.runs ?? 0, st.cycles ?? 0, st.promotions ?? 0,
+    best && Number.isFinite(best.absElo) ? best.absElo.toFixed(0) : '—',
+    best && Number.isFinite(best.score) ? (best.score * 100).toFixed(1) + '%' : '—',
+    fmtAge(parseTs(st.lastRunTs)),
+    producedChampion(t.dir) ? '★' : '',
+  ];
+}));
+console.log("\n  absElo / gate% = the track's best cycle, re-anchored onto today's ledger.  16×7 = seven 16-wide layers.");
+console.log('  ★ = produced the current champion.  Detail one: `npm run train:experiments -- --show=<id>`.');
 
 printSuggestions();

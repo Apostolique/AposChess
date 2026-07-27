@@ -133,7 +133,8 @@ strong-engine play at depth 8 (plus `--batch` generation when enabled).
   normal path **omits it** and lets the dataset accumulate (and be maintained — see
   "Dataset maintenance").
 - Options: `--batch`, `--depth` (generation), `--gate-games` (default 2000), `--gate-depth`,
-  `--elo1` (promotion bar, below), `--hidden` (candidate shape; default = champion's),
+  `--elo1` (promotion bar, below), `--hidden` (candidate shape; omit it — and the recipe
+  knobs — and the loop designs them itself, see "Experiment tracks"),
   `--lambda` (TD target mix, below), `--cold` (random-init candidates instead of
   warm-starting from the lineage/champion), `--skip-gen` (skip the FIRST cycle's
   generation and gate the dataset as it stands — resume after a Ctrl-C mid-generation
@@ -207,7 +208,27 @@ the ones that don't win are preserved for later.
 npm run train:loop -- --hidden=256,32              # a track for this architecture
 npm run train:loop -- --hidden=128 --quiet-only    # a different, independent track
 npm run train:loop -- --hidden=256,32              # resumes the first track's lineage/best
+npm run train:loop -- --quiet-only                 # no shape given: the registry picks one
+npm run train:loop -- --rotate=8                   # nothing given: it designs the whole recipe
 ```
+
+**What you don't pass, the loop picks.** The registry runs a design over two families — the
+architecture (`--hidden`) and the training knobs (`--lambda`, `--quiet-only`,
+`--filter-weak`, `--drop-conflicts`) — and fills in whichever you left off. Leave out
+`--hidden` and it chooses a shape. Leave out *all four* knobs and it chooses those too, so
+`npm run train:loop -- --rotate=8` is a complete instruction for an unattended run.
+
+The knob set is all-or-nothing on purpose. Omitting a flag that defaults to off is the
+ordinary way to write a command, so pin any one knob and the rest keep their documented
+defaults — every command line that used to work still means exactly what it meant.
+
+Suggestions are one-axis variations of the reigning recipe, so a result is an ablation of
+what's currently working rather than a jump somewhere unrelated, and the family the registry
+has sampled less goes first. That's what it needed: the first 9 tracks covered 8 distinct
+architectures but only 3 knob settings — λ never once moved off 0.5 and `--quiet-only` was
+never once turned off, across 129 cycles. On a fresh clone with no tracks yet it falls back
+to the champion's shape and your flags as given. The startup log prints what it chose, why,
+and the command that pins that exact recipe.
 
 Browse and get suggestions with **`npm run train:experiments`**:
 
