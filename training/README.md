@@ -91,9 +91,9 @@ a dedicated champion self-play batch at `--depth`, default 8) → featurize (inc
 lineage/best or the champion so it fine-tunes in a few epochs; `--cold` restores
 from-scratch training) → play **candidate vs champion** as an SPRT → **promote the
 candidate only if it wins** (accepts H1). Otherwise the champion is kept. So the
-champion only ever moves uphill. Every cycle it also refreshes the weakest value
-labels (`--refresh-cycle`, below), and on promotion it can run a bigger refresh
-(`--refresh-frac`, below).
+champion only ever moves uphill. It can also refresh the weakest value labels every
+cycle (`--refresh-cycle`, below — off by default), and run a bigger refresh on
+promotion (`--refresh-frac`, below).
 
 **Candidate lineage (sub-threshold gains accumulate).** A mature champion's real
 per-cycle gains are often +10-ish Elo — genuinely positive but below what the SPRT can
@@ -257,12 +257,23 @@ hours; refreshing a fraction `P` each time amortizes that cost and keeps the *av
 synchronized all-stale→all-fresh lurch. (Pure-random `P` has a coupon-collector tail; a
 future champion-version stamp would enable exact oldest-first coverage.)
 
-**Wired into the loop, two ways.** `train:loop --refresh-cycle=P` (default **1**)
-refreshes **every cycle** between generation and featurize, at `--refresh-cycle-depth`
-(default = the generation `--depth`). In ledger mode (the loop's default) refresh-v
-restricts itself to the **weakest label cohort** under a 10-minute wall-clock budget,
-so `P=1` just drains the weakest labels first; the adaptive maintenance budget scales
-the effective fraction per cycle. Separately, `--refresh-frac=P` (default 0 = off)
+**Wired into the loop, two ways — both off by default.** `train:loop --refresh-cycle=P`
+(default **0**) refreshes **every cycle** between generation and featurize, at
+`--refresh-cycle-depth` (default = the generation `--depth`). In ledger mode (the loop's
+default) refresh-v restricts itself to the **weakest label cohort** under a 10-minute
+wall-clock budget, so `P=1` just drains the weakest labels first; the adaptive
+maintenance budget scales the effective fraction per cycle.
+
+It defaults to off since 2026-07-26 because it stopped keeping up with the dataset. At
+21.0M positions it relabels ~0.25% per cycle (~5.6k positions per minute of budget at
+depth 8, measured), and the in-place rewrite costs a **full** re-featurize per track —
+7m22s on a 1.9 GB features file, against seconds for the incremental path. That's ~15%
+of a 2-hour cycle to move a quarter-percent of the labels. New games already arrive
+labeled by top-band engines, so the fresh share climbs on its own, and `featurize
+--filter-weak` retires the weak old bulk for free. Turning it on in bursts still makes
+sense — draining the unrecoverable/untagged (−∞) cohort is something nothing else does.
+
+Separately, `--refresh-frac=P` (default 0 = off)
 runs a bigger pass **after each promotion** (using the just-promoted champion) at
 `--refresh-depth` (default **8**, matching generation — a big fraction at depth 8 is
 many hours). Both seed the slice differently each run, so successive refreshes cover

@@ -117,25 +117,36 @@
 //   --refresh-depth=D  search depth for the refresh (default 8 — matches generation;
 //                   a depth-8 refresh of a big fraction is hours, lower it for speed)
 //   --refresh-cycle=P  EVERY cycle (between generation and featurize), recompute `v` with
-//                   the current champion (default 1 = the whole weakest cohort; 0 = off).
-//                   Unlike --refresh-frac this helps between promotions too: most records
-//                   carry `v` from OLDER champions (or shallower gate-harvest/backfill
-//                   searches), so re-labeling them with the current champion steadily
-//                   upgrades the TD target even while the champion is unchanged. In
-//                   ledger mode (the loop's default once a champion exists) refresh-v
-//                   already restricts itself to the single WEAKEST cohort and is capped
-//                   at a 10-minute wall-clock budget, so P throttles only how much of
-//                   that cohort is eligible — P=1 simply spends the whole budget draining
-//                   the weakest labels first (and, unthrottled, reaches the "nothing to
-//                   refresh" steady state sooner, after which the refresh is a cheap
-//                   read-only scan that no longer forces a full re-featurize). A small P
-//                   wastes budget; only lower it if you want shorter cycles than 10m.
+//                   the current champion. DEFAULT 0 = OFF (2026-07-26); P=1 means "the
+//                   whole weakest cohort". It re-labels older/shallower `v` upward, which
+//                   is real work at λ<1 — but it no longer scales. Measured on the 21.0M-
+//                   position set: refresh-v does ~5.6k positions per minute of budget, so
+//                   the 10-minute budget relabels ~0.25% of the set per cycle (~350+ cycles
+//                   to walk it once), while the in-place rewrite forces a FULL re-featurize
+//                   (7m22s per track on a 1.9 GB features file, vs seconds incremental) —
+//                   ~15% of a 2-hour cycle for a quarter-percent of the labels. New data
+//                   already arrives labeled by top-band engines, so the fresh share grows
+//                   on its own; the cheap lever for the old bulk is featurize --filter-weak
+//                   (it drops weak-labeled games outright and is a gateable recipe knob),
+//                   not this. Set P>0 to turn it back on — worthwhile in bursts, e.g. to
+//                   drain the unrecoverable/untagged (-Inf) cohort, which nothing else fixes.
 //   --refresh-cycle-depth=D  search depth for the per-cycle refresh (default: --depth,
 //                   so the re-labels match generation's deep-label quality)
 //   --no-refresh    skip ALL value refreshing (both --refresh-cycle and --refresh-frac),
-//                   regardless of their values — shorthand for --refresh-cycle=0 with no
-//                   promotion refresh, for when you want the fastest possible cycles and
-//                   accept the staler `v` targets
+//                   regardless of their values. Both default to 0 now, so this only matters
+//                   as a hard override on a command line that also passes a fraction.
+//   --rank-cycle=N  refit the Bradley-Terry pool every N cycles instead of EVERY cycle
+//                   (default 1 = every cycle, the historical behaviour). The corpus fold is
+//                   free, but the --rank-minutes play budget is not — measured 2026-07-26 it
+//                   was ~35 min of a ~2 h cycle (25-35%) for 28 new ladder games. Between
+//                   promotions that mostly re-confirms a ledger that isn't moving: the
+//                   champion's margin holds steady (the adaptive note printed an identical
+//                   `±42 → 1.06×` every cycle) and --filter-weak's cutoff is quantized to
+//                   50-Elo steps, so it only shifts when the champion actually climbs. N=3
+//                   buys back ~25% of a cycle for a slightly staler ledger — a one-cycle lag
+//                   is benign, it just means the weakest-first refresh targets a marginally
+//                   out-of-date cohort. A PROMOTION always forces a refit regardless of N,
+//                   so a fresh champion is rated and depth-calibrated immediately.
 //   --calibrate-minutes=M  after a PROMOTION, extend that cycle's rank pass by M minutes
 //                   (default 10) with the new champion schedulable at EVERY depth, so the pool's
 //                   onboard floor rates its 0-game depth bands instead of leaving them at the
@@ -147,6 +158,7 @@
 //                   cycle from a signal — rank-minutes ↑ when the champion's ledger margin (the CI
 //                   on its absElo) is wide, refresh ↑ in the cycles right after a promotion (stalest
 //                   `v`) — anchored so a neutral signal == today's fixed values (can't starve a step).
+//                   With --refresh-cycle at its 0 default only the rank-minutes half does anything.
 //   --float / --no-quant  train a NON-quantized (float) candidate instead of the default
 //                   quantized one. Quant is a recipe knob, so this forks a distinct track.
 //   --scale=S / --lr=L / --wd=W  forwarded to train.py (else its own defaults). Each is part
@@ -422,11 +434,11 @@ const cfg = {
   // the deep anchor. A depth-8 refresh of a big fraction is many hours — lower it (or the
   // fraction) to trade accuracy for speed. Off by default (refreshFrac 0).
   refreshDepth: num(args['refresh-depth'], 8),
-  // Per-cycle refresh: a small slice of the dataset re-labeled with the current champion
-  // every cycle. Helps between promotions too — most `v` in the set came from older
-  // champions or shallower searches, so "unchanged champion" does NOT mean "nothing to
-  // refresh"; only records the current champion already labeled at this depth are no-ops.
-  refreshCycle: args['no-refresh'] ? 0 : num(args['refresh-cycle'], 1),
+  // Per-cycle refresh: a slice of the dataset re-labeled with the current champion every
+  // cycle. OFF by default since 2026-07-26 — at 21M positions it relabels ~0.25% per cycle
+  // yet forces a full re-featurize on every track, ~15% of cycle time for a quarter-percent
+  // of the labels (see the --refresh-cycle help above). --refresh-cycle=1 turns it back on.
+  refreshCycle: args['no-refresh'] ? 0 : num(args['refresh-cycle'], 0),
   refreshCycleDepth: num(args['refresh-cycle-depth'], num(args.depth, 8)),
   // Engine ranking for smart weakest-first v refresh. On by default, driven by the
   // self-relative Bradley-Terry POOL (rank:pool / depth-ladder.mjs).
@@ -442,6 +454,17 @@ const cfg = {
   // corpus already rates the champion from its gate games and the store accumulates across
   // cycles — each cycle just tightens the most-ambiguous orderings.
   rankMinutes: num(args['rank-minutes'], 5),
+  // Refit the pool every N cycles instead of every cycle (1 = every cycle, the old behaviour).
+  // The --rank-minutes play budget is the second-largest slice of a cycle after the gate, and
+  // between promotions the ledger barely moves — the champion's margin holds steady and
+  // --filter-weak's cutoff is quantized to 50-Elo steps, so a refit mostly re-confirms what the
+  // last one said. Keyed on the TRACK-cumulative cycle number at the call site, so the cadence
+  // survives a Ctrl-C + warm relaunch instead of restarting (and re-ranking) on every launch's
+  // first cycle. A promotion overrides it, so a fresh champion is never left uncalibrated.
+  // Non-finite input falls back to 1 rather than propagating NaN — `c % NaN === 0` is never
+  // true, which would silently disable the refit for the whole run instead of erroring.
+  rankCycle: Number.isFinite(Math.round(num(args['rank-cycle'], 1)))
+    ? Math.max(1, Math.round(num(args['rank-cycle'], 1))) : 1,
   // After a PROMOTION, extend that cycle's rank pass by this many minutes with the NEW champion
   // schedulable at EVERY depth (a bare-hash --play spec), so the ladder's onboard floor anchors
   // its 0-game depth nodes to the scale. Without it a fresh champion is rated only at the depths
@@ -651,7 +674,10 @@ function championLedgerConfidence() {
 //   refresh-frac ← post-promotion staleness: relabel MORE in the cycles right after a promotion
 //                  (the whole dataset's `v` came from the OLD champion), tapering as the
 //                  weakest-first refresh chips the staleness down with the champion unchanged.
-function adaptiveMaintenance(cyclesSincePromo) {
+//                  Inert unless --refresh-cycle>0, which is off by default — scaling 0 is 0.
+// `rankDue` is false on a cycle the --rank-cycle cadence skips: the rank half of the budget is
+// moot then, so the note says so rather than advertising minutes that never get spent.
+function adaptiveMaintenance(cyclesSincePromo, rankDue = true) {
   const base = { rankMinutes: cfg.rankMinutes, refreshFrac: cfg.refreshCycle, notes: null };
   if (!cfg.adaptive) return base;
   const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
@@ -674,7 +700,8 @@ function adaptiveMaintenance(cyclesSincePromo) {
   }
   return {
     rankMinutes, refreshFrac,
-    notes: `rank ${rankMinutes}m (${rankWhy}); refresh ${(refreshFrac * 100).toFixed(1)}% (${refreshWhy})`,
+    notes: (rankDue ? `rank ${rankMinutes}m (${rankWhy})` : `rank skipped this cycle (--rank-cycle=${cfg.rankCycle})`)
+      + (cfg.refreshCycle > 0 ? `; refresh ${(refreshFrac * 100).toFixed(1)}% (${refreshWhy})` : ''),
   };
 }
 
@@ -1051,7 +1078,7 @@ log(`train:loop start — ${cfg.batch === 0
   + `${existsSync(lineage) ? ' (resuming lineage)' : ''} | `
   + `refresh/cycle ${cfg.refreshCycle > 0 ? `${(cfg.refreshCycle * 100).toFixed(1)}% @ depth ${cfg.refreshCycleDepth}` : 'off'} | `
   + `refresh on promotion ${cfg.refreshFrac > 0 ? `${(cfg.refreshFrac * 100).toFixed(0)}% @ depth ${cfg.refreshDepth}` : 'off'} | `
-  + `rank ${cfg.rank ? `full pool every cycle (hc${cfg.rankDepth} pin, all depths, corpus + ${cfg.rankMinutes}m play${cfg.adaptive ? ', adaptive' : ''})` : 'off'} | `
+  + `rank ${cfg.rank ? `full pool every ${cfg.rankCycle > 1 ? `${cfg.rankCycle} cycles` : 'cycle'} (hc${cfg.rankDepth} pin, all depths, corpus + ${cfg.rankMinutes}m play${cfg.adaptive ? ', adaptive' : ''}${cfg.rankCycle > 1 ? ', always on promotion' : ''})` : 'off'} | `
   + `cycles ${cfg.cycles === Infinity ? '∞' : cfg.cycles}`);
 if (cycleBase > 0) log(`Continuing cycle numbering at ${cycleBase + 1} — this recipe's track already has ${cycleBase} recorded cycle(s).`);
 log('Pause/resume from another terminal: `npm run train:pause` / `npm run train:resume` (frees all CPU, no work lost).');
@@ -1297,9 +1324,16 @@ for (let i = 1; i <= cfg.cycles && !stopping; i++) {
   // Size this cycle's maintenance budget (rank-minutes + refresh fraction) from the current
   // signals, bounded around the configured values (see adaptiveMaintenance). Computed once here so
   // the rank pass and the refresh below use one consistent, logged decision.
-  const budget = adaptiveMaintenance(cyclesSincePromo);
+  // Refit cadence (--rank-cycle=N): every N-th cycle, keyed on the TRACK-cumulative `c` so a warm
+  // relaunch continues the cadence instead of re-ranking on every launch's first cycle. A
+  // PROMOTION always forces a refit — a fresh champion sits at the placeholder-floor Elo at every
+  // depth it hasn't played, and the depth-calibration pass that fixes it only runs here, so
+  // deferring it would leave the absElo the loop steers by resting on one or two thin bands.
+  const rankDue = cfg.rankCycle <= 1 || Boolean(promotedChampHash) || c % cfg.rankCycle === 0;
+  const budget = adaptiveMaintenance(cyclesSincePromo, rankDue);
   if (budget.notes) log(`  Adaptive maintenance: ${budget.notes}.`);
-  if (!stopping) runRankPool('Rank pool (Bradley-Terry, corpus + scheduled play)',
+  if (!rankDue) log(`  Pool refit skipped (--rank-cycle=${cfg.rankCycle}) — next at cycle ${c + cfg.rankCycle - (c % cfg.rankCycle)}, or sooner on a promotion. The last fitted ledger still drives the filters/refresh.`);
+  if (!stopping && rankDue) runRankPool('Rank pool (Bradley-Terry, corpus + scheduled play)',
     { calibrateChamp: promotedChampHash, minutes: budget.rankMinutes });
 
   // Per-cycle value refresh — the LAST step of the cycle. Re-label a small slice of the

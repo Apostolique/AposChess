@@ -415,7 +415,7 @@ if (stalled) {
   if (resume.length || fresh.length) {
     console.log('=== Stalled? Ideas to try (full list: `npm run train:experiments`) ===');
     for (const s of resume) console.log(`  • revive ${s.slug} — ${s.reason}\n      ${s.cmd}`);
-    for (const s of fresh) console.log(`  • try ${s.slug} (architecture never tried)\n      ${s.cmd}`);
+    for (const s of fresh) console.log(`  • try ${s.slug} — ${s.reason}\n      ${s.cmd}`);
     console.log('');
   }
 }

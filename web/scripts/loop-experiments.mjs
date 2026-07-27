@@ -9,10 +9,17 @@
 // recipes to revive (they carry a saved best net to warm-start from) and architectures never
 // tried. Nothing here writes or spawns, so it's safe against a live loop.
 //
+// The "what to try next" list is a sequential design over recipe space, not a fixed ladder: each
+// finished track is an observation, a surrogate fitted to them scores a generated candidate pool,
+// and the ranking switches from space-filling exploration to predicted-Elo once the surrogate
+// actually beats predicting the mean. See suggestRecipes in experiment-registry.mjs.
+//
 //   npm run train:experiments                 # table of all tracks + suggestions
 //   npm run train:experiments -- --show=<id>  # one track's recipe + per-cycle history
 //                                             #   (<id> matches the 8-char id or the slug)
 //   npm run train:experiments -- --suggest    # just the "what to try next" suggestions
+//   npm run train:experiments -- --min-obs=N --min-gain=G   # move the surrogate's trust bars
+//   npm run train:experiments -- --cost-mult=M --kappa=K    # design region / exploration weight
 
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, resolve, join } from 'node:path';
@@ -21,7 +28,7 @@ import { fileURLToPath } from 'node:url';
 import { weightsHash } from './vtag.mjs';
 import {
   readAllTracks, readHistory, recipeLabel, recipeResumeCmd, suggestRecipes, trackPaths,
-  ledgerBestByVersion, reAnchoredAbsElo, trackBestAbs,
+  ledgerBestByVersion, reAnchoredAbsElo, trackBestAbs, surrogateReport,
 } from './experiment-registry.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -66,9 +73,22 @@ const ledgerElo = ledgerBestByVersion(loopDir);
 const bestByTrack = new Map(tracks.map((t) => [t.id, trackBestAbs(t.dir, ledgerElo)]));
 
 // --- Suggestions block (shared by default view and --suggest). --------------------------
+// Tuning knobs for the suggester, all optional. --min-obs/--min-gain move the bars the surrogate
+// has to clear before predictions are ranked on (lower them to inspect the UCB ranking early);
+// --cost-mult widens or tightens the design region; --kappa weights exploration in UCB mode.
+const suggestOpts = {};
+for (const [flag, key] of [['min-obs', 'minObs'], ['min-gain', 'minGain'],
+  ['cost-mult', 'costMult'], ['kappa', 'kappa'], ['probe-cycles', 'probeCycles']]) {
+  if (args[flag] !== undefined && args[flag] !== true) suggestOpts[key] = Number(args[flag]);
+}
+
 function printSuggestions() {
-  const sugg = suggestRecipes(loopDir, {});
+  const sugg = suggestRecipes(loopDir, suggestOpts);
+  const rep = surrogateReport(loopDir, suggestOpts);
   console.log('\n=== What to try next ===');
+  // Say what the suggester actually knows before it makes a claim — the ranking means something
+  // different in each mode (predicted Elo vs pure information gain).
+  console.log(`  Model: ${rep.verdict}`);
   if (!sugg.length) {
     console.log('  (no suggestions — no registry yet; just run `npm run train:loop -- --hidden=…`).');
     return;
@@ -76,16 +96,23 @@ function printSuggestions() {
   const resume = sugg.filter((s) => s.kind === 'resume');
   const fresh = sugg.filter((s) => s.kind === 'new');
   if (resume.length) {
-    console.log('  Revive a promising-but-stalled recipe (warm-starts from its saved best):');
+    console.log('\n  Revive a promising-but-stalled recipe (warm-starts from its saved best):');
     for (const s of resume) {
       console.log(`    • ${pad(s.slug, 22)} ${s.reason}`);
       console.log(`        ${s.cmd}`);
     }
   }
   if (fresh.length) {
-    console.log('  Explore an architecture with no track yet:');
-    for (const s of fresh) console.log(`    • ${pad(s.slug, 22)} ${s.cmd}`);
+    console.log(`\n  ${rep.useful ? 'Highest upper-confidence bound (predicted Elo + uncertainty)' : 'Most informative untried recipes (space-filling)'}:`);
+    for (const s of fresh) {
+      console.log(`    • ${pad(s.slug, 22)} ${s.reason}`);
+      console.log(`        ${s.cmd}`);
+    }
   }
+  console.log('\n  Probe a suggestion for a few cycles, then stop — a track that hasn\'t promoted by');
+  console.log('  ~8-10 cycles is far less likely to than a fresh shape is on its first (see the');
+  console.log('  registry: 2 of 4 promotions landed on a new track\'s cycle 1). Every finished track');
+  console.log('  is one more observation, so short probes teach the model faster than long grinds.');
   console.log('\n  (Strength is signal-limited, not capacity-limited — docs/first-layer-strategy.md —');
   console.log('   so a bigger net isn\'t automatically better; gate every recipe head-to-head as usual.)');
 }

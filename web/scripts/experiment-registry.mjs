@@ -306,12 +306,273 @@ export function trackBestAbs(dir, ledgerElo, runFilter = null) {
 }
 
 // --- Suggestions ---------------------------------------------------------------------
+//
+// The suggester is a small sequential-design loop over recipe space, not a fixed list. Every
+// finished track is one observation — recipe features in, best re-anchored absElo out — and a
+// kernel-regression surrogate fitted to those observations scores a generated pool of untried
+// recipes. Candidates are ranked by an upper-confidence bound (predicted Elo + kappa · sigma), so
+// the ranking rewards BOTH a promising prediction and a region the registry knows little about.
+// As tracks accumulate, sigma shrinks where you've measured and the suggestions concentrate on
+// the parts of the space that still look good — the "gets better as it learns" behaviour.
+//
+// This is deliberately modest machinery. With a handful of tracks the surrogate is barely more
+// than "a distance-weighted average of what you already ran", so `surrogateReport` cross-validates
+// it (leave-one-out) against the do-nothing baseline of predicting the global mean, and
+// `suggestRecipes` falls back to a pure space-filling design when the model can't beat that
+// baseline. The tool says which mode it's in rather than dressing up noise as a prediction.
 
-// A small ladder of architectures worth exploring, roughly increasing capacity. Used to
-// suggest shapes with no track yet. (Strength is signal-limited, not capacity-limited —
-// docs/first-layer-strategy.md — so wider isn't automatically better; these are exploration
-// candidates to be gated the usual way, not recommendations.)
-const ARCH_LADDER = ['32', '64', '128', '256', '128,32', '256,32', '256,64', '256,64,16', '384', '512,64'];
+// Layer widths of a hidden spec ("64,32,16" -> [64,32,16]). Invalid entries are dropped.
+export function hiddenWidths(hidden) {
+  return String(hidden ?? '').split(',')
+    .map((s) => Number(s.trim()))
+    .filter((n) => Number.isFinite(n) && n > 0);
+}
+
+// Total weight count of a net built from this hidden spec. Dominated by the sparse input layer
+// (NUM_FEATURES x w0), which is why w0 gets its own feature below — it's the capacity knob that
+// actually costs parameters, while extra narrow layers are nearly free.
+export function recipeParams(hidden, numFeatures = 768) {
+  const w = hiddenWidths(hidden);
+  if (!w.length) return numFeatures;
+  let p = numFeatures * w[0] + w[0];
+  for (let i = 1; i < w.length; i++) p += w[i - 1] * w[i] + w[i];
+  return p + w[w.length - 1] + 1; // scalar head
+}
+
+// Multiply-accumulates per EVALUATED NODE — the cost that actually shows up as ns/node, and a
+// different quantity from the parameter count. The 768 x w0 input layer is excluded on purpose:
+// the Zig search maintains it as an incrementally-updated accumulator (the "U" in NNUE, see
+// web/engine/README.md), so a wide first layer is nearly free at inference. What costs nodes is
+// the DENSE stack behind it. That distinction matters a lot for candidate generation: a
+// [256 x 12] net is ~60x the per-node work of the current champion while a [256, 16, 16] net is
+// cheaper than it, and a search that halves its nps has to be far more accurate just to break
+// even at the loop's fixed-depth gate.
+export function denseCost(hidden) {
+  const w = hiddenWidths(hidden);
+  if (w.length < 1) return 1;
+  let c = 0;
+  for (let i = 1; i < w.length; i++) c += w[i - 1] * w[i];
+  return c + w[w.length - 1] + 1; // + scalar head
+}
+
+// The surrogate's input space. Log2 on everything multiplicative so "twice as wide" is one unit
+// in every direction and the kernel's single bandwidth means the same thing per axis.
+// `cycles` is a feature, not a covariate to ignore: a track that ran 53 cycles had far more
+// chances to hit a high best-absElo than one that ran 2, so leaving it out would credit the
+// architecture for what was really just a bigger sample. Predictions for untried recipes are
+// made at a fixed probe budget, which makes them comparable to each other.
+export const FEATURE_KEYS = [
+  'logParams', 'logDenseCost', 'depth', 'logW0', 'logLast', 'logTaper', 'logNeck',
+  'lambda', 'quiet', 'quant', 'filterWeak', 'dropConflicts', 'logCycles',
+];
+
+export function recipeFeatures(recipe, cycles = 1) {
+  const w = hiddenWidths(recipe.hidden);
+  const depth = w.length || 1;
+  const w0 = w[0] || 1;
+  const last = w[depth - 1] || 1;
+  const neck = w.length ? Math.min(...w) : 1;
+  return {
+    logParams: Math.log2(recipeParams(recipe.hidden)),
+    logDenseCost: Math.log2(denseCost(recipe.hidden)),
+    depth,
+    logW0: Math.log2(w0),
+    logLast: Math.log2(last),
+    logTaper: Math.log2(w0 / last),   // how hard the stack narrows
+    logNeck: Math.log2(neck),         // the tightest bottleneck anywhere in the stack
+    lambda: Number(recipe.lambda ?? 1),
+    quiet: recipe.quietOnly ? 1 : 0,
+    quant: recipe.quant === false ? 0 : 1,
+    filterWeak: recipe.filterWeak === undefined ? 0 : 1,
+    dropConflicts: recipe.dropConflicts === undefined ? 0 : 1,
+    logCycles: Math.log2(Math.max(1, cycles)),
+  };
+}
+
+const featureVector = (recipe, cycles) => {
+  const f = recipeFeatures(recipe, cycles);
+  return FEATURE_KEYS.map((k) => f[k]);
+};
+
+// Every track that recorded at least one rated cycle, as a surrogate observation.
+export function surrogateObservations(loopDir) {
+  const ledgerElo = ledgerBestByVersion(loopDir);
+  const out = [];
+  for (const t of readAllTracks(loopDir)) {
+    const best = trackBestAbs(t.dir, ledgerElo);
+    if (!best || !Number.isFinite(best.absElo)) continue;
+    const cycles = (t.state && t.state.cycles) || readHistory(t.dir).length || 1;
+    out.push({
+      id: t.id, slug: t.slug, recipe: t.recipe, cycles,
+      promotions: (t.state && t.state.promotions) || 0,
+      y: best.absElo, x: featureVector(t.recipe, cycles),
+    });
+  }
+  return out;
+}
+
+// Fit a Nadaraya-Watson kernel regression over z-scored features. Returns a predictor giving
+// { mean, sigma, ess, nearest } at any point, or null when there's nothing to fit.
+//
+// sigma is the honest part: it combines the residual spread of the observations with the
+// EFFECTIVE sample size at the query point (ess = (sum w)^2 / sum w^2). Far from every observed
+// recipe the kernel weights collapse onto the single nearest neighbour, ess -> 1, and sigma
+// widens to the full spread — which is exactly the "we know nothing here" signal the acquisition
+// function needs to go exploring.
+export function fitSurrogate(obs, opts = {}) {
+  if (obs.length < 2) return null;
+  const d = FEATURE_KEYS.length;
+  const mu = [], sd = [];
+  for (let j = 0; j < d; j++) {
+    const col = obs.map((o) => o.x[j]);
+    const m = col.reduce((a, b) => a + b, 0) / col.length;
+    const v = col.reduce((a, b) => a + (b - m) ** 2, 0) / col.length;
+    mu.push(m);
+    sd.push(Math.sqrt(v) || 1); // a constant feature carries no information; 1 keeps it inert
+  }
+  const z = (x) => x.map((v, j) => (v - mu[j]) / sd[j]);
+  const Z = obs.map((o) => z(o.x));
+  const ys = obs.map((o) => o.y);
+  const yMean = ys.reduce((a, b) => a + b, 0) / ys.length;
+  const ySpread = Math.sqrt(ys.reduce((a, b) => a + (b - yMean) ** 2, 0) / ys.length) || 1;
+  const dist2 = (a, b) => a.reduce((s, v, j) => s + (v - b[j]) ** 2, 0);
+
+  // Bandwidth by leave-one-out CV over a log grid. Too small and every prediction is its own
+  // nearest neighbour; too large and everything is the global mean.
+  const grid = [0.5, 0.75, 1, 1.5, 2, 3, 4, 6];
+  const looErr = (h) => {
+    let se = 0;
+    for (let i = 0; i < Z.length; i++) {
+      let sw = 0, swy = 0;
+      for (let k = 0; k < Z.length; k++) {
+        if (k === i) continue;
+        const w = Math.exp(-dist2(Z[i], Z[k]) / (2 * h * h));
+        sw += w; swy += w * ys[k];
+      }
+      const pred = sw > 1e-12 ? swy / sw : yMean;
+      se += (pred - ys[i]) ** 2;
+    }
+    return Math.sqrt(se / Z.length);
+  };
+  const h = opts.bandwidth ?? grid.reduce((bestH, cand) =>
+    (looErr(cand) < looErr(bestH) ? cand : bestH), grid[0]);
+
+  const predict = (recipe, cycles) => {
+    const q = z(featureVector(recipe, cycles));
+    let sw = 0, sw2 = 0, swy = 0, nearest = Infinity;
+    for (let k = 0; k < Z.length; k++) {
+      const dd = dist2(q, Z[k]);
+      nearest = Math.min(nearest, Math.sqrt(dd));
+      const w = Math.exp(-dd / (2 * h * h));
+      sw += w; sw2 += w * w; swy += w * ys[k];
+    }
+    if (sw <= 1e-12) return { mean: yMean, sigma: ySpread, ess: 0, nearest };
+    const ess = (sw * sw) / sw2;                       // 1 = one point dominates, n = all equal
+    const mean = swy / sw;
+    const sigma = ySpread / Math.sqrt(Math.max(1, ess));
+    return { mean, sigma, ess, nearest };
+  };
+
+  return {
+    predict, bandwidth: h, n: obs.length, yMean, ySpread,
+    looRmse: looErr(h),
+    baselineRmse: ySpread, // predicting the global mean for everything
+    normalize: z,
+  };
+}
+
+// Human-readable read on whether the surrogate has learned anything yet. `useful` is the switch
+// suggestRecipes reads: false means fall back to a space-filling design.
+export function surrogateReport(loopDir, opts = {}) {
+  const obs = surrogateObservations(loopDir);
+  const model = fitSurrogate(obs);
+  if (!model) {
+    return { obs, model: null, useful: false, n: obs.length,
+      verdict: `${obs.length} rated track(s) — need at least 2 to fit anything. Suggestions are pure exploration.` };
+  }
+  const gain = 1 - model.looRmse / model.baselineRmse; // >0 means it beats predicting the mean
+  // Trust the surrogate only when it has both enough observations and a gain that isn't noise.
+  // At n<MIN_OBS a leave-one-out win of a few percent is well inside the sampling error of the
+  // gate scores the absElo comes from, and the bandwidth search will happily overfit to it — the
+  // fit above picks the smallest bandwidth in the grid (nearest-neighbour) on tiny samples. Both
+  // bars have to clear, and until they do the right move is to go collect observations anyway,
+  // which is exactly what the space-filling fallback does.
+  const MIN_OBS = Number.isFinite(opts.minObs) ? opts.minObs : 12;
+  const MIN_GAIN = Number.isFinite(opts.minGain) ? opts.minGain : 0.15;
+  const useful = obs.length >= MIN_OBS && gain > MIN_GAIN;
+  const rmse = `leave-one-out RMSE ${model.looRmse.toFixed(1)} Elo vs ${model.baselineRmse.toFixed(1)} for predicting the mean`;
+  return {
+    obs, model, useful, n: obs.length, gain, minObs: MIN_OBS,
+    verdict: useful
+      ? `${rmse} (${(gain * 100).toFixed(0)}% better) over ${obs.length} track(s) — weak but informative, ranking by predicted Elo + uncertainty.`
+      : `${rmse} (${(gain * 100).toFixed(0)}% better) over ${obs.length} track(s). `
+        + (obs.length < MIN_OBS
+          ? `Too few to trust — ${MIN_OBS - obs.length} more track(s) before predictions are ranked on. `
+          : 'Not enough of a gain over the mean to rank on. ')
+        + 'Suggestions are a space-filling design: maximise what the next track teaches.',
+  };
+}
+
+// The candidate pool: plausible architectures, generated rather than listed, so the search space
+// grows with the width/depth set instead of being capped by whatever was hand-written here.
+// Shapes are non-increasing (every champion so far tapers or holds flat) and built from two
+// families that between them cover what has actually won: a geometric taper from w0 down to a
+// tail width, and a "block" shape (a wide head, then k identical narrow layers — Olga's
+// 64,32x6 and Nash's 64,64,64,16,16).
+const WIDTHS = [16, 32, 64, 96, 128, 192, 256];
+const snap = (v) => WIDTHS.reduce((a, b) => (Math.abs(b - v) < Math.abs(a - v) ? b : a), WIDTHS[0]);
+
+// Coverage buckets for the exploration design. Ranking untried recipes by raw distance in the
+// 13-dim z-scored feature space is degenerate while the registry is small: with a handful of
+// observations, every untried recipe is "far", and the ranking is decided by whichever axis
+// happens to have the smallest sample spread — which is how a pure-distance criterion returned
+// four 12-layer 256-wide nets, and then four single-layer nets, instead of a spread of shapes.
+// So in explore mode the design works on three interpretable axes instead, the ones this engine's
+// own history says matter: how deep the stack is, how wide its first layer is, and what it costs
+// per node. A candidate is scored by how EMPTY its bucket is, and the picks are forced into
+// distinct buckets — a real space-filling design over the region, not a march to the corners.
+const DEPTH_BUCKETS = [[1, 1], [2, 3], [4, 6], [7, 10], [11, 99]];
+const W0_BUCKETS = [[0, 32], [33, 64], [65, 128], [129, 9999]];
+const COST_BUCKETS = [[0, 2e3], [2e3, 8e3], [8e3, 32e3], [32e3, Infinity]];
+const bucketOf = (v, buckets) => Math.max(0, buckets.findIndex(([lo, hi]) => v >= lo && v <= hi));
+
+export function coverageKey(hidden) {
+  const w = hiddenWidths(hidden);
+  return [
+    bucketOf(w.length || 1, DEPTH_BUCKETS),
+    bucketOf(w[0] || 1, W0_BUCKETS),
+    bucketOf(denseCost(hidden), COST_BUCKETS),
+  ].join('/');
+}
+
+// `costBudget` bounds the DESIGN REGION, and it is what keeps this from degenerating. A
+// space-filling criterion over an unbounded box always picks the far corner, so without a budget
+// every suggestion comes back as the widest, deepest net in the grid — maximally novel, and
+// maximally unbuildable (a 12-layer 256-wide stack is ~60x the champion's per-node work, which
+// the fixed-depth gate would never reward). Bounding by dense cost relative to the reigning shape
+// keeps exploration inside the region where a candidate could actually win.
+export function candidateArchitectures(maxDepth = 12, costBudget = Infinity) {
+  const out = new Set();
+  const keep = (spec) => { if (denseCost(spec) <= costBudget) out.add(spec); };
+  for (const w0 of WIDTHS) {
+    keep(String(w0));
+    for (const tail of WIDTHS) {
+      if (tail > w0) continue;
+      for (let depth = 2; depth <= maxDepth; depth++) {
+        // Geometric taper w0 -> tail across `depth` layers.
+        const geo = [];
+        for (let i = 0; i < depth; i++) {
+          const t = depth === 1 ? 0 : i / (depth - 1);
+          geo.push(snap(w0 * (tail / w0) ** t));
+        }
+        if (geo.every((v, i) => i === 0 || v <= geo[i - 1])) keep(geo.join(','));
+        // Block: one w0 head, then depth-1 layers at `tail`.
+        if (depth >= 2) keep([w0, ...Array(depth - 1).fill(tail)].join(','));
+      }
+    }
+  }
+  return [...out];
+}
 
 // Suggest what to try next, drawing on the registry:
 //   kind 'resume' — a PAST recipe whose best net was promising (high estimated abs Elo) but
@@ -375,15 +636,129 @@ export function suggestRecipes(loopDir, opts = {}) {
     }
   }
 
-  // Never-tried architectures from the ladder (keep near-champion knobs otherwise).
-  for (const h of ARCH_LADDER) {
-    if (triedHidden.has(h)) continue;
-    if (out.filter((o) => o.kind === 'new').length >= 4) break;
-    const recipe = buildRecipe({ hidden: h, lambda: 1, quietOnly: false, quant: true });
+  // Untried recipes, scored by the surrogate. The pool is generated (candidateArchitectures)
+  // rather than listed, and inherits the reigning track's knobs so a suggestion differs from
+  // what's working in ONE axis — the architecture — unless it's deliberately a knob trial.
+  const rep = surrogateReport(loopDir, opts);
+  const probe = Number(opts.probeCycles) || 5; // predict every candidate at the same budget
+  const kappa = Number.isFinite(opts.kappa) ? Number(opts.kappa) : 1.5; // exploration weight
+  const knobs = reigning
+    ? { lambda: reigning.recipe.lambda, quietOnly: reigning.recipe.quietOnly, quant: reigning.recipe.quant,
+        filterWeak: reigning.recipe.filterWeak, dropConflicts: reigning.recipe.dropConflicts }
+    : { lambda: 1, quietOnly: false, quant: true };
+
+  // Design region: dense cost within `costMult` of the reigning shape's. Anything pricier can't
+  // pay for itself at a fixed-depth gate, and anything far cheaper is the distillation question
+  // (a separate experiment — a smaller net's payoff is nps, which fixed depth doesn't measure).
+  const costMult = Number(opts.costMult) || 3;
+  const budget = reigning ? denseCost(reigning.recipe.hidden) * costMult : Infinity;
+  const pool = [];
+  for (const hidden of candidateArchitectures(12, budget)) {
+    if (triedHidden.has(hidden)) continue;
+    pool.push(buildRecipe({ ...knobs, hidden }));
+  }
+  // Knob trials are NOT added here: the FILTER_TRIALS block above already proposes them, and the
+  // coverage design below keys on architecture alone (coverageKey reads `hidden`), so a knob
+  // variation on the reigning shape lands in an already-occupied bucket and would never surface.
+  // Keeping the two mechanisms separate means the arch axis gets a real design and the knob axis
+  // keeps its explicit trials, instead of the two quietly cancelling out.
+
+  // How many tracks already sit in each coverage bucket — the emptiness signal for explore mode.
+  const occupancy = new Map();
+  for (const t of tracks) {
+    const k = coverageKey(t.recipe.hidden);
+    occupancy.set(k, (occupancy.get(k) || 0) + 1);
+  }
+
+  const known = new Set(tracks.map((t) => t.id));
+  const scored = [];
+  for (const recipe of pool) {
+    const id = recipeId(recipe);
+    if (known.has(id)) continue;
+    known.add(id); // the pool can generate the same recipe twice (taper == block at some depths)
+    const p = rep.model ? rep.model.predict(recipe, probe) : null;
+    const bucket = coverageKey(recipe.hidden);
+    const occupied = occupancy.get(bucket) || 0;
+    // With a trusted model, rank by UCB (promise + uncertainty). Without one, rank by how unmeasured
+    // the candidate's REGION is, tie-broken by feature distance so the pick sits in the middle of
+    // the empty bucket rather than on its edge.
+    const novelty = p ? p.nearest : 0;
+    const ucb = p ? p.mean + kappa * p.sigma : 0;
+    scored.push({
+      recipe, id, pred: p, novelty, bucket, occupied,
+      score: rep.useful ? ucb : -occupied * 1e6 + novelty,
+    });
+  }
+  scored.sort((a, b) => b.score - a.score);
+
+  // Greedy diverse pick: after each choice, drop candidates that sit almost on top of it in
+  // feature space. Five near-identical suggestions would waste the exploration budget.
+  const picked = [];
+  // Separation floor, auto-scaled: distances in this z-scored space depend on how spread the few
+  // observations are, so a hard-coded threshold is meaningless (it was letting through four
+  // near-identical shapes). Use the mean nearest-neighbour distance among the OBSERVED tracks —
+  // suggestions should be at least as far apart as the experiments already run.
+  const MIN_SEP = (() => {
+    if (!rep.model || rep.obs.length < 2) return 0;
+    const Z = rep.obs.map((o) => rep.model.normalize(o.x));
+    const dists = Z.map((a, i) => Math.min(...Z.map((b, k) => (k === i ? Infinity
+      : Math.sqrt(a.reduce((s, v, j) => s + (v - b[j]) ** 2, 0))))));
+    return dists.reduce((a, b) => a + b, 0) / dists.length;
+  })();
+  if (!rep.useful) {
+    // Explore mode: greedy coverage. Requiring only DISTINCT buckets isn't enough — the four
+    // depth-1 buckets are all empty, so a naive pass fills every slot with single-layer nets that
+    // differ solely in width. So after each pick, penalise reusing that pick's value on any one
+    // axis (depth weighted hardest, being the most structurally distinct choice). The result
+    // spreads the suggestions across depths AND widths AND cost bands.
+    const useD = new Map(), useW = new Map(), useC = new Map();
+    const bump = (m, k) => m.set(k, (m.get(k) || 0) + 1);
+    const remaining = scored.slice();
+    while (picked.length < 3 && remaining.length) {
+      let bestI = 0, bestScore = -Infinity;
+      for (let i = 0; i < remaining.length; i++) {
+        const [d, w, cst] = remaining[i].bucket.split('/').map(Number);
+        const penalty = remaining[i].occupied + 3 * (useD.get(d) || 0)
+          + 2 * (useW.get(w) || 0) + (useC.get(cst) || 0);
+        // Tiny novelty term only breaks ties within an equally-uncovered region.
+        const s = -penalty + remaining[i].novelty * 1e-3;
+        if (s > bestScore) { bestScore = s; bestI = i; }
+      }
+      const [c] = remaining.splice(bestI, 1);
+      const [d, w, cst] = c.bucket.split('/').map(Number);
+      bump(useD, d); bump(useW, w); bump(useC, cst);
+      picked.push(c);
+    }
+  }
+  for (const c of rep.useful ? scored : []) {
+    if (picked.length >= 3) break;
+    if (rep.model) {
+      const cz = rep.model.normalize(featureVector(c.recipe, probe));
+      const tooClose = picked.some((p) => {
+        const pz = rep.model.normalize(featureVector(p.recipe, probe));
+        return Math.sqrt(cz.reduce((s, v, j) => s + (v - pz[j]) ** 2, 0)) < MIN_SEP;
+      });
+      if (tooClose) continue;
+    }
+    picked.push(c);
+  }
+
+  for (const c of picked) {
+    const parts = [];
+    if (rep.useful && c.pred) parts.push(`predicts ≈ ${c.pred.mean.toFixed(0)} ±${c.pred.sigma.toFixed(0)} Elo after ${probe} cycles`);
+    else if (c.bucket !== undefined) {
+      const w = hiddenWidths(c.recipe.hidden);
+      parts.push(`${c.occupied === 0 ? 'no track yet' : `only ${c.occupied} track(s)`} at depth ${w.length}`
+        + ` / first layer ${w[0]} / ${denseCost(c.recipe.hidden).toLocaleString('en-US')} mults per node`);
+    }
     out.push({
-      kind: 'new', slug: recipeSlug(recipe), recipe,
-      reason: 'architecture never tried',
-      cmd: recipeResumeCmd(recipe),
+      kind: 'new', slug: recipeSlug(c.recipe), recipe: c.recipe,
+      predElo: c.pred ? c.pred.mean : null,
+      sigma: c.pred ? c.pred.sigma : null,
+      novelty: c.novelty,
+      mode: rep.useful ? 'ucb' : 'explore',
+      reason: parts.join(', '),
+      cmd: recipeResumeCmd(c.recipe),
     });
   }
   return out;
