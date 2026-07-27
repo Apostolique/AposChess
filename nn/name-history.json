@@ -33,6 +33,17 @@
         1
       ],
       "note": "Retired train:loop champion (932b7c, 2026-06-15); pruned from the catalog 2026-07-21."
+    },
+    {
+      "name": "Dexter",
+      "hash": "880f6d",
+      "gen": 4,
+      "arch": [
+        768,
+        64,
+        1
+      ],
+      "note": "Retired train:loop champion (880f6d, 2026-06-15); pruned from the catalog 2026-07-27."
     }
   ]
 }

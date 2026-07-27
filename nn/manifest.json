@@ -1,19 +1,6 @@
 {
-  "default": "Pia",
+  "default": "Quinn",
   "nets": [
-    {
-      "name": "Dexter",
-      "file": "dexter.json",
-      "arch": [
-        768,
-        64,
-        1
-      ],
-      "loopChampion": true,
-      "hash": "880f6d",
-      "gen": 4,
-      "note": "Retired train:loop champion (880f6d, 2026-06-15)."
-    },
     {
       "name": "Elena",
       "file": "elena.json",
@@ -216,7 +203,23 @@
       "loopChampion": true,
       "hash": "fabe06",
       "gen": 16,
-      "note": "train:loop champion Pia (gen 16, fabe06, 2026-07-21).",
+      "note": "train:loop champion Pia (gen 16, fabe06, 2026-07-21)."
+    },
+    {
+      "name": "Quinn",
+      "file": "quinn.json",
+      "arch": [
+        768,
+        128,
+        16,
+        16,
+        16,
+        1
+      ],
+      "loopChampion": true,
+      "hash": "d97de8",
+      "gen": 17,
+      "note": "train:loop champion Quinn (gen 17, d97de8, 2026-07-27).",
       "current": true
     },
     {
