@@ -44,6 +44,18 @@
         1
       ],
       "note": "Retired train:loop champion (880f6d, 2026-06-15); pruned from the catalog 2026-07-27."
+    },
+    {
+      "name": "Elena",
+      "hash": "f63cda",
+      "gen": 5,
+      "arch": [
+        768,
+        64,
+        16,
+        1
+      ],
+      "note": "Retired train:loop champion (f63cda, 2026-06-16); pruned from the catalog 2026-07-27."
     }
   ]
 }
