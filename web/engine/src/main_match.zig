@@ -372,6 +372,13 @@ fn playGame(
         }
         if (gs.status != .ongoing) break;
 
+        // Threefold repetition is a draw. `seen` is cleared after every irreversible move
+        // (below), so it already IS the "positions that can still recur" window. Without
+        // this a drawn shuffle runs on to the fifty-move rule or max_plies, which costs
+        // search time and tells the SPRT gate nothing it doesn't already know.
+        const h = zobrist.hashOf(&st);
+        if (zobrist.isThreefold(h, seen.items)) break; // result_white stays 0
+
         // Divergence probe: score this position with both nets, but only past the scripted
         // random opening (the forced plies carry no judgment signal).
         if (dp) |probe| {
@@ -400,7 +407,7 @@ fn playGame(
             });
         }
 
-        try seen.append(alloc, zobrist.hashOf(&st));
+        try seen.append(alloc, h);
         const next = engine.applyMove(&st, m);
         if (next.halfmove == 0) seen.clearRetainingCapacity();
         st = next;

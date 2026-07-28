@@ -187,6 +187,26 @@ probePlies.forEach((plies, i) => {
 });
 positions.push(...collectTerminals(seed));
 
+// Hand-written bare endgames pinning the insufficient-material classifier, which
+// random games effectively never reach. The rule is "kings plus bishops, every
+// bishop on one square colour" — so these come in matched dead/alive pairs that
+// differ only by a bishop's square colour, plus the variant-specific K+N cases
+// (the knight CAN mate here, so K+N vs K must stay `ongoing`).
+const MATERIAL_PROBES = [
+  ['im-kk', '8/8/8/8/8/8/8/K1k5 w - - 0 1', true], // K vs K
+  ['im-kbk', '8/8/8/8/8/8/2B5/K1k5 w - - 0 1', true], // K+B vs K
+  ['im-kbbk-same', '8/8/8/8/4B3/8/2B5/K1k5 w - - 0 1', true], // both bishops light
+  ['im-kbbk-opp', '8/8/8/8/3B4/8/2B5/K1k5 w - - 0 1', false], // both colour complexes
+  ['im-kbkb-same', '8/8/8/8/4b3/8/2B5/K1k5 w - - 0 1', true], // one each, same colour
+  ['im-kbkb-opp', '8/8/8/8/3b4/8/2B5/K1k5 w - - 0 1', false], // one each, opposite
+  ['im-knk', '8/8/8/8/8/1N6/8/K1k5 w - - 0 1', false], // knight mates in this variant
+  ['im-knk-mate', '8/8/8/8/8/1N6/8/k1K5 b - - 0 1', true], // ...and here it has
+  ['im-kpk', '8/8/8/8/8/8/2P5/K1k5 w - - 0 1', false], // a pawn promotes
+];
+for (const [id, fen, terminal] of MATERIAL_PROBES) {
+  positions.push({ id, plies: 0, state: parseFen(fen), terminal });
+}
+
 console.log(`engine-parity: seed ${seed} | ${positions.length} positions | `
   + `start depth ${startDepth}, probe depth ${probeDepth} | eval ${doEval ? `on (nn weights ${weightsLoaded ? 'loaded' : 'NOT loaded — material fallback'})` : 'off'}`);
 

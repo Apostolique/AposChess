@@ -372,13 +372,34 @@ export function hasLegalMove(state, pseudo = null) {
   return legalMoves(state).length > 0; // exotic: castling as the only legal move
 }
 
-// Draw by insufficient material. Only the unambiguous case is claimed: bare
-// king vs bare king (no other pieces of any kind). The variant's pieces move
-// differently enough that minor-piece mating potential isn't obvious, so we
-// don't extend this to K+minor vs K.
+// Draw by insufficient material: the material left on the board admits no
+// checkmate position at all, so no sequence of legal moves can ever end the game
+// — the FIDE criterion. In this variant that reduces to a single rule: KINGS PLUS
+// BISHOPS, WITH EVERY BISHOP ON ONE SQUARE COLOUR.
+//
+//   - A jump can never attack a king (the king's safety zone repels enemy jumps),
+//     so a bishop only ever attacks squares of its own colour. The mated king
+//     would have to stand on that colour, leaving its orthogonal neighbours — the
+//     other colour — attackable by the enemy king alone, which can never cover two
+//     of them while staying off a square adjacent to the mated king. So no mate.
+//   - Any pawn keeps K+Q vs K reachable by promotion, so a pawn is always enough.
+//   - Every other piece has mates. Note that includes the KNIGHT: unlike standard
+//     chess, K+N vs K is *not* drawn here, because the variant's knight travels a
+//     clear rook path before stepping aside and so reaches far enough to mate
+//     (8/8/8/8/8/1N6/8/k1K5 b — a1 is checked, a2 covered by the knight, b1/b2 by
+//     the king). Don't copy the standard-chess minor-piece rule into this file.
+//
+// Verified by exhaustively enumerating every placement of each material set up to
+// two extra pieces (plus the three-bishop cases) and finding no mate.
 export function insufficientMaterial(board) {
-  for (const p of board) {
-    if (p && p.role !== 'k') return false;
+  let bishopSquareColor = -1;
+  for (let i = 0; i < 64; i++) {
+    const p = board[i];
+    if (!p || p.role === 'k') continue;
+    if (p.role !== 'b') return false;
+    const c = (fileOf(i) + rankOf(i)) % 2;
+    if (bishopSquareColor < 0) bishopSquareColor = c;
+    else if (c !== bishopSquareColor) return false; // both colour complexes: mates exist
   }
   return true;
 }

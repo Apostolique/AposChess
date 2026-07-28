@@ -216,11 +216,19 @@ fn playGame(s: *ai.Searcher, cfg: *const Cfg, g: u64, alloc: std.mem.Allocator, 
         }
         if (gs.status != .ongoing) break; // stalemate / draw -> 0
 
-        try states.append(alloc, st);
-
         // Repetition window: only positions since the last irreversible move can recur.
         const tail_start = seen.items.len -| (st.halfmove + 1);
         const prev = seen.items[tail_start..];
+
+        // Threefold repetition is a draw (result stays 0). gameStatus() can't see game
+        // history, so the loop claims it — otherwise a shuffle grinds on to the fifty-move
+        // rule or the ply cap, recording ~40 worthless positions per drawn game. Checked
+        // before states.append so the repeated position isn't recorded, exactly like the
+        // other terminals.
+        const h = zobrist.hashOf(&st);
+        if (zobrist.isThreefold(h, prev)) break;
+
+        try states.append(alloc, st);
 
         const r = s.chooseMove(&st, depth, max_ms, prev);
         nodes.* += r.nodes;
@@ -257,7 +265,7 @@ fn playGame(s: *ai.Searcher, cfg: *const Cfg, g: u64, alloc: std.mem.Allocator, 
         }
 
         const m = move orelse break;
-        try seen.append(alloc, zobrist.hashOf(&st));
+        try seen.append(alloc, h);
         try moves_played.append(alloc, m);
         st = engine.applyMove(&st, m);
     }

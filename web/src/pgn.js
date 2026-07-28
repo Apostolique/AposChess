@@ -33,7 +33,7 @@ function moveToken(pre, move) {
 function resultToken(status) {
   if (!status || !status.over) return '*';
   if (status.result === 'checkmate') return status.winner === 'white' ? '1-0' : '0-1';
-  return '1/2-1/2'; // stalemate / fifty-move / repetition
+  return '1/2-1/2'; // stalemate / insufficient material / fifty-move / repetition
 }
 
 // Wrap movetext at ~80 columns on token boundaries (PGN convention).

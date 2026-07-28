@@ -550,10 +550,25 @@ pub fn hasLegalMove(state: *const State, pseudo: ?*const MoveList) bool {
     return full.len > 0;
 }
 
+// Draw by insufficient material: the material left admits no checkmate position at
+// all, so no sequence of legal moves can end the game. In this variant that reduces
+// to KINGS PLUS BISHOPS, EVERY BISHOP ON ONE SQUARE COLOUR — a jump can never attack
+// a king, so a bishop only attacks its own colour and the mated king's orthogonal
+// neighbours are left for the enemy king alone, which can never cover two of them.
+// Pawns promote (K+Q vs K is reachable), and unlike standard chess K+N vs K DOES
+// mate here — the knight's clear-rook-path move reaches far enough. See the long
+// comment on insufficientMaterial() in engine.js.
 fn insufficientMaterial(b: *const [64]?Piece) bool {
-    for (b) |sqp| {
-        if (sqp) |p| {
-            if (p.role != .k) return false;
+    var bishop_square_color: i8 = -1;
+    for (b, 0..) |sqp, i| {
+        const p = sqp orelse continue;
+        if (p.role == .k) continue;
+        if (p.role != .b) return false;
+        const c: i8 = @intCast((board.fileOf(i) + board.rankOf(i)) % 2);
+        if (bishop_square_color < 0) {
+            bishop_square_color = c;
+        } else if (c != bishop_square_color) {
+            return false; // both colour complexes: mates exist
         }
     }
     return true;

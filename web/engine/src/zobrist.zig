@@ -88,6 +88,28 @@ pub fn hashOf(state: *const State) u64 {
     return h;
 }
 
+// Threefold repetition: is the position hashed `h` about to occur for the THIRD
+// time? Both earlier occurrences must already be in `window`, which must hold only
+// the positions since the last irreversible move (a pawn move or capture makes an
+// earlier position unreachable) — both offline game loops already maintain exactly
+// that window for the search's repetition detection, so this reuses it.
+//
+// This lives here rather than in engine.zig because gameStatus() sees a single
+// position and repetition is a property of the GAME, not the board. The offline
+// loops are therefore the only place it's claimed; the browser does its own count
+// in main.js. Position identity matches on both sides: the hash covers pieces +
+// side to move + castling rights, which is the first three FEN fields main.js keys
+// on (and the same identity standard chess uses — there's no en passant here).
+pub fn isThreefold(h: u64, window: []const u64) bool {
+    var n: usize = 0;
+    for (window) |seen| {
+        if (seen != h) continue;
+        n += 1;
+        if (n >= 2) return true;
+    }
+    return false;
+}
+
 // Incrementally derive the hash after `m` from the hash before it. MUST mirror
 // applyMove() exactly — verified by the parity runner's incremental invariant.
 pub fn hashAfter(h0: u64, state: *const State, m: Move) u64 {

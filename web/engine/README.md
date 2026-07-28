@@ -19,7 +19,7 @@ featurize, and training glue stay in JS/Python.
 |------|---------|----------|
 | `board.zig` | `board.js` | board rep, FEN parse/serialize, `squareName` |
 | `engine.zig` | `engine.js` | move generation, `applyMove` (make/unmake, in-place), safety zones, `gameStatus` |
-| `zobrist.zig` | (key gen in `ai.js`) | Zobrist keys + incremental hashing |
+| `zobrist.zig` | (key gen in `ai.js`) | Zobrist keys + incremental hashing, and `isThreefold` (repetition needs game history, so it can't live in `gameStatus`) |
 | `eval.zig` | `evalStm` in `ai.js` | handcrafted PST eval (bit-exact vs JS) |
 | `nn.zig` | `nn.js` | neural-net eval (KING_BUCKETS = 0; ±1 cp vs JS) |
 | `ai.zig` | `ai.js` | search: alpha-beta, PVS, null-move, LMR, qsearch, TT, killers/history, repetition |
