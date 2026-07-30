@@ -118,6 +118,12 @@ function lineChart(opts) {
     g.append(el('line', { class: 'crosshair', x1: m.l, x2: m.l + iw, y1: yy, y2: yy, style: `stroke:${ref.color || css('--muted')}` }));
     g.append(el('text', { x: m.l + iw - 2, y: yy - 4, 'text-anchor': 'end', style: `fill:${ref.color || css('--muted')}` }, ref.label));
   }
+  for (const ref of opts.vrefs || []) {
+    if (ref.x < xd[0] || ref.x > xd[1]) continue;
+    const xx = x(ref.x);
+    g.append(el('line', { class: 'crosshair', x1: xx, x2: xx, y1: m.t, y2: m.t + ih, style: `stroke:${ref.color || css('--muted')}` }));
+    if (ref.label) g.append(el('text', { x: xx + 4, y: m.t + 10, style: `fill:${ref.color || css('--muted')}` }, ref.label));
+  }
 
   // series
   for (const s of series) {
@@ -201,9 +207,18 @@ function legend(items, onToggle) {
 // ------------------------------------------------------------------- state
 const State = {
   ladder: null, champs: null, summary: null, pool: null,
-  // Depth pickers start unset and are resolved from the data on first render (see pickDepth) —
-  // a hardcoded default filters every view down to nothing when a run doesn't cover that depth.
-  depthSel: new Set(), depthMode: 'fixed', ladderDepth: null, ladderMode: 'depth',
+  // ONE depth for the whole dashboard — ladder, generations and matchups all read it, so a depth
+  // picked on any of them carries to the others and the numbers stay comparable. It starts unset
+  // and is resolved from the data on first render (see resolveDepth): a hardcoded default filters
+  // every view down to nothing when a run doesn't cover that depth. 'all' means "don't pin a
+  // depth", and each view spells out what that means for it.
+  depth: null,
+  depthSel: new Set(),   // depth×Elo: which engines are plotted
+  mFam: 'all',           // matchups: engine family filter
+  gamesFilter: null,     // games: {a, b} tag filter
+  openGame: null,        // games: {g, ply} currently in the viewer
+  pendingGame: null,     // games: {g, ply} asked for by the URL, honoured once
+  trackId: null,         // training: open track
 };
 // Controls for the game currently open in the viewer; driven by keyboard hotkeys.
 let activeViewer = null;
@@ -253,28 +268,38 @@ function availableDepths() {
   if (!seen.size) for (const d of State.ladder?.depths || [1, 2, 3, 4, 5, 6, 7, 8]) seen.add(Number(d));
   return [...seen].sort((a, b) => a - b);
 }
-// Keep the depth the user picked as long as the data still has nodes at it, otherwise snap to
-// the deepest one that does. Runs on every render, not once — State survives live reloads, and
-// a run that changes --depths must not leave the views pinned to a depth that no longer exists.
-function pickDepth(current, pred = () => true, min = 2) {
+// Deepest depth carrying at least `min` rows that match `pred`, or null.
+function deepestWith(pred = () => true, min = 2) {
   const count = new Map();
   for (const r of State.ladder?.ranking || []) {
     if (!pred(r)) continue;
     const d = Number(r.depth);
-    count.set(d, (count.get(d) || 0) + 1);
+    if (Number.isFinite(d)) count.set(d, (count.get(d) || 0) + 1);
   }
-  // An explicit pick survives on a single node (the anchor's own depth is worth a look). Only
-  // the auto-picked default insists on `min`, so it lands on a board that has rows in it.
-  if (current != null && (count.get(Number(current)) || 0) >= 1) return Number(current);
   const usable = [...count.entries()].filter(([, n]) => n >= min).map(([d]) => d);
-  if (usable.length) return Math.max(...usable);
-  return availableDepths().at(-1) ?? null;
+  return usable.length ? Math.max(...usable) : null;
 }
-function depthSelect(value, onPick, depths = availableDepths(), extra = []) {
-  return el('select', { onchange: (e) => onPick(e.target.value) },
-    ...[...extra, ...depths].map((d) => el('option', { value: d, selected: String(d) === String(value) ? '' : null },
+// Keep the depth the user picked as long as the data still has a node at it, otherwise fall back
+// to a sensible one. Runs on every render, not once — State survives live reloads, and a run that
+// changes --depths must not leave the views pinned to a depth that no longer exists.
+// A single explicit pick survives (the anchor's own depth is worth a look); only the auto-picked
+// default insists on company, and it prefers a depth the CHAMPIONS were rated at — the anchor's
+// depth often holds nothing else, which leaves the generations curve empty.
+function resolveDepth() {
+  if (State.depth === 'all') return 'all';
+  if (State.depth != null && availableDepths().includes(Number(State.depth))) return Number(State.depth);
+  const isChampRow = (r) => State.champs?.byHash?.[r.version]?.gen != null;
+  return deepestWith(isChampRow, 2) ?? deepestWith(() => true, 2) ?? availableDepths().at(-1) ?? null;
+}
+// The one depth control, rendered by every view that filters by depth. Picking here re-renders the
+// current view and writes the URL; the other views pick the value up when you switch to them.
+function depthSelect() {
+  return el('select', { 'data-ctl': 'depth', onchange: (e) => setDepth(e.target.value === 'all' ? 'all' : Number(e.target.value)) },
+    ...['all', ...availableDepths()].map((d) => el('option', { value: d, selected: String(d) === String(State.depth) ? '' : null },
       d === 'all' ? 'all depths' : `depth ${d}`)));
 }
+function setDepth(v) { State.depth = v; renderView(currentView); syncUrl(); }
+const depthNote = 'Depth is shared by every view.';
 
 // ================================================================= LADDER view
 function renderLadder() {
@@ -331,29 +356,20 @@ function renderLadder() {
 
   // ---- toolbar
   const tb = el('div', { class: 'toolbar mt' });
-  State.ladderDepth = pickDepth(State.ladderDepth);
-  const modeSeg = el('div', { class: 'seg' },
-    segBtn('Best depth', State.ladderMode === 'best', () => { State.ladderMode = 'best'; renderLadder(); }),
-    segBtn('By depth', State.ladderMode === 'depth', () => { State.ladderMode = 'depth'; renderLadder(); }));
-  tb.append(el('label', {}, 'View', modeSeg));
-  if (State.ladderMode === 'depth') {
-    tb.append(el('label', {}, 'Depth',
-      depthSelect(State.ladderDepth, (v) => { State.ladderDepth = Number(v); renderLadder(); })));
-  }
+  tb.append(el('label', {}, 'Depth', depthSelect()));
   const anchorTag = State.ladder.anchor || 'the anchor';
-  tb.append(el('span', { class: 'sub' }, State.ladderMode === 'best' ? 'Each engine at its strongest depth.' : `All engines searching to depth ${State.ladderDepth}. Anchor ${anchorTag} ≡ 1500.`));
+  tb.append(el('span', { class: 'sub' }, State.depth === 'all'
+    ? `Each engine at its strongest depth. ${depthNote}`
+    : `All engines searching to depth ${State.depth}. Anchor ${anchorTag} ≡ 1500. ${depthNote}`));
   root.append(tb);
 
   // ---- leaderboard rows
-  let rows;
-  if (State.ladderMode === 'best') {
-    rows = [...versions.values()].map((v) => ({ v, r: bestNode(v) })).filter((x) => x.r);
-  } else {
-    rows = [...versions.values()].map((v) => ({ v, r: v.byDepth.get(State.ladderDepth) })).filter((x) => x.r);
-  }
+  const rows = [...versions.values()]
+    .map((v) => ({ v, r: State.depth === 'all' ? bestNode(v) : v.byDepth.get(State.depth) }))
+    .filter((x) => x.r);
   rows.sort((a, b) => b.r.elo - a.r.elo);
   if (!rows.length) {
-    root.append(el('div', { class: 'empty-state' }, `No rated node searches to depth ${State.ladderDepth}. Pick another depth.`));
+    root.append(el('div', { class: 'empty-state' }, `No rated node searches to depth ${State.depth}. Pick another depth.`));
     return;
   }
   const maxElo = Math.max(...rows.map((x) => x.r.elo));
@@ -387,7 +403,6 @@ function renderLadder() {
   table.append(tbody);
   root.append(table);
 }
-function segBtn(label, active, on) { return el('button', { class: active ? 'active' : '', onclick: on }, label); }
 function archStr(arch) { return arch ? `[${arch.join(',')}]` : '–'; }
 function convBadge(c) {
   if (!c) return el('span', { class: 'badge neutral' }, 'no data');
@@ -401,27 +416,23 @@ function convBadge(c) {
 function renderGenerations() {
   const root = $('#view-generations'); root.innerHTML = '';
   const versions = [...groupVersions().values()].filter((v) => v.gen != null).sort((a, b) => a.gen - b.gen);
-  // Default to the deepest depth the CHAMPIONS were rated at — the anchor's depth usually has
-  // only the anchor, and a run at other depths leaves it with no champion curve to draw.
-  const isChampRow = (r) => State.champs?.byHash?.[r.version]?.gen != null;
-  State.genDepth = pickDepth(State.genDepth, isChampRow);
+  const atDepth = (v) => (State.depth === 'all' ? bestNode(v) : v.byDepth.get(State.depth));
 
   const tb = el('div', { class: 'toolbar' });
-  tb.append(el('label', {}, 'At depth',
-    depthSelect(State.genDepth, (v) => { State.genDepth = Number(v); renderGenerations(); })));
-  tb.append(el('span', { class: 'sub' }, 'Champion strength across train:loop generations — the climb.'));
+  tb.append(el('label', {}, 'At depth', depthSelect()));
+  tb.append(el('span', { class: 'sub' }, `Champion strength across train:loop generations — the climb. ${State.depth === 'all' ? 'Each champion at its strongest depth, so the curve mixes depths. ' : ''}${depthNote}`));
   root.append(el('h2', { class: 'section' }, 'Generational progress ', el('span', { class: 'sub' }, '· Elo of each loop champion')));
   root.append(tb);
 
-  const pts = versions.map((v) => { const r = v.byDepth.get(State.genDepth); return r ? { x: v.gen, y: r.elo, meta: v, name: v.name } : null; }).filter(Boolean);
+  const pts = versions.map((v) => { const r = atDepth(v); return r ? { x: v.gen, y: r.elo, meta: v, name: v.name } : null; }).filter(Boolean);
   if (!pts.length) {
-    root.append(el('div', { class: 'empty-state' }, `No champion is rated at depth ${State.genDepth}. Pick a depth this run covers.`));
+    root.append(el('div', { class: 'empty-state' }, `No champion is rated at depth ${State.depth}. Pick a depth this run covers.`));
     return;
   }
-  // hc reference at same depth
+  // hc reference at the same depth
   const hc = [...groupVersions().values()].find((v) => v.eng === 'hc' && v.version === '2');
-  const hcNode = hc?.byDepth.get(State.genDepth);
-  const refs = hcNode ? [{ y: hcNode.elo, label: `handcrafted v2 (d${State.genDepth})`, color: css('--hc') }] : [];
+  const hcNode = hc ? atDepth(hc) : null;
+  const refs = hcNode ? [{ y: hcNode.elo, label: `handcrafted v2 (d${hcNode.depth})`, color: css('--hc') }] : [];
 
   const card = el('div', { class: 'card pad0' });
   const wrap = el('div', { class: 'chart-wrap', style: { padding: '10px' } });
@@ -440,7 +451,7 @@ function renderGenerations() {
   // delta bars (Elo gained per generation)
   const deltas = [];
   for (let i = 1; i < pts.length; i++) deltas.push({ label: pts[i].name, value: pts[i].y - pts[i - 1].y, color: (pts[i].y - pts[i - 1].y) >= 0 ? css('--s3') : css('--s2') });
-  root.append(el('h2', { class: 'section mt' }, 'Elo gained per generation ', el('span', { class: 'sub' }, `· at depth ${State.genDepth}`)));
+  root.append(el('h2', { class: 'section mt' }, 'Elo gained per generation ', el('span', { class: 'sub' }, State.depth === 'all' ? '· at each champion\'s best depth' : `· at depth ${State.depth}`)));
   const card2 = el('div', { class: 'card pad0' });
   const wrap2 = el('div', { class: 'chart-wrap', style: { padding: '10px' } });
   wrap2.append(barChart({ height: 300, data: deltas, valueLabel: 'Δ Elo', formatY: (v) => `${v >= 0 ? '+' : ''}${fmt(v, 0)}` }));
@@ -466,6 +477,10 @@ function renderDepth() {
     const hc = all.find((v) => v.eng === 'hc' && v.version === '2'); if (hc) State.depthSel.add(hc.key);
   }
   root.append(el('h2', { class: 'section' }, 'Search depth × Elo ', el('span', { class: 'sub' }, '· how much strength each extra ply buys')));
+  // Depth is the x-axis here, so there is nothing to filter — but the dashboard's shared depth is
+  // marked, so you can see where the other views are reading these curves.
+  const marker = State.depth === 'all' ? [] : [{ x: Number(State.depth), label: `depth ${State.depth}`, color: css('--s4') }];
+  if (marker.length) root.append(el('div', { class: 'sub', style: { marginBottom: '8px' } }, `Marker at depth ${State.depth} — the depth the other views are showing.`));
 
   const selected = [...State.depthSel].map((k) => versions.get(k)).filter(Boolean);
   selected.sort((a, b) => (b.gen ?? -1) - (a.gen ?? -1));
@@ -486,7 +501,7 @@ function renderDepth() {
   const wrap = el('div', { class: 'chart-wrap', style: { padding: '10px' } });
   if (series.length) {
     wrap.append(lineChart({
-      height: 440, series, directLabels: true,
+      height: 440, series, directLabels: true, vrefs: marker,
       xDomain: [xLo - 0.3, xHi + 0.3], xTicks,
       xLabel: 'search depth (plies)', yLabel: 'Elo',
       formatX: (d) => `depth ${fmt(d)}`, formatY: (v) => fmt(v),
@@ -517,13 +532,14 @@ function renderDepth() {
   root.append(legend(items, (it) => {
     if (State.depthSel.has(it.key)) State.depthSel.delete(it.key); else State.depthSel.add(it.key);
     renderDepth();
+    syncUrl();
   }));
 }
 
 // =============================================================== MATCHUPS view
 async function renderMatchups() {
   const root = $('#view-matchups'); root.innerHTML = '';
-  root.append(el('h2', { class: 'section' }, 'Head-to-head ', el('span', { class: 'sub' }, '· games actually played in the ranking pool')));
+  root.append(el('h2', { class: 'section' }, 'Head-to-head ', el('span', { class: 'sub' }, '· every game these engines have played')));
   if (!State.pool) State.pool = await api('/api/pool');
   const pairs = State.pool.pairs || {};
   const eloOf = new Map(); const labelOf = new Map(); const parsedOf = new Map();
@@ -536,24 +552,22 @@ async function renderMatchups() {
     const [a, b] = k.split('|'); present.add(a); present.add(b);
   }
 
-  // Default to a depth whose nodes have actually played each other, so the heatmap opens with
-  // cells in it rather than a filter that matches one lonely node.
-  if (State.mDepth !== 'all') State.mDepth = pickDepth(State.mDepth ?? null, (r) => present.has(r.tag));
-  if (State.mFam === undefined) State.mFam = 'all';
   const tb = el('div', { class: 'toolbar' });
-  tb.append(el('label', {}, 'Depth', depthSelect(State.mDepth,
-    (v) => { State.mDepth = v === 'all' ? 'all' : Number(v); renderMatchups(); }, availableDepths(), ['all'])));
-  tb.append(el('label', {}, 'Family', el('select', { onchange: (e) => { State.mFam = e.target.value; renderMatchups(); } },
+  tb.append(el('label', {}, 'Depth', depthSelect()));
+  tb.append(el('label', {}, 'Family', el('select', { 'data-ctl': 'fam', onchange: (e) => { State.mFam = e.target.value; keepFocus(renderMatchups); syncUrl(); } },
     ...['all', 'nn', 'hc'].map((f) => el('option', { value: f, selected: f === State.mFam ? '' : null }, f === 'all' ? 'all engines' : f)))));
 
-  let tags = [...present].filter((t) => {
+  const tags = [...present].filter((t) => {
     const p = parsedOf.get(t); if (!p) return false;
-    if (State.mDepth !== 'all' && Number(p.depth) !== Number(State.mDepth)) return false;
+    if (State.depth !== 'all' && Number(p.depth) !== Number(State.depth)) return false;
     if (State.mFam !== 'all' && p.eng !== State.mFam) return false;
     return true;
   });
   tags.sort((a, b) => (eloOf.get(a) ?? 0) - (eloOf.get(b) ?? 0));
   tb.append(el('span', { class: 'sub' }, `${tags.length} nodes · cell = row's score vs column · click a played cell for the games`));
+  // The corpus half of a cell is only as current as the last rank:pool scan (it caches on the
+  // dataset's size+mtime), so a cell can trail the dataset until the next run.
+  if (State.pool.stale) tb.append(el('span', { class: 'badge warn' }, 'corpus scan behind dataset'));
   root.append(tb);
 
   if (tags.length < 2) { root.append(el('div', { class: 'empty-state' }, 'Not enough directly-played nodes at this filter. Try “all depths”.')); return; }
@@ -574,7 +588,11 @@ async function renderMatchups() {
       td.addEventListener('mousemove', (ev) => showTip(
         `<div class="tt-title">${labelOf.get(rTag)} vs ${labelOf.get(cTag)}</div>`
         + `<div class="tt-row"><span class="k">Score</span><span class="v">${pct(info.score)}</span></div>`
-        + `<div class="tt-row"><span class="k">Games</span><span class="v">${info.games}</span></div>`, ev.clientX, ev.clientY));
+        + `<div class="tt-row"><span class="k">Games</span><span class="v">${info.games}</span></div>`
+        // Where the evidence came from. A pair the ranker never scheduled can still be the
+        // best-measured on the board: a promotion gate is thousands of games at depth 6.
+        + (info.store < info.games
+          ? `<div class="tt-row"><span class="k">of which gate/self-play</span><span class="v">${info.games - info.store}</span></div>` : ''), ev.clientX, ev.clientY));
       td.addEventListener('mouseleave', hideTip);
       td.addEventListener('click', () => openGamesFor(rTag, cTag));
       tr.append(td);
@@ -597,8 +615,8 @@ function shortLabel(tag, parsedOf) { const p = parsedOf.get(tag); if (!p) return
 // played, so it reads as never-met (empty cell) rather than 0/0 = NaN.
 function pairScore(pairs, a, b) {
   const played = (e) => (e && e.games > 0 ? e : null);
-  const ab = played(pairs[`${a}|${b}`]); if (ab) return { score: ab.sumA / ab.games, games: ab.games };
-  const ba = played(pairs[`${b}|${a}`]); if (ba) return { score: 1 - ba.sumA / ba.games, games: ba.games };
+  const ab = played(pairs[`${a}|${b}`]); if (ab) return { score: ab.sumA / ab.games, games: ab.games, store: ab.store ?? ab.games };
+  const ba = played(pairs[`${b}|${a}`]); if (ba) return { score: 1 - ba.sumA / ba.games, games: ba.games, store: ba.store ?? ba.games };
   return null;
 }
 function divergingColor(score) {
@@ -619,7 +637,7 @@ async function renderGames() {
 
   const tb = el('div', { class: 'toolbar' });
   const f = State.gamesFilter || {};
-  const mkSel = (which, val) => el('select', { onchange: (e) => { State.gamesFilter = { ...State.gamesFilter, [which]: e.target.value || null }; loadGameList(); } },
+  const mkSel = (which, val) => el('select', { 'data-ctl': `games-${which}`, onchange: (e) => { State.gamesFilter = { ...State.gamesFilter, [which]: e.target.value || null }; syncUrl(); loadGameList(); } },
     el('option', { value: '' }, which === 'a' ? 'any engine' : 'any opponent'),
     ...allTags.map((t) => el('option', { value: t, selected: t === val ? '' : null }, tagLabel(t))));
   tb.append(el('label', {}, 'Player', mkSel('a', f.a)));
@@ -648,8 +666,12 @@ async function loadGameList() {
   // A live run rebuilds this list under the user, so keep the open game and the ply it was on
   // when it is still in the page. Only fall back to the newest game when it isn't.
   const keep = State.openGame && data.games.some((g) => g.g === State.openGame.g) ? State.openGame : null;
-  const openId = keep ? keep.g : data.games[0].g;
-  const resume = keep ? isPlaying() : false; // a rebuild mid-replay shouldn't stop the replay
+  // A game named by the URL is honoured once even when it falls outside this page of the list —
+  // that's a link someone pasted or a refresh, and the game it names is the point of the link.
+  const want = State.pendingGame; State.pendingGame = null;
+  const openId = want ? want.g : keep ? keep.g : data.games[0].g;
+  const openPly = want ? want.ply : keep ? keep.ply : null;
+  const resume = !want && keep ? isPlaying() : false; // a rebuild mid-replay shouldn't stop the replay
   for (const g of data.games) {
     const resChar = g.r === 1 ? 'W' : g.r === -1 ? 'B' : '½';
     const resClass = g.r === 1 ? 'w' : g.r === -1 ? 'l' : 'd';
@@ -661,10 +683,14 @@ async function loadGameList() {
     row.addEventListener('click', () => { $$('.game-row', list).forEach((r) => r.style.background = ''); row.style.background = 'var(--surface-2)'; openGame(g.g); });
     list.append(row);
   }
-  openGame(openId, keep ? keep.ply : null, resume);
+  openGame(openId, openPly, resume);
 }
 
 // ---- board + eval game viewer (blue2 board + Merida pieces, matching the app)
+// The viewer writes the URL from async callbacks (a fetch that lands late, a replay timer), so
+// every one of them checks it still owns the page — otherwise leaving mid-load stamps a games
+// URL over the view you switched to.
+const syncGamesUrl = () => { if (currentView === 'games') syncUrl(); };
 let viewerSeq = 0; // bumped per open; a slower fetch checks it before touching the DOM
 const pieceUrl = (color, role) => `/assets/pieces/merida/${color}${role.toUpperCase()}.svg`;
 function parseFen(fen) {
@@ -720,6 +746,7 @@ async function openGame(g, startPly = null, autoplay = false) {
   if (game.error) { wrap.innerHTML = '<div class="empty-state">Game not found.</div>'; return; }
   const state = { ply: startPly == null ? game.moves.length : Math.max(0, Math.min(game.moves.length, startPly)) };
   State.openGame = { g, ply: state.ply };
+  syncGamesUrl();
   wrap.innerHTML = '';
 
   const info = el('div', { class: 'flex wrap', style: { justifyContent: 'space-between', marginBottom: '10px' } },
@@ -732,7 +759,15 @@ async function openGame(g, startPly = null, autoplay = false) {
   const range = el('input', { type: 'range', min: '0', max: String(game.moves.length), value: String(state.ply) });
   const btn = (t, on) => el('button', { onclick: on }, t);
   const stop = stopPlayback;
-  const setPly = (p) => { state.ply = Math.max(0, Math.min(game.moves.length, p)); State.openGame = { g, ply: state.ply }; range.value = String(state.ply); draw(); };
+  // The URL carries the ply, but not while a replay is running: that would be a history write
+  // twice a second, and the ply worth remembering is the one you stopped on.
+  const setPly = (p) => {
+    state.ply = Math.max(0, Math.min(game.moves.length, p));
+    State.openGame = { g, ply: state.ply };
+    range.value = String(state.ply);
+    draw();
+    if (!isPlaying()) syncGamesUrl();
+  };
   const play = () => {
     playBtn.textContent = '❚❚';
     playback = {
@@ -741,7 +776,7 @@ async function openGame(g, startPly = null, autoplay = false) {
         setPly(state.ply + 1);
         if (state.ply >= game.moves.length) stopPlayback();
       }, 550),
-      onStop: () => { playBtn.textContent = '▶'; },
+      onStop: () => { playBtn.textContent = '▶'; syncGamesUrl(); },
     };
   };
   const playBtn = btn('▶', () => { if (isPlaying()) stopPlayback(); else play(); });
@@ -845,10 +880,13 @@ async function renderTraining() {
   table.append(tbody);
   root.append(table);
   root.append(el('div', { id: 'trackChart', class: 'mt' }));
-  openTrack(tracks[0].id);
+  // The track from the URL wins, as long as it is still a track this loop knows.
+  openTrack(tracks.some((t) => t.id === State.trackId) ? State.trackId : tracks[0].id);
 }
 async function openTrack(id) {
   const box = $('#trackChart'); if (!box) return;
+  State.trackId = id;
+  if (currentView === 'training') syncUrl();
   box.innerHTML = '<div class="empty-state">Loading…</div>';
   const data = await api(`/api/experiment?id=${encodeURIComponent(id)}`);
   const rows = (data.history || []).map((r, i) => ({ ...r, seq: i + 1 }));
@@ -880,14 +918,88 @@ async function openTrack(id) {
 // =============================================================== router / live
 const VIEWS = { ladder: renderLadder, generations: renderGenerations, depth: renderDepth, matchups: renderMatchups, games: renderGames, training: renderTraining };
 let currentView = 'ladder';
-function switchView(name) {
+// A rebuild throws away the toolbar the user is standing in, so a dropdown that triggers one loses
+// focus on its first pick and the arrow keys stop cycling. Controls that survive a rebuild carry a
+// stable `data-ctl` name, and whatever held focus gets it back once the new DOM is in place —
+// async views (matchups, games, training) restore after their fetch, not before it.
+function keepFocus(render) {
+  const ctl = document.activeElement?.dataset?.ctl;
+  const restore = () => {
+    if (!ctl) return;
+    // A view keeps its DOM when you switch away, so an older copy of the same control can still be
+    // sitting in a hidden section. Only the active view's copy can take focus.
+    const sel = `[data-ctl="${ctl}"]`;
+    ($(`.view.active ${sel}`) || $(sel))?.focus({ preventScroll: true });
+  };
+  const out = render();
+  if (out && typeof out.then === 'function') return out.then((v) => { restore(); return v; }, (e) => { restore(); throw e; });
+  restore();
+  return out;
+}
+function renderView(name) {
+  // Every view reads State.depth, so the depth is re-checked against the data here rather than
+  // in each view — a run that drops a depth must not leave any of them pinned to a dead one.
+  State.depth = resolveDepth();
+  try { keepFocus(VIEWS[name]); } catch (e) { $(`#view-${name}`).innerHTML = `<div class="empty-state">Error: ${e.message}</div>`; console.error(e); }
+}
+function switchView(name, { push = true } = {}) {
   if (currentView !== 'games' || name !== 'games') stopPlayback(); // leaving the viewer, or a full rebuild of it
   currentView = name;
   $$('nav.tabs button').forEach((b) => b.classList.toggle('active', b.dataset.view === name));
   $$('.view').forEach((v) => v.classList.toggle('active', v.id === `view-${name}`));
-  try { VIEWS[name](); } catch (e) { $(`#view-${name}`).innerHTML = `<div class="empty-state">Error: ${e.message}</div>`; console.error(e); }
+  renderView(name);
+  syncUrl(push);
 }
 $('#tabs').addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) switchView(b.dataset.view); });
+
+// ------------------------------------------------------------------- URL state
+// The whole view state lives in the hash, so a reload lands back where you were — this page sits
+// open for hours next to a running train:loop and gets refreshed constantly. Hash rather than
+// path: the server stays a plain static file handler with no catch-all route.
+// The shared depth rides along on every view, including the two that don't filter by it, so it
+// survives a refresh taken from the depth curve or the game viewer.
+function urlParams() {
+  const q = new URLSearchParams();
+  if (State.depth != null) q.set('depth', String(State.depth));
+  if (currentView === 'depth' && State.depthSel.size) q.set('sel', [...State.depthSel].join(','));
+  if (currentView === 'matchups' && State.mFam !== 'all') q.set('fam', State.mFam);
+  if (currentView === 'games') {
+    const f = State.gamesFilter || {};
+    if (f.a) q.set('a', f.a);
+    if (f.b) q.set('b', f.b);
+    if (State.openGame) { q.set('g', State.openGame.g); q.set('ply', String(State.openGame.ply)); }
+  }
+  if (currentView === 'training' && State.trackId) q.set('track', State.trackId);
+  return q;
+}
+function syncUrl(push = false) {
+  const q = urlParams().toString();
+  const hash = `#/${currentView}${q ? `?${q}` : ''}`;
+  if (hash === location.hash) return;
+  // pushState/replaceState don't fire hashchange, so writing here never re-enters applyUrl.
+  if (push) history.pushState(null, '', hash); else history.replaceState(null, '', hash);
+}
+function applyUrl() {
+  const [pathPart, qs] = location.hash.replace(/^#\/?/, '').split('?');
+  const view = Object.hasOwn(VIEWS, pathPart) ? pathPart : 'ladder';
+  const p = new URLSearchParams(qs || '');
+  const depth = p.get('depth');
+  if (depth) State.depth = depth === 'all' ? 'all' : Number(depth);
+  const sel = p.get('sel');
+  if (sel) State.depthSel = new Set(sel.split(',').filter(Boolean));
+  State.mFam = p.get('fam') || 'all';
+  const a = p.get('a'), b = p.get('b');
+  State.gamesFilter = a || b ? { a: a || null, b: b || null } : null;
+  const g = p.get('g');
+  const ply = p.has('ply') ? Number(p.get('ply')) : NaN;
+  State.pendingGame = g ? { g, ply: Number.isFinite(ply) ? ply : null } : null; // null opens at the end
+  State.openGame = null;
+  State.trackId = p.get('track') || null;
+  switchView(view, { push: false });
+}
+// Back/forward and a hand-edited hash both land here (every entry we write is a hash, so
+// hashchange covers popstate); re-applying is idempotent.
+window.addEventListener('hashchange', applyUrl);
 
 // keyboard hotkeys — drive the open game viewer (ignored while typing in a control)
 document.addEventListener('keydown', (e) => {
@@ -912,7 +1024,7 @@ themeBtn.addEventListener('click', () => {
   const next = cur === 'light' ? 'dark' : 'light';
   document.documentElement.setAttribute('data-theme', next);
   localStorage.setItem('viz-theme', next);
-  switchView(currentView);
+  renderView(currentView); // charts read the CSS variables at build time
 });
 if (localStorage.getItem('viz-theme')) document.documentElement.setAttribute('data-theme', localStorage.getItem('viz-theme'));
 
@@ -945,7 +1057,7 @@ function connectLive() {
       structural = false;
       State.pool = null;
       await loadCore();
-      if (rebuild) switchView(currentView); else refreshCounters();
+      if (rebuild) { renderView(currentView); syncUrl(); } else refreshCounters();
       txt.textContent = 'live';
     }, 300);
   };
@@ -955,7 +1067,7 @@ function connectLive() {
 (async function main() {
   try {
     await loadCore();
-    switchView('ladder');
+    applyUrl();
     connectLive();
   } catch (e) {
     $('#view-ladder').innerHTML = `<div class="empty-state">Could not load data: ${e.message}<br><span class="sub">Is training/data/loop present?</span></div>`;

@@ -122,10 +122,9 @@ select, input[type="text"] {
   background: var(--surface-2); color: var(--text-primary); border: 1px solid var(--border);
   border-radius: 7px; padding: 5px 9px; font-size: 13px; font-family: inherit;
 }
-.seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
-.seg button { background: var(--surface-1); border: 0; color: var(--text-secondary); padding: 5px 11px; cursor: pointer; font-size: 12.5px; }
-.seg button + button { border-left: 1px solid var(--border); }
-.seg button.active { background: var(--s1); color: #fff; }
+/* A pick rebuilds the view and the control is focused again on the other side, so the ring says
+   which dropdown the arrow keys are still driving. */
+select:focus, input[type="text"]:focus { outline: 2px solid var(--s1); outline-offset: 1px; border-color: var(--s1); }
 
 /* ---- table ------------------------------------------------------------ */
 table.data { width: 100%; border-collapse: collapse; font-size: 13px; }

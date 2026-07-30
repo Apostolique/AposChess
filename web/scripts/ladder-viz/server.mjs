@@ -22,7 +22,8 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '../../..');           // repo root
-const LOOP = path.join(ROOT, 'training', 'data', 'loop');
+const DATA = path.join(ROOT, 'training', 'data');
+const LOOP = path.join(DATA, 'loop');
 const NN = path.join(ROOT, 'web', 'public', 'nn');
 const PUBLIC = path.join(__dirname, 'public');
 const ASSETS = path.join(ROOT, 'web', 'src', 'assets'); // blue2 board + merida pieces (shared with the app)
@@ -30,7 +31,13 @@ const ASSETS = path.join(ROOT, 'web', 'src', 'assets'); // blue2 board + merida 
 const F = {
   ledger: path.join(LOOP, 'engine-elo.ladder.json'),
   pool: path.join(LOOP, 'ladder-pool.json'),
+  // rank:pool fits from the pool store PLUS a scan of the whole dataset (--corpus), but only the
+  // store is persisted — the corpus half lives in this cache. Gate games are corpus-only, and the
+  // gate runs at depth 6, so without this the busiest depth on the ladder looks like it never
+  // played. See combinedPairs() and depth-ladder.mjs:381.
+  corpus: path.join(LOOP, 'ladder-corpus-cache.json'),
   games: path.join(LOOP, 'ladder-games.jsonl'),
+  selfplay: path.join(DATA, 'selfplay.jsonl'),
   match: path.join(LOOP, 'match.json'),
   timing: path.join(LOOP, 'match-timing.json'),
   manifest: path.join(NN, 'manifest.json'),
@@ -87,36 +94,51 @@ function championIndex() {
 }
 
 // ------------------------------------------------------------- games byte-index
-// The harvested games file is large (100s of MB). We keep a light in-memory index
-// of {byteOffset, byteLen, g, w, b, r, plies} per line so a single game body can
+// The game files are large (100s of MB). We keep a light in-memory index of
+// {byteOffset, byteLen, g, w, b, r, plies} per line so a single game body can
 // be read by seeking, and matchup filters run over metadata only. Built once,
-// then extended incrementally as the file grows (train:loop appends live).
-const gindex = { entries: [], byG: new Map(), indexedBytes: 0, size: 0 };
+// then extended incrementally as the files grow (train:loop appends live).
+//
+// TWO sources, because the pool's own harvest is only half the games. Gate matches are
+// folded straight into the dataset (train-loop.mjs foldGateHarvest) and never reach
+// ladder-games.jsonl, so a promotion's decisive match — thousands of games at depth 6 —
+// was invisible here. Indexed in order, first source to claim a game id wins: the two
+// overlap (rank:pool harvests into both), and the pool's copy is the canonical one.
+const SOURCES = [F.games, F.selfplay];
+const gindex = { entries: [], byG: new Map(), src: SOURCES.map(() => ({ indexedBytes: 0, size: 0 })), size: 0, skipped: 0 };
 
-function addGameLine(buf, off, len) {
+// A non-promoted gate candidate is never archived and carries an "elo<N>" strength label
+// instead of an identity (see vtag.mjs ephemeralVersion) — rank:pool leaves it out of the
+// fit, so it has no ladder row and no rating. Its games would be unattributable rows here,
+// so they stay out of the viz entirely.
+const EPHEMERAL = /@elo-?\d+$/;
+
+function addGameLine(buf, off, len, src) {
   let rec;
   try { rec = JSON.parse(buf.toString('utf8')); } catch { return; }
   if (!rec || !rec.g) return;
+  if (gindex.byG.has(rec.g)) return;                      // already claimed by an earlier source
   const w = rec.players?.w ?? null;
   const b = rec.players?.b ?? null;
-  const e = { off, len, g: rec.g, w, b, r: rec.r ?? null, n: rec.moves?.length ?? 0 };
+  if (EPHEMERAL.test(w || '') || EPHEMERAL.test(b || '')) { gindex.skipped++; return; }
+  const e = { off, len, src, g: rec.g, w, b, r: rec.r ?? null, n: rec.moves?.length ?? 0 };
   gindex.byG.set(rec.g, e);
   gindex.entries.push(e);
 }
 
-function indexGames(reset = false) {
-  const st = statSafe(F.games);
-  if (!st) { gindex.entries = []; gindex.byG.clear(); gindex.indexedBytes = 0; gindex.size = 0; return; }
-  if (reset || st.size < gindex.indexedBytes) {
-    gindex.entries = []; gindex.byG.clear(); gindex.indexedBytes = 0;
-  }
-  if (st.size === gindex.indexedBytes) { gindex.size = st.size; return; }
+function indexSource(src, reset) {
+  const file = SOURCES[src];
+  const state = gindex.src[src];
+  const st = statSafe(file);
+  if (!st) { state.indexedBytes = 0; state.size = 0; return; }
+  if (reset || st.size < state.indexedBytes) state.indexedBytes = 0;
+  if (st.size === state.indexedBytes) { state.size = st.size; return; }
 
-  const fd = fs.openSync(F.games, 'r');
+  const fd = fs.openSync(file, 'r');
   try {
     const CHUNK = 1 << 20;
     const buf = Buffer.allocUnsafe(CHUNK);
-    let filePos = gindex.indexedBytes;
+    let filePos = state.indexedBytes;
     let lineStart = filePos;
     let carry = Buffer.alloc(0);
     while (filePos < st.size) {
@@ -129,7 +151,7 @@ function indexGames(reset = false) {
           const line = carry.length
             ? Buffer.concat([carry, buf.subarray(chunkStart, i)])
             : buf.subarray(chunkStart, i);
-          addGameLine(line, lineStart, line.length);
+          addGameLine(line, lineStart, line.length, src);
           carry = Buffer.alloc(0);
           chunkStart = i + 1;
           lineStart = filePos + i + 1;
@@ -140,22 +162,62 @@ function indexGames(reset = false) {
     }
     // Only fully terminated lines are indexed; a partial trailing line (a game
     // being written right now) waits for its newline on the next pass.
-    gindex.indexedBytes = lineStart;
-    gindex.size = st.size;
+    state.indexedBytes = lineStart;
+    state.size = st.size;
   } finally {
     fs.closeSync(fd);
   }
 }
 
+function indexGames(reset = false) {
+  // A truncated/rewritten source invalidates cross-source dedup, so rebuild everything.
+  const shrank = SOURCES.some((f, i) => { const st = statSafe(f); return st && st.size < gindex.src[i].indexedBytes; });
+  if (reset || shrank) {
+    gindex.entries = []; gindex.byG.clear(); gindex.skipped = 0;
+    for (const s of gindex.src) { s.indexedBytes = 0; s.size = 0; }
+    reset = true;
+  }
+  for (let i = 0; i < SOURCES.length; i++) indexSource(i, reset);
+  gindex.size = gindex.src.reduce((n, s) => n + s.size, 0);
+}
+
 function readGameBody(g) {
   const e = gindex.byG.get(g);
   if (!e) return null;
-  const fd = fs.openSync(F.games, 'r');
+  const fd = fs.openSync(SOURCES[e.src], 'r');
   try {
     const buf = Buffer.allocUnsafe(e.len);
     fs.readSync(fd, buf, 0, e.len, e.off);
     return JSON.parse(buf.toString('utf8'));
   } catch { return null; } finally { fs.closeSync(fd); }
+}
+
+// ------------------------------------------------------------- combined pairwise
+// What rank:pool actually fits on: the persisted store plus the corpus scan. Mirrors
+// depth-ladder.mjs combinedPairs() — the store is authoritative for its own matchups, so the
+// corpus contributes only the games BEYOND what the store already counts (clamped at 0), and a
+// pool game harvested into the dataset can't be counted twice. Each pair reports how many of
+// its games came from the store, so the UI can say where a cell's evidence lives.
+function combinedPairs() {
+  const store = readJson(F.pool) || {};
+  const corpus = readJson(F.corpus) || {};
+  const sp = store.pairs || {};
+  const out = {};
+  for (const [k, v] of Object.entries(sp)) out[k] = { games: v.games, sumA: v.sumA, store: v.games };
+  for (const [k, v] of Object.entries(corpus.pairs || {})) {
+    if (k.split('|').some((id) => EPHEMERAL.test(id))) continue;   // unrated candidate — never shown
+    const s = sp[k] || { games: 0, sumA: 0 };
+    const extra = v.games - s.games;
+    if (extra <= 0) continue;
+    const e = out[k] || (out[k] = { games: 0, sumA: 0, store: 0 });
+    e.games += extra;
+    e.sumA += Math.min(Math.max(v.sumA - s.sumA, 0), extra);
+  }
+  // The corpus cache is rewritten only when rank:pool re-scans, and it keys on the dataset's
+  // size+mtime — so say when the dataset has moved on and these counts trail it.
+  const ds = statSafe(F.selfplay);
+  const stale = !!(ds && corpus.size != null && (corpus.size !== ds.size || Math.abs((corpus.mtimeMs ?? 0) - ds.mtimeMs) > 1));
+  return { pairs: out, corpusGames: corpus.corpusGames ?? 0, stale };
 }
 
 // ------------------------------------------------------- experiments / tracks
@@ -216,7 +278,7 @@ function scheduleBroadcast(name) {
     watchTimer = null;
     const files = [...pendingChanges];
     pendingChanges.clear();
-    if (files.some((f) => f.includes('ladder-games'))) indexGames();
+    if (files.some((f) => f.includes('ladder-games') || f.includes('selfplay.jsonl'))) indexGames();
     broadcast({ type: 'change', files, ts: Date.now() });
   }, 500);
 }
@@ -230,6 +292,8 @@ function startWatch() {
   };
   watchDir(LOOP);
   watchDir(NN);
+  // selfplay.jsonl sits beside loop/, not in it — non-recursive so LOOP isn't watched twice.
+  try { fs.watch(DATA, (_ev, filename) => { if (filename) scheduleBroadcast(String(filename)); }); } catch { /* may not exist */ }
 }
 
 // ----------------------------------------------------------------------- routes
@@ -273,12 +337,12 @@ const server = http.createServer((req, res) => {
       convergence: ledger?.convergence ?? null,
       meta: ledger ? { generated: ledger.generated, anchor: ledger.anchor, depths: ledger.depths, dataset: ledger.dataset } : null,
       match: readJson(F.match),
-      counts: { games: gindex.entries.length, gamesBytes: gindex.size },
+      counts: { games: gindex.entries.length, gamesBytes: gindex.size, gamesSkipped: gindex.skipped },
       files: fileStatus(),
     });
   }
   if (p === '/api/ladder') return sendJson(res, readJson(F.ledger) || { ranking: [] });
-  if (p === '/api/pool') return sendJson(res, readJson(F.pool) || { pairs: {} });
+  if (p === '/api/pool') return sendJson(res, combinedPairs());
   if (p === '/api/timing') return sendJson(res, readJson(F.timing) || {});
   if (p === '/api/log') return sendJson(res, { text: tailFile(F.log) });
   if (p === '/api/experiments') return sendJson(res, { tracks: experimentTracks() });
