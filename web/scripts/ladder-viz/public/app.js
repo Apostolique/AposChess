@@ -207,6 +207,19 @@ const State = {
 };
 // Controls for the game currently open in the viewer; driven by keyboard hotkeys.
 let activeViewer = null;
+// One playback timer for the whole page. A viewer gets replaced under a running interval every
+// time the user picks another game or a live refresh rebuilds the list, and an orphaned interval
+// keeps stepping — repainting the new viewer's eval chart and dragging State.openGame back to the
+// game it belongs to, with no button left that can stop it. Every teardown path calls stopPlayback.
+let playback = null; // { timer, onStop }
+const isPlaying = () => playback !== null;
+function stopPlayback() {
+  if (!playback) return;
+  clearInterval(playback.timer);
+  const { onStop } = playback;
+  playback = null;
+  onStop();
+}
 
 async function loadCore() {
   const [summary, ladder] = await Promise.all([api('/api/summary'), api('/api/ladder')]);
@@ -290,6 +303,7 @@ function renderLadder() {
     el('h3', {}, 'Convergence'),
     convBadge(conv),
     el('div', { class: 'kv mt' }, el('span', { class: 'k' }, 'Pairs'), el('span', { class: 'v' }, fmt(conv?.pairs))),
+    el('div', { class: 'kv' }, el('span', { class: 'k' }, 'Never met'), el('span', { class: 'v' }, fmt(conv?.adjacentUnlinked))),
     el('div', { class: 'kv' }, el('span', { class: 'k' }, 'Worst mis-order'), el('span', { class: 'v' }, `${fmt(conv?.misorderCost, 0)} Elo`)),
     el('div', { class: 'kv' }, el('span', { class: 'k' }, 'Depth inversions'), el('span', { class: 'v' }, fmt(conv?.confidentInversions))),
     el('div', { class: 'pill-note mt', text: conv?.verdict || '' }),
@@ -378,6 +392,7 @@ function archStr(arch) { return arch ? `[${arch.join(',')}]` : '–'; }
 function convBadge(c) {
   if (!c) return el('span', { class: 'badge neutral' }, 'no data');
   if (c.converged) return el('span', { class: 'badge good' }, '✓ converged');
+  if (c.linked === false) return el('span', { class: 'badge warn' }, 'unlinked pairs');
   if (c.resolved) return el('span', { class: 'badge warn' }, '⚠ inversions');
   return el('span', { class: 'badge warn' }, 'not converged');
 }
@@ -623,11 +638,12 @@ async function loadGameList() {
   const list = $('#gamesList'); if (!list) return;
   list.innerHTML = '';
   const cnt = $('#gamesCount'); if (cnt) cnt.textContent = `${fmt(data.total)} games${(f.a || f.b) ? ' match this filter' : ' total'} · showing ${data.games.length}`;
-  if (!data.games.length) { list.append(el('div', { class: 'empty-state' }, 'No games.')); activeViewer = null; State.openGame = null; return; }
+  if (!data.games.length) { list.append(el('div', { class: 'empty-state' }, 'No games.')); stopPlayback(); activeViewer = null; State.openGame = null; return; }
   // A live run rebuilds this list under the user, so keep the open game and the ply it was on
   // when it is still in the page. Only fall back to the newest game when it isn't.
   const keep = State.openGame && data.games.some((g) => g.g === State.openGame.g) ? State.openGame : null;
   const openId = keep ? keep.g : data.games[0].g;
+  const resume = keep ? isPlaying() : false; // a rebuild mid-replay shouldn't stop the replay
   for (const g of data.games) {
     const resChar = g.r === 1 ? 'W' : g.r === -1 ? 'B' : '½';
     const resClass = g.r === 1 ? 'w' : g.r === -1 ? 'l' : 'd';
@@ -639,10 +655,11 @@ async function loadGameList() {
     row.addEventListener('click', () => { $$('.game-row', list).forEach((r) => r.style.background = ''); row.style.background = 'var(--surface-2)'; openGame(g.g); });
     list.append(row);
   }
-  openGame(openId, keep ? keep.ply : null);
+  openGame(openId, keep ? keep.ply : null, resume);
 }
 
 // ---- board + eval game viewer (blue2 board + Merida pieces, matching the app)
+let viewerSeq = 0; // bumped per open; a slower fetch checks it before touching the DOM
 const pieceUrl = (color, role) => `/assets/pieces/merida/${color}${role.toUpperCase()}.svg`;
 function parseFen(fen) {
   const [bp, turn] = fen.split(' ');
@@ -687,10 +704,13 @@ function whitePovEval(game) {
     return { i, mate: Math.abs(v) > 50000, v: val };
   });
 }
-async function openGame(g, startPly = null) {
+async function openGame(g, startPly = null, autoplay = false) {
   const wrap = $('#gameViewerWrap'); if (!wrap) return;
+  stopPlayback();
+  const seq = ++viewerSeq;
   wrap.innerHTML = '<div class="empty-state">Loading…</div>';
   const game = await api(`/api/game?g=${encodeURIComponent(g)}`);
+  if (seq !== viewerSeq) return; // a newer pick won the race — don't overwrite its viewer
   if (game.error) { wrap.innerHTML = '<div class="empty-state">Game not found.</div>'; return; }
   const state = { ply: startPly == null ? game.moves.length : Math.max(0, Math.min(game.moves.length, startPly)) };
   State.openGame = { g, ply: state.ply };
@@ -705,14 +725,20 @@ async function openGame(g, startPly = null) {
   const readout = el('div', { class: 'ply-readout' });
   const range = el('input', { type: 'range', min: '0', max: String(game.moves.length), value: String(state.ply) });
   const btn = (t, on) => el('button', { onclick: on }, t);
-  let playTimer = null;
-  const stop = () => { if (playTimer) { clearInterval(playTimer); playTimer = null; playBtn.textContent = '▶'; } };
+  const stop = stopPlayback;
   const setPly = (p) => { state.ply = Math.max(0, Math.min(game.moves.length, p)); State.openGame = { g, ply: state.ply }; range.value = String(state.ply); draw(); };
-  const playBtn = btn('▶', () => {
-    if (playTimer) { stop(); return; }
+  const play = () => {
     playBtn.textContent = '❚❚';
-    playTimer = setInterval(() => { if (state.ply >= game.moves.length) { setPly(0); } setPly(state.ply + 1); if (state.ply >= game.moves.length) stop(); }, 550);
-  });
+    playback = {
+      timer: setInterval(() => {
+        if (state.ply >= game.moves.length) setPly(0);
+        setPly(state.ply + 1);
+        if (state.ply >= game.moves.length) stopPlayback();
+      }, 550),
+      onStop: () => { playBtn.textContent = '▶'; },
+    };
+  };
+  const playBtn = btn('▶', () => { if (isPlaying()) stopPlayback(); else play(); });
   transport.append(
     btn('⏮', () => { stop(); setPly(0); }),
     btn('‹', () => { stop(); setPly(state.ply - 1); }),
@@ -734,7 +760,9 @@ async function openGame(g, startPly = null) {
   const hint = el('div', { class: 'pill-note', style: { marginTop: '6px' } }, '← → step · ↑↓ / Home End jump · Space play');
   const left = el('div', {}, boardEl, transport, hint);
   const movelist = el('div', { class: 'movelist' });
-  const evalWrap = el('div', { class: 'card pad0 mt' }, el('div', { class: 'chart-wrap', id: 'evalChartWrap', style: { padding: '8px' } }));
+  // Held by reference, not looked up by id: a stale viewer must never be able to find this one.
+  const evalBox = el('div', { class: 'chart-wrap', style: { padding: '8px' } });
+  const evalWrap = el('div', { class: 'card pad0 mt' }, evalBox);
   const right = el('div', {}, info, evalWrap, movelist);
 
   function draw() {
@@ -754,7 +782,7 @@ async function openGame(g, startPly = null) {
   }
   const evalPts = whitePovEval(game);
   function drawEval() {
-    const w = $('#evalChartWrap'); if (!w) return; w.innerHTML = '';
+    const w = evalBox; w.innerHTML = '';
     const pts = evalPts.map((e) => ({ x: e.i, y: Math.max(-1000, Math.min(1000, e.v)), mate: e.mate }));
     const chart = lineChart({
       height: 220, margin: { l: 48, b: 30, t: 10 },
@@ -780,6 +808,7 @@ async function openGame(g, startPly = null) {
 
   wrap.append(el('div', { class: 'viewer' }, left, right));
   draw();
+  if (autoplay) play();
 }
 
 // =============================================================== TRAINING view
@@ -846,6 +875,7 @@ async function openTrack(id) {
 const VIEWS = { ladder: renderLadder, generations: renderGenerations, depth: renderDepth, matchups: renderMatchups, games: renderGames, training: renderTraining };
 let currentView = 'ladder';
 function switchView(name) {
+  if (currentView !== 'games' || name !== 'games') stopPlayback(); // leaving the viewer, or a full rebuild of it
   currentView = name;
   $$('nav.tabs button').forEach((b) => b.classList.toggle('active', b.dataset.view === name));
   $$('.view').forEach((v) => v.classList.toggle('active', v.id === `view-${name}`));

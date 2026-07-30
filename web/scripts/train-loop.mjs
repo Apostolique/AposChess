@@ -537,6 +537,11 @@ const cfg = {
   // matchup always plays to completion, and depth-8 matchups are slow). One wave keeps every
   // core busy exactly once per matchup; the store accumulates the games across cycles regardless.
   rankGames: num(args['rank-games'], defaultRankGames),
+  // Direct-link floor passed through to rank:pool (--link): games a rank-adjacent pair must have
+  // played AGAINST EACH OTHER before the ordering objective gets the budget. Left unset, rank:pool
+  // defaults it to half a matchup, so one of the loop's small matchups clears a pair; --rank-link=0
+  // turns it off and hands the whole budget back to the ordering objective.
+  rankLink: args['rank-link'] !== undefined ? Math.max(0, Number(args['rank-link'])) : null,
   // On each promotion the NEW champion is published into the playable net catalog
   // (web/public/nn) under the next free human name and flagged the current champion, so it's
   // pickable in the app under a real name from the moment it's promoted (past champions stay
@@ -1000,7 +1005,8 @@ function runRankPool(label, opts = {}) {
       `--anchor-depth=${cfg.rankDepth}`,
       ...(playSet ? [`--play=${playSet}`] : []),
       ...(calib ? ['--onboard=1'] : []), // fill the champion's under-played depths before the ordering objective
-      `--games=${cfg.rankGames}`, `--store=${ladderStore}`, `--ledger=${ledgerFile}`,
+      `--games=${cfg.rankGames}`, ...(cfg.rankLink === null ? [] : [`--link=${cfg.rankLink}`]),
+      `--store=${ladderStore}`, `--ledger=${ledgerFile}`,
       ...(cfg.harvest ? [] : ['--no-save-games']),
       '--no-scan', `--seed=${Date.now()}`, ...jobArg]);
   if (cfg.harvest) foldNewLadderGames();
