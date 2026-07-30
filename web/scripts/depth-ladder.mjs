@@ -448,6 +448,9 @@ function ratedNodes() {
 
 function record(idA, idB, gamesPlayed, scoreA) {
   // scoreA = A's average score (wins+0.5 draws)/games, from apos-match.
+  // A stop-file stop finalizes from the games COMPLETED, which can be none. Storing that would
+  // leave an empty {games:0} pair — a matchup that never happened, whose score is 0/0.
+  if (!(gamesPlayed > 0)) return;
   const key = pairKey(idA, idB);
   const lowFirst = idA < idB;
   const sumForA = scoreA * gamesPlayed; // points A scored

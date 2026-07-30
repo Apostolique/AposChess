@@ -529,9 +529,12 @@ async function renderMatchups() {
   const eloOf = new Map(); const labelOf = new Map(); const parsedOf = new Map();
   for (const r of State.ladder.ranking) { eloOf.set(r.tag, r.elo); labelOf.set(r.tag, `${r.name || nodeLabel(r.eng, r.version, State.champs)} d${r.depth}`); parsedOf.set(r.tag, r); }
 
-  // tags present in pool
+  // tags present in pool (zero-game entries don't count — see pairScore)
   const present = new Set();
-  for (const k of Object.keys(pairs)) { const [a, b] = k.split('|'); present.add(a); present.add(b); }
+  for (const [k, v] of Object.entries(pairs)) {
+    if (!(v.games > 0)) continue;
+    const [a, b] = k.split('|'); present.add(a); present.add(b);
+  }
 
   // Default to a depth whose nodes have actually played each other, so the heatmap opens with
   // cells in it rather than a filter that matches one lonely node.
@@ -589,10 +592,13 @@ async function renderMatchups() {
   root.append(lg);
 }
 function shortLabel(tag, parsedOf) { const p = parsedOf.get(tag); if (!p) return tag; const nm = (p.name || nodeLabel(p.eng, p.version, State.champs)); return `${nm.length > 10 ? nm.slice(0, 10) : nm} d${p.depth}`; }
+// A pool entry can exist with zero games: a matchup the orchestrator stopped before any game
+// finished still gets recorded, as {games:0,sumA:0}. That's a pair the two nodes never actually
+// played, so it reads as never-met (empty cell) rather than 0/0 = NaN.
 function pairScore(pairs, a, b) {
-  const kab = `${a}|${b}`, kba = `${b}|${a}`;
-  if (pairs[kab]) return { score: pairs[kab].sumA / pairs[kab].games, games: pairs[kab].games };
-  if (pairs[kba]) return { score: 1 - pairs[kba].sumA / pairs[kba].games, games: pairs[kba].games };
+  const played = (e) => (e && e.games > 0 ? e : null);
+  const ab = played(pairs[`${a}|${b}`]); if (ab) return { score: ab.sumA / ab.games, games: ab.games };
+  const ba = played(pairs[`${b}|${a}`]); if (ba) return { score: 1 - ba.sumA / ba.games, games: ba.games };
   return null;
 }
 function divergingColor(score) {
