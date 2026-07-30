@@ -39,8 +39,11 @@
 //                   [+ material]) or a comma list of specs (content hash/prefix, archived
 //                   filename/path, 'champion', 'hc', 'material'). hc<anchor-depth> is added
 //                   regardless. --net=X is shorthand for --engines=X (one net's depth sweep).
-//   --depths=LIST   depths to rate each engine at: range (1-8) or list (6,8). Default 1-8
-//                   (the whole spectrum). Narrow it (e.g. --depths=6,8) for a quick run.
+//   --depths=LIST   depths this run PLAYS each engine at: range (1-8) or list (6,8). Default 1-8
+//                   (the whole spectrum). Narrow it (e.g. --depths=6,8) for a quick run — the
+//                   depths you leave out keep their rating and their ledger row from the games
+//                   already in the store, they just don't get new ones. The ledger always holds
+//                   every node the store knows, so narrowing the schedule never narrows the ladder.
 //   --anchor-depth=D  the hc depth that is the pin / Elo 1500 (default 6). Always present as a node.
 //   --play=SPEC     restrict NEW scheduled games to matchups among these specs only (comma list).
 //                   Each is EITHER a bare engine spec (same forms as --engines) — every --depths
@@ -51,6 +54,12 @@
 //                   The pin and the rest of the pool are STILL rated from the games already in the
 //                   store + --corpus; they just don't play any new games. Use this to pile games
 //                   onto a specific head-to-head while keeping everyone on the stable hc6 scale.
+//   --no-pin-play   keep the pin OUT of new games. hc<anchor-depth> stays a rated node at Elo 1500
+//                   (the scale), it just never plays. Its depth is fixed at --anchor-depth, so in a
+//                   single-depth run (--depths=4) it's the one node off that depth and every game it
+//                   plays is a cross-depth game. The pool stays tied to the scale through the games
+//                   the pin has ALREADY played (store + --corpus). Use this instead of moving
+//                   --anchor-depth, which would move every persisted absolute Elo with it.
 //   --no-material   skip the hc<d>@? material fallback node (otherwise included as the floor).
 //   --minutes=M     play for M minutes, then finalize. Omit to run until you stop it (q/Ctrl-C).
 //   --matchups=N    stop after N matchups (default unlimited).
@@ -170,6 +179,11 @@ const cfg = {
   // The pin + the rest of the pool are still rated from already-played store/--corpus games;
   // they just don't play new games. null = schedule across the whole pool (default).
   play: typeof args.play === 'string' ? args.play.split(',').map((s) => s.trim()).filter(Boolean) : null,
+  // --no-pin-play: the pin anchors the SCALE, it doesn't have to be an opponent. Its depth is
+  // fixed at --anchor-depth, so a single-depth run (--depths=4) has it as the only off-depth node
+  // and every game it plays is cross-depth. Dropping it from the schedulable set keeps new games
+  // inside --depths; it's still rated at PIN_ELO from the games already in the store/--corpus.
+  pinPlay: !args['no-pin-play'],
   material: !args['no-material'],
   // Pool stores from other machines to fold in before fitting (pairwise counts are additive).
   // Each MUST come from a distinct --seed (else identical games would be double-counted).
@@ -295,17 +309,22 @@ if (competitors.length < 2) { console.error('Need at least 2 nodes (engines × d
 const byId = new Map(competitors.map((c) => [c.id, c]));
 
 // --- schedulable subset (--play): which nodes may play NEW games ---------------
-// fit() always rates ALL competitors (the pin + the whole pool) from the persisted store +
-// --corpus. --play just restricts the ACTIVE SCHEDULER to matchups among the named specs, so
-// only that head-to-head gains new games while everyone else keeps their from-existing-data
-// estimate. A bare engine spec (depth == null) matches every --depths of that engine; a
-// depth-qualified node id matches only that exact (engine, depth) node.
+// fit() always rates the WHOLE pool (the pin, every competitor, and every node the store or
+// --corpus has games for — see ratedNodes) from the persisted results. --play just restricts the
+// ACTIVE SCHEDULER to matchups among the named specs, so only that head-to-head gains new games
+// while everyone else keeps their from-existing-data estimate. A bare engine spec (depth == null)
+// matches every --depths of that engine; a depth-qualified node id matches only that exact
+// (engine, depth) node.
 const playMatch = playSpecs
   ? (c) => playSpecs.some(({ engine, depth }) => c.eng === engine.eng && c.version === engine.version && (depth == null || c.depth === depth))
   : null;
-const schedulable = playMatch ? competitors.filter(playMatch) : competitors;
+// --no-pin-play drops the pin on top of that, even if --play named it: it keeps its Elo 1500 from
+// the games already on disk, so new games all stay inside --depths instead of going to the one
+// node whose depth is fixed at --anchor-depth.
+const schedulable = (playMatch ? competitors.filter(playMatch) : competitors).filter((c) => cfg.pinPlay || c.id !== pinId);
 if (cfg.rounds !== 0 && schedulable.length < 2) {
-  console.error(`--play needs ≥2 schedulable nodes to play (got ${schedulable.length}); widen --play or --depths.`);
+  const widen = ['--depths', playMatch ? '--play' : null, cfg.pinPlay ? null : 'drop --no-pin-play'].filter(Boolean).join(' / ');
+  console.error(`Need ≥2 schedulable nodes to play (got ${schedulable.length}); widen ${widen}.`);
   process.exit(1);
 }
 
@@ -373,6 +392,38 @@ function combinedPairs() {
   return m;
 }
 
+// --- rated pool = competitors + every node the store already knows --------------
+// --engines / --depths / --play decide who PLAYS. They don't decide who EXISTS: a node that
+// falls outside this run's selection keeps the games it already played, so it stays in the fit
+// and keeps its ledger row instead of dropping off the ladder for a run. So `--depths=1-3`
+// narrows the schedule, not the ledger — depths 4-8 stay rated from the store.
+// A node whose engine this run can't resolve (a champion that was pruned from the archive) is
+// still rated from its games; it just can't play again, which the ledger marks recoverable:false.
+let ratedCache = null;
+function ratedNodes() {
+  const pairs = combinedPairs();
+  if (ratedCache && ratedCache.size === pairs.size) return ratedCache.list;
+  const list = [...competitors];
+  const have = new Set(list.map((c) => c.id));
+  for (const key of pairs.keys()) {
+    for (const id of key.split('|')) {
+      if (have.has(id)) continue;
+      have.add(id);
+      const t = parseTag(id);
+      const d = Number(t?.depth);
+      if (!t || !Number.isFinite(d)) continue;      // 't' (time-budget) tags aren't pool nodes
+      // An `elo<N>` version is a STRENGTH LABEL, not an identity: two candidates that measured
+      // the same Elo carry the same tag, so its games aren't one engine's games. Ephemeral
+      // candidates stay out of the fit (they were never pool nodes) — see ephemeralVersion.
+      if (/^elo-?\d+$/.test(t.version)) continue;
+      const e = engines.find((x) => x.eng === t.eng && x.version === t.version);
+      list.push(e ? node(e, d) : { id, eng: t.eng, eval: null, weights: null, version: t.version, depth: d });
+    }
+  }
+  ratedCache = { size: pairs.size, list };
+  return list;
+}
+
 function record(idA, idB, gamesPlayed, scoreA) {
   // scoreA = A's average score (wins+0.5 draws)/games, from apos-match.
   const key = pairKey(idA, idB);
@@ -387,7 +438,7 @@ function record(idA, idB, gamesPlayed, scoreA) {
 // --- Bradley-Terry fit (MM algorithm) ------------------------------------------
 const ELO_VAR = (400 / Math.LN10) ** 2; // beta-variance -> Elo-variance (Elo = (400/ln10)·beta)
 function fit() {
-  const ids = competitors.map((c) => c.id);
+  const ids = ratedNodes().map((c) => c.id);
   const gamma = new Map(ids.map((id) => [id, 1]));
   const W = new Map(ids.map((id) => [id, cfg.prior * 0.5])); // points, incl. prior half-draws vs phantom
   const adj = new Map(ids.map((id) => [id, []]));            // id -> [{opp, N}]
@@ -760,14 +811,18 @@ function printConvergence(rep) {
 // ledger is always reasonably fresh even if the run is killed hard.
 function writeRankLedger(verbose) {
   const { elo, ci, varDiff, gamesOf } = fit();
-  const ranked = [...competitors].sort((a, b) => elo.get(a.id) - elo.get(b.id));
+  const rated = ratedNodes();
+  const ratedById = new Map(rated.map((c) => [c.id, c]));
+  const ranked = [...rated].sort((a, b) => elo.get(a.id) - elo.get(b.id));
   const recordsByVersion = new Map();
   for (const [tag, n] of tagCounts) { const t = parseTag(tag); if (!t) continue; const k = `${t.eng}@${t.version}`; recordsByVersion.set(k, (recordsByVersion.get(k) || 0) + n); }
   const ranking = ranked.map((c) => ({
     tag: c.id, eng: c.eng, version: c.version, name: niceName(c.version), depth: String(c.depth),
     anchor: c.id === pinId, elo: elo.get(c.id), score: null,
     margin: ci.get(c.id) ?? null, games: gamesOf(c.id),
-    records: recordsByVersion.get(`${c.eng}@${c.version}`) || 0, recoverable: true, file: c.weights,
+    // No eval means the store has games for a node this run can't build an engine for, so its
+    // rating stands but nothing can play it again until its weights are back in the archive.
+    records: recordsByVersion.get(`${c.eng}@${c.version}`) || 0, recoverable: !!c.eval, file: c.weights ?? null,
   }));
   const unrecoverable = [];
   if (cfg.scan) {
@@ -775,8 +830,8 @@ function writeRankLedger(verbose) {
       const t = parseTag(tag);
       if (!t) { unrecoverable.push({ tag, records: n, reason: 'malformed tag' }); continue; }
       if (/^elo-?\d+$/.test(t.version)) continue;       // ephemeral candidate tag — self-describing
-      if (byId.has(tag)) continue;                       // ranked node at this exact depth
-      if (competitors.some((c) => c.eng === t.eng && c.version === t.version)) continue; // engine ranked (other depth)
+      if (ratedById.has(tag)) continue;                  // rated node at this exact depth
+      if (rated.some((c) => c.eng === t.eng && c.version === t.version)) continue; // engine rated (other depth)
       let reason;
       if (t.version === '?') reason = 'material fallback (drop --no-material to rank it)';
       else if (t.eng === 'hc') reason = `old handcrafted (HC_VERSION now ${HC_VERSION})`;
@@ -790,7 +845,10 @@ function writeRankLedger(verbose) {
     generated: new Date().toISOString(), anchor: pinId, method: 'bradley-terry-pool',
     depths: cfg.depths, games: cfg.games, seed: cfg.seed,
     dataset: cfg.scan ? { file: cfg.data, totalLines, withV: totalLines - noV, legacyNoTag } : null,
-    convergence: conv.summary,
+    // `nodes` is the convergence scope (this run's own competitors — the nodes it can still
+    // buy games for), `rated` the whole ledger. They differ whenever the store carries nodes
+    // outside --engines/--depths, so the verdict stays about what this run can actually fix.
+    convergence: { ...conv.summary, nodes: competitors.length, rated: ranked.length },
     ranking, unrecoverable,
   };
   mkdirSync(dirname(cfg.ledger), { recursive: true });
@@ -800,7 +858,8 @@ function writeRankLedger(verbose) {
   console.log(`  ${'#'.padStart(3)} ${'engine'.padEnd(16)} ${'name'.padEnd(12)} ${'Elo'.padStart(8)} ${'±95'.padStart(6)} ${'games'.padStart(7)}`);
   for (const [i, c] of ranked.entries()) {
     const rank = ranked.length - i; // ranked is weakest-first, so #1 = strongest
-    console.log(`  ${String(rank).padStart(3)} ${c.id.padEnd(16)} ${(niceName(c.version) || '').padEnd(12)} ${elo.get(c.id).toFixed(0).padStart(8)} ${(ci.get(c.id) == null ? '' : ci.get(c.id).toFixed(0)).padStart(6)} ${String(gamesOf(c.id)).padStart(7)}${c.id === pinId ? '  (pin)' : ''}`);
+    const note = c.id === pinId ? '  (pin)' : byId.has(c.id) ? '' : '  (carried — rated, not scheduled this run)';
+    console.log(`  ${String(rank).padStart(3)} ${c.id.padEnd(16)} ${(niceName(c.version) || '').padEnd(12)} ${elo.get(c.id).toFixed(0).padStart(8)} ${(ci.get(c.id) == null ? '' : ci.get(c.id).toFixed(0)).padStart(6)} ${String(gamesOf(c.id)).padStart(7)}${note}`);
   }
   if (unrecoverable.length) {
     console.log(`\n  Unrecoverable contributors (no Elo -> weakest, refresh on sight):`);
@@ -811,7 +870,7 @@ function writeRankLedger(verbose) {
   // the ledger (e.g. filter to one version for that net's depth curve), not a separate artifact.
   if (cfg.csv) {
     const rows = ['engine,version,depth,elo,ci95,games'];
-    for (const c of [...competitors].sort((a, b) => a.eng.localeCompare(b.eng) || a.version.localeCompare(b.version) || a.depth - b.depth))
+    for (const c of [...rated].sort((a, b) => a.eng.localeCompare(b.eng) || a.version.localeCompare(b.version) || a.depth - b.depth))
       rows.push([`${c.eng}${c.depth}`, c.version, c.depth, elo.get(c.id).toFixed(1), (ci.get(c.id) ?? '').toString(), gamesOf(c.id)].join(','));
     writeFileSync(cfg.csv, rows.join('\n') + '\n');
     console.log(`\nCSV -> ${cfg.csv}`);
@@ -824,9 +883,32 @@ console.log(`Engine ranking pool (active scheduler)`);
 console.log(`  ${competitors.length} node(s): ${competitors.map((c) => `${c.id.split('@')[0]}@${c.version.slice(0, 6)}${niceName(c.version) ? ` (${niceName(c.version)})` : ''}`).join(', ')}`);
 console.log(`  pin ${pinId} | ${cfg.games} games/matchup | onboard ${cfg.onboard ? `${cfg.onboard}×avg` : 'off'} | ${cfg.jobs} parallel job(s) | store ${cfg.store}`);
 if (playMatch) console.log(`  --play: new games only among ${schedulable.map(nodeLabel).join(', ')} (rest rated from existing data)`);
+if (!cfg.pinPlay) console.log(`  --no-pin-play: ${pinId} is rated but plays nothing new (${schedulable.length} schedulable node(s))`);
+else if (!cfg.depths.includes(cfg.anchorDepth)) console.log(`  note: the pin is at depth ${cfg.anchorDepth}, outside --depths, so it plays cross-depth games (--no-pin-play keeps new games inside --depths)`);
 console.log(`  games -> ${cfg.saveGames || '(not harvested; --no-save-games)'}`);
 if (cfg.rounds !== 0) await scanDataset(); // once up front, so the periodic ledger emit has record counts
 await scanCorpus(); // fold the dataset's game results into the fit (no-op unless --corpus)
+
+// Everything the store already knows is rated alongside this run's nodes, so say how much of
+// the ladder is carried rather than played — the ledger is wider than the schedule.
+{
+  const carried = ratedNodes().length - competitors.length;
+  if (carried > 0) console.log(`  rated pool: ${ratedNodes().length} node(s) — ${carried} carried from the store/corpus (rated from their existing games, not scheduled this run)`);
+}
+
+// The pin only puts the pool on the absolute scale if it's actually connected to it. With
+// --no-pin-play that connection has to already exist on disk, so say how strong it is (or that
+// there isn't one, in which case the printed Elos are relative and the 1500 means nothing).
+if (!cfg.pinPlay && cfg.rounds !== 0) {
+  const rated = new Set(ratedNodes().map((c) => c.id));
+  let pinGames = 0;
+  for (const [key, v] of combinedPairs()) {
+    const [i, j] = key.split('|');
+    if ((i === pinId && rated.has(j)) || (j === pinId && rated.has(i))) pinGames += v.games;
+  }
+  if (pinGames) console.log(`  ${pinId} is anchored by ${pinGames} game(s) already in the store/corpus.`);
+  else console.warn(`  WARNING: ${pinId} has no games against this pool, so nothing ties these ratings to Elo ${PIN_ELO} — they're relative only. Run once without --no-pin-play, or point --data at a dataset the pin appears in.`);
+}
 
 if (cfg.rounds === 0) {
   // Offline: no matches — just persist the (possibly merged) store, refit, and emit.

@@ -201,7 +201,9 @@ function legend(items, onToggle) {
 // ------------------------------------------------------------------- state
 const State = {
   ladder: null, champs: null, summary: null, pool: null,
-  depthSel: new Set(), depthMode: 'fixed', ladderDepth: 6, ladderMode: 'depth',
+  // Depth pickers start unset and are resolved from the data on first render (see pickDepth) —
+  // a hardcoded default filters every view down to nothing when a run doesn't cover that depth.
+  depthSel: new Set(), depthMode: 'fixed', ladderDepth: null, ladderMode: 'depth',
 };
 // Controls for the game currently open in the viewer; driven by keyboard hotkeys.
 let activeViewer = null;
@@ -227,6 +229,39 @@ function groupVersions() {
   return map;
 }
 function bestNode(v) { let best = null; for (const r of v.byDepth.values()) if (!best || r.elo > best.elo) best = r; return best; }
+
+// ---------------------------------------------------------------- depth pickers
+// The depths the RANKING actually contains, not `ladder.depths` (which is only what the
+// current run schedules). A `--depths=1-3` run still carries the depth-6 anchor row, so the
+// two lists differ and the pin has to stay reachable in the dropdowns.
+function availableDepths() {
+  const seen = new Set();
+  for (const r of State.ladder?.ranking || []) { const d = Number(r.depth); if (Number.isFinite(d)) seen.add(d); }
+  if (!seen.size) for (const d of State.ladder?.depths || [1, 2, 3, 4, 5, 6, 7, 8]) seen.add(Number(d));
+  return [...seen].sort((a, b) => a - b);
+}
+// Keep the depth the user picked as long as the data still has nodes at it, otherwise snap to
+// the deepest one that does. Runs on every render, not once — State survives live reloads, and
+// a run that changes --depths must not leave the views pinned to a depth that no longer exists.
+function pickDepth(current, pred = () => true, min = 2) {
+  const count = new Map();
+  for (const r of State.ladder?.ranking || []) {
+    if (!pred(r)) continue;
+    const d = Number(r.depth);
+    count.set(d, (count.get(d) || 0) + 1);
+  }
+  // An explicit pick survives on a single node (the anchor's own depth is worth a look). Only
+  // the auto-picked default insists on `min`, so it lands on a board that has rows in it.
+  if (current != null && (count.get(Number(current)) || 0) >= 1) return Number(current);
+  const usable = [...count.entries()].filter(([, n]) => n >= min).map(([d]) => d);
+  if (usable.length) return Math.max(...usable);
+  return availableDepths().at(-1) ?? null;
+}
+function depthSelect(value, onPick, depths = availableDepths(), extra = []) {
+  return el('select', { onchange: (e) => onPick(e.target.value) },
+    ...[...extra, ...depths].map((d) => el('option', { value: d, selected: String(d) === String(value) ? '' : null },
+      d === 'all' ? 'all depths' : `depth ${d}`)));
+}
 
 // ================================================================= LADDER view
 function renderLadder() {
@@ -274,7 +309,7 @@ function renderLadder() {
     el('h3', {}, 'Pool'),
     el('div', { class: 'stat small' }, fmt(State.ladder.ranking?.length), el('span', { class: 'unit' }, 'nodes')),
     el('div', { class: 'kv mt' }, el('span', { class: 'k' }, 'Champions'), el('span', { class: 'v' }, fmt([...versions.values()].filter((v) => v.gen != null).length))),
-    el('div', { class: 'kv' }, el('span', { class: 'k' }, 'Ladder games'), el('span', { class: 'v' }, fmt(S.counts?.games))),
+    el('div', { class: 'kv' }, el('span', { class: 'k' }, 'Ladder games'), el('span', { class: 'v', id: 'statLadderGames' }, fmt(S.counts?.games))),
     el('div', { class: 'kv' }, el('span', { class: 'k' }, 'Dataset positions'), el('span', { class: 'v' }, fmt(S.meta?.dataset?.totalLines))),
     el('div', { class: 'kv' }, el('span', { class: 'k' }, 'Ledger updated'), el('span', { class: 'v' }, S.meta?.generated ? new Date(S.meta.generated).toLocaleString() : '–')),
   ));
@@ -282,17 +317,17 @@ function renderLadder() {
 
   // ---- toolbar
   const tb = el('div', { class: 'toolbar mt' });
-  const depths = State.ladder.depths || [1, 2, 3, 4, 5, 6, 7, 8];
+  State.ladderDepth = pickDepth(State.ladderDepth);
   const modeSeg = el('div', { class: 'seg' },
     segBtn('Best depth', State.ladderMode === 'best', () => { State.ladderMode = 'best'; renderLadder(); }),
     segBtn('By depth', State.ladderMode === 'depth', () => { State.ladderMode = 'depth'; renderLadder(); }));
   tb.append(el('label', {}, 'View', modeSeg));
   if (State.ladderMode === 'depth') {
-    const sel = el('select', { onchange: (e) => { State.ladderDepth = Number(e.target.value); renderLadder(); } },
-      ...depths.map((d) => el('option', { value: d, selected: d === State.ladderDepth ? '' : null }, `depth ${d}`)));
-    tb.append(el('label', {}, 'Depth', sel));
+    tb.append(el('label', {}, 'Depth',
+      depthSelect(State.ladderDepth, (v) => { State.ladderDepth = Number(v); renderLadder(); })));
   }
-  tb.append(el('span', { class: 'sub' }, State.ladderMode === 'best' ? 'Each engine at its strongest depth.' : `All engines searching to depth ${State.ladderDepth}. Anchor hc6@2 ≡ 1500.`));
+  const anchorTag = State.ladder.anchor || 'the anchor';
+  tb.append(el('span', { class: 'sub' }, State.ladderMode === 'best' ? 'Each engine at its strongest depth.' : `All engines searching to depth ${State.ladderDepth}. Anchor ${anchorTag} ≡ 1500.`));
   root.append(tb);
 
   // ---- leaderboard rows
@@ -303,6 +338,10 @@ function renderLadder() {
     rows = [...versions.values()].map((v) => ({ v, r: v.byDepth.get(State.ladderDepth) })).filter((x) => x.r);
   }
   rows.sort((a, b) => b.r.elo - a.r.elo);
+  if (!rows.length) {
+    root.append(el('div', { class: 'empty-state' }, `No rated node searches to depth ${State.ladderDepth}. Pick another depth.`));
+    return;
+  }
   const maxElo = Math.max(...rows.map((x) => x.r.elo));
   const minElo = Math.min(...rows.map((x) => x.r.elo));
 
@@ -347,18 +386,23 @@ function convBadge(c) {
 function renderGenerations() {
   const root = $('#view-generations'); root.innerHTML = '';
   const versions = [...groupVersions().values()].filter((v) => v.gen != null).sort((a, b) => a.gen - b.gen);
-  const depths = State.ladder.depths || [1, 2, 3, 4, 5, 6, 7, 8];
-  if (!State.genDepth) State.genDepth = 6;
+  // Default to the deepest depth the CHAMPIONS were rated at — the anchor's depth usually has
+  // only the anchor, and a run at other depths leaves it with no champion curve to draw.
+  const isChampRow = (r) => State.champs?.byHash?.[r.version]?.gen != null;
+  State.genDepth = pickDepth(State.genDepth, isChampRow);
 
   const tb = el('div', { class: 'toolbar' });
   tb.append(el('label', {}, 'At depth',
-    el('select', { onchange: (e) => { State.genDepth = Number(e.target.value); renderGenerations(); } },
-      ...depths.map((d) => el('option', { value: d, selected: d === State.genDepth ? '' : null }, `depth ${d}`)))));
+    depthSelect(State.genDepth, (v) => { State.genDepth = Number(v); renderGenerations(); })));
   tb.append(el('span', { class: 'sub' }, 'Champion strength across train:loop generations — the climb.'));
   root.append(el('h2', { class: 'section' }, 'Generational progress ', el('span', { class: 'sub' }, '· Elo of each loop champion')));
   root.append(tb);
 
   const pts = versions.map((v) => { const r = v.byDepth.get(State.genDepth); return r ? { x: v.gen, y: r.elo, meta: v, name: v.name } : null; }).filter(Boolean);
+  if (!pts.length) {
+    root.append(el('div', { class: 'empty-state' }, `No champion is rated at depth ${State.genDepth}. Pick a depth this run covers.`));
+    return;
+  }
   // hc reference at same depth
   const hc = [...groupVersions().values()].find((v) => v.eng === 'hc' && v.version === '2');
   const hcNode = hc?.byDepth.get(State.genDepth);
@@ -415,12 +459,20 @@ function renderDepth() {
     points: [...v.byDepth.values()].map((r) => ({ x: Number(r.depth), y: r.elo })).sort((a, b) => a.x - b.x),
   }));
 
+  // x-axis spans the depths actually plotted — a run at --depths=1-3 shouldn't leave half the
+  // chart empty, and a node rated only at the anchor depth should show its gap honestly.
+  const xs = series.flatMap((s) => s.points.map((p) => p.x));
+  const xLo = xs.length ? Math.min(...xs) : 1;
+  const xHi = Math.max(xLo + 1, xs.length ? Math.max(...xs) : 8);
+  const xTicks = [];
+  for (let d = Math.floor(xLo); d <= Math.ceil(xHi); d++) xTicks.push(d);
+
   const card = el('div', { class: 'card pad0' });
   const wrap = el('div', { class: 'chart-wrap', style: { padding: '10px' } });
   if (series.length) {
     wrap.append(lineChart({
       height: 440, series, directLabels: true,
-      xDomain: [0.7, 8.3], xTicks: [1, 2, 3, 4, 5, 6, 7, 8],
+      xDomain: [xLo - 0.3, xHi + 0.3], xTicks,
       xLabel: 'search depth (plies)', yLabel: 'Elo',
       formatX: (d) => `depth ${fmt(d)}`, formatY: (v) => fmt(v),
       margin: { r: 120 },
@@ -466,12 +518,13 @@ async function renderMatchups() {
   const present = new Set();
   for (const k of Object.keys(pairs)) { const [a, b] = k.split('|'); present.add(a); present.add(b); }
 
-  const depths = ['all', ...(State.ladder.depths || [1, 2, 3, 4, 5, 6, 7, 8])];
-  if (State.mDepth === undefined) State.mDepth = 6;
+  // Default to a depth whose nodes have actually played each other, so the heatmap opens with
+  // cells in it rather than a filter that matches one lonely node.
+  if (State.mDepth !== 'all') State.mDepth = pickDepth(State.mDepth ?? null, (r) => present.has(r.tag));
   if (State.mFam === undefined) State.mFam = 'all';
   const tb = el('div', { class: 'toolbar' });
-  tb.append(el('label', {}, 'Depth', el('select', { onchange: (e) => { State.mDepth = e.target.value === 'all' ? 'all' : Number(e.target.value); renderMatchups(); } },
-    ...depths.map((d) => el('option', { value: d, selected: String(d) === String(State.mDepth) ? '' : null }, d === 'all' ? 'all depths' : `depth ${d}`)))));
+  tb.append(el('label', {}, 'Depth', depthSelect(State.mDepth,
+    (v) => { State.mDepth = v === 'all' ? 'all' : Number(v); renderMatchups(); }, availableDepths(), ['all'])));
   tb.append(el('label', {}, 'Family', el('select', { onchange: (e) => { State.mFam = e.target.value; renderMatchups(); } },
     ...['all', 'nn', 'hc'].map((f) => el('option', { value: f, selected: f === State.mFam ? '' : null }, f === 'all' ? 'all engines' : f)))));
 
@@ -570,7 +623,11 @@ async function loadGameList() {
   const list = $('#gamesList'); if (!list) return;
   list.innerHTML = '';
   const cnt = $('#gamesCount'); if (cnt) cnt.textContent = `${fmt(data.total)} games${(f.a || f.b) ? ' match this filter' : ' total'} · showing ${data.games.length}`;
-  if (!data.games.length) { list.append(el('div', { class: 'empty-state' }, 'No games.')); activeViewer = null; return; }
+  if (!data.games.length) { list.append(el('div', { class: 'empty-state' }, 'No games.')); activeViewer = null; State.openGame = null; return; }
+  // A live run rebuilds this list under the user, so keep the open game and the ply it was on
+  // when it is still in the page. Only fall back to the newest game when it isn't.
+  const keep = State.openGame && data.games.some((g) => g.g === State.openGame.g) ? State.openGame : null;
+  const openId = keep ? keep.g : data.games[0].g;
   for (const g of data.games) {
     const resChar = g.r === 1 ? 'W' : g.r === -1 ? 'B' : '½';
     const resClass = g.r === 1 ? 'w' : g.r === -1 ? 'l' : 'd';
@@ -578,11 +635,11 @@ async function loadGameList() {
       el('div', { class: `res ${resClass}` }, resChar),
       el('div', {}, el('div', {}, `${tagLabel(g.w)}  vs  ${tagLabel(g.b)}`), el('div', { class: 'sub mono' }, g.g)),
       el('div', { class: 'sub num' }, `${g.n} plies`));
+    if (g.g === openId) row.style.background = 'var(--surface-2)';
     row.addEventListener('click', () => { $$('.game-row', list).forEach((r) => r.style.background = ''); row.style.background = 'var(--surface-2)'; openGame(g.g); });
     list.append(row);
   }
-  // auto-open first
-  openGame(data.games[0].g);
+  openGame(openId, keep ? keep.ply : null);
 }
 
 // ---- board + eval game viewer (blue2 board + Merida pieces, matching the app)
@@ -630,12 +687,13 @@ function whitePovEval(game) {
     return { i, mate: Math.abs(v) > 50000, v: val };
   });
 }
-async function openGame(g) {
+async function openGame(g, startPly = null) {
   const wrap = $('#gameViewerWrap'); if (!wrap) return;
   wrap.innerHTML = '<div class="empty-state">Loading…</div>';
   const game = await api(`/api/game?g=${encodeURIComponent(g)}`);
   if (game.error) { wrap.innerHTML = '<div class="empty-state">Game not found.</div>'; return; }
-  const state = { ply: game.moves.length };
+  const state = { ply: startPly == null ? game.moves.length : Math.max(0, Math.min(game.moves.length, startPly)) };
+  State.openGame = { g, ply: state.ply };
   wrap.innerHTML = '';
 
   const info = el('div', { class: 'flex wrap', style: { justifyContent: 'space-between', marginBottom: '10px' } },
@@ -649,7 +707,7 @@ async function openGame(g) {
   const btn = (t, on) => el('button', { onclick: on }, t);
   let playTimer = null;
   const stop = () => { if (playTimer) { clearInterval(playTimer); playTimer = null; playBtn.textContent = '▶'; } };
-  const setPly = (p) => { state.ply = Math.max(0, Math.min(game.moves.length, p)); range.value = String(state.ply); draw(); };
+  const setPly = (p) => { state.ply = Math.max(0, Math.min(game.moves.length, p)); State.openGame = { g, ply: state.ply }; range.value = String(state.ply); draw(); };
   const playBtn = btn('▶', () => {
     if (playTimer) { stop(); return; }
     playBtn.textContent = '❚❚';
@@ -823,21 +881,35 @@ themeBtn.addEventListener('click', () => {
 if (localStorage.getItem('viz-theme')) document.documentElement.setAttribute('data-theme', localStorage.getItem('viz-theme'));
 
 // live SSE
+// A running rank:pool appends a finished game every second or two but only rewrites the ledger
+// and the pool once a whole matchup lands. Rebuilding the DOM per appended game would reset the
+// scroll position, the heatmap and the open replay every second, so those files only refresh the
+// counters — a view rebuild waits for data that actually changes the view.
+const VOLATILE_FILES = /(ladder-games\.jsonl|match-timing\.json|loop\.log)$/;
+function refreshCounters() {
+  const n = $('#statLadderGames');
+  if (n) n.textContent = fmt(State.summary?.counts?.games);
+}
 function connectLive() {
   const pill = $('#livePill'); const txt = $('#liveText');
   const es = new EventSource('/api/events');
   es.onopen = () => { pill.classList.add('on'); txt.textContent = 'live'; };
   es.onerror = () => { pill.classList.remove('on'); txt.textContent = 'reconnecting…'; };
   let reloadTimer = null;
+  let structural = false; // sticky across the events the timer coalesces
   es.onmessage = (ev) => {
     let msg; try { msg = JSON.parse(ev.data); } catch { return; }
     if (msg.type !== 'change') return;
+    const files = msg.files || [];
+    structural = structural || !files.length || files.some((f) => !VOLATILE_FILES.test(f));
     txt.textContent = 'updating…';
     clearTimeout(reloadTimer);
     reloadTimer = setTimeout(async () => {
+      const rebuild = structural;
+      structural = false;
       State.pool = null;
       await loadCore();
-      switchView(currentView);
+      if (rebuild) switchView(currentView); else refreshCounters();
       txt.textContent = 'live';
     }, 300);
   };

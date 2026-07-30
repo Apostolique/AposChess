@@ -20,6 +20,11 @@ npm run viz -- --port=6000
 No install step, no bundler: pure `node:http` + `node:fs`. Open browsers refresh
 themselves over SSE whenever a watched file changes.
 
+While `rank:pool` runs, a finished game is appended to `ladder-games.jsonl` every
+second or two, so those changes only refresh the counters. A view rebuilds when the
+ledger, the pool or a training track changes, and the game you have open keeps its
+place across the rebuild.
+
 ## Views
 
 - **Ladder** — leaderboard at a chosen depth (or each engine's best depth),
@@ -27,13 +32,18 @@ themselves over SSE whenever a watched file changes.
   jump to its depth curve.
 - **Generations** — champion Elo across `train:loop` generations, plus Elo gained
   per generation.
-- **Depth × Elo** — one line per engine of Elo vs search depth (1–8); toggle
-  engines, read Elo-per-ply slopes.
+- **Depth × Elo** — one line per engine of Elo vs search depth, over the depths
+  actually rated. Toggle engines, read Elo-per-ply slopes.
 - **Matchups** — head-to-head heatmap of the games actually played in the ranking
   pool (diverging blue↔orange around 50%). Click a cell for the games.
 - **Games** — filter by engine / matchup, replay any game on a board with an eval
   graph (white-POV, mate-aware) and a clickable move list.
 - **Training** — per-experiment tracks: absElo and gate score over cycles.
+
+Every depth dropdown is built from the depths the ledger actually contains, and each
+view opens on the deepest one that has something to show. `rank:pool` rates every node
+its store knows, so a `--depths=1-3` run still puts depths 4-8 on the ladder — those
+nodes just aren't gaining games.
 
 ## Data sources (all read-only, re-read per request)
 
