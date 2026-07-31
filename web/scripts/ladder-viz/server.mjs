@@ -27,6 +27,8 @@ const LOOP = path.join(DATA, 'loop');
 const NN = path.join(ROOT, 'web', 'public', 'nn');
 const PUBLIC = path.join(__dirname, 'public');
 const ASSETS = path.join(ROOT, 'web', 'src', 'assets'); // blue2 board + merida pieces (shared with the app)
+const SRC = path.join(ROOT, 'web', 'src');              // board.js + engine.js, imported by the game viewer
+const SOUND = path.join(ROOT, 'web', 'public', 'sound'); // the app's move / capture / check sounds
 
 const F = {
   ledger: path.join(LOOP, 'engine-elo.ladder.json'),
@@ -302,7 +304,7 @@ function sendJson(res, obj, code = 200) {
   res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
   res.end(body);
 }
-const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png' };
+const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.mp3': 'audio/mpeg' };
 function sendFileFrom(res, baseDir, rel) {
   const file = path.join(baseDir, rel);
   if (!file.startsWith(baseDir)) { res.writeHead(403); res.end('forbidden'); return; }
@@ -374,6 +376,13 @@ const server = http.createServer((req, res) => {
   if (p === '/app.js') return sendStatic(res, 'app.js');
   if (p === '/style.css') return sendStatic(res, 'style.css');
   if (p.startsWith('/assets/')) return sendFileFrom(res, ASSETS, decodeURIComponent(p.slice('/assets/'.length)));
+  // The app's own sounds, so a replay clicks the way the site does.
+  if (p.startsWith('/sound/')) return sendFileFrom(res, SOUND, decodeURIComponent(p.slice('/sound/'.length)));
+  // The app's engine, so the viewer replays games through the real variant rules rather than a
+  // second copy of them (that is where check detection comes from). board.js and engine.js are
+  // plain ES modules with no bundler features, so the browser imports them as they ship — but
+  // nothing else in src/ is meant to be reachable, hence the .js-only gate.
+  if (p.startsWith('/src/') && p.endsWith('.js')) return sendFileFrom(res, SRC, decodeURIComponent(p.slice('/src/'.length)));
 
   res.writeHead(404); res.end('not found');
 });

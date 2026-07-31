@@ -1,6 +1,14 @@
 // AposChess ladder visualizer — client. Vanilla ES module, hand-rolled SVG
 // charts (no chart lib, no CDN). Everything is driven by the local server's
 // /api/* endpoints and refreshes live over SSE.
+//
+// The game viewer imports the app's own board and rules (served from web/src by
+// the tool server) instead of carrying a second copy: replaying a recorded game
+// through the real move generator is what makes the check sound and the material
+// trays agree with the site.
+
+import { parseFen, parseSquare, opponent, START_FEN } from '/src/board.js';
+import { legalMoves, applyMove, kingAttacked } from '/src/engine.js';
 
 // ------------------------------------------------------------------ utilities
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -692,41 +700,89 @@ async function loadGameList() {
 // URL over the view you switched to.
 const syncGamesUrl = () => { if (currentView === 'games') syncUrl(); };
 let viewerSeq = 0; // bumped per open; a slower fetch checks it before touching the DOM
-const pieceUrl = (color, role) => `/assets/pieces/merida/${color}${role.toUpperCase()}.svg`;
-function parseFen(fen) {
-  const [bp, turn] = fen.split(' ');
-  const board = new Array(64).fill(null);
-  const rows = bp.split('/');
-  for (let r = 0; r < 8; r++) {
-    const row = rows[7 - r]; let f = 0;
-    for (const ch of row) {
-      if (/\d/.test(ch)) { f += +ch; continue; }
-      const role = ch.toLowerCase(); const color = ch === role ? 'b' : 'w';
-      board[r * 8 + f] = { role, color }; f++;
-    }
-  }
-  return { board, whiteToMove: turn !== 'b' };
+const pieceUrl = (color, role) => `/assets/pieces/merida/${color === 'white' ? 'w' : 'b'}${role.toUpperCase()}.svg`;
+
+// A recorded move is UCI text; the engine wants the move object it generated, which also
+// carries the castle and promotion flags applyMove needs. Look it up among the legal moves
+// rather than reconstructing it, so a record that disagrees with the rules is caught here
+// instead of quietly producing a board that never existed.
+function moveFromUci(state, uci) {
+  const from = parseSquare(uci.slice(0, 2));
+  const to = parseSquare(uci.slice(2, 4));
+  const promotion = uci[4] ? uci[4].toLowerCase() : null;
+  return legalMoves(state).find((m) => m.from === from && m.to === to && (m.promotion || null) === promotion) || null;
 }
-function sqIdx(name) { return (name.charCodeAt(1) - 49) * 8 + (name.charCodeAt(0) - 97); }
-function applyMoveTo(board, mv) {
-  const from = sqIdx(mv.slice(0, 2)), to = sqIdx(mv.slice(2, 4)), promo = mv[4];
-  const p = board[from]; if (!p) return { from, to };
-  board[from] = null;
-  const np = promo ? { role: promo.toLowerCase(), color: p.color } : p;
-  board[to] = np;
-  // castling: king two files → move rook alongside
-  if (p.role === 'k' && Math.abs((to % 8) - (from % 8)) === 2) {
-    const rank = Math.floor(to / 8);
-    if (to % 8 === 6) { board[rank * 8 + 5] = board[rank * 8 + 7]; board[rank * 8 + 7] = null; }
-    else if (to % 8 === 2) { board[rank * 8 + 3] = board[rank * 8 + 0]; board[rank * 8 + 0] = null; }
+
+// Replay the game once when it opens, into one entry per ply. Each carries what the board,
+// the trays and the sounds need: the squares the move touched, whether it captured, and
+// whether it left the side to move in check. Precomputed rather than re-derived per ply —
+// a running replay redraws twice a second, and the check flag costs a move generation.
+//
+// A ply the rules reject ends the replay, and the viewer says where it stopped. These
+// records are written by the engines themselves, so that would be a bug worth seeing.
+function replay(game) {
+  let state = parseFen(game.start || START_FEN);
+  const plies = [{ state, last: null, capture: false, check: false }];
+  for (const uci of game.moves) {
+    const m = moveFromUci(state, uci);
+    if (!m) break;
+    const capture = !!state.board[m.to];
+    state = applyMove(state, { ...m, capture });
+    plies.push({ state, last: { from: m.from, to: m.to }, capture, check: kingAttacked(state.board, state.turn) });
   }
-  return { from, to };
+  return plies;
 }
-function boardAtPly(game, ply) {
-  const { board, whiteToMove } = parseFen(game.start || 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1');
-  let last = null;
-  for (let i = 0; i < ply; i++) last = applyMoveTo(board, game.moves[i]);
-  return { board, last, whiteToMove };
+
+// --- material difference (the app's trays, same rules) -----------------------
+// Read off the BOARD rather than from capture history: per role, this side's surplus of
+// pieces still standing. Equal trades cancel for free and a promotion reads correctly.
+// The point values are the app's, which are the familiar chess ones rather than the
+// engine's own (in this variant a knight is worth about a rook).
+const POINTS = { p: 1, n: 3, b: 3, r: 5, q: 9, k: 0 };
+function materialDiff(board, color) {
+  const counts = { white: {}, black: {} };
+  let pts = 0;
+  for (const p of board) {
+    if (!p) continue;
+    counts[p.color][p.role] = (counts[p.color][p.role] || 0) + 1;
+    pts += (p.color === 'white' ? 1 : -1) * POINTS[p.role];
+  }
+  const mine = counts[color], theirs = counts[opponent(color)];
+  const surplus = [];
+  for (const role of ['q', 'r', 'b', 'n', 'p']) { // descending value
+    for (let i = (mine[role] || 0) - (theirs[role] || 0); i > 0; i--) surplus.push(role);
+  }
+  return { surplus, adv: color === 'white' ? pts : -pts };
+}
+// One tray, built once per open and refilled per ply. Mono (single-colour) glyphs like the
+// app's — whose pieces they were is already said by the tray they sit in.
+function makeTray(who) {
+  const caps = el('div', { class: 'caps' });
+  const adv = el('span', { class: 'adv' });
+  const box = el('div', { class: 'tray' }, caps, adv, el('span', { class: 'who' }, who));
+  box.fill = (board, color) => {
+    const { surplus, adv: n } = materialDiff(board, color);
+    caps.innerHTML = surplus.map((role) => `<span class="cap cap-${role}"></span>`).join('');
+    adv.textContent = n > 0 ? `+${n}` : '';
+  };
+  return box;
+}
+
+// --- sounds ------------------------------------------------------------------
+// The app's three, with the app's priority: check beats capture (and covers checkmate,
+// which is also a check). One reusable element each, rewound before playing, so a fast
+// replay still clicks. Muting persists — this page sits open for hours next to a loop.
+const SOUNDS = {
+  move: new Audio('/sound/standard/Move.mp3'),
+  capture: new Audio('/sound/standard/Capture.mp3'),
+  check: new Audio('/sound/standard/Check.mp3'),
+};
+let muted = localStorage.getItem('viz-muted') === '1';
+function playMoveSound(capture, check) {
+  if (muted) return;
+  const a = check ? SOUNDS.check : capture ? SOUNDS.capture : SOUNDS.move;
+  a.currentTime = 0;
+  a.play().catch(() => {}); // ignore autoplay blocks before the first click on the page
 }
 function whitePovEval(game) {
   const startWhite = !(game.start && game.start.split(' ')[1] === 'b');
@@ -744,7 +800,11 @@ async function openGame(g, startPly = null, autoplay = false) {
   const game = await api(`/api/game?g=${encodeURIComponent(g)}`);
   if (seq !== viewerSeq) return; // a newer pick won the race — don't overwrite its viewer
   if (game.error) { wrap.innerHTML = '<div class="empty-state">Game not found.</div>'; return; }
-  const state = { ply: startPly == null ? game.moves.length : Math.max(0, Math.min(game.moves.length, startPly)) };
+  // Everything below indexes plies, so `lastPly` — not the record's move count — is the end of
+  // the board: they differ only when the replay hit a move the rules reject.
+  const plies = replay(game);
+  const lastPly = plies.length - 1;
+  const state = { ply: startPly == null ? lastPly : Math.max(0, Math.min(lastPly, startPly)) };
   State.openGame = { g, ply: state.ply };
   syncGamesUrl();
   wrap.innerHTML = '';
@@ -754,27 +814,37 @@ async function openGame(g, startPly = null, autoplay = false) {
     el('span', { class: `badge ${game.r === 1 ? 'good' : game.r === -1 ? 'crit' : 'neutral'}` }, game.r === 1 ? 'white won' : game.r === -1 ? 'black won' : 'draw'));
 
   const boardEl = el('div', { class: 'board' });
+  // Material trays flank the board the way the app's do: bottom is White, since the viewer
+  // always draws from White's side. Each names its engine, so the board says who is who.
+  const trayTop = makeTray(tagLabel(game.players.b));
+  const trayBottom = makeTray(tagLabel(game.players.w));
   const transport = el('div', { class: 'transport' });
   const readout = el('div', { class: 'ply-readout' });
-  const range = el('input', { type: 'range', min: '0', max: String(game.moves.length), value: String(state.ply) });
+  const range = el('input', { type: 'range', min: '0', max: String(lastPly), value: String(state.ply) });
   const btn = (t, on) => el('button', { onclick: on }, t);
   const stop = stopPlayback;
   // The URL carries the ply, but not while a replay is running: that would be a history write
   // twice a second, and the ply worth remembering is the one you stopped on.
-  const setPly = (p) => {
-    state.ply = Math.max(0, Math.min(game.moves.length, p));
+  // Forward moves are sounded, like the app's move tree: it sounds the ply you land on, and
+  // stepping back is silent. Dragging the slider is silent too — a scrub across a game would
+  // be a hundred sounds cutting each other off.
+  const setPly = (p, { silent = false } = {}) => {
+    const next = Math.max(0, Math.min(lastPly, p));
+    const forward = next > state.ply;
+    state.ply = next;
     State.openGame = { g, ply: state.ply };
     range.value = String(state.ply);
     draw();
+    if (forward && !silent) playMoveSound(plies[next].capture, plies[next].check);
     if (!isPlaying()) syncGamesUrl();
   };
   const play = () => {
     playBtn.textContent = '❚❚';
     playback = {
       timer: setInterval(() => {
-        if (state.ply >= game.moves.length) setPly(0);
+        if (state.ply >= lastPly) setPly(0);
         setPly(state.ply + 1);
-        if (state.ply >= game.moves.length) stopPlayback();
+        if (state.ply >= lastPly) stopPlayback();
       }, 550),
       onStop: () => { playBtn.textContent = '▶'; syncGamesUrl(); },
     };
@@ -785,21 +855,26 @@ async function openGame(g, startPly = null, autoplay = false) {
     btn('‹', () => { stop(); setPly(state.ply - 1); }),
     playBtn,
     btn('›', () => { stop(); setPly(state.ply + 1); }),
-    btn('⏭', () => { stop(); setPly(game.moves.length); }),
+    btn('⏭', () => { stop(); setPly(lastPly); }),
     range, readout);
-  range.addEventListener('input', () => { stop(); setPly(Number(range.value)); });
+  range.addEventListener('input', () => { stop(); setPly(Number(range.value), { silent: true }); });
 
   // expose to the global hotkey handler (← → step, Home/End jump, Space play)
   activeViewer = {
     prev: () => { stop(); setPly(state.ply - 1); },
     next: () => { stop(); setPly(state.ply + 1); },
     first: () => { stop(); setPly(0); },
-    last: () => { stop(); setPly(game.moves.length); },
+    last: () => { stop(); setPly(lastPly); },
     toggle: () => playBtn.click(),
   };
 
   const hint = el('div', { class: 'pill-note', style: { marginTop: '6px' } }, '← → step · ↑↓ / Home End jump · Space play');
-  const left = el('div', {}, boardEl, transport, hint);
+  const left = el('div', {}, trayTop, boardEl, trayBottom, transport, hint);
+  // Only when the replay stopped early — the record and the rules disagree from here on.
+  if (lastPly < game.moves.length) {
+    left.append(el('div', { class: 'pill-note', style: { color: 'var(--warning)' } },
+      `Replay stops at ply ${lastPly}: ${game.moves[lastPly]} is not legal here. The record has ${game.moves.length}.`));
+  }
   const movelist = el('div', { class: 'movelist' });
   // Held by reference, not looked up by id: a stale viewer must never be able to find this one.
   const evalBox = el('div', { class: 'chart-wrap', style: { padding: '8px' } });
@@ -807,17 +882,19 @@ async function openGame(g, startPly = null, autoplay = false) {
   const right = el('div', {}, info, evalWrap, movelist);
 
   function draw() {
-    const { board, last } = boardAtPly(game, state.ply);
+    const pos = plies[state.ply];
+    const board = pos.state.board, last = pos.last;
     boardEl.innerHTML = '';
     for (let r = 7; r >= 0; r--) for (let f = 0; f < 8; f++) {
       const idx = r * 8 + f;
-      const dark = (r + f) % 2 === 0;
       const sq = el('div', { class: `sq${last && (idx === last.from || idx === last.to) ? ' hl' : ''}` });
       const p = board[idx];
       if (p) sq.append(el('div', { class: 'piece', style: `background-image:url('${pieceUrl(p.color, p.role)}')` }));
       boardEl.append(sq);
     }
-    readout.textContent = `${state.ply} / ${game.moves.length}`;
+    trayTop.fill(board, 'black');
+    trayBottom.fill(board, 'white');
+    readout.textContent = `${state.ply} / ${lastPly}`;
     $$('.mv', movelist).forEach((m) => m.classList.toggle('on', Number(m.dataset.ply) === state.ply));
     drawEval();
   }
@@ -839,8 +916,8 @@ async function openGame(g, startPly = null, autoplay = false) {
     const xx = m.l + (state.ply / (game.moves.length || 1)) * iw;
     svg.append(el('line', { class: 'crosshair', x1: xx, x2: xx, y1: m.t, y2: 220 - m.b, style: `stroke:${css('--s4')}` }));
   }
-  // build movelist
-  for (let i = 0; i < game.moves.length; i++) {
+  // build movelist — only the plies that replayed, so every entry has a position to jump to
+  for (let i = 0; i < lastPly; i++) {
     if (i % 2 === 0) movelist.append(el('span', { class: 'mvno' }, `${i / 2 + 1}.`));
     const mv = el('span', { class: 'mv', 'data-ply': String(i + 1) }, game.moves[i]);
     mv.addEventListener('click', () => { stop(); setPly(i + 1); });
@@ -1016,6 +1093,20 @@ document.addEventListener('keydown', (e) => {
   e.preventDefault();
   activeViewer[action]();
 });
+
+// sound toggle — the replay is the only thing that makes noise, but this page is often open
+// beside other work, so the mute has to be one click away and has to survive a refresh.
+const soundBtn = $('#soundBtn');
+function paintSoundBtn() {
+  soundBtn.textContent = muted ? '🔇' : '🔊';
+  soundBtn.title = muted ? 'Unmute move sounds' : 'Mute move sounds';
+}
+soundBtn.addEventListener('click', () => {
+  muted = !muted;
+  localStorage.setItem('viz-muted', muted ? '1' : '0');
+  paintSoundBtn();
+});
+paintSoundBtn();
 
 // theme
 const themeBtn = $('#themeBtn');

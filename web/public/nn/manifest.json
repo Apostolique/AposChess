@@ -1,20 +1,6 @@
 {
-  "default": "Rosa",
+  "default": "Sven",
   "nets": [
-    {
-      "name": "Felix",
-      "file": "felix.json",
-      "arch": [
-        768,
-        64,
-        16,
-        1
-      ],
-      "loopChampion": true,
-      "hash": "08df7b",
-      "gen": 6,
-      "note": "Retired train:loop champion (08df7b, 2026-06-17)."
-    },
     {
       "name": "Greta",
       "file": "greta.json",
@@ -231,7 +217,23 @@
       "loopChampion": true,
       "hash": "98032b",
       "gen": 18,
-      "note": "train:loop champion Rosa (gen 18, 98032b, 2026-07-27).",
+      "note": "train:loop champion Rosa (gen 18, 98032b, 2026-07-27)."
+    },
+    {
+      "name": "Sven",
+      "file": "sven.json",
+      "arch": [
+        768,
+        128,
+        16,
+        16,
+        16,
+        1
+      ],
+      "loopChampion": true,
+      "hash": "4fa2d8",
+      "gen": 19,
+      "note": "train:loop champion Sven (gen 19, 4fa2d8, 2026-07-31).",
       "current": true
     }
   ]

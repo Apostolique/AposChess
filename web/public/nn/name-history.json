@@ -56,6 +56,18 @@
         1
       ],
       "note": "Retired train:loop champion (f63cda, 2026-06-16); pruned from the catalog 2026-07-27."
+    },
+    {
+      "name": "Felix",
+      "hash": "08df7b",
+      "gen": 6,
+      "arch": [
+        768,
+        64,
+        16,
+        1
+      ],
+      "note": "Retired train:loop champion (08df7b, 2026-06-17); pruned from the catalog 2026-07-31."
     }
   ]
 }

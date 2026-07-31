@@ -90,7 +90,9 @@ while a replay is running, so the URL holds the ply you stopped on.
 - **Matchups** — head-to-head heatmap of every game two engines have played
   (diverging blue↔orange around 50%). Click a cell for the games.
 - **Games** — filter by engine / matchup, replay any game on a board with an eval
-  graph (white-POV, mate-aware) and a clickable move list.
+  graph (white-POV, mate-aware) and a clickable move list. The board is the app's:
+  material trays either side, and the app's move / capture / check sounds as you step
+  forward (🔊 in the header mutes them, and the mute sticks).
 - **Training** — per-experiment tracks: absElo and gate score over cycles.
 
 The depth dropdown is built from the depths the ledger actually contains, and it opens on
@@ -98,6 +100,24 @@ the deepest one the champions were rated at. If a run drops the depth you had pi
 falls back rather than leaving every view empty. `rank:pool` rates every node its store
 knows, so a `--depths=1-3` run still puts depths 4-8 on the ladder, those nodes just
 aren't gaining games.
+
+## The viewer runs the real rules
+
+The game viewer imports `web/src/board.js` and `web/src/engine.js` — the app's own move
+generator, served straight out of the Vite tree (they are plain ES modules, so the browser
+takes them as they ship; the server only exposes `.js` under `/src/`). Opening a game
+replays it through `legalMoves` + `applyMove` once, into one entry per ply.
+
+That is where the check sound comes from: nothing in a record says a move gave check, and
+in this variant you cannot work it out with standard-chess logic — knights travel like
+rooks, bishops and rooks jump, and a king's safety zone repels enemy jumps. Reimplementing
+any of that here would be a second copy of frozen rules waiting to drift. It also means the
+board is exact rather than approximate: castling, promotions and the material trays all
+come from the same `applyMove` the app uses.
+
+A recorded move the rules reject stops the replay, and the viewer says which ply and which
+move. These records are written by the engines themselves, so that would be a real bug —
+worth showing rather than papering over. (150 games from each source replay clean today.)
 
 ## Data sources (all read-only, re-read per request)
 
