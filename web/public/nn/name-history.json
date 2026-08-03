@@ -68,6 +68,19 @@
         1
       ],
       "note": "Retired train:loop champion (08df7b, 2026-06-17); pruned from the catalog 2026-07-31."
+    },
+    {
+      "name": "Greta",
+      "hash": "22577c",
+      "gen": 7,
+      "arch": [
+        768,
+        64,
+        16,
+        8,
+        1
+      ],
+      "note": "Retired train:loop champion (22577c, 2026-06-18); pruned from the catalog 2026-08-03."
     }
   ]
 }
