@@ -151,6 +151,10 @@ svg.chart .axis-title { fill: var(--text-secondary); font-size: 12px; }
 svg.chart .gridline { stroke: var(--grid); stroke-width: 1; }
 svg.chart .baseline { stroke: var(--axis); stroke-width: 1; }
 svg.chart .series-line { fill: none; stroke-width: 2; }
+/* uncertainty band: a wash at the series hue, with the two bounds as hairlines so they read as
+   bounds without competing with the estimate. */
+svg.chart .series-band { fill-opacity: 0.1; stroke: none; }
+svg.chart .series-band-edge { fill: none; stroke-width: 1; stroke-opacity: 0.35; }
 svg.chart .dot { stroke: var(--surface-1); stroke-width: 1.5; }
 svg.chart .crosshair { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 3 3; }
 .legend { display: flex; flex-wrap: wrap; gap: 6px 14px; margin: 10px 2px 0; }
@@ -169,6 +173,7 @@ svg.chart .crosshair { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 
 .tooltip .tt-row { display: flex; justify-content: space-between; gap: 14px; }
 .tooltip .tt-row .k { color: var(--muted); display: inline-flex; align-items: center; gap: 6px; }
 .tooltip .tt-row .v { font-variant-numeric: tabular-nums; }
+.tooltip .tt-row .v .tt-band { color: var(--muted); margin-left: 8px; font-size: 11px; }
 
 /* ---- heatmap ---------------------------------------------------------- */
 .heat-scroll { overflow: auto; max-height: 74vh; border: 1px solid var(--border); border-radius: var(--radius); }
@@ -181,6 +186,10 @@ svg.chart .crosshair { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 
 .heat th.collab { position: sticky; top: 0; background: var(--surface-1); z-index: 1; height: 96px; }
 .heat th.collab div { transform: rotate(-90deg); white-space: nowrap; width: 20px; color: var(--text-secondary); }
 .heat th.corner { position: sticky; left: 0; top: 0; z-index: 3; background: var(--surface-1); }
+/* cross-depth columns: opponents a row played at another depth, kept past a divider so the
+   same-depth block still reads as a block. */
+.heat .sep { border-left: 2px dashed var(--border-strong); }
+.heat th.collab.off div { color: var(--muted); font-style: italic; }
 
 /* ---- game viewer ------------------------------------------------------ */
 .viewer { display: grid; grid-template-columns: minmax(320px, 460px) 1fr; gap: 18px; align-items: start; }

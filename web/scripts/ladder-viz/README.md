@@ -69,7 +69,7 @@ link is worth pasting:
 
 ```
 #/ladder?depth=8
-#/matchups?depth=6&fam=nn
+#/matchups?depth=6&fam=nn&cross=all
 #/games?a=nn8@2c9f1a&b=hc8@2&g=<game-id>&ply=42
 #/training?depth=8&track=mona
 ```
@@ -77,18 +77,45 @@ link is worth pasting:
 Back and forward work too. The ply is written while you step through a game but not
 while a replay is running, so the URL holds the ply you stopped on.
 
+## The heatmap can run past the picked depth
+
+The depth filter used to apply to both axes, so a cell only showed up when the row and the
+column sat at the same depth. That hides the first thing a new engine does. The ladder
+calibrates a fresh net against itself at depth 6, and the direct-link floor pairs it with a
+rated champion, so the day Tara arrived her depth-1 row was blank while carrying 128 games:
+28 against Tara d6 and 100 against Quinn d2.
+
+Rows are still the nodes at the picked depth. Columns can now run past them, and the
+`Cross-depth` dropdown says how far:
+
+- `for blank rows` (default) — a node whose every game was played at another depth gets its
+  opponents added as columns. That is 3 extra columns on top of 23 at depth 1.
+- `all opponents` — every off-depth opponent of every row. Complete, and wide: 23 rows by
+  115 columns at depth 6, mostly empty, since every node keeps a calibration link to itself
+  at depth 6 and to the handcrafted anchors.
+- `hide` — same-depth only, the square grid. A row the filter leaves blank gets named in the
+  toolbar instead, so it doesn't read as a node that never played.
+
+The extra columns sit past a dashed divider with their labels in italics, and they open the
+games on click like any other cell. `all depths` never has any, because there every opponent
+is already a row.
+
+New engines aren't the only ones this catches. At depth 4 the handcrafted anchor carries 820
+games and Quinn 742, and neither has a same-depth opponent.
+
 ## Views
 
 - **Ladder** — leaderboard at the shared depth (or each engine's best depth, at
   `all depths`), convergence verdict, current-champion card, latest gate result. Click
   a row to jump to its depth curve.
 - **Generations** — champion Elo across `train:loop` generations, plus Elo gained
-  per generation.
+  per generation. The line carries a band, see below.
 - **Depth × Elo** — one line per engine of Elo vs search depth, over the depths
   actually rated. Toggle engines, read Elo-per-ply slopes. Depth is the x-axis here, so
   nothing is filtered — a vertical marker shows where the other views are reading.
 - **Matchups** — head-to-head heatmap of every game two engines have played
-  (diverging blue↔orange around 50%). Click a cell for the games.
+  (diverging blue↔orange around 50%). Click a cell for the games. Columns can reach past the
+  picked depth, see above.
 - **Games** — filter by engine / matchup, replay any game on a board with an eval
   graph (white-POV, mate-aware) and a clickable move list. The board is the app's:
   material trays either side, and the app's move / capture / check sounds as you step
@@ -100,6 +127,34 @@ the deepest one the champions were rated at. If a run drops the depth you had pi
 falls back rather than leaving every view empty. `rank:pool` rates every node its store
 knows, so a `--depths=1-3` run still puts depths 4-8 on the ladder, those nodes just
 aren't gaining games.
+
+## The generations band, and what it does not say
+
+The champion line is drawn with its ±95 around it: a 10% wash in the series hue, the two bounds
+as hairlines, the Elo itself the only full-weight mark. Hover gives you the numbers,
+`1889` with `1842 – 1936` beside it.
+
+It is worth having because the interval moves by two orders of magnitude across the pool. A
+champion with a few thousand games at depth 6 sits at ±35, and the whole 13-generation climb from
+Hugo to Tara is +163, so the band is about half the height of the climb. A champion the ranker
+hasn't onboarded yet reads ±426, and the band swallows the chart. That is the correct picture.
+Sven's depth-1 rating right now is not a measurement of Sven at depth 1, it's the `--prior=1`
+virtual half-draw holding up a node whose entire record is 0 points from 42 games against Sven d6.
+Take the prior away and the fit sends it to −∞. It fixes itself: onboarding gives every node a
+real opponent within a run or two, and Tara's depth-1 band went from ±443 to ±91 over the course
+of one afternoon.
+
+The band is each node's ±95 **against the `hc6` pin**, so it answers "how well do we know where
+this champion sits on the scale". It does not answer "is generation N+1 above generation N".
+Every consecutive pair of champions has overlapping bands at every depth, and that is not a
+verdict: two vs-pin intervals share the path to the anchor, so subtracting them overstates the
+pairwise uncertainty badly. Two neighbours that played each other directly can have their
+difference pinned to ±15 while both still read ±50 vs the pin. The pairwise contrast variance is
+what settles the order, `rank:pool` computes it (`depth-ladder.mjs:794`) but doesn't persist it,
+so it isn't in the ladder file and isn't on this chart.
+
+For the same reason the Elo-gained bars below the line carry no error bars. A difference of two
+banded numbers is not a banded difference.
 
 ## The viewer runs the real rules
 

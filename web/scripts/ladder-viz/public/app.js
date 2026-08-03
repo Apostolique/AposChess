@@ -93,7 +93,9 @@ function lineChart(opts) {
   const iw = W - m.l - m.r, ih = H - m.t - m.b;
   const series = opts.series.filter((s) => s.points.length);
   const allX = series.flatMap((s) => s.points.map((p) => p.x));
-  const allY = series.flatMap((s) => s.points.map((p) => p.y));
+  // A band is data, so it sets the scale like any other value. One unmeasured point stretches the
+  // axis and flattens the rest of the curve, which is the honest reading of that point.
+  const allY = series.flatMap((s) => s.points.flatMap((p) => (s.band && p.lo != null ? [p.y, p.lo, p.hi] : [p.y])));
   const xd = opts.xDomain || [Math.min(...allX), Math.max(...allX)];
   let yd = opts.yDomain || [Math.min(...allY), Math.max(...allY)];
   if (yd[0] === yd[1]) yd = [yd[0] - 1, yd[1] + 1];
@@ -133,9 +135,26 @@ function lineChart(opts) {
     if (ref.label) g.append(el('text', { x: xx + 4, y: m.t + 10, style: `fill:${ref.color || css('--muted')}` }, ref.label));
   }
 
+  // Uncertainty bands, all of them before any line, so a later series' wash never sits on top of an
+  // earlier series' line. The fill is the series hue at 10% with the two bounds drawn as hairlines:
+  // the estimate keeps the only full-weight mark, and the bounds stay readable as bounds.
+  const sortX = (pts) => pts.slice().sort((a, b) => a.x - b.x);
+  for (const s of series) {
+    if (!s.band) continue;
+    const bp = sortX(s.points).filter((p) => p.lo != null && p.hi != null);
+    if (!bp.length) continue;
+    const at = (p, k) => `${x(p.x).toFixed(1)},${y(clampY(p[k], yd)).toFixed(1)}`;
+    const top = bp.map((p, i) => `${i ? 'L' : 'M'}${at(p, 'hi')}`).join(' ');
+    const bottom = bp.slice().reverse().map((p) => `L${at(p, 'lo')}`).join(' ');
+    g.append(el('path', { class: 'series-band', d: `${top} ${bottom} Z`, style: `fill:${s.color}` }));
+    for (const edge of ['hi', 'lo']) {
+      g.append(el('path', { class: 'series-band-edge', d: bp.map((p, i) => `${i ? 'L' : 'M'}${at(p, edge)}`).join(' '), style: `stroke:${s.color}` }));
+    }
+  }
+
   // series
   for (const s of series) {
-    const pts = s.points.slice().sort((a, b) => a.x - b.x);
+    const pts = sortX(s.points);
     const d = pts.map((p, i) => `${i ? 'L' : 'M'}${x(p.x).toFixed(1)},${y(clampY(p.y, yd)).toFixed(1)}`).join(' ');
     g.append(el('path', { class: 'series-line', d, style: `stroke:${s.color};${s.dash ? `stroke-dasharray:${s.dash}` : ''}` }));
     if (s.dots !== false) for (const p of pts) g.append(el('circle', { class: 'dot', cx: x(p.x), cy: y(clampY(p.y, yd)), r: p.mate ? 5 : 3.5, style: `fill:${p.mate ? css('--warning') : s.color}` }));
@@ -162,7 +181,11 @@ function lineChart(opts) {
     if (cx == null) return;
     cross.style.display = ''; cross.setAttribute('x1', x(cx)); cross.setAttribute('x2', x(cx));
     const here = flatPts.filter((p) => p.x === cx).sort((a, b) => b.y - a.y);
-    const rows = here.map((p) => `<div class="tt-row"><span class="k"><span class="swatch" style="background:${p.s.color}"></span>${p.s.label}</span><span class="v">${opts.formatY ? opts.formatY(p.y) : fmt(p.y, 1)}${p.mate ? ' ⚑' : ''}</span></div>`).join('');
+    const fy = (v) => (opts.formatY ? opts.formatY(v) : fmt(v, 1));
+    const rows = here.map((p) => {
+      const band = p.s.band && p.lo != null ? `<span class="tt-band">${fy(p.lo)} – ${fy(p.hi)}</span>` : '';
+      return `<div class="tt-row"><span class="k"><span class="swatch" style="background:${p.s.color}"></span>${p.s.label}</span><span class="v">${fy(p.y)}${p.mate ? ' ⚑' : ''}${band}</span></div>`;
+    }).join('');
     showTip(`<div class="tt-title">${opts.formatX ? opts.formatX(cx) : fmt(cx)}${opts.xLabel ? '' : ''}</div>${rows}`, ev.clientX, ev.clientY);
   });
   overlay.addEventListener('mouseleave', () => { hideTip(); cross.style.display = 'none'; });
@@ -223,6 +246,7 @@ const State = {
   depth: null,
   depthSel: new Set(),   // depth×Elo: which engines are plotted
   mFam: 'all',           // matchups: engine family filter
+  mCross: 'unlinked',    // matchups: which rows get cross-depth columns — none | unlinked | all
   gamesFilter: null,     // games: {a, b} tag filter
   openGame: null,        // games: {g, ply} currently in the viewer
   pendingGame: null,     // games: {g, ply} asked for by the URL, honoured once
@@ -429,10 +453,20 @@ function renderGenerations() {
   const tb = el('div', { class: 'toolbar' });
   tb.append(el('label', {}, 'At depth', depthSelect()));
   tb.append(el('span', { class: 'sub' }, `Champion strength across train:loop generations — the climb. ${State.depth === 'all' ? 'Each champion at its strongest depth, so the curve mixes depths. ' : ''}${depthNote}`));
-  root.append(el('h2', { class: 'section' }, 'Generational progress ', el('span', { class: 'sub' }, '· Elo of each loop champion')));
+  root.append(el('h2', { class: 'section' }, 'Generational progress ', el('span', { class: 'sub' }, '· Elo of each loop champion, banded by its ±95 against the pin')));
   root.append(tb);
 
-  const pts = versions.map((v) => { const r = atDepth(v); return r ? { x: v.gen, y: r.elo, meta: v, name: v.name } : null; }).filter(Boolean);
+  // lo/hi are the ladder's ±95 against the hc6 pin. It's the interval the fit publishes per node, so
+  // it answers "how well do we know this champion's place on the scale" — not "is gen N+1 above gen
+  // N", which needs the pairwise contrast variance the ladder doesn't persist (depth-ladder.mjs:794
+  // on why subtracting two vs-pin margins overstates it). Two overlapping bands are not a verdict.
+  const pts = versions.map((v) => {
+    const r = atDepth(v);
+    if (!r) return null;
+    // A row with no margin drops out of the band rather than poisoning the y-domain with NaN.
+    const ci = Number.isFinite(r.margin) ? r.margin : null;
+    return { x: v.gen, y: r.elo, lo: ci == null ? null : r.elo - ci, hi: ci == null ? null : r.elo + ci, meta: v, name: v.name };
+  }).filter(Boolean);
   if (!pts.length) {
     root.append(el('div', { class: 'empty-state' }, `No champion is rated at depth ${State.depth}. Pick a depth this run covers.`));
     return;
@@ -446,7 +480,7 @@ function renderGenerations() {
   const wrap = el('div', { class: 'chart-wrap', style: { padding: '10px' } });
   wrap.append(lineChart({
     height: 420,
-    series: [{ key: 'gen', label: 'champion Elo', color: css('--s1'), points: pts }],
+    series: [{ key: 'gen', label: 'champion Elo', color: css('--s1'), points: pts, band: true }],
     xDomain: [Math.min(...pts.map((p) => p.x)) - 0.4, Math.max(...pts.map((p) => p.x)) + 0.4],
     xTicks: versions.map((v) => v.gen),
     xLabel: 'generation', yLabel: 'Elo', refs,
@@ -564,35 +598,79 @@ async function renderMatchups() {
   tb.append(el('label', {}, 'Depth', depthSelect()));
   tb.append(el('label', {}, 'Family', el('select', { 'data-ctl': 'fam', onchange: (e) => { State.mFam = e.target.value; keepFocus(renderMatchups); syncUrl(); } },
     ...['all', 'nn', 'hc'].map((f) => el('option', { value: f, selected: f === State.mFam ? '' : null }, f === 'all' ? 'all engines' : f)))));
+  const CROSS = { none: 'hide', unlinked: 'for blank rows', all: 'all opponents' };
+  tb.append(el('label', {}, 'Cross-depth', el('select', { 'data-ctl': 'cross', onchange: (e) => { State.mCross = e.target.value; keepFocus(renderMatchups); syncUrl(); } },
+    ...Object.entries(CROSS).map(([v, lbl]) => el('option', { value: v, selected: v === State.mCross ? '' : null }, lbl)))));
 
-  const tags = [...present].filter((t) => {
+  // Rows are the nodes at the picked depth. Columns are those plus every off-depth opponent a row
+  // actually played, because a node's first games are cross-depth by construction: the ladder
+  // calibrates a new net against itself at depth 6, and the direct-link floor pairs it with a rated
+  // champion. Filtering both axes to one depth hid exactly the evidence a new engine has — Tara's
+  // depth-1 row was blank the day she arrived while carrying 128 games.
+  const byElo = (a, b) => (eloOf.get(a) ?? 0) - (eloOf.get(b) ?? 0);
+  const inFam = (p) => State.mFam === 'all' || p.eng === State.mFam;
+  const rows = [...present].filter((t) => {
     const p = parsedOf.get(t); if (!p) return false;
     if (State.depth !== 'all' && Number(p.depth) !== Number(State.depth)) return false;
-    if (State.mFam !== 'all' && p.eng !== State.mFam) return false;
-    return true;
-  });
-  tags.sort((a, b) => (eloOf.get(a) ?? 0) - (eloOf.get(b) ?? 0));
-  tb.append(el('span', { class: 'sub' }, `${tags.length} nodes · cell = row's score vs column · click a played cell for the games`));
+    return inFam(p);
+  }).sort(byElo);
+  const rowSet = new Set(rows);
+  // Every node keeps a calibration link to itself at depth 6 and to the handcrafted anchors, so
+  // pulling in every off-depth opponent quadruples the columns for a very sparse block — 23 rows
+  // become 115 columns at depth 6. Default to rescuing only the rows the depth filter left with no
+  // opponent at all, which is the case that reads as missing data; 'all opponents' is the full view.
+  const linked = new Set();
+  for (const [k, v] of Object.entries(pairs)) {
+    if (!(v.games > 0)) continue;
+    const [a, b] = k.split('|');
+    if (rowSet.has(a) && rowSet.has(b)) { linked.add(a); linked.add(b); }
+  }
+  const wantsCross = (t) => (State.mCross === 'all' ? true : State.mCross === 'unlinked' ? !linked.has(t) : false);
+  const off = new Set();
+  for (const [k, v] of Object.entries(pairs)) {
+    if (!(v.games > 0)) continue;
+    const [a, b] = k.split('|');
+    for (const [x, y] of [[a, b], [b, a]]) {
+      if (!rowSet.has(x) || rowSet.has(y) || off.has(y) || !wantsCross(x)) continue;
+      const p = parsedOf.get(y);
+      if (p && inFam(p)) off.add(y);
+    }
+  }
+  // At 'all depths' every opponent that passes the family filter is already a row, so this is empty
+  // and the grid stays square without a special case.
+  const offCols = [...off].sort(byElo);
+  const cols = [...rows, ...offCols];
+  tb.append(el('span', { class: 'sub' }, `${rows.length} nodes · cell = row's score vs column · click a played cell for the games`));
+  if (offCols.length) tb.append(el('span', { class: 'sub' }, `· ${offCols.length} cross-depth opponent${offCols.length === 1 ? '' : 's'} past the divider`));
+  else {
+    // With cross-depth hidden, a node whose every game was played against another depth reads as a
+    // node with no games at all. Say which, rather than leaving a blank row to be read as a bug.
+    const blank = rows.filter((t) => !linked.has(t));
+    if (blank.length) tb.append(el('span', { class: 'badge warn' }, `${blank.map((t) => shortLabel(t, parsedOf)).join(', ')} played only at other depths`));
+  }
   // The corpus half of a cell is only as current as the last rank:pool scan (it caches on the
   // dataset's size+mtime), so a cell can trail the dataset until the next run.
   if (State.pool.stale) tb.append(el('span', { class: 'badge warn' }, 'corpus scan behind dataset'));
   root.append(tb);
 
-  if (tags.length < 2) { root.append(el('div', { class: 'empty-state' }, 'Not enough directly-played nodes at this filter. Try “all depths”.')); return; }
+  if (!rows.length || cols.length < 2) { root.append(el('div', { class: 'empty-state' }, 'Not enough directly-played nodes at this filter. Try “all depths”.')); return; }
 
+  // The first off-depth column carries the divider, so the same-depth block stays readable as a block.
+  const colExtra = (i) => (i < rows.length ? '' : i === rows.length ? ' off sep' : ' off');
   const scroll = el('div', { class: 'heat-scroll' });
   const table = el('table', { class: 'heat' });
   const head = el('tr', {}, el('th', { class: 'corner' }, ''));
-  for (const c of tags) head.append(el('th', { class: 'collab' }, el('div', {}, shortLabel(c, parsedOf))));
+  cols.forEach((c, i) => head.append(el('th', { class: `collab${colExtra(i)}` }, el('div', {}, shortLabel(c, parsedOf)))));
   table.append(head);
-  for (const rTag of tags) {
+  for (const rTag of rows) {
     const tr = el('tr', {}, el('th', { class: 'rowlab' }, shortLabel(rTag, parsedOf)));
-    for (const cTag of tags) {
-      if (rTag === cTag) { tr.append(el('td', { class: 'cell diag' }, '')); continue; }
+    for (let i = 0; i < cols.length; i++) {
+      const cTag = cols[i];
+      if (rTag === cTag) { tr.append(el('td', { class: `cell diag${colExtra(i)}` }, '')); continue; }
       const info = pairScore(pairs, rTag, cTag);
-      if (!info) { tr.append(el('td', { class: 'cell empty' }, '')); continue; }
+      if (!info) { tr.append(el('td', { class: `cell empty${colExtra(i)}` }, '')); continue; }
       const bg = divergingColor(info.score);
-      const td = el('td', { class: 'cell', style: `background:${bg}` }, Math.round(info.score * 100));
+      const td = el('td', { class: `cell${colExtra(i)}`, style: `background:${bg}` }, Math.round(info.score * 100));
       td.addEventListener('mousemove', (ev) => showTip(
         `<div class="tt-title">${labelOf.get(rTag)} vs ${labelOf.get(cTag)}</div>`
         + `<div class="tt-row"><span class="k">Score</span><span class="v">${pct(info.score)}</span></div>`
@@ -1040,6 +1118,7 @@ function urlParams() {
   if (State.depth != null) q.set('depth', String(State.depth));
   if (currentView === 'depth' && State.depthSel.size) q.set('sel', [...State.depthSel].join(','));
   if (currentView === 'matchups' && State.mFam !== 'all') q.set('fam', State.mFam);
+  if (currentView === 'matchups' && State.mCross !== 'unlinked') q.set('cross', State.mCross);
   if (currentView === 'games') {
     const f = State.gamesFilter || {};
     if (f.a) q.set('a', f.a);
@@ -1065,6 +1144,7 @@ function applyUrl() {
   const sel = p.get('sel');
   if (sel) State.depthSel = new Set(sel.split(',').filter(Boolean));
   State.mFam = p.get('fam') || 'all';
+  State.mCross = ['none', 'unlinked', 'all'].includes(p.get('cross')) ? p.get('cross') : 'unlinked';
   const a = p.get('a'), b = p.get('b');
   State.gamesFilter = a || b ? { a: a || null, b: b || null } : null;
   const g = p.get('g');
