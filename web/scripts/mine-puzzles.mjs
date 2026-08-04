@@ -32,6 +32,14 @@
 //                      generator opens every game with random plies (gen default 8,
 //                      i.e. through move 4), and "punish the random opening move"
 //                      makes for boring puzzles nobody would blunder into for real
+//     [--min-engine-depth=2]  both sides of the game must have searched at least this
+//                      deep. A depth-1 search can't even see the recapture, so the
+//                      ranking pool's depth-1 ladder games hang a piece every few moves
+//                      and flood the candidate list with sound-but-dull "the queen is
+//                      en prise" positions — 46% of the raw pool, and 3.6x the
+//                      one-move-win rejects. 0 keeps every game.
+//     [--per-game=3]   cap on candidates taken from one game (seeded pick), so a
+//                      single collapse doesn't crowd out other games. 0 = no cap.
 //     [--win=500]      best move must score at least this (cp) — or mate
 //     [--second=150]   runner-up move must score at most this (uniqueness)
 //     [--line-gap=250] continuation moves stay in the solution while they beat the
@@ -44,7 +52,12 @@
 //                      ('razor-edge'-tagged when every alternative outright loses)
 //                      and a DEFENSE (only-move) puzzle from the position before it,
 //                      where the game's own engine fell off the tightrope
-//     [--max-candidates=6000]  cap on candidates verified (seeded sample)
+//     [--verify-depth=D+2]  re-run the root gates this deep before accepting. The app
+//                      plays the position out with a deeper engine than the mining
+//                      depth and only accepts the scripted move, so a "unique win"
+//                      a stronger search disagrees with is a puzzle that marks the
+//                      solver wrong for solving it. 0 disables.
+//     [--max-candidates=20000] cap on candidates verified (seeded sample). 0 = all.
 //     [--limit=N]              stop after this many accepted puzzles (default: none —
 //                      accept every candidate that verifies; --max-candidates still
 //                      bounds how many are checked)
@@ -83,11 +96,14 @@ const seed = num('seed', 1);
 const swing = num('swing', 400);
 const minMove = num('min-move', 10);
 const preFloor = num('pre-floor', -200);
+const minEngineDepth = num('min-engine-depth', 2);
+const perGame = num('per-game', 3);
 const lineGap = num('line-gap', 250);
 const saveFloor = num('save-floor', -150);
 const win = num('win', 500);
 const second = num('second', 150);
-const maxCandidates = num('max-candidates', 6000);
+const verifyDepth = num('verify-depth', depth + 2);
+const maxCandidates = num('max-candidates', 20000) || Infinity;
 const limit = num('limit', Infinity); // no accept cap by default; --max-candidates bounds the work
 const minDifficulty = num('min-difficulty', 1);
 const minWinMoves = num('min-win-moves', 2);
@@ -111,10 +127,17 @@ const rng = mulberry32(seed);
 const t0 = Date.now();
 const status = liveStatus();
 const tick = everyMs(1000);
-console.log(`mine-puzzles: ${inFile} (${fmtMB(statSync(inFile).size)}) | depth ${depth} | jobs ${jobs} | seed ${seed}`);
-console.log(`  gates: swing>=${swing} | pre>=${preFloor} | move>=${minMove} | win>=${win} | second<=${second} | line-gap>=${lineGap} | difficulty>=${minDifficulty} | win-moves>=${minWinMoves} | limit ${Number.isFinite(limit) ? limit : 'none'} of <=${fmtNum(maxCandidates)} candidates`);
+console.log(`mine-puzzles: ${inFile} (${fmtMB(statSync(inFile).size)}) | depth ${depth}${verifyDepth > depth ? ` (verify ${verifyDepth})` : ''} | jobs ${jobs} | seed ${seed}`);
+console.log(`  gates: swing>=${swing} | pre>=${preFloor} | move>=${minMove} | engine-depth>=${minEngineDepth} | per-game<=${perGame || '∞'} | win>=${win} | second<=${second} | line-gap>=${lineGap} | difficulty>=${minDifficulty} | win-moves>=${minWinMoves} | limit ${Number.isFinite(limit) ? limit : 'none'} of <=${Number.isFinite(maxCandidates) ? fmtNum(maxCandidates) : 'all'} candidates`);
 
 // --- phase 1: scan the dataset for blunder-punish candidates ----------------------
+// Two passes per record, cheapest first. The blunder test reads only the record's `v`
+// array — plain arithmetic, no board — so the ~92% of games that nominate nothing are
+// dropped without replaying a single move, and a game that does nominate is expanded
+// only as far as the last ply that needs a FEN. (Building a FEN for every position of
+// every game and throwing almost all of them away cost ~9 min on a 790 MB dataset;
+// this way the whole scan is under a minute.)
+
 // The position key ignores the move counters (board + turn + castling) so the same
 // position reached in different games is verified only once.
 const posKey = (fen) => fen.split(' ').slice(0, 3).join(' ');
@@ -122,50 +145,97 @@ const posKey = (fen) => fen.split(' ').slice(0, 3).join(' ');
 // let the worker apply the real gate.
 const vMin = Math.max(300, win - 150);
 
+// Ply -> fullmove without replaying: the standard start is fullmove 1 with White to
+// move, and a `start` FEN carries its own counter and side.
+function fullmoveAt(rec, ply) {
+  if (!rec.start) return 1 + (ply >> 1);
+  const f = rec.start.split(' ');
+  return Number(f[5]) + ((ply + (f[1] === 'b' ? 1 : 0)) >> 1);
+}
+// Search depth from a vtag: "nn6@c76205" -> 6, "hc2@?" -> 2, unreadable -> 0.
+const tagDepth = (t) => (typeof t === 'string' ? Number((/^[a-z]+(\d+)/.exec(t) || [])[1]) || 0 : 0);
+
 const candidates = [];
+// Positions already accounted for. Under --append the existing catalog seeds it, so a
+// re-mine spends its budget on new positions instead of re-verifying shipped ones.
 const seen = new Set();
+let existing = [];
+if (args.append && existsSync(outFile)) {
+  try {
+    existing = JSON.parse(readFileSync(outFile, 'utf8')).puzzles || [];
+    for (const p of existing) seen.add(posKey(p.fen));
+    console.log(`  append: ${fmtNum(existing.length)} puzzles already in the catalog`);
+  } catch { console.log('  append: existing catalog unreadable — writing fresh'); }
+}
+let gamesScanned = 0, gamesWeak = 0, gamesHit = 0, nominated = 0;
 {
-  let gamesScanned = 0;
   const rl = createInterface({ input: createReadStream(inFile), crlfDelay: Infinity });
   for await (const line of rl) {
     if (!line) continue;
     let rec;
     try { rec = JSON.parse(line); } catch { continue; }
-    if (!isGameRecord(rec)) continue;
+    if (!isGameRecord(rec) || !rec.v) continue;
     gamesScanned++;
-    // Replay the game into its positions: a blunder is a decisive v swing between two
-    // consecutive positions (prev's side was fine, then the new side to move sees a big
-    // edge). Each position carries its side-to-move v and a lazily-built FEN.
-    const ps = [];
-    for (const p of expandPositions(rec)) ps.push({ v: p.v, fen: toFen(p.state) });
-    for (let i = 1; i < ps.length; i++) {
-      const prev = ps[i - 1], cur = ps[i];
-      if (typeof prev.v !== 'number' || typeof cur.v !== 'number') continue;
-      if (!(cur.v >= vMin && prev.v + cur.v >= swing
-        // The blunderer must not have been lost already: a dead-lost side "blundering"
-        // is just delaying the end, and the solver was then already winning anyway.
-        && prev.v >= preFloor
-        // Skip the opening: the generator's first plies are RANDOM moves, and punishing
-        // one of those isn't a tactic anyone needs to learn.
-        && Number(cur.fen.split(' ')[5]) >= minMove)) continue;
-      const key = posKey(cur.fen);
+    // Both engines must have looked deep enough for a mistake to be worth punishing.
+    // A depth-1 search doesn't see the recapture, so those games hang something every
+    // few moves and the candidate list fills up with sound-but-dull "the queen is en
+    // prise" positions — the ranking pool plays a lot of them.
+    if (minEngineDepth && (!rec.players
+      || Math.min(tagDepth(rec.players.w), tagDepth(rec.players.b)) < minEngineDepth)) { gamesWeak++; continue; }
+    // A blunder is a decisive v swing between two consecutive positions: prev's side
+    // was fine, then the new side to move sees a big edge (their view went from
+    // prev.v to -cur.v).
+    const v = rec.v;
+    let hits = null;
+    for (let i = 1; i < v.length; i++) {
+      const prev = v[i - 1], cur = v[i];
+      if (typeof prev !== 'number' || typeof cur !== 'number') continue;
+      // The blunderer must not have been lost already: a dead-lost side "blundering"
+      // is just delaying the end, and the solver was then already winning anyway.
+      if (cur < vMin || prev + cur < swing || prev < preFloor) continue;
+      // Skip the opening: the generator's first plies are RANDOM moves, and punishing
+      // one of those isn't a tactic anyone needs to learn.
+      if (fullmoveAt(rec, i) < minMove) continue;
+      (hits || (hits = [])).push(i);
+    }
+    if (!hits) continue;
+    gamesHit++; nominated += hits.length;
+    // One collapse can nominate dozens of near-identical plies. Keep a seeded few so
+    // the catalog samples many games instead of a handful of blowouts.
+    if (perGame && hits.length > perGame) {
+      for (let i = hits.length - 1; i > 0; i--) { const j = Math.floor(rng() * (i + 1)); [hits[i], hits[j]] = [hits[j], hits[i]]; }
+      hits.length = perGame;
+      hits.sort((a, b) => a - b);
+    }
+    // Now replay, and only up to the last ply anyone needs. Each candidate wants the
+    // blunder position and the two before it (lead-in, and the defense mine's own lead-in).
+    const need = new Set();
+    for (const i of hits) { need.add(i); need.add(i - 1); if (i >= 2) need.add(i - 2); }
+    const last = hits[hits.length - 1];
+    const fens = new Map();
+    try {
+      for (const p of expandPositions(rec)) {
+        if (need.has(p.ply)) fens.set(p.ply, toFen(p.state));
+        if (p.ply >= last) break;
+      }
+    } catch { continue; } // a record whose moves don't replay is corrupt — skip the game
+    for (const i of hits) {
+      const fen = fens.get(i);
+      if (!fen) continue;
+      const key = posKey(fen);
       if (seen.has(key)) continue;
       seen.add(key);
       // prevFen is the position BEFORE the blunder: the worker derives the blunder move
       // from it for the win puzzle's lead-in, and mines it as a defense (only-move) puzzle
       // of its own — prevPrevFen then serves as THAT puzzle's lead-in, the same way.
-      candidates.push({
-        id: `${rec.g}#${i}`,
-        fen: cur.fen,
-        prevFen: prev.fen,
-        prevPrevFen: i >= 2 ? ps[i - 2].fen : undefined,
-      });
+      candidates.push({ id: `${rec.g}#${i}`, fen, prevFen: fens.get(i - 1), prevPrevFen: fens.get(i - 2) });
     }
     if (tick()) status.update(`  scanning… ${fmtNum(gamesScanned)} games, ${fmtNum(candidates.length)} candidates`);
   }
 }
 status.clear();
-console.log(`  scan: ${fmtNum(candidates.length)} candidate positions in ${fmtDur((Date.now() - t0) / 1000)}`);
+console.log(`  scan: ${fmtNum(gamesScanned)} games (${fmtNum(gamesWeak)} below engine-depth, ${fmtNum(gamesHit)} nominating) `
+  + `-> ${fmtNum(nominated)} plies -> ${fmtNum(candidates.length)} candidate positions in ${fmtDur((Date.now() - t0) / 1000)}`);
 
 // Seeded sample down to the verification budget (shuffle then slice, so reruns with
 // the same seed verify the same set).
@@ -203,7 +273,7 @@ await new Promise((done) => {
   ensureWasm(); // build the native engine (wasm) once before the workers race for it
   for (let i = 0; i < jobs; i++) {
     const w = new Worker(new URL('./puzzleWorker.mjs', import.meta.url), {
-      workerData: { weights, depth, win, second, lineGap, saveFloor, maxSolverMoves, minWinMoves, eval: evalName },
+      workerData: { weights, depth, verifyDepth, win, second, lineGap, saveFloor, maxSolverMoves, minWinMoves, eval: evalName },
     });
     pool.push(w);
     w.on('message', (msg) => {
@@ -250,17 +320,18 @@ finish();
 function finish() {
   status.clear();
 
-  // Merge with the existing catalog under --append (new puzzles win nothing — an
-  // already-present position keeps its existing entry).
-  let all = puzzles;
-  if (args.append && existsSync(outFile)) {
-    try {
-      const old = JSON.parse(readFileSync(outFile, 'utf8')).puzzles || [];
-      const have = new Set(old.map((p) => posKey(p.fen)));
-      all = old.concat(puzzles.filter((p) => !have.has(posKey(p.fen))));
-      console.log(`  append: ${fmtNum(old.length)} existing + ${fmtNum(all.length - old.length)} new`);
-    } catch { console.log('  append: existing catalog unreadable — writing fresh'); }
-  }
+  // One position, one puzzle. Consecutive blunders nominate overlapping plies, so the
+  // defense mine of ply i and the win mine of ply i-1 can land on the same board — same
+  // solution, different id. Keep the first and drop the rest (--append seeded `seen`
+  // with the shipped catalog, so this also covers re-mines).
+  const have = new Set();
+  const keep = (p) => { const k = posKey(p.fen); return have.has(k) ? false : (have.add(k), true); };
+  const kept = existing.filter(keep);
+  const fresh = puzzles.filter(keep);
+  const all = kept.concat(fresh);
+  const dropped = existing.length + puzzles.length - all.length;
+  if (dropped) console.log(`  deduped: ${fmtNum(dropped)} repeated position(s)`);
+  if (existing.length) console.log(`  append: ${fmtNum(kept.length)} existing + ${fmtNum(fresh.length)} new`);
   all.sort((a, b) => a.difficulty - b.difficulty || a.id.localeCompare(b.id));
 
   const json = '{\n  "puzzles": [\n'

@@ -8,7 +8,10 @@
 //                 re-search with that move excluded for the runner-up. A puzzle
 //                 needs a UNIQUE winning move: best decisively winning (or mate),
 //                 runner-up clearly not. Positions where several moves win, or
-//                 where nothing does, are rejected.
+//                 where nothing does, are rejected. Whatever survives repeats the
+//                 same gates at `verifyDepth` (mining depth + 2 by default): the app
+//                 accepts only the scripted move, so a second winning move a deeper
+//                 search would find is a puzzle that calls a good answer wrong.
 //   2. Solution — walk the line forward: the engine's best reply for the
 //                 opponent, then the solver's next move for as long as it stays
 //                 unique (each solver ply re-passes the uniqueness test, so the
@@ -59,7 +62,7 @@ import { legalMoves, applyMove, gameStatus, generatePseudoMoves, safetyZones } f
 import { _internal } from '../src/ai.js'; // MATE_THRESH constant only (search runs in wasm)
 import { makeEngine } from './wasmEngine.mjs';
 
-const { weights, depth, win, second, lineGap, saveFloor, maxSolverMoves, minWinMoves } = workerData;
+const { weights, depth, verifyDepth, win, second, lineGap, saveFloor, maxSolverMoves, minWinMoves } = workerData;
 const { MATE_THRESH } = _internal;
 
 // Same engine-selection policy as the rest of the tools: the champion net when it's a
@@ -85,7 +88,7 @@ const uci = (m) => squareName(m.from) + squareName(m.to) + (m.promotion || '');
 // `rand` is unused now (the wasm searcher has its own deterministic root variety); kept in
 // the signatures so the call sites are unchanged.
 const best = (state, rand, d = depth) => eng.searchMove(state, d, null);
-const secondBest = (state, rand, excludeMove) => eng.searchMove(state, depth, [keyOf(excludeMove)]);
+const secondBest = (state, rand, excludeMove, d = depth) => eng.searchMove(state, d, [keyOf(excludeMove)]);
 
 // Is `m` the only move good enough to BE the puzzle? (The first move's test — line
 // continuations use the looser clearly-best rule in the walk below.) `score` is m's
@@ -195,6 +198,19 @@ function mineWin(fen, leadFen, id, seed) {
   const bk = keyOf(top.move);
   for (let d = depth - 1; d >= 1 && keyOf(ladder[d - 1].move) === bk; d--) solveDepth = d;
 
+  // Deeper confirmation of the premise. The app only accepts the scripted move, so a
+  // "unique win" that a stronger search disagrees with is a puzzle that marks the
+  // solver wrong for finding a move that also wins. Run the same root gates deeper;
+  // it costs two searches and only fires on candidates that already passed everything
+  // above, so it is close to free.
+  if (verifyDepth > depth) {
+    const re = best(state, rand, verifyDepth);
+    if (keyOf(re.move) !== bk) return { reject: 'verify-move' };
+    if (re.score < (isMate ? MATE_THRESH : win)) return { reject: 'verify-score' };
+    const alt = secondBest(state, rand, re.move, verifyDepth);
+    if (alt.score > second || (re.score >= MATE_THRESH && alt.score >= re.score)) return { reject: 'verify-unique' };
+  }
+
   // --- walk the solution line -------------------------------------------------
   const line = [top.move];
   const themes = new Set(themesOf(state, top.move));
@@ -232,8 +248,9 @@ function mineWin(fen, leadFen, id, seed) {
     if (isMate && next.score < MATE_THRESH) return { reject: 'unsound' }; // search disagrees with itself
     // The solver-move cap only applies while the continuation is NOT a forced mate:
     // a line that walks into a mate runs to checkmate regardless, so "win the queen,
-    // then mate in two" doesn't stop one move short of the finish.
-    if (next.score < MATE_THRESH && (line.length + 1) / 2 > maxSolverMoves) break;
+    // then mate in two" doesn't stop one move short of the finish. `line.length` is
+    // odd here, so adding the reply + next move takes the solver to (len + 3) / 2.
+    if (next.score < MATE_THRESH && (line.length + 3) / 2 > maxSolverMoves) break;
     // Continuation rule: unlike the FIRST move (which must be the only good one —
     // that's the puzzle's premise), a follow-up only has to be CLEARLY BEST, beating
     // the runner-up by lineGap. Otherwise the line stops the moment a second move
@@ -322,6 +339,15 @@ function mineDefense(item) {
   const bk = keyOf(top.move);
   for (let d = depth - 1; d >= 1 && keyOf(ladder[d - 1].move) === bk; d--) solveDepth = d;
 
+  // Same deeper confirmation as the win mine: the same move still has to be the one
+  // that holds, and everything else still has to lose.
+  if (verifyDepth > depth) {
+    const re = best(state, rand, verifyDepth);
+    if (keyOf(re.move) !== bk) return { reject: 'verify-move' };
+    if (re.score < saveFloor || re.score >= win) return { reject: 'verify-score' };
+    if (secondBest(state, rand, re.move, verifyDepth).score > -win) return { reject: 'verify-unique' };
+  }
+
   // Walk the tightrope: scripted best replies, and the solver's follow-up stays in
   // the line only while it is STILL the only move that holds. The line ends when
   // the danger has passed (several moves hold), the position resolves (a draw end
@@ -365,7 +391,7 @@ function mineDefense(item) {
       }
     } else {
       if (next.score < saveFloor || next.score >= win) break; // line over: collapsed (noise) or flipped to winning
-      if ((line.length + 1) / 2 > maxSolverMoves) break;
+      if ((line.length + 3) / 2 > maxSolverMoves) break;
       if (st.legal.length > 1) {
         const alt2 = secondBest(afterReply, rand, next.move);
         if (alt2.score > -win) break; // danger passed: more than one move holds now
@@ -384,11 +410,11 @@ function mineDefense(item) {
   // Final soundness check: the root claim ("the save holds") was made at `depth`,
   // but the app's play-it-out engine searches deeper than that, so an unsound save
   // gets refuted on the board a few moves later. Re-search the end-of-line position
-  // two plies deeper (opponent to move): if they're decisively winning after all,
-  // the save was a mirage.
+  // deeper (opponent to move): if they're decisively winning after all, the save was
+  // a mirage.
   {
     const st = gameStatus(cur);
-    if (!st.over && best(cur, rand, depth + 2).score >= win) return { reject: 'unsound' };
+    if (!st.over && best(cur, rand, Math.max(verifyDepth, depth + 2)).score >= win) return { reject: 'unsound' };
   }
 
   const puzzle = {
