@@ -232,7 +232,6 @@
 import { spawnSync } from 'node:child_process';
 import {
   existsSync, rmSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, appendFileSync, statSync,
-  openSync, readSync, closeSync,
 } from 'node:fs';
 import { dirname, resolve, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -380,23 +379,11 @@ const resultFile = join(loopDir, 'match.json');
 // so the loop can rewrite a non-promoted candidate's provenance before folding it in (see
 // foldGateHarvest). Cleared before each gate and deleted after folding.
 const gateHarvest = join(loopDir, 'gate-harvest.jsonl');
-// Bradley-Terry pool ledger (npm run rank:pool) + its persisted pairwise-results store. The
-// store accumulates games across cycles; the ledger is the fitted Elo the refreshes consume.
+// Bradley-Terry pool ledger (npm run rank:pool): the fitted Elo the refreshes consume. rank:pool
+// harvests its games straight into the dataset and re-derives its ratings from it every run, so
+// there's nothing to fold or keep in lockstep here — a standalone rank:pool between cycles is
+// picked up automatically, because it wrote to the same file.
 const ledgerFile = join(loopDir, 'engine-elo.ladder.json');
-const ladderStore = join(loopDir, 'ladder-pool.json');
-// rank:pool's harvested games (its --save-games default). A persistent, accumulating archive of
-// every game the strength pool has played — kept in lockstep with ladderStore. Each cycle we
-// append only the games it ADDED this cycle into the dataset (like the gate harvest), so the
-// next incremental featurize trains on them; their players are all rankable engines (champion /
-// hc / archived / material), so no provenance rewrite is needed. --corpus subtracts the store,
-// so re-reading them from the dataset never double-counts in the ratings.
-const ladderGames = join(loopDir, 'ladder-games.jsonl');
-// Persistent high-water mark: bytes of ladderGames already folded into the dataset. Persisting
-// it (vs a per-cycle snapshot) means the fold also catches games a STANDALONE `rank:pool` in
-// another terminal appended between cycles — not just the loop's own rank step. Missing/0 ⇒ fold
-// the whole archive (first run on this clone, or after --fresh clears the dataset but keeps the
-// archive); merge-data dedups by game id any game an earlier fold already added.
-const ladderFoldMark = join(loopDir, 'ladder-fold.json');
 const logFile = join(loopDir, 'loop.log');
 // PID of this loop, so `npm run train:pause`/`train:resume` (scripts/loop-ctl.mjs) can find
 // and freeze/thaw the loop's whole process tree from another terminal — a long run pegs every
@@ -487,10 +474,10 @@ const cfg = {
   refreshCycleDepth: num(args['refresh-cycle-depth'], num(args.depth, 8)),
   // Engine ranking for smart weakest-first v refresh. On by default, driven by the
   // self-relative Bradley-Terry POOL (rank:pool / depth-ladder.mjs).
-  // EVERY cycle the loop refits the pool: it folds the whole dataset's harvested
-  // games into the fit (--corpus — so the new champion is rated automatically from its gate
-  // matches, no dedicated gauntlet) and plays a short --rank-minutes budget of the most-
-  // ambiguous matchups to tighten ratings. The refreshes below read the resulting parallel
+  // EVERY cycle the loop refits the pool: it derives the ratings from the whole dataset's games
+  // (--corpus — so the new champion is rated automatically from its gate matches, no dedicated
+  // gauntlet) and plays a short --rank-minutes budget of the most-ambiguous matchups, harvested
+  // back into that same dataset, to tighten ratings. The refreshes below read the resulting parallel
   // ledger (engine-elo.ladder.json) to relabel the WEAKEST engine's `v` first. --no-rank reverts.
   rank: !args['no-rank'],
   // hc pin depth for the pool (Elo 1500) — every rating lands on this stable scale.
@@ -552,8 +539,8 @@ const cfg = {
   keepChampions: num(args['keep-champions'], 12),
   // Strong-engine ladder play as the generator. With no dedicated generation (--batch=0), the
   // per-cycle rank step restricts --play to the strongest nn engines (current champion + recent
-  // champions) at --play-depth, so its harvested games — already folded into the dataset
-  // — are deep, strong-play training data: the ranked pool IS the generator. On by default when
+  // champions) at --play-depth, so its harvested games — written straight into the dataset —
+  // are deep, strong-play training data: the ranked pool IS the generator. On by default when
   // --batch=0; --play-strong / --no-play-strong force it; --rank-play=SPEC pins the play set by
   // hand (goes stale on promotion — prefer the auto set for an unattended loop). See docs.
   playStrong: args['no-play-strong'] ? false
@@ -996,49 +983,19 @@ function runRankPool(label, opts = {}) {
   if (calib) log(`  Calibrating champion ${calib} across all depths (+${cfg.calibrateMinutes}m, onboard floor fills its 0-game depth nodes).`);
   // Base play budget: the adaptive per-cycle value when given (opts.minutes), else the fixed knob.
   const baseMinutes = opts.minutes ?? cfg.rankMinutes;
-  // With harvesting on (default), rank:pool appends its games to its archive (ladderGames); we
-  // then fold everything past the persistent mark into the dataset — the loop's own rank games
-  // AND any a standalone rank:pool added between cycles. With --no-harvest, suppress the archive
-  // too (--no-save-games), consistent with the gate.
+  // With harvesting on (default), rank:pool appends its games straight into the dataset — the same
+  // file the next incremental featurize trains on and the next fit reads its ratings back from, so
+  // there's no fold step. Their players are all rankable engines (champion / hc / archived /
+  // material), so no provenance rewrite is needed either (unlike the gate's candidate).
   run(label, process.execPath,
     [rankScript, '--corpus', `--minutes=${baseMinutes + (calib ? cfg.calibrateMinutes : 0)}`,
       `--anchor-depth=${cfg.rankDepth}`,
       ...(playSet ? [`--play=${playSet}`] : []),
       ...(calib ? ['--onboard=1'] : []), // fill the champion's under-played depths before the ordering objective
       `--games=${cfg.rankGames}`, ...(cfg.rankLink === null ? [] : [`--link=${cfg.rankLink}`]),
-      `--store=${ladderStore}`, `--ledger=${ledgerFile}`,
+      `--data=${rawFile}`, `--ledger=${ledgerFile}`,
       ...(cfg.harvest ? [] : ['--no-save-games']),
       '--no-scan', `--seed=${Date.now()}`, ...jobArg]);
-  if (cfg.harvest) foldNewLadderGames();
-}
-
-// Last byte of ladderGames already folded into the dataset (0 if never / after --fresh).
-const readLadderMark = () => { try { return JSON.parse(readFileSync(ladderFoldMark, 'utf8')).offset || 0; } catch { return 0; } };
-const writeLadderMark = (offset) => { try { writeFileSync(ladderFoldMark, JSON.stringify({ offset }) + '\n'); } catch { /* best-effort: a missed write only re-folds dedup-able games next run */ } };
-
-// Fold every ladder game past the persistent mark into the dataset, so the next incremental
-// featurize trains on it. The mark persists across cycles (and across runs), so this catches not
-// just the loop's own rank games but any a STANDALONE rank:pool appended to the archive between
-// cycles — the whole point of persisting it. On a clone with no mark yet it folds the entire
-// archive once; games an earlier fold already placed are collapsed by merge-data's game-id dedup.
-// Players are all rankable engines, so labels are kept as-is (no ephemeral rewrite).
-function foldNewLadderGames() {
-  if (!existsSync(ladderGames)) return;
-  const size = statSync(ladderGames).size;
-  const mark = readLadderMark();
-  const from = mark > size ? 0 : mark; // archive shrank (deleted + recreated) ⇒ re-fold from 0
-  if (size <= from) return; // nothing new (rank played no games, or harvesting was off)
-  const fd = openSync(ladderGames, 'r');
-  try {
-    const buf = Buffer.alloc(size - from);
-    readSync(fd, buf, 0, buf.length, from);
-    let chunk = buf.toString('utf8');
-    if (!chunk.endsWith('\n')) chunk += '\n'; // each game is a full line; guard a torn tail
-    appendFileSync(rawFile, chunk);
-    const added = chunk.split('\n').filter(Boolean).length;
-    log(`  Folded ${added} new ladder game(s) into the dataset (next featurize trains on them).`);
-  } finally { closeSync(fd); }
-  writeLadderMark(size); // advance only after a successful append
 }
 
 // Featurize args for this recipe's dataset filters. --drop-conflicts forwards as-is.
@@ -1182,10 +1139,9 @@ archiveChampion(champion);
 writeFileSync(pidFile, `${process.pid}\n`);
 rmSync(pauseFlag, { force: true });
 process.on('exit', () => { try { rmSync(pidFile, { force: true }); } catch { /* best effort */ } });
+// --fresh clears the dataset, which is also the strength pool's body of evidence: the ledger's
+// ratings rebuild from whatever the fresh run plays (plus loop/legacy-pairs.json).
 if (cfg.fresh && existsSync(rawFile)) { rmSync(rawFile); log('Cleared dataset (--fresh).'); }
-// --fresh empties the dataset but keeps the ladder archive (games between static engines), so
-// reset the fold mark too — otherwise the kept archive wouldn't re-enter the fresh dataset.
-if (cfg.fresh && existsSync(ladderFoldMark)) rmSync(ladderFoldMark);
 
 // The recipe is resolved to concrete values HERE — whether they came from flags or the registry
 // picked them (autoRecipe) — so the recipe id is fixed for the run rather than a moving target

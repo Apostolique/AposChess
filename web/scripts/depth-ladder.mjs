@@ -14,7 +14,16 @@
 // itself) via --depth/--depth-b. hc<anchor-depth> (hc6) is ALWAYS a node and is the pin
 // (Elo := 1500, so the whole pool sits on a familiar all-positive scale), so every pool — all
 // engines, or one net's depth sweep — lands on the SAME stable scale. So there is no separate "depth curve" mode: a curve is just the ledger filtered to one
-// net's nodes. The store persists pairwise results, so re-running ACCUMULATES games.
+// net's nodes.
+//
+// ONE GAME STORE. Every game this pool plays is harvested straight into the self-play dataset
+// (selfplay.jsonl, like apos-gen's), and the ratings are a pure DERIVATION of it: each run
+// re-reads the dataset's game records (players + result) into a pairwise W/D/L matrix and fits
+// that. There is no second copy of the games and no separate authoritative pairwise store, so
+// nothing has to be deduplicated, subtracted, or folded from one into the other — re-running
+// simply adds games to the dataset and ACCUMULATES. (Before 2026-08-03 the pool kept its own
+// game archive + pairwise store alongside the dataset, and ~98% of those games were literally
+// stored twice; loop/legacy-pairs.json is the frozen remainder — see below.)
 //
 // Output is the ledger (engine-elo.*.json), the schema refresh-v/merge already read, so
 // refresh-v/merge can read it. The ACTIVE scheduler targets the RANKING objective — each step
@@ -42,8 +51,8 @@
 //   --depths=LIST   depths this run PLAYS each engine at: range (1-8) or list (6,8). Default 1-8
 //                   (the whole spectrum). Narrow it (e.g. --depths=6,8) for a quick run — the
 //                   depths you leave out keep their rating and their ledger row from the games
-//                   already in the store, they just don't get new ones. The ledger always holds
-//                   every node the store knows, so narrowing the schedule never narrows the ladder.
+//                   already in the dataset, they just don't get new ones. The ledger always holds
+//                   every node the dataset knows, so narrowing the schedule never narrows the ladder.
 //   --anchor-depth=D  the hc depth that is the pin / Elo 1500 (default 6). Always present as a node.
 //   --play=SPEC     restrict NEW scheduled games to matchups among these specs only (comma list).
 //                   Each is EITHER a bare engine spec (same forms as --engines) — every --depths
@@ -52,27 +61,25 @@
 //                   (engine, depth) node, so you can target an asymmetric cross-depth matchup like
 //                   --play=nn8@08df7b,nn6@22577c. A named depth outside --depths is force-added.
 //                   The pin and the rest of the pool are STILL rated from the games already in the
-//                   store + --corpus; they just don't play any new games. Use this to pile games
+//                   dataset; they just don't play any new games. Use this to pile games
 //                   onto a specific head-to-head while keeping everyone on the stable hc6 scale.
 //   --no-pin-play   keep the pin OUT of new games. hc<anchor-depth> stays a rated node at Elo 1500
 //                   (the scale), it just never plays. Its depth is fixed at --anchor-depth, so in a
 //                   single-depth run (--depths=4) it's the one node off that depth and every game it
 //                   plays is a cross-depth game. The pool stays tied to the scale through the games
-//                   the pin has ALREADY played (store + --corpus). Use this instead of moving
+//                   the pin has ALREADY played (in the dataset). Use this instead of moving
 //                   --anchor-depth, which would move every persisted absolute Elo with it.
 //   --no-material   skip the hc<d>@? material fallback node (otherwise included as the floor).
 //   --minutes=M     play for M minutes, then finalize. Omit to run until you stop it (q/Ctrl-C).
 //   --matchups=N    stop after N matchups (default unlimited).
-//   --rounds=0      play nothing; just merge/refit the existing store and emit (offline).
-//   --merge=F[,F]   fold pool stores from other machines in before fitting (pairwise counts are
-//                   additive). Requires the SAME node set and DISTINCT --seed per machine.
+//   --rounds=0      play nothing; just refit from the dataset and emit (offline).
 //   --games=N       games per matchup (even; default 100). Re-running accumulates.
 //   --onboard=F     no-one-left-behind floor (default 0.5): while any schedulable node has
 //                   fewer games than F × the schedulable pool's AVERAGE games, the scheduler
 //                   plays the least-played such node (vs the nearest-Elo node that has at least
 //                   ANCHOR_GAMES games) before the ordering objective — so fresh champions get
 //                   anchored to the scale right away instead of waiting to be "ambiguous
-//                   enough". Relative, so a fresh store (everyone at 0) onboards no one. 0 disables.
+//                   enough". Relative, so an empty dataset (everyone at 0) onboards no one. 0 disables.
 //   --link=N        direct-link floor (default: half a matchup, so one matchup clears a pair):
 //                   every rank-adjacent pair must have played N games AGAINST EACH OTHER before
 //                   the ordering objective gets the budget. Without it a near-tie at the top of
@@ -83,33 +90,40 @@
 //   --jobs=N        parallel game workers (default: CPU cores).
 //   --openings=K    random opening plies per game (default 6).
 //   --maxmoves=N    draw adjudication ply cap (default 200).
-//   --seed=S        base seed (default 1). The store advances a seed cursor so accumulated
-//                   re-runs never replay identical games.
-//   --store=FILE    pairwise-results store (default loop/ladder-pool.json — one shared pool).
+//   --seed=S        base seed (default 1). A seed cursor (in the pool snapshot) advances so
+//                   accumulated re-runs never replay identical games.
+//   --pool=FILE     pool snapshot written after every matchup (default loop/ladder-pool.json):
+//                   the exact pairwise matrix this run fitted, plus the seed cursor. DERIVED —
+//                   it's an output for the visualizer and for diagnostics, never an authority
+//                   the fit reads back. Delete it and the next run rebuilds it from the dataset.
 //   --ledger=FILE   ledger output (default loop/engine-elo.ladder.json — the live strength
 //                   ledger train:loop / refresh-v / merge consume for weakest-first v refresh).
-//   --data=FILE     dataset to scan for record counts (default selfplay.jsonl). --no-scan skips.
-//   --corpus        fold the WHOLE dataset's game results into the fit: every game record's
-//                   players + result becomes a pairwise W/D/L among the ranked nodes, so the
-//                   entire self-play corpus informs the ratings (not just dedicated matchups).
-//                   ON by default; pass --no-corpus for the pool's dedicated matchups only.
-//                   Recomputed each run (never persisted), so it can't double-count itself;
-//                   self-play games (same engine both sides) are skipped. The pool store's own
-//                   games are SUBTRACTED per pair before folding (corpus contributes only the
-//                   games beyond what the store already counts), so harvested ladder games that
-//                   later land in the dataset can't be counted twice. Pairs with `node.js
-//                   --rounds=0` for a pure corpus-only refit.
+//   --data=FILE     the dataset: the single source of every game, both for the ratings and for
+//                   the vs-tag record counts (default selfplay.jsonl). --no-scan skips the
+//                   tag scan only; the game-results scan is what the ratings ARE.
+//   --no-corpus     rate ONLY from the games this run plays (plus legacy-pairs.json), instead of
+//                   from the whole dataset. Debug/what-if switch: the dataset's games are the
+//                   pool's evidence, so this normally throws away almost everything. The scan
+//                   skips self-play games (same engine both sides — no relative signal) and games
+//                   with unknown players; ephemeral `elo<N>` candidates aren't rated nodes, so
+//                   their games drop out in the fit. Pair `--rounds=0` with the default for a
+//                   pure refit-from-dataset.
 //   --csv=FILE      also write a flat engine,version,depth,elo,ci95,games CSV (for plotting a
 //                   depth curve — filter to one version). Off unless given.
-//   --save-games[=F]  harvest the played games to F (default ON -> loop/ladder-games.jsonl):
-//                   the self-contained body of every game this ladder has played, appended
-//                   across runs. These are games between STATIC engines (archived champions +
-//                   hc), so they're permanent training data — PRESERVED across --fresh (delete
-//                   the file by hand to clear it). It lives under loop/ so merge-data (top-level
-//                   scan) won't auto-fold it into selfplay; merge it in explicitly for training.
-//   --no-save-games  don't harvest games (ranking only).
-//   --fresh         discard the existing store (ratings) and start over. The harvested games
-//                   archive is PRESERVED (permanent games between static engines).
+//   --save-games[=F]  harvest the played games into F (default ON -> the --data dataset): every
+//                   game the pool plays is training data (real games between static engines), and
+//                   the dataset is also where the ratings read them back from, so this is the one
+//                   write. apos-match appends as it goes, exactly like apos-gen.
+//                   Caveat: refresh-v and train:merge REWRITE the dataset (stream to .tmp, then
+//                   rename), so games appended while one of those runs are lost with the old file.
+//                   The loop runs its steps in sequence, so its own rank step is safe; a standalone
+//                   rank:pool grinding the ladder in a second terminal is not — stop it (q) before
+//                   a refresh/merge, or point it at --data=<other file> and merge after.
+//   --no-save-games  don't harvest games. They then inform THIS run's fit and are gone after it —
+//                   the dataset is the only persistence, so ranking-only runs don't accumulate.
+//   --fresh         ignore loop/legacy-pairs.json (the frozen pre-2026-08-03 pool games that
+//                   predate harvesting) and reset the seed cursor. The dataset is untouched —
+//                   the ratings are derived from it, so there is no rating state to discard.
 
 import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync, readdirSync, createReadStream, statSync } from 'node:fs';
@@ -182,19 +196,16 @@ const cfg = {
   depths: parseDepths(args.depths, [1, 2, 3, 4, 5, 6, 7, 8]),
   anchorDepth: num(args['anchor-depth'], 6), // the hc depth that is the pin (Elo := PIN_ELO)
   // --play: restrict NEW scheduled games to matchups among these engines (comma list of specs).
-  // The pin + the rest of the pool are still rated from already-played store/--corpus games;
+  // The pin + the rest of the pool are still rated from the games already in the dataset;
   // they just don't play new games. null = schedule across the whole pool (default).
   play: typeof args.play === 'string' ? args.play.split(',').map((s) => s.trim()).filter(Boolean) : null,
   // --no-pin-play: the pin anchors the SCALE, it doesn't have to be an opponent. Its depth is
   // fixed at --anchor-depth, so a single-depth run (--depths=4) has it as the only off-depth node
   // and every game it plays is cross-depth. Dropping it from the schedulable set keeps new games
-  // inside --depths; it's still rated at PIN_ELO from the games already in the store/--corpus.
+  // inside --depths; it's still rated at PIN_ELO from the games already in the dataset.
   pinPlay: !args['no-pin-play'],
   material: !args['no-material'],
-  // Pool stores from other machines to fold in before fitting (pairwise counts are additive).
-  // Each MUST come from a distinct --seed (else identical games would be double-counted).
-  merge: typeof args.merge === 'string' ? args.merge.split(',').map((s) => resolve(process.cwd(), s.trim())).filter(Boolean) : [],
-  rounds: Math.max(0, num(args.rounds, 1)), // 0 = don't play; just merge/refit and emit (offline)
+  rounds: Math.max(0, num(args.rounds, 1)), // 0 = don't play; just refit from the dataset and emit
   // ACTIVE scheduler: play until --minutes elapse / --matchups are played / the user stops
   // (q or Ctrl-C). Defaults run until stopped — built for overnight.
   minutes: args.minutes !== undefined ? Number(args.minutes) : null,
@@ -202,7 +213,7 @@ const cfg = {
   games: Math.max(2, Math.round(num(args.games, 100) / 2) * 2),
   // Onboarding floor, as a FRACTION of the schedulable pool's average game count (relative on
   // purpose — no magic absolute number: the floor scales with how much the pool has actually
-  // played, and a fresh store where everyone sits at 0 games onboards no one). A node below the
+  // played, and an empty dataset where everyone sits at 0 games onboards no one). A node below the
   // floor is "under-played" and gets scheduled first (least-played, vs the nearest-Elo
   // established node). Without it, fresh nodes sit at the prior (~35 below the pin, ±600s) where the ordering
   // objective pairs them with EACH OTHER — two unknowns playing each other stay disconnected
@@ -218,23 +229,25 @@ const cfg = {
   maxmoves: num(args.maxmoves, 200),
   seed: num(args.seed, 1),
   scan: !args['no-scan'],
-  // Fold the WHOLE self-play corpus into the fit: every stored game records who played
-  // (players.w/.b) and its result, so the entire dataset becomes a pairwise W/D/L matrix
-  // among the ranked nodes — not just the pool's own dedicated matchups. The corpus
-  // contribution is recomputed each run (not persisted into the pool store), so it never
-  // double-counts. Self-play games (same engine both sides) are uninformative and skipped.
+  // THE ratings input: every game record in the dataset says who played (players.w/.b) and how it
+  // went, so the dataset IS the pairwise W/D/L matrix — the pool's own matchups included, since it
+  // harvests into the same file. Recomputed from scratch each run (~3 s per GB), which is why no
+  // pairwise state has to be persisted, reconciled, or de-duplicated. Self-play games (same engine
+  // both sides) carry no relative signal and are skipped. --no-corpus rates only from this run's
+  // own games (a what-if switch; see the header).
   corpus: !args['no-corpus'],
   data: typeof args.data === 'string' ? resolve(process.cwd(), args.data) : join(dataDir, 'selfplay.jsonl'),
-  store: typeof args.store === 'string' ? resolve(process.cwd(), args.store) : join(loopDir, 'ladder-pool.json'),
+  // Derived snapshot of the fitted pairwise matrix + seed cursor (an output; see the header).
+  pool: typeof args.pool === 'string' ? resolve(process.cwd(), args.pool) : join(loopDir, 'ladder-pool.json'),
   ledger: typeof args.ledger === 'string' ? resolve(process.cwd(), args.ledger) : join(loopDir, 'engine-elo.ladder.json'),
   csv: typeof args.csv === 'string' ? resolve(process.cwd(), args.csv) : null, // opt-in flat dump for plotting
   // Harvest the played games (default ON). An absolute path string when enabled, else false.
-  // Default target is loop/ladder-games.jsonl — the self-contained body of every game the
-  // ladder has played (appended across runs; PRESERVED across --fresh, since they're permanent
-  // games between static engines). It's under loop/, so merge-data's top-level scan won't
-  // auto-fold it into selfplay (no corpus double-count); fold it in explicitly for training.
+  // Default target is the DATASET itself: these are real games between static engines, so they're
+  // permanent training data, and the dataset is also where the next run reads them back as rating
+  // evidence. One file, one write, nothing to fold or dedupe afterwards.
   saveGames: args['no-save-games'] ? false
-    : (typeof args['save-games'] === 'string' ? resolve(process.cwd(), args['save-games']) : join(loopDir, 'ladder-games.jsonl')),
+    : (typeof args['save-games'] === 'string' ? resolve(process.cwd(), args['save-games'])
+      : (typeof args.data === 'string' ? resolve(process.cwd(), args.data) : join(dataDir, 'selfplay.jsonl'))),
   fresh: !!args.fresh,
 };
 if (cfg.link === null) cfg.link = Math.round(cfg.games / 2);
@@ -296,8 +309,8 @@ if (!engines.some((e) => `${e.eng}@${e.version}` === `hc@${HC_VERSION}`)) engine
 { const seen = new Set(); engines = engines.filter((e) => { const k = `${e.eng}@${e.version}`; if (seen.has(k)) return false; seen.add(k); return true; }); }
 
 // --- competitors (nodes of the rating pool) ------------------------------------
-// Each node is an (engine, depth) pair; id is its `vs`-tag (stable across runs, the store
-// key AND the ledger tag): nn<d>@<ver> / hc<d>@<HC_VERSION> / hc<d>@? (material).
+// Each node is an (engine, depth) pair; id is its `vs`-tag (stable across runs, the pair key
+// AND the ledger tag): nn<d>@<ver> / hc<d>@<HC_VERSION> / hc<d>@? (material).
 const node = (e, d) => ({ id: `${e.eng}${d}@${e.version}`, eng: e.eng, eval: e.eval, weights: e.weights, version: e.version, depth: d });
 const competitors = [];
 for (const e of engines) for (const d of cfg.depths) competitors.push(node(e, d));
@@ -320,8 +333,8 @@ if (competitors.length < 2) { console.error('Need at least 2 nodes (engines × d
 const byId = new Map(competitors.map((c) => [c.id, c]));
 
 // --- schedulable subset (--play): which nodes may play NEW games ---------------
-// fit() always rates the WHOLE pool (the pin, every competitor, and every node the store or
-// --corpus has games for — see ratedNodes) from the persisted results. --play just restricts the
+// fit() always rates the WHOLE pool (the pin, every competitor, and every node the dataset has
+// games for — see ratedNodes) from those games. --play just restricts the
 // ACTIVE SCHEDULER to matchups among the named specs, so only that head-to-head gains new games
 // while everyone else keeps their from-existing-data estimate. A bare engine spec (depth == null)
 // matches every --depths of that engine; a depth-qualified node id matches only that exact
@@ -339,71 +352,77 @@ if (cfg.rounds !== 0 && schedulable.length < 2) {
   process.exit(1);
 }
 
-// --- persistent pairwise store -------------------------------------------------
-// pairs: { "idA|idB" (sorted): { games, sumA } } where sumA = points scored by idA. One shared
-// store ('rank') accumulates ALL pool games — any run fits only its own node subset, so a
-// single-net depth sweep and the full ledger pool feed the same body of knowledge.
+// --- pairwise evidence: three DISJOINT sources, summed ---------------------------
+// pairs: { "idA|idB" (sorted): { games, sumA } } where sumA = points scored by the lexically-first
+// id. Nothing here is an authority the fit reads back from disk — the games themselves are, and
+// they all live in one file. The three sources can't overlap by construction, so they simply add:
+//
+//   corpusPairs   every game in the DATASET (scanned once at startup). The pool harvests into it,
+//                 so this already includes the pool's own past matchups — that's the whole point.
+//   sessionPairs  games played by THIS run, after the scan. In memory only: apos-match has already
+//                 appended them to the dataset, so the next run reads them from there.
+//   legacyPairs   frozen pre-2026-08-03 pool games that predate harvesting and so were never in
+//                 any dataset (loop/legacy-pairs.json). Immutable and disjoint by definition.
 mkdirSync(loopDir, { recursive: true });
 const poolId = 'rank';
-// --fresh resets the RATINGS (the store) only; the harvested games archive is PRESERVED. Those
-// are real games between STATIC engines (archived champions + hc, which never change), so they
-// stay valid training data and a valid body of results forever — discarding them would throw
-// away genuine games just because the BT fit is being recomputed. The store going empty is fine:
-// --corpus subtracts the store, so when the store is 0 the archive's games (if in the dataset)
-// simply count once in the refit. Delete the archive by hand if you ever truly want it gone.
-let store = { net: poolId, seedCursor: cfg.seed, pairs: {} };
-if (!cfg.fresh && existsSync(cfg.store)) {
-  try {
-    const s = JSON.parse(readFileSync(cfg.store, 'utf8'));
-    if (s.net === poolId) store = { net: poolId, seedCursor: s.seedCursor ?? cfg.seed, pairs: s.pairs || {} };
-    else console.warn(`(existing store is for pool ${s.net}, this run ${poolId} — starting fresh)`);
-  } catch (e) { console.warn(`(could not read store: ${e.message}; starting fresh)`); }
-}
-// Fold in pool stores from other machines (--merge). Pairwise {games, sumA} are additive, so
-// a second machine's games simply sum in — provided it used a DISTINCT --seed (same seed =
-// identical openings = double-counting) and the SAME node set (same champion + archive, so
-// the pair keys align). seedCursor takes the max so continued play won't reuse a seed window.
-for (const mf of cfg.merge) {
-  let s;
-  try { s = JSON.parse(readFileSync(mf, 'utf8')); }
-  catch (e) { console.error(`--merge: could not read ${mf}: ${e.message}`); process.exit(1); }
-  if (s.net !== poolId) { console.error(`--merge: ${mf} is pool '${s.net}', this run is '${poolId}' — incompatible node sets.`); process.exit(1); }
-  let folded = 0;
-  for (const [key, v] of Object.entries(s.pairs || {})) {
-    const e = store.pairs[key] || { games: 0, sumA: 0 };
-    e.games += v.games; e.sumA += v.sumA; store.pairs[key] = e; folded += v.games;
-  }
-  store.seedCursor = Math.max(store.seedCursor, s.seedCursor ?? 0);
-  console.log(`merged ${folded} games from ${mf.replace(/^.*[\\/]/, '')}`);
-}
 const pairKey = (a, b) => (a < b ? `${a}|${b}` : `${b}|${a}`);
 
-// Corpus-derived pairwise results (from --corpus): recomputed each run, NOT persisted into
-// the pool store, so re-runs never double-count. Same {games, sumA} shape (sumA = points for
-// the lexically-first id). fit() sums these on top of the persisted store.
 const corpusPairs = new Map();
 let corpusGames = 0;
-// Combined view of persisted + corpus pairs. The persisted store is authoritative for the
-// pool's own matchups, so the corpus contributes only the games BEYOND what the store already
-// counts (corpus − store per pair, clamped at 0). That way, if harvested ladder games ever
-// land in the scanned dataset, --corpus re-reads them but they aren't double-counted on top of
-// the store; pairs the corpus knows but the store doesn't (organic self-play) pass through in
-// full. Used by fit() so the corpus contributes to every rating without touching disk.
+const sessionPairs = new Map();
+
+// The frozen remainder of the old pairwise store: 37 pairs / 2256 games the pool played before it
+// harvested its games, which therefore exist nowhere else. Additive and never rewritten, so it
+// needs none of the reconciliation the old store did. --fresh ignores it.
+const legacyPairs = new Map();
+const legacyFile = join(loopDir, 'legacy-pairs.json');
+if (!cfg.fresh && existsSync(legacyFile)) {
+  try {
+    const l = JSON.parse(readFileSync(legacyFile, 'utf8'));
+    for (const [k, v] of Object.entries(l.pairs || {})) legacyPairs.set(k, { games: v.games, sumA: v.sumA });
+  } catch (e) { console.warn(`(could not read ${legacyFile}: ${e.message}; ignoring those games)`); }
+}
+
+// Seed cursor: the one piece of genuinely non-derivable run state. Kept in the (derived) pool
+// snapshot so accumulated re-runs never replay identical openings.
+let seedCursor = cfg.seed;
+if (!cfg.fresh && existsSync(cfg.pool)) {
+  try {
+    const s = JSON.parse(readFileSync(cfg.pool, 'utf8'));
+    if (s.seedCursor != null) seedCursor = s.seedCursor;
+  } catch { /* unreadable snapshot -> start the cursor at --seed */ }
+}
+
+// Everything the fit sees, in one map. Used by fit(), the scheduler, and the pool snapshot.
 function combinedPairs() {
   const m = new Map();
-  for (const [k, v] of Object.entries(store.pairs)) m.set(k, { games: v.games, sumA: v.sumA });
-  for (const [k, v] of corpusPairs) {
-    const s = store.pairs[k] || { games: 0, sumA: 0 };
-    const extraGames = v.games - s.games;
-    if (extraGames <= 0) continue; // corpus fully overlaps the pool store — don't double-count
-    const extraSumA = Math.min(Math.max(v.sumA - s.sumA, 0), extraGames);
-    const e = m.get(k) || { games: 0, sumA: 0 };
-    e.games += extraGames; e.sumA += extraSumA; m.set(k, e);
-  }
+  const add = (src) => {
+    for (const [k, v] of src) {
+      const e = m.get(k) || { games: 0, sumA: 0 };
+      e.games += v.games; e.sumA += v.sumA; m.set(k, e);
+    }
+  };
+  add(legacyPairs);
+  add(corpusPairs);
+  add(sessionPairs);
   return m;
 }
 
-// Direct games per pair (store + --corpus), keyed like the store. This is the ORDER-measured-vs-
+// Write the derived snapshot: the exact matrix this run fitted, plus the seed cursor. An OUTPUT
+// (the ladder visualizer reads it, and it makes a run's evidence inspectable); deleting it costs
+// only the cursor, since the next run rebuilds the matrix from the dataset.
+function writePoolSnapshot() {
+  const pairs = {};
+  for (const [k, v] of combinedPairs()) pairs[k] = { games: v.games, sumA: v.sumA };
+  // Stamp the dataset this matrix was derived from, so a reader (the visualizer) can tell when
+  // games have landed in the dataset since — gate games between rank runs, say — and the ratings
+  // haven't seen them yet.
+  let data = null;
+  try { const st = statSync(cfg.data); data = { size: st.size, mtimeMs: st.mtimeMs }; } catch { /* no dataset yet */ }
+  writeFileSync(cfg.pool, JSON.stringify({ net: poolId, seedCursor, data, pairs }, null, 2) + '\n');
+}
+
+// Direct games per pair, over all of combinedPairs(). This is the ORDER-measured-vs-
 // inferred distinction: with no direct games a pair's gap comes entirely from paths through third
 // parties, and the Bradley-Terry covariance reads that as ordinary noise even though a
 // non-transitivity would show up as bias no amount of other games can shrink. Cheap (~1k pairs)
@@ -414,11 +433,11 @@ function directLinks() {
   return m;
 }
 
-// --- rated pool = competitors + every node the store already knows --------------
+// --- rated pool = competitors + every node the dataset already knows -------------
 // --engines / --depths / --play decide who PLAYS. They don't decide who EXISTS: a node that
 // falls outside this run's selection keeps the games it already played, so it stays in the fit
 // and keeps its ledger row instead of dropping off the ladder for a run. So `--depths=1-3`
-// narrows the schedule, not the ledger — depths 4-8 stay rated from the store.
+// narrows the schedule, not the ledger — depths 4-8 stay rated from their existing games.
 // A node whose engine this run can't resolve (a champion that was pruned from the archive) is
 // still rated from its games; it just can't play again, which the ledger marks recoverable:false.
 let ratedCache = null;
@@ -451,13 +470,15 @@ function record(idA, idB, gamesPlayed, scoreA) {
   // A stop-file stop finalizes from the games COMPLETED, which can be none. Storing that would
   // leave an empty {games:0} pair — a matchup that never happened, whose score is 0/0.
   if (!(gamesPlayed > 0)) return;
+  // In-memory only: apos-match has already appended these games to the dataset (--save-games), so
+  // this just keeps the running fit current without re-scanning. Next run reads them from there.
   const key = pairKey(idA, idB);
   const lowFirst = idA < idB;
   const sumForA = scoreA * gamesPlayed; // points A scored
-  const e = store.pairs[key] || { games: 0, sumA: 0 };
+  const e = sessionPairs.get(key) || { games: 0, sumA: 0 };
   e.games += gamesPlayed;
   e.sumA += lowFirst ? sumForA : (gamesPlayed - sumForA); // sumA tracks the lexically-first id
-  store.pairs[key] = e;
+  sessionPairs.set(key, e);
 }
 
 // --- Bradley-Terry fit (MM algorithm) ------------------------------------------
@@ -467,7 +488,7 @@ function fit() {
   const gamma = new Map(ids.map((id) => [id, 1]));
   const W = new Map(ids.map((id) => [id, cfg.prior * 0.5])); // points, incl. prior half-draws vs phantom
   const adj = new Map(ids.map((id) => [id, []]));            // id -> [{opp, N}]
-  const pairs = combinedPairs();                             // persisted store + --corpus games
+  const pairs = combinedPairs();                             // dataset + this run's games + legacy
   for (const [key, v] of pairs) {
     const [i, j] = key.split('|');
     if (!W.has(i) || !W.has(j)) continue;
@@ -570,7 +591,7 @@ const ncdf = (x) => 0.5 * (1 + erf(x / Math.SQRT2));
 // each other stay disconnected from the scale — while the well-played cluster keeps winning the
 // ambiguity contest. Least-played-first cycles through every under-played node, so a new champion
 // (and each of its depths, in a full-pool run) is anchored within a run or two; the floor being
-// relative means everyone graduates as the pool's average rises, and a fresh store (all zeros)
+// relative means everyone graduates as the pool's average rises, and an empty dataset (all zeros)
 // onboards no one.
 //
 // DIRECT LINKS: the ordering objective can only buy an order it can price, and a near-tie prices
@@ -666,8 +687,8 @@ function requestMatchStop() { try { writeFileSync(stopFile, ''); } catch { /* be
 // stdin is 'ignore' so the parent keeps sole ownership of the TTY for keypress detection.
 function playPair(a, b) {
   const tmp = join(loopDir, 'ladder-match.json');
-  const seed = store.seedCursor;
-  store.seedCursor += cfg.games; // advance so accumulated re-runs use fresh openings
+  const seed = seedCursor;
+  seedCursor += cfg.games; // advance so accumulated re-runs use fresh openings
   const argv = [
     `--games=${cfg.games}`, `--jobs=${cfg.jobs}`, `--openings=${cfg.openings}`, `--maxmoves=${cfg.maxmoves}`,
     `--seed=${seed}`,
@@ -677,7 +698,7 @@ function playPair(a, b) {
   if (a.eval === 'nn' && a.weights) argv.push(`--weights-a=${a.weights}`);
   if (b.eval === 'nn' && b.weights) argv.push(`--weights-b=${b.weights}`);
   // apos-match only honours --save-games=<path> (a bare flag is silently ignored), so cfg.saveGames
-  // is always an absolute path (default loop/ladder-games.jsonl) or false.
+  // is always an absolute path (default: the dataset) or false.
   if (typeof cfg.saveGames === 'string') argv.push(`--save-games=${cfg.saveGames}`);
   console.log(`\n=== ${nodeLabel(a)}  vs  ${nodeLabel(b)}  (${cfg.games} games) ===`);
   return new Promise((done) => {
@@ -736,27 +757,17 @@ async function scanDataset() {
 }
 // --- corpus cross-reference (--corpus): the whole dataset as a pairwise W/D/L matrix ----
 // Every game record stores who played (players.w/.b) and its White-view result, so the entire
-// self-play corpus is a body of games among the ranked nodes. We fold those into the fit
-// (corpusPairs, summed on top of the persisted pool store) so ranking uses far more evidence
-// than the pool's own dedicated matchups. Self-play games (same engine both sides) carry no
-// relative-ranking signal and are skipped; legacy games without players are ignored.
-const corpusCacheFile = join(loopDir, 'ladder-corpus-cache.json');
+// self-play corpus IS the pool's body of evidence — the pool's own matchups included, since it
+// harvests into the same dataset. This is the ratings' primary input, not a supplement to a
+// separate store. Self-play games (same engine both sides) carry no relative-ranking signal and
+// are skipped; games without players are ignored.
+// Not cached: the pool appends to the dataset as it plays, so a size+mtime cache would miss on
+// nearly every run anyway, and ~3 s per GB is cheap enough that always re-deriving is the simpler
+// contract — the ratings can't drift from the games they came from.
 async function scanCorpus() {
   if (!cfg.corpus) return;
-  if (!existsSync(cfg.data)) { console.warn(`(no dataset at ${cfg.data} — --corpus has nothing to fold in)`); return; }
-  const st = statSync(cfg.data);
-  if (existsSync(corpusCacheFile)) {
-    try {
-      const c = JSON.parse(readFileSync(corpusCacheFile, 'utf8'));
-      if (c.file === cfg.data && c.size === st.size && c.mtimeMs === st.mtimeMs) {
-        for (const [k, v] of Object.entries(c.pairs)) corpusPairs.set(k, v);
-        corpusGames = c.corpusGames;
-        console.log(`Using cached corpus scan (${corpusGames} games, ${corpusPairs.size} pairs).`);
-        return;
-      }
-    } catch { /* stale/unreadable -> rescan */ }
-  }
-  console.log(`\nScanning ${cfg.data} for game results (--corpus)...`);
+  if (!existsSync(cfg.data)) { console.warn(`(no dataset at ${cfg.data} — nothing to rate from)`); return; }
+  console.log(`\nScanning ${cfg.data} for game results...`);
   let skippedSelf = 0, noPlayers = 0;
   try {
     const rl = createInterface({ input: createReadStream(cfg.data), crlfDelay: Infinity });
@@ -775,9 +786,8 @@ async function scanCorpus() {
       corpusPairs.set(key, e);
       corpusGames++;
     }
-    writeFileSync(corpusCacheFile, JSON.stringify({ file: cfg.data, size: st.size, mtimeMs: st.mtimeMs, corpusGames, pairs: Object.fromEntries(corpusPairs) }));
   } catch (e) { console.warn(`  corpus scan interrupted (${e.message}); partial.`); }
-  console.log(`  corpus: ${corpusGames} mixed-engine games -> ${corpusPairs.size} pair(s) folded into the fit `
+  console.log(`  corpus: ${corpusGames} mixed-engine games -> ${corpusPairs.size} pair(s) rated `
     + `(${skippedSelf} self-play skipped).`);
 }
 const parseTag = (tag) => { const m = /^(nn|hc)(\d+|t)@(.+)$/.exec(tag); return m ? { eng: m[1], depth: m[2], version: m[3] } : null; };
@@ -905,7 +915,7 @@ function writeRankLedger(verbose) {
     tag: c.id, eng: c.eng, version: c.version, name: niceName(c.version), depth: String(c.depth),
     anchor: c.id === pinId, elo: elo.get(c.id), score: null,
     margin: ci.get(c.id) ?? null, games: gamesOf(c.id),
-    // No eval means the store has games for a node this run can't build an engine for, so its
+    // No eval means the dataset has games for a node this run can't build an engine for, so its
     // rating stands but nothing can play it again until its weights are back in the archive.
     records: recordsByVersion.get(`${c.eng}@${c.version}`) || 0, recoverable: !!c.eval, file: c.weights ?? null,
   }));
@@ -931,11 +941,11 @@ function writeRankLedger(verbose) {
     depths: cfg.depths, games: cfg.games, seed: cfg.seed,
     // The regularizer belongs to the fit, not to the run: it sits on the diagonal of the Fisher
     // information, so anything that wants to rebuild a contrast variance from `ranking` + the pool
-    // store (the visualizer's expected-score view does) needs the value this fit actually used.
+    // pool snapshot (the visualizer's expected-score view does) needs the value this fit used.
     prior: cfg.prior,
     dataset: cfg.scan ? { file: cfg.data, totalLines, withV: totalLines - noV, legacyNoTag } : null,
     // `nodes` is the convergence scope (this run's own competitors — the nodes it can still
-    // buy games for), `rated` the whole ledger. They differ whenever the store carries nodes
+    // buy games for), `rated` the whole ledger. They differ whenever the dataset carries nodes
     // outside --engines/--depths, so the verdict stays about what this run can actually fix.
     convergence: { ...conv.summary, nodes: competitors.length, rated: ranked.length },
     ranking, unrecoverable,
@@ -964,25 +974,29 @@ function writeRankLedger(verbose) {
     writeFileSync(cfg.csv, rows.join('\n') + '\n');
     console.log(`\nCSV -> ${cfg.csv}`);
   }
-  console.log(`\nLedger -> ${cfg.ledger}  (store ${cfg.store}; re-run to add games and tighten all ratings)`);
+  console.log(`\nLedger -> ${cfg.ledger}  (games in ${cfg.data}; re-run to add games and tighten all ratings)`);
   console.log('This is the strength ledger refresh-v/merge read for weakest-first v refresh (they default to engine-elo.ladder.json).');
 }
 
 console.log(`Engine ranking pool (active scheduler)`);
 console.log(`  ${competitors.length} node(s): ${competitors.map((c) => `${c.id.split('@')[0]}@${c.version.slice(0, 6)}${niceName(c.version) ? ` (${niceName(c.version)})` : ''}`).join(', ')}`);
-console.log(`  pin ${pinId} | ${cfg.games} games/matchup | onboard ${cfg.onboard ? `${cfg.onboard}×avg` : 'off'} | link floor ${cfg.link || 'off'} | ${cfg.jobs} parallel job(s) | store ${cfg.store}`);
+console.log(`  pin ${pinId} | ${cfg.games} games/matchup | onboard ${cfg.onboard ? `${cfg.onboard}×avg` : 'off'} | link floor ${cfg.link || 'off'} | ${cfg.jobs} parallel job(s)`);
 if (playMatch) console.log(`  --play: new games only among ${schedulable.map(nodeLabel).join(', ')} (rest rated from existing data)`);
 if (!cfg.pinPlay) console.log(`  --no-pin-play: ${pinId} is rated but plays nothing new (${schedulable.length} schedulable node(s))`);
 else if (!cfg.depths.includes(cfg.anchorDepth)) console.log(`  note: the pin is at depth ${cfg.anchorDepth}, outside --depths, so it plays cross-depth games (--no-pin-play keeps new games inside --depths)`);
 console.log(`  games -> ${cfg.saveGames || '(not harvested; --no-save-games)'}`);
+if (legacyPairs.size) {
+  let n = 0; for (const v of legacyPairs.values()) n += v.games;
+  console.log(`  + ${n} legacy game(s) over ${legacyPairs.size} pair(s) (loop/legacy-pairs.json — pre-harvest, exist nowhere else)`);
+}
 if (cfg.rounds !== 0) await scanDataset(); // once up front, so the periodic ledger emit has record counts
-await scanCorpus(); // fold the dataset's game results into the fit (no-op unless --corpus)
+await scanCorpus(); // the dataset's game results ARE the ratings input (skipped by --no-corpus)
 
-// Everything the store already knows is rated alongside this run's nodes, so say how much of
+// Everything the dataset already knows is rated alongside this run's nodes, so say how much of
 // the ladder is carried rather than played — the ledger is wider than the schedule.
 {
   const carried = ratedNodes().length - competitors.length;
-  if (carried > 0) console.log(`  rated pool: ${ratedNodes().length} node(s) — ${carried} carried from the store/corpus (rated from their existing games, not scheduled this run)`);
+  if (carried > 0) console.log(`  rated pool: ${ratedNodes().length} node(s) — ${carried} carried from the dataset (rated from their existing games, not scheduled this run)`);
 }
 
 // The pin only puts the pool on the absolute scale if it's actually connected to it. With
@@ -995,20 +1009,20 @@ if (!cfg.pinPlay && cfg.rounds !== 0) {
     const [i, j] = key.split('|');
     if ((i === pinId && rated.has(j)) || (j === pinId && rated.has(i))) pinGames += v.games;
   }
-  if (pinGames) console.log(`  ${pinId} is anchored by ${pinGames} game(s) already in the store/corpus.`);
+  if (pinGames) console.log(`  ${pinId} is anchored by ${pinGames} game(s) already in the dataset.`);
   else console.warn(`  WARNING: ${pinId} has no games against this pool, so nothing ties these ratings to Elo ${PIN_ELO} — they're relative only. Run once without --no-pin-play, or point --data at a dataset the pin appears in.`);
 }
 
 if (cfg.rounds === 0) {
-  // Offline: no matches — just persist the (possibly merged) store, refit, and emit.
-  if (cfg.merge.length) writeFileSync(cfg.store, JSON.stringify(store, null, 2) + '\n');
+  // Offline: no matches — just refit from the dataset and emit.
   await scanDataset();
-  console.log('rounds=0: merge/refit only, no games played.');
+  console.log('rounds=0: refit from the dataset only, no games played.');
 } else {
-  // Active scheduler: refit -> pick the most ordering-ambiguous matchup -> play -> persist ->
-  // repeat, until --minutes / --matchups / the user stops it. The store is written after every
-  // matchup (overnight stop/start is lossless — a restart resumes from it), and the ledger is
-  // re-emitted every few matchups so it's never far behind even on a hard kill.
+  // Active scheduler: refit -> pick the most ordering-ambiguous matchup -> play -> repeat, until
+  // --minutes / --matchups / the user stops it. Overnight stop/start is lossless because
+  // apos-match appends each game to the dataset as it plays: a restart re-reads them in its
+  // corpus scan, with no store to keep in sync. The ledger is re-emitted every few matchups so
+  // it's never far behind even on a hard kill.
   const EMIT_EVERY = 5;
   buildEngine();
   rmSync(stopFile, { force: true }); // clear any stale stop-file from a prior run
@@ -1059,8 +1073,9 @@ if (cfg.rounds === 0) {
     await playPair(a, b);
     matchSecs.push((Date.now() - matchT0) / 1000);
     // playPair recorded this matchup — a full run, or the completed games if a stop landed
-    // mid-matchup. Persist the store either way so the games already played are never lost.
-    writeFileSync(cfg.store, JSON.stringify(store, null, 2) + '\n');
+    // mid-matchup. The games are already in the dataset (apos-match appended them); refresh the
+    // derived snapshot so the visualizer and the seed cursor keep up.
+    writePoolSnapshot();
     { // refit so the pair's post-matchup ratings show right away (cheap next to the games)
       const { elo: e2, ci: c2 } = fit();
       const upd = (c) => `${nodeLabel(c)} ${e2.get(c.id).toFixed(0)} ±${(c2.get(c.id) ?? 0).toFixed(0)}`;
@@ -1078,3 +1093,4 @@ if (cfg.rounds === 0) {
 }
 
 writeRankLedger(true);
+writePoolSnapshot(); // final derived snapshot (also refreshes it after a --rounds=0 refit)

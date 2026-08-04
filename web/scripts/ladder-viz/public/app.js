@@ -653,7 +653,7 @@ async function renderMatchups() {
   }
   // The corpus half of a cell is only as current as the last rank:pool scan (it caches on the
   // dataset's size+mtime), so a cell can trail the dataset until the next run.
-  if (State.pool.stale) tb.append(el('span', { class: 'badge warn' }, 'corpus scan behind dataset'));
+  if (State.pool.stale) tb.append(el('span', { class: 'badge warn' }, 'pool snapshot behind dataset'));
   root.append(tb);
 
   if (!rows.length || cols.length < 2) { root.append(el('div', { class: 'empty-state' }, 'Not enough directly-played nodes at this filter. Try “all depths”.')); return; }
@@ -677,11 +677,7 @@ async function renderMatchups() {
       td.addEventListener('mousemove', (ev) => showTip(
         `<div class="tt-title">${labelOf.get(rTag)} vs ${labelOf.get(cTag)}</div>`
         + `<div class="tt-row"><span class="k">Score</span><span class="v">${pct(info.score)}</span></div>`
-        + `<div class="tt-row"><span class="k">Games</span><span class="v">${info.games}</span></div>`
-        // Where the evidence came from. A pair the ranker never scheduled can still be the
-        // best-measured on the board: a promotion gate is thousands of games at depth 6.
-        + (info.store < info.games
-          ? `<div class="tt-row"><span class="k">of which gate/self-play</span><span class="v">${info.games - info.store}</span></div>` : ''), ev.clientX, ev.clientY));
+        + `<div class="tt-row"><span class="k">Games</span><span class="v">${info.games}</span></div>`, ev.clientX, ev.clientY));
       td.addEventListener('mouseleave', hideTip);
       td.addEventListener('click', () => openGamesFor(rTag, cTag));
       tr.append(td);
@@ -704,8 +700,8 @@ function shortLabel(tag, parsedOf) { const p = parsedOf.get(tag); if (!p) return
 // played, so it reads as never-met (empty cell) rather than 0/0 = NaN.
 function pairScore(pairs, a, b) {
   const played = (e) => (e && e.games > 0 ? e : null);
-  const ab = played(pairs[`${a}|${b}`]); if (ab) return { score: ab.sumA / ab.games, games: ab.games, store: ab.store ?? ab.games };
-  const ba = played(pairs[`${b}|${a}`]); if (ba) return { score: 1 - ba.sumA / ba.games, games: ba.games, store: ba.store ?? ba.games };
+  const ab = played(pairs[`${a}|${b}`]); if (ab) return { score: ab.sumA / ab.games, games: ab.games };
+  const ba = played(pairs[`${b}|${a}`]); if (ba) return { score: 1 - ba.sumA / ba.games, games: ba.games };
   return null;
 }
 function divergingColor(score) {
@@ -752,8 +748,8 @@ const expectedScore = (dElo) => 1 / (1 + 10 ** (-dElo / 400));
 //
 // It checks itself. The ledger's `margin` column IS 1.96·√varDiff(node, pin), so the two agree to
 // rounding when the reconstruction is right. They do — except while rank:pool is running, where the
-// pool store has already moved past the ledger it last wrote and a handful of rows come out tighter
-// than the ledger says. `drift` reports that instead of hiding it.
+// pool snapshot has already moved past the ledger it last wrote and a handful of rows come out
+// tighter than the ledger says. `drift` reports that instead of hiding it.
 const ELO_VAR = (400 / Math.LN10) ** 2; // beta-variance -> Elo-variance (Elo = (400/ln10)·beta)
 function contrastModel() {
   if (State.contrast) return State.contrast;
@@ -858,13 +854,14 @@ async function renderExpected() {
   let cells = 0, played = 0;
   for (const r of rows) for (const c of cols) { if (r === c) continue; cells++; if (pairScore(pairs, r, c)) played++; }
   tb.append(el('span', { class: 'sub' }, `${rows.length}×${cols.length} · ${fmt(played)} of ${fmt(cells)} cells have games behind them`));
-  // The self-check disagreeing is nearly always rank:pool running right now: the store it appends to
-  // has games the ledger it last wrote hasn't seen, so those rows rebuild TIGHTER than the ledger says.
+  // The self-check disagreeing is nearly always rank:pool running right now: the snapshot it
+  // rewrites each matchup has games the ledger it last wrote hasn't seen, so those rows rebuild
+  // TIGHTER than the ledger says.
   if (model.drift.off) {
-    tb.append(el('span', { class: 'badge warn', title: 'The ±95 here is rebuilt from the pool store, which a running rank:pool updates between ledger writes. A disagreement that outlives the run would mean the fit used a --prior the ledger didn’t record.' },
+    tb.append(el('span', { class: 'badge warn', title: 'The ±95 here is rebuilt from the pool snapshot, which a running rank:pool updates between ledger writes. A disagreement that outlives the run would mean the fit used a --prior the ledger didn’t record.' },
       `pool ahead of ledger · ${model.drift.off} row${model.drift.off === 1 ? '' : 's'} up to ${fmt(model.drift.worst, 0)} Elo tighter`));
   }
-  if (State.pool.stale) tb.append(el('span', { class: 'badge warn' }, 'corpus scan behind dataset'));
+  if (State.pool.stale) tb.append(el('span', { class: 'badge warn' }, 'pool snapshot behind dataset'));
   root.append(tb);
 
   if (!rows.length || !cols.length) { root.append(el('div', { class: 'empty-state' }, 'No rated node at this filter. Try “all depths”.')); return; }
@@ -967,8 +964,7 @@ function cellTip(a, b, pairs, eloOf, labelOf, model) {
     // is why it is lopsided near the ends: 100 Elo of slack buys much less score up at 90%.
     + row('Expected', `${pct(p)}<span class="tt-band">${pct(expectedScore(d - m))} – ${pct(expectedScore(d + m))}</span>`)
     + row('Direct games', obs ? fmt(obs.games) : 'never met')
-    + (obs ? row('Observed', `${pct(obs.score)} <span class="tt-band">${obs.score - p >= 0 ? '+' : ''}${fmt((obs.score - p) * 100, 1)} pts</span>`) : '')
-    + (obs && obs.store < obs.games ? row('of which gate/self-play', fmt(obs.games - obs.store)) : '');
+    + (obs ? row('Observed', `${pct(obs.score)} <span class="tt-band">${obs.score - p >= 0 ? '+' : ''}${fmt((obs.score - p) * 100, 1)} pts</span>`) : '');
 }
 
 // ================================================================= GAMES view
@@ -1468,7 +1464,7 @@ if (localStorage.getItem('viz-theme')) document.documentElement.setAttribute('da
 // and the pool once a whole matchup lands. Rebuilding the DOM per appended game would reset the
 // scroll position, the heatmap and the open replay every second, so those files only refresh the
 // counters — a view rebuild waits for data that actually changes the view.
-const VOLATILE_FILES = /(ladder-games\.jsonl|match-timing\.json|loop\.log)$/;
+const VOLATILE_FILES = /(selfplay\.jsonl|match-timing\.json|loop\.log)$/;
 function refreshCounters() {
   const n = $('#statLadderGames');
   if (n) n.textContent = fmt(State.summary?.counts?.games);

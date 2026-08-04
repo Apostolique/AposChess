@@ -32,13 +32,10 @@ const SOUND = path.join(ROOT, 'web', 'public', 'sound'); // the app's move / cap
 
 const F = {
   ledger: path.join(LOOP, 'engine-elo.ladder.json'),
+  // The pairwise matrix rank:pool last fitted, which it writes out after every matchup. Derived
+  // from the dataset (plus loop/legacy-pairs.json), so it's the whole picture in one file —
+  // ladder matchups, gate games and all.
   pool: path.join(LOOP, 'ladder-pool.json'),
-  // rank:pool fits from the pool store PLUS a scan of the whole dataset (--corpus), but only the
-  // store is persisted — the corpus half lives in this cache. Gate games are corpus-only, and the
-  // gate runs at depth 6, so without this the busiest depth on the ladder looks like it never
-  // played. See combinedPairs() and depth-ladder.mjs:381.
-  corpus: path.join(LOOP, 'ladder-corpus-cache.json'),
-  games: path.join(LOOP, 'ladder-games.jsonl'),
   selfplay: path.join(DATA, 'selfplay.jsonl'),
   match: path.join(LOOP, 'match.json'),
   timing: path.join(LOOP, 'match-timing.json'),
@@ -101,12 +98,11 @@ function championIndex() {
 // be read by seeking, and matchup filters run over metadata only. Built once,
 // then extended incrementally as the files grow (train:loop appends live).
 //
-// TWO sources, because the pool's own harvest is only half the games. Gate matches are
-// folded straight into the dataset (train-loop.mjs foldGateHarvest) and never reach
-// ladder-games.jsonl, so a promotion's decisive match — thousands of games at depth 6 —
-// was invisible here. Indexed in order, first source to claim a game id wins: the two
-// overlap (rank:pool harvests into both), and the pool's copy is the canonical one.
-const SOURCES = [F.games, F.selfplay];
+// ONE source: every producer — generation, the gate, the ranking pool — harvests into the
+// dataset, so it holds every game exactly once. (It used to take two, with the pool's separate
+// archive indexed first to claim the ids both files held; the game-id dedup below is what's left
+// of that, and it still earns its keep against a torn tail or a re-indexed prefix.)
+const SOURCES = [F.selfplay];
 const gindex = { entries: [], byG: new Map(), src: SOURCES.map(() => ({ indexedBytes: 0, size: 0 })), size: 0, skipped: 0 };
 
 // A non-promoted gate candidate is never archived and carries an "elo<N>" strength label
@@ -119,7 +115,7 @@ function addGameLine(buf, off, len, src) {
   let rec;
   try { rec = JSON.parse(buf.toString('utf8')); } catch { return; }
   if (!rec || !rec.g) return;
-  if (gindex.byG.has(rec.g)) return;                      // already claimed by an earlier source
+  if (gindex.byG.has(rec.g)) return;                      // already indexed
   const w = rec.players?.w ?? null;
   const b = rec.players?.b ?? null;
   if (EPHEMERAL.test(w || '') || EPHEMERAL.test(b || '')) { gindex.skipped++; return; }
@@ -194,32 +190,24 @@ function readGameBody(g) {
   } catch { return null; } finally { fs.closeSync(fd); }
 }
 
-// ------------------------------------------------------------- combined pairwise
-// What rank:pool actually fits on: the persisted store plus the corpus scan. Mirrors
-// depth-ladder.mjs combinedPairs() — the store is authoritative for its own matchups, so the
-// corpus contributes only the games BEYOND what the store already counts (clamped at 0), and a
-// pool game harvested into the dataset can't be counted twice. Each pair reports how many of
-// its games came from the store, so the UI can say where a cell's evidence lives.
-function combinedPairs() {
-  const store = readJson(F.pool) || {};
-  const corpus = readJson(F.corpus) || {};
-  const sp = store.pairs || {};
+// ------------------------------------------------------------- pairwise evidence
+// Exactly what rank:pool fitted, read straight from the snapshot it writes after every matchup.
+// Nothing to mirror or reconcile: every game lives in the dataset and the ratings are derived
+// from it in one pass, so this file already holds ladder matchups and gate games alike.
+function poolPairs() {
+  const snap = readJson(F.pool) || {};
   const out = {};
-  for (const [k, v] of Object.entries(sp)) out[k] = { games: v.games, sumA: v.sumA, store: v.games };
-  for (const [k, v] of Object.entries(corpus.pairs || {})) {
+  let total = 0;
+  for (const [k, v] of Object.entries(snap.pairs || {})) {
     if (k.split('|').some((id) => EPHEMERAL.test(id))) continue;   // unrated candidate — never shown
-    const s = sp[k] || { games: 0, sumA: 0 };
-    const extra = v.games - s.games;
-    if (extra <= 0) continue;
-    const e = out[k] || (out[k] = { games: 0, sumA: 0, store: 0 });
-    e.games += extra;
-    e.sumA += Math.min(Math.max(v.sumA - s.sumA, 0), extra);
+    out[k] = { games: v.games, sumA: v.sumA };
+    total += v.games;
   }
-  // The corpus cache is rewritten only when rank:pool re-scans, and it keys on the dataset's
-  // size+mtime — so say when the dataset has moved on and these counts trail it.
+  // The snapshot stamps the dataset it was derived from. Between rank:pool runs the loop keeps
+  // appending (gate games, generation), so say when the ratings haven't seen the newest games.
   const ds = statSafe(F.selfplay);
-  const stale = !!(ds && corpus.size != null && (corpus.size !== ds.size || Math.abs((corpus.mtimeMs ?? 0) - ds.mtimeMs) > 1));
-  return { pairs: out, corpusGames: corpus.corpusGames ?? 0, stale };
+  const stale = !!(ds && snap.data && (snap.data.size !== ds.size || Math.abs((snap.data.mtimeMs ?? 0) - ds.mtimeMs) > 1));
+  return { pairs: out, corpusGames: total, stale };
 }
 
 // ------------------------------------------------------- experiments / tracks
@@ -280,7 +268,7 @@ function scheduleBroadcast(name) {
     watchTimer = null;
     const files = [...pendingChanges];
     pendingChanges.clear();
-    if (files.some((f) => f.includes('ladder-games') || f.includes('selfplay.jsonl'))) indexGames();
+    if (files.some((f) => f.includes('selfplay.jsonl'))) indexGames();
     broadcast({ type: 'change', files, ts: Date.now() });
   }, 500);
 }
@@ -344,7 +332,7 @@ const server = http.createServer((req, res) => {
     });
   }
   if (p === '/api/ladder') return sendJson(res, readJson(F.ledger) || { ranking: [] });
-  if (p === '/api/pool') return sendJson(res, combinedPairs());
+  if (p === '/api/pool') return sendJson(res, poolPairs());
   if (p === '/api/timing') return sendJson(res, readJson(F.timing) || {});
   if (p === '/api/log') return sendJson(res, { text: tailFile(F.log) });
   if (p === '/api/experiments') return sendJson(res, { tracks: experimentTracks() });

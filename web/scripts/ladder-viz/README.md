@@ -21,36 +21,35 @@ npm run viz -- --port=6000
 No install step, no bundler: pure `node:http` + `node:fs`. Open browsers refresh
 themselves over SSE whenever a watched file changes.
 
-While `rank:pool` runs, a finished game is appended to `ladder-games.jsonl` every
-second or two, so those changes only refresh the counters. A view rebuilds when the
-ledger, the pool or a training track changes, and the game you have open keeps its
-place across the rebuild.
+While `rank:pool` runs, a finished game is appended to `selfplay.jsonl` every second or
+two, so those changes only refresh the counters. A view rebuilds when the ledger, the pool
+or a training track changes, and the game you have open keeps its place across the rebuild.
 
-Indexing both game files takes ~4s at 870 MB and happens once at boot, so give it a
-moment before the first request.
+Indexing the dataset takes ~4s at 870 MB and happens once at boot, so give it a moment
+before the first request.
 
-## Games come from two places
+## Every game is in one file
 
-`rank:pool` rates engines from the matchups it schedules itself **plus** a scan of the
-whole dataset (`--corpus`), and only the first half gets persisted to `ladder-pool.json`.
-The other half is the promotion gates, which `foldGateHarvest` writes straight into
-`selfplay.jsonl`. So the dashboard reads both, and merges them the way `fit()` does: the
-pool store is authoritative for its own matchups, and the corpus adds only the games
-beyond what the store already counts.
+Generation, the promotion gates and the ranking pool all harvest into `selfplay.jsonl`, so
+the dashboard reads one file and `rank:pool` derives its ratings from that same file. The
+pairwise matrix it fitted lands in `ladder-pool.json` after every matchup, which is what
+the heatmap draws.
 
-It matters most at depth 6, which is where the gate runs (`--gate-depth`). Reading the
-pool alone, the whole champion lineage from Kara to Rosa had never met at depth 6. It had:
-Rosa vs Quinn is 1648 games. A cell's tooltip breaks out how many of its games came from
-gates rather than from the ranker.
+That used to take two sources merged the way `fit()` did, since the pool kept its own game
+archive and its own pairwise store next to the dataset. It mattered most at depth 6, which
+is where the gate runs (`--gate-depth`): reading the pool's own matchups alone, the whole
+champion lineage from Kara to Rosa had never met at depth 6, when Rosa vs Quinn is 1648
+games.
 
 Non-promoted gate candidates are left out on purpose. They carry an `elo<N>` strength
 label instead of an identity, `rank:pool` keeps them out of the fit, and so they have no
 ladder row to hang a heatmap cell on. Their games are skipped at index time, which is most
 of `selfplay.jsonl` (~168k of 240k records).
 
-The corpus half is only as fresh as the last `rank:pool` run, though. The cache keys on
-the dataset's size and mtime, so the toolbar shows `corpus scan behind dataset` when the
-dataset has moved on since.
+The matrix is only as fresh as the last `rank:pool` run, though. The snapshot records the
+dataset's size and mtime, so the toolbar shows `pool snapshot behind dataset` once the
+dataset has moved on since. That is normal between cycles, when the gate has appended games
+the ratings have not seen yet.
 
 ## Depth is shared, and the URL remembers everything
 
@@ -235,10 +234,8 @@ worth showing rather than papering over. (150 games from each source replay clea
 | File | Used for |
 |---|---|
 | `training/data/loop/engine-elo.ladder.json` | ranking, Elo, depths, convergence |
-| `training/data/loop/ladder-pool.json` | pairwise scores the pool played itself |
-| `training/data/loop/ladder-corpus-cache.json` | pairwise scores from the dataset scan |
-| `training/data/loop/ladder-games.jsonl` | game bodies (byte-indexed, incremental) |
-| `training/data/selfplay.jsonl` | game bodies for gate + generation games |
+| `training/data/loop/ladder-pool.json` | the pairwise matrix `rank:pool` last fitted |
+| `training/data/selfplay.jsonl` | every game body (byte-indexed, incremental) |
 | `training/data/loop/match.json` | latest gate summary (transient) |
 | `training/data/loop/experiments/*/` | training tracks (`state.json`, `history.jsonl`) |
 | `web/public/nn/manifest.json` + `name-history.json` | name ↔ hash ↔ gen ↔ arch |
