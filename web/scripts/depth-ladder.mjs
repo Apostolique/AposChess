@@ -929,6 +929,10 @@ function writeRankLedger(verbose) {
   const ledger = {
     generated: new Date().toISOString(), anchor: pinId, method: 'bradley-terry-pool',
     depths: cfg.depths, games: cfg.games, seed: cfg.seed,
+    // The regularizer belongs to the fit, not to the run: it sits on the diagonal of the Fisher
+    // information, so anything that wants to rebuild a contrast variance from `ranking` + the pool
+    // store (the visualizer's expected-score view does) needs the value this fit actually used.
+    prior: cfg.prior,
     dataset: cfg.scan ? { file: cfg.data, totalLines, withV: totalLines - noV, legacyNoTag } : null,
     // `nodes` is the convergence scope (this run's own competitors — the nodes it can still
     // buy games for), `rated` the whole ledger. They differ whenever the store carries nodes

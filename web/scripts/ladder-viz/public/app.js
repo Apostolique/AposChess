@@ -245,8 +245,11 @@ const State = {
   // depth", and each view spells out what that means for it.
   depth: null,
   depthSel: new Set(),   // depth×Elo: which engines are plotted
-  mFam: 'all',           // matchups: engine family filter
+  mFam: 'all',           // matchups + expected: engine family filter (shared, the two are read together)
   mCross: 'unlinked',    // matchups: which rows get cross-depth columns — none | unlinked | all
+  xOpp: 'same',          // expected: which depth the columns come from — same | all | a depth
+  xShow: 'score',        // expected: score | margin | residual
+  contrast: null,        // expected: the rebuilt contrast variances, invalidated with the pool
   gamesFilter: null,     // games: {a, b} tag filter
   openGame: null,        // games: {g, ply} currently in the viewer
   pendingGame: null,     // games: {g, ply} asked for by the URL, honoured once
@@ -714,6 +717,260 @@ function divergingColor(score) {
   return `rgb(${rgb.join(',')})`;
 }
 
+// ============================================================== EXPECTED view
+// Fitting a Bradley-Terry model gives every pair an expected score, played or not. That is what it
+// is for. This view is that matrix with nothing left blank, next to the Matchups grid which can
+// only show the pairs that met.
+//
+// The point estimates carry nothing the Ladder column doesn't already: an expected score is a
+// monotone function of one Elo difference, so reading a cell is reading a subtraction. What is
+// worth having is the two numbers beside it.
+//
+//   ±95      how well the pool pins THAT difference. Two nodes joined only through third parties
+//            can sit ±200 apart while both read ±40 against the pin.
+//   residual observed − expected on the pairs that did play. The fit already saw those games and
+//            tried to match them, so a residual that survives on a well-played pair is the model
+//            failing to fit — which is what non-transitivity looks like from inside a model that
+//            cannot represent it.
+//
+// Draws are half a point each side (the convention the gate and `eloFromScore` use), so these are
+// expected SCORES, not win rates. A pair that draws every game scores 50% with no win in it.
+const expectedScore = (dElo) => 1 / (1 + 10 ** (-dElo / 400));
+
+// The variance of the Elo difference between ANY two nodes, rebuilt from what the ladder persists.
+//
+// rank:pool computes this — it is the currency the scheduler spends games in — but only ever writes
+// out each node's ±95 against the pin (`margin`). Those two can't be subtracted into a pairwise
+// interval: they share the whole path to the anchor, so the difference overstates how unknown the
+// pair is, badly (depth-ladder.mjs:794).
+//
+// So rebuild it, which is cheaper than it sounds and is NOT a second fit. The Fisher information of
+// a BT model is H_ii = prior/4 + Σ_j N_ij·p_ij(1−p_ij), H_ij = −N_ij·p_ij(1−p_ij), and that needs
+// only the game counts (the pool) and the strengths (the ladder's own Elos, since γ = 10^(Elo/400)).
+// No MM iteration is repeated and no rating is recomputed: every Elo on screen is the ledger's. H is
+// scale-free in γ, so the pin offset drops out and the reconstruction doesn't care about PIN_ELO.
+//
+// It checks itself. The ledger's `margin` column IS 1.96·√varDiff(node, pin), so the two agree to
+// rounding when the reconstruction is right. They do — except while rank:pool is running, where the
+// pool store has already moved past the ledger it last wrote and a handful of rows come out tighter
+// than the ledger says. `drift` reports that instead of hiding it.
+const ELO_VAR = (400 / Math.LN10) ** 2; // beta-variance -> Elo-variance (Elo = (400/ln10)·beta)
+function contrastModel() {
+  if (State.contrast) return State.contrast;
+  const ranking = State.ladder?.ranking || [];
+  const pairs = State.pool?.pairs || {};
+  const prior = Number(State.ladder?.prior ?? 1); // pre-2026-08 ledgers predate the field; 1 is the default
+  const ids = ranking.map((r) => r.tag);
+  const n = ids.length;
+  const elo = new Map(ranking.map((r) => [r.tag, r.elo]));
+  // γ only ever appears as a ratio, so centre it — the ladder spans ~1600 Elo and 10^(1600/400) is
+  // fine, but centring keeps it that way if the pool ever widens.
+  const mid = ids.reduce((s, id) => s + elo.get(id), 0) / (n || 1);
+  const gamma = new Map(ids.map((id) => [id, 10 ** ((elo.get(id) - mid) / 400)]));
+  const pos = new Map(ids.map((id, k) => [id, k]));
+  const H = Array.from({ length: n }, () => new Float64Array(n));
+  for (let k = 0; k < n; k++) H[k][k] = prior * 0.25; // phantom self-anchor, p(1−p)=0.25 at parity
+  for (const [key, v] of Object.entries(pairs)) {
+    const [i, j] = key.split('|');
+    if (!pos.has(i) || !pos.has(j) || !(v.games > 0)) continue;
+    const gi = gamma.get(i), gj = gamma.get(j);
+    const w = v.games * (gi * gj) / ((gi + gj) * (gi + gj)); // N·p(1−p)
+    const a = pos.get(i), b = pos.get(j);
+    H[a][a] += w; H[b][b] += w; H[a][b] -= w; H[b][a] -= w;
+  }
+  const S = invSym(H, n);
+  const varDiff = (a, b) => {
+    const i = pos.get(a), j = pos.get(b);
+    if (i == null || j == null || i === j) return 0;
+    return Math.max(0, ELO_VAR * (S[i][i] + S[j][j] - 2 * S[i][j]));
+  };
+  const margin = (a, b) => 1.96 * Math.sqrt(varDiff(a, b));
+  // Self-check against the column the ledger already published.
+  const pin = State.ladder?.anchor;
+  let off = 0, worst = 0;
+  if (pin && pos.has(pin)) {
+    for (const r of ranking) {
+      if (r.tag === pin || r.margin == null) continue;
+      const d = Math.abs(margin(r.tag, pin) - r.margin);
+      if (d > 1) { off++; worst = Math.max(worst, d); }
+    }
+  }
+  State.contrast = { varDiff, margin, prior, nodes: n, drift: { off, worst } };
+  return State.contrast;
+}
+// Gauss-Jordan inverse of a symmetric positive-definite matrix. n is the node count (~184 today),
+// so this is ~6M flops and runs in ~30ms — once per data reload, not per render.
+function invSym(A, n) {
+  const M = A.map((r) => Float64Array.from(r));
+  const I = Array.from({ length: n }, (_, k) => { const r = new Float64Array(n); r[k] = 1; return r; });
+  for (let col = 0; col < n; col++) {
+    let piv = col;
+    for (let r = col + 1; r < n; r++) if (Math.abs(M[r][col]) > Math.abs(M[piv][col])) piv = r;
+    if (Math.abs(M[piv][col]) < 1e-12) continue; // ~singular (the prior should prevent it); skip
+    if (piv !== col) { const t = M[piv]; M[piv] = M[col]; M[col] = t; const u = I[piv]; I[piv] = I[col]; I[col] = u; }
+    const d = M[col][col];
+    for (let c = 0; c < n; c++) { M[col][c] /= d; I[col][c] /= d; }
+    for (let r = 0; r < n; r++) {
+      if (r === col) continue;
+      const f = M[r][col]; if (f === 0) continue;
+      for (let c = 0; c < n; c++) { M[r][c] -= f * M[col][c]; I[r][c] -= f * I[col][c]; }
+    }
+  }
+  return I;
+}
+
+const XSHOW = { score: 'expected score', margin: '±95 on the Elo gap', residual: 'observed − expected' };
+async function renderExpected() {
+  const root = $('#view-expected'); root.innerHTML = '';
+  root.append(el('h2', { class: 'section' }, 'Expected score ',
+    el('span', { class: 'sub' }, '· what the ledger says every matchup would do, including the ones that never met')));
+  if (!State.pool) State.pool = await api('/api/pool');
+  const pairs = State.pool.pairs || {};
+  const model = contrastModel();
+
+  const eloOf = new Map(); const labelOf = new Map(); const parsedOf = new Map();
+  for (const r of State.ladder.ranking) { eloOf.set(r.tag, r.elo); labelOf.set(r.tag, `${r.name || nodeLabel(r.eng, r.version, State.champs)} d${r.depth}`); parsedOf.set(r.tag, r); }
+
+  const tb = el('div', { class: 'toolbar' });
+  tb.append(el('label', {}, 'Depth', depthSelect()));
+  // The family filter is shared with the Matchups grid: the two views are read against each other
+  // (predicted here, played there) and re-picking the family on every switch got old fast.
+  tb.append(el('label', {}, 'Family', el('select', { 'data-ctl': 'fam', onchange: (e) => { State.mFam = e.target.value; keepFocus(renderExpected); syncUrl(); } },
+    ...['all', 'nn', 'hc'].map((f) => el('option', { value: f, selected: f === State.mFam ? '' : null }, f === 'all' ? 'all engines' : f)))));
+  // Nothing here needs a game to exist, so the columns are free to be another depth entirely.
+  // "Ada d8 vs today's champion at d4" is a question only this view can answer.
+  tb.append(el('label', {}, 'Opponents', el('select', { 'data-ctl': 'xopp', onchange: (e) => { State.xOpp = e.target.value; keepFocus(renderExpected); syncUrl(); } },
+    el('option', { value: 'same', selected: State.xOpp === 'same' ? '' : null }, 'same depth as rows'),
+    el('option', { value: 'all', selected: State.xOpp === 'all' ? '' : null }, 'every depth'),
+    ...availableDepths().map((d) => el('option', { value: String(d), selected: String(d) === String(State.xOpp) ? '' : null }, `depth ${d}`)))));
+  tb.append(el('label', {}, 'Show', el('select', { 'data-ctl': 'xshow', onchange: (e) => { State.xShow = e.target.value; keepFocus(renderExpected); syncUrl(); } },
+    ...Object.entries(XSHOW).map(([v, lbl]) => el('option', { value: v, selected: v === State.xShow ? '' : null }, lbl)))));
+
+  const inFam = (p) => State.mFam === 'all' || p.eng === State.mFam;
+  const atDepth = (p, d) => d === 'all' || Number(p.depth) === Number(d);
+  const byElo = (a, b) => (eloOf.get(a) ?? 0) - (eloOf.get(b) ?? 0);
+  const pick = (d) => State.ladder.ranking.filter((r) => inFam(r) && atDepth(r, d)).map((r) => r.tag).sort(byElo);
+  const rows = pick(State.depth);
+  const cols = State.xOpp === 'same' ? rows : pick(State.xOpp === 'all' ? 'all' : Number(State.xOpp));
+
+  // How much of the grid is extrapolation. Every cell has a number either way, and that is the whole
+  // risk of this view — the ones with no game behind them look exactly as confident as the rest.
+  let cells = 0, played = 0;
+  for (const r of rows) for (const c of cols) { if (r === c) continue; cells++; if (pairScore(pairs, r, c)) played++; }
+  tb.append(el('span', { class: 'sub' }, `${rows.length}×${cols.length} · ${fmt(played)} of ${fmt(cells)} cells have games behind them`));
+  // The self-check disagreeing is nearly always rank:pool running right now: the store it appends to
+  // has games the ledger it last wrote hasn't seen, so those rows rebuild TIGHTER than the ledger says.
+  if (model.drift.off) {
+    tb.append(el('span', { class: 'badge warn', title: 'The ±95 here is rebuilt from the pool store, which a running rank:pool updates between ledger writes. A disagreement that outlives the run would mean the fit used a --prior the ledger didn’t record.' },
+      `pool ahead of ledger · ${model.drift.off} row${model.drift.off === 1 ? '' : 's'} up to ${fmt(model.drift.worst, 0)} Elo tighter`));
+  }
+  if (State.pool.stale) tb.append(el('span', { class: 'badge warn' }, 'corpus scan behind dataset'));
+  root.append(tb);
+
+  if (!rows.length || !cols.length) { root.append(el('div', { class: 'empty-state' }, 'No rated node at this filter. Try “all depths”.')); return; }
+
+  const scroll = el('div', { class: 'heat-scroll' });
+  const table = el('table', { class: 'heat' });
+  const head = el('tr', {}, el('th', { class: 'corner' }, ''));
+  for (const c of cols) head.append(el('th', { class: 'collab' }, el('div', {}, shortLabel(c, parsedOf))));
+  table.append(head);
+  for (let ri = 0; ri < rows.length; ri++) {
+    const rTag = rows[ri];
+    const tr = el('tr', {}, el('th', { class: 'rowlab' }, shortLabel(rTag, parsedOf)));
+    for (let ci = 0; ci < cols.length; ci++) {
+      const cTag = cols[ci];
+      if (rTag === cTag) { tr.append(el('td', { class: 'cell diag' }, '')); continue; }
+      const v = cellValue(rTag, cTag, pairs, eloOf, model);
+      // Only the residual grid can come up blank (a pair with no game has nothing to residual
+      // against). It still gets the hover, since the expected score behind it is the thing you came
+      // to this view for.
+      if (v == null) { tr.append(el('td', { class: 'cell empty noclick', 'data-r': String(ri), 'data-c': String(ci) }, '')); continue; }
+      // A cell with no direct game is a number the pool inferred through other engines. Dimming it
+      // is the only thing separating it from a 3000-game measurement at a glance.
+      const cls = `cell${v.games ? '' : ' inferred noclick'}`;
+      const td = el('td', { class: cls, style: `background:${v.bg}`, 'data-r': String(ri), 'data-c': String(ci) }, v.text);
+      tr.append(td);
+    }
+    table.append(tr);
+  }
+  // One delegated listener for the whole grid: "every depth" is 184 columns, and 34k cells with two
+  // listeners each is a real cost on a page that rebuilds itself whenever the loop writes a file.
+  table.addEventListener('mousemove', (ev) => {
+    const td = ev.target.closest?.('td.cell');
+    if (!td || !td.dataset.r) return hideTip();
+    showTip(cellTip(rows[+td.dataset.r], cols[+td.dataset.c], pairs, eloOf, labelOf, model), ev.clientX, ev.clientY);
+  });
+  table.addEventListener('mouseleave', hideTip);
+  table.addEventListener('click', (ev) => {
+    const td = ev.target.closest?.('td.cell');
+    if (!td || !td.dataset.r || td.classList.contains('noclick')) return;
+    openGamesFor(rows[+td.dataset.r], cols[+td.dataset.c]);
+  });
+  scroll.append(table);
+  root.append(scroll);
+
+  const lg = el('div', { class: 'flex mt', style: { gap: '8px' } });
+  if (State.xShow === 'margin') {
+    lg.append(el('span', { class: 'sub' }, 'gap pinned'));
+    for (let m = 0; m <= 200.01; m += 20) lg.append(swatchBox(marginColor(m)));
+    lg.append(el('span', { class: 'sub' }, '≥200 Elo, anyone’s guess'));
+  } else if (State.xShow === 'residual') {
+    lg.append(el('span', { class: 'sub' }, 'row does worse than predicted'));
+    for (let z = -3; z <= 3.01; z += 0.6) lg.append(swatchBox(divergingColor(0.5 + z / 6)));
+    lg.append(el('span', { class: 'sub' }, 'better · shaded by σ, ±3 saturates'));
+  } else {
+    lg.append(el('span', { class: 'sub' }, 'row loses'));
+    for (let s = 0; s <= 1.0001; s += 0.1) lg.append(swatchBox(divergingColor(s)));
+    lg.append(el('span', { class: 'sub' }, 'row wins'));
+  }
+  root.append(lg);
+
+  root.append(el('div', { class: 'pill-note mt' },
+    'Every cell is one Elo subtraction put through the logistic, so the scores add no information the ranking '
+    + 'doesn’t have. The ±95 and the residual do: the first says how much of a cell is measurement and how much is '
+    + 'inference through other engines, the second is the only place the fit can admit it got a pair wrong. '
+    + 'Draws count half, so these are scores, not win rates.'));
+}
+function swatchBox(bg) { return el('span', { style: { width: '26px', height: '14px', borderRadius: '3px', background: bg, display: 'inline-block' } }); }
+// ±95 ramp, dark (pinned) to violet (unknown). Deliberately not on the blue↔orange the score and the
+// residual share — it is a different quantity and shouldn't borrow their poles.
+function marginColor(m) {
+  const lo = [38, 38, 36], hi = [122, 104, 224];
+  const t = Math.min(1, Math.sqrt(Math.max(0, m) / 200)); // √ so the interesting 0-50 range spreads out
+  return `rgb(${lo.map((c, i) => Math.round(c + (hi[i] - c) * t)).join(',')})`;
+}
+// The three grids are the same cells read three ways, so they share one value function.
+function cellValue(a, b, pairs, eloOf, model) {
+  const p = expectedScore((eloOf.get(a) ?? 0) - (eloOf.get(b) ?? 0));
+  const obs = pairScore(pairs, a, b);
+  const games = obs?.games || 0;
+  if (State.xShow === 'margin') return { text: Math.round(model.margin(a, b)), bg: marginColor(model.margin(a, b)), games };
+  if (State.xShow === 'residual') {
+    if (!obs) return null;
+    const r = obs.score - p;
+    // A [0,1]-valued score has variance ≤ p(1−p), and a draw-heavy pair is well under it, so this σ
+    // is an upper bound and the shading understates rather than oversells.
+    const z = r / Math.sqrt(Math.max(p * (1 - p), 1e-9) / games);
+    return { text: `${r >= 0 ? '+' : ''}${Math.round(r * 100)}`, bg: divergingColor(0.5 + Math.max(-0.5, Math.min(0.5, z / 6))), games };
+  }
+  return { text: Math.round(p * 100), bg: divergingColor(p), games };
+}
+function cellTip(a, b, pairs, eloOf, labelOf, model) {
+  const d = (eloOf.get(a) ?? 0) - (eloOf.get(b) ?? 0);
+  const p = expectedScore(d);
+  const m = model.margin(a, b);
+  const obs = pairScore(pairs, a, b);
+  const row = (k, v) => `<div class="tt-row"><span class="k">${k}</span><span class="v">${v}</span></div>`;
+  return `<div class="tt-title">${labelOf.get(a)} vs ${labelOf.get(b)}</div>`
+    + row('Elo gap', `${d >= 0 ? '+' : ''}${fmt(d, 0)} ±${fmt(m, 0)}`)
+    // The interval on the score is the interval on the gap pushed through the same logistic, which
+    // is why it is lopsided near the ends: 100 Elo of slack buys much less score up at 90%.
+    + row('Expected', `${pct(p)}<span class="tt-band">${pct(expectedScore(d - m))} – ${pct(expectedScore(d + m))}</span>`)
+    + row('Direct games', obs ? fmt(obs.games) : 'never met')
+    + (obs ? row('Observed', `${pct(obs.score)} <span class="tt-band">${obs.score - p >= 0 ? '+' : ''}${fmt((obs.score - p) * 100, 1)} pts</span>`) : '')
+    + (obs && obs.store < obs.games ? row('of which gate/self-play', fmt(obs.games - obs.store)) : '');
+}
+
 // ================================================================= GAMES view
 function openGamesFor(a, b) { State.gamesFilter = { a, b }; switchView('games'); }
 async function renderGames() {
@@ -1071,7 +1328,7 @@ async function openTrack(id) {
 }
 
 // =============================================================== router / live
-const VIEWS = { ladder: renderLadder, generations: renderGenerations, depth: renderDepth, matchups: renderMatchups, games: renderGames, training: renderTraining };
+const VIEWS = { ladder: renderLadder, generations: renderGenerations, depth: renderDepth, matchups: renderMatchups, expected: renderExpected, games: renderGames, training: renderTraining };
 let currentView = 'ladder';
 // A rebuild throws away the toolbar the user is standing in, so a dropdown that triggers one loses
 // focus on its first pick and the arrow keys stop cycling. Controls that survive a rebuild carry a
@@ -1117,8 +1374,12 @@ function urlParams() {
   const q = new URLSearchParams();
   if (State.depth != null) q.set('depth', String(State.depth));
   if (currentView === 'depth' && State.depthSel.size) q.set('sel', [...State.depthSel].join(','));
-  if (currentView === 'matchups' && State.mFam !== 'all') q.set('fam', State.mFam);
+  if ((currentView === 'matchups' || currentView === 'expected') && State.mFam !== 'all') q.set('fam', State.mFam);
   if (currentView === 'matchups' && State.mCross !== 'unlinked') q.set('cross', State.mCross);
+  if (currentView === 'expected') {
+    if (State.xOpp !== 'same') q.set('opp', String(State.xOpp));
+    if (State.xShow !== 'score') q.set('show', State.xShow);
+  }
   if (currentView === 'games') {
     const f = State.gamesFilter || {};
     if (f.a) q.set('a', f.a);
@@ -1145,6 +1406,9 @@ function applyUrl() {
   if (sel) State.depthSel = new Set(sel.split(',').filter(Boolean));
   State.mFam = p.get('fam') || 'all';
   State.mCross = ['none', 'unlinked', 'all'].includes(p.get('cross')) ? p.get('cross') : 'unlinked';
+  const opp = p.get('opp');
+  State.xOpp = opp === 'all' || opp === 'same' ? opp : (Number.isFinite(Number(opp)) && opp ? Number(opp) : 'same');
+  State.xShow = Object.hasOwn(XSHOW, p.get('show')) ? p.get('show') : 'score';
   const a = p.get('a'), b = p.get('b');
   State.gamesFilter = a || b ? { a: a || null, b: b || null } : null;
   const g = p.get('g');
@@ -1227,6 +1491,7 @@ function connectLive() {
       const rebuild = structural;
       structural = false;
       State.pool = null;
+      State.contrast = null; // rebuilt from the pool + the ledger, so it dies with them
       await loadCore();
       if (rebuild) { renderView(currentView); syncUrl(); } else refreshCounters();
       txt.textContent = 'live';

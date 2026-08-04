@@ -190,6 +190,10 @@ svg.chart .crosshair { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 
    same-depth block still reads as a block. */
 .heat .sep { border-left: 2px dashed var(--border-strong); }
 .heat th.collab.off div { color: var(--muted); font-style: italic; }
+/* Expected view: a cell with no game behind it is inference through other engines, and it would
+   otherwise look exactly as solid as a 3000-game measurement. */
+.heat td.cell.inferred { color: rgba(255, 255, 255, 0.55); }
+.heat td.cell.noclick { cursor: default; }
 
 /* ---- game viewer ------------------------------------------------------ */
 .viewer { display: grid; grid-template-columns: minmax(320px, 460px) 1fr; gap: 18px; align-items: start; }

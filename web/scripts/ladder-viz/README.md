@@ -70,9 +70,13 @@ link is worth pasting:
 ```
 #/ladder?depth=8
 #/matchups?depth=6&fam=nn&cross=all
+#/expected?depth=4&opp=6&show=margin
 #/games?a=nn8@2c9f1a&b=hc8@2&g=<game-id>&ply=42
 #/training?depth=8&track=mona
 ```
+
+The family filter is shared between Matchups and Expected. Those two get read against each other
+constantly, so having to re-pick `nn` on every switch got old.
 
 Back and forward work too. The ply is written while you step through a game but not
 while a replay is running, so the URL holds the ply you stopped on.
@@ -103,6 +107,54 @@ is already a row.
 New engines aren't the only ones this catches. At depth 4 the handcrafted anchor carries 820
 games and Quinn 742, and neither has a same-depth opponent.
 
+## Expected: the same grid with nothing missing
+
+Matchups can only show the pairs that met. Fitting a Bradley-Terry model gives every pair an
+expected score whether it met or not, which is the whole reason to fit one, so the Expected tab is
+that matrix filled in end to end. Draws count half a point each side (the convention the gate and
+`eloFromScore` use), so these are expected **scores**, not win rates: a pair that draws every game
+scores 50% with no win in it.
+
+The scores themselves add nothing the Ladder column doesn't already have. A cell is one Elo
+subtraction put through `1/(1+10^(-Δ/400))`, so reading the grid is reading a subtraction. Two other
+things are on it, and those are the reason it exists.
+
+**±95** is how well the pool pins *that* difference. Cells with no game behind them have their
+number dimmed, which at depth 6 is 434 of 506 — most of the grid is inference through third
+parties, and without the dimming it looks exactly as solid as a 3000-game measurement. The interval
+says how much that costs: Tara d8 has never played the `hc6@2` pin directly, and their gap still
+comes out +566 ±72 because the path between them is short and busy.
+
+**Observed − expected** is the residual, on the pairs that did play. The fit already saw those games
+and tried to match them, so a residual that survives on a well-played pair is the model failing to
+fit, which is what non-transitivity looks like from inside a model that can't represent it. Shading
+is by σ (±3 saturates) with the bound `Var ≤ p(1−p)`, which a draw-heavy pair sits well under, so it
+understates rather than oversells.
+
+Since nothing here needs a game to exist, the columns are free to come from another depth entirely.
+`Opponents` picks: same depth as the rows, one specific depth, or every depth (184 columns).
+"How does Ada at depth 8 do against today's champion at depth 4" is a question only this view answers.
+
+### Where the ±95 comes from
+
+`rank:pool` computes the pairwise contrast variance — it is the currency the scheduler spends games
+in — but only ever writes out each node's ±95 against the pin (`margin`). Those can't be subtracted
+into a pairwise interval: they share the whole path to the anchor, so the difference overstates how
+unknown the pair is (`depth-ladder.mjs:794`, and the generations band below says the same).
+
+So the view rebuilds it, which is cheaper than a refit. The Fisher information of a BT model is
+`H_ii = prior/4 + Σ_j N_ij·p_ij(1−p_ij)`, `H_ij = −N_ij·p_ij(1−p_ij)`, and that needs only the game
+counts (the pool) and the strengths (the ladder's own Elos, since `γ = 10^(Elo/400)`). No MM
+iteration is repeated and no rating is recomputed — every Elo on screen is the ledger's. `H` is
+scale-free in `γ`, so the pin offset drops out.
+
+It checks itself, because the ledger's `margin` column *is* `1.96·√varDiff(node, pin)`. Across 183
+nodes the rebuild reproduces it to a median of 0.008 Elo. The exceptions show up as a
+`pool ahead of ledger` badge and are almost always a `rank:pool` running right now: the store it
+appends to has games the ledger it last wrote hasn't seen, so those rows come out tighter. A
+disagreement that outlives the run would mean the fit used a `--prior` the ledger didn't record,
+which is why `rank:pool` now writes `prior` into the ledger.
+
 ## Views
 
 - **Ladder** — leaderboard at the shared depth (or each engine's best depth, at
@@ -116,6 +168,8 @@ games and Quinn 742, and neither has a same-depth opponent.
 - **Matchups** — head-to-head heatmap of every game two engines have played
   (diverging blue↔orange around 50%). Click a cell for the games. Columns can reach past the
   picked depth, see above.
+- **Expected** — the same grid with no gaps: what the ledger says every matchup would score,
+  played or not, plus the ±95 on each pair and the residual where games exist. See above.
 - **Games** — filter by engine / matchup, replay any game on a board with an eval
   graph (white-POV, mate-aware) and a clickable move list. The board is the app's:
   material trays either side, and the app's move / capture / check sounds as you step
@@ -151,7 +205,9 @@ verdict: two vs-pin intervals share the path to the anchor, so subtracting them 
 pairwise uncertainty badly. Two neighbours that played each other directly can have their
 difference pinned to ±15 while both still read ±50 vs the pin. The pairwise contrast variance is
 what settles the order, `rank:pool` computes it (`depth-ladder.mjs:794`) but doesn't persist it,
-so it isn't in the ladder file and isn't on this chart.
+so it isn't in the ladder file and isn't on this chart. It is on the **Expected** tab, which
+rebuilds it from the pool — that is where to go to ask whether two champions are really in that
+order.
 
 For the same reason the Elo-gained bars below the line carry no error bars. A difference of two
 banded numbers is not a banded difference.
