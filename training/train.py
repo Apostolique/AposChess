@@ -25,6 +25,7 @@
 #   python training/train.py [--data ...] [--epochs N] [--hidden H] ...
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -155,44 +156,249 @@ def parse_args():
                         "with nn-generated data (handcrafted v reintroduces its bias).")
     p.add_argument("--val", type=float, default=0.05, help="validation fraction")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--no-cache", action="store_true",
+                   help="don't read or write the packed-array cache beside --data "
+                        "(<data>.cache.*): parse the JSONL every run, as before. The "
+                        "cache is keyed to the file's length + a hash of its tail, so "
+                        "it invalidates itself; this is for debugging it.")
     return p.parse_args()
 
 
-def load_data(path, np):
-    """Read the featurized JSONL and pack it into dense arrays.
+# --- Packed-array cache -----------------------------------------------------
+#
+# Parsing the featurized JSONL is the trainer's biggest fixed cost once the
+# dataset is large, and it is paid again on every loop cycle even though the
+# cycle usually only APPENDED a few MB to the file. Measured on the 3.07 GB /
+# 25.7M-position set: ~14 min of the ~25-59 min training step, and a ~18 GB
+# memory peak (14.7 GB of that is interpreter objects — a list of 25.7M little
+# Python lists — on a 32 GB machine shared with the gate match).
+#
+# So the packed arrays are cached beside the data in NumPy's binary format.
+# Validity mirrors featurize.mjs's own incremental sidecar: the source's byte
+# LENGTH at cache time plus a SHA-1 of that prefix's last 64 KB.
+#   same length and hash          -> load the cache, parse nothing
+#   longer, prefix still hashes    -> parse only the appended tail, extend
+#   anything else                  -> full rebuild
+# An in-place rewrite (refresh-v), a filter change, or a num_features change
+# therefore each fall back to a full pass on their own, with no flag to
+# remember. The cache is a derived artifact under the git-ignored
+# training/data/ and is safe to delete at any time (--no-cache skips it).
+CACHE_VERSION = 1
+CACHE_TAIL = 64 * 1024
+
+
+def _cache_paths(data_path):
+    base = data_path[:-len(".jsonl")] if data_path.endswith(".jsonl") else data_path
+    return base + ".cache.json", base + ".cache.f.npy", base + ".cache.aux.npz"
+
+
+def _tail_hash(path, upto):
+    """SHA-1 of the last CACHE_TAIL bytes of `path`'s first `upto` bytes."""
+    with open(path, "rb") as f:
+        f.seek(max(0, upto - CACHE_TAIL))
+        return hashlib.sha1(f.read(min(upto, CACHE_TAIL))).hexdigest()
+
+
+def _parse_jsonl(path, start, np, dtype, pad, codes, next_code):
+    """Parse whole JSONL records from byte offset `start` to EOF.
+
+    Feature rows go straight into fixed-width int blocks and each record's Python
+    list is dropped immediately. The old list-of-lists cost ~570 B/row in
+    interpreter objects (14.7 GB across the current set) and was what made the
+    load slow as much as the json.loads itself. Blocks carry their own width and
+    are padded up to the global one at the end, so no maximum row length is
+    baked in.
+
+    `codes` maps game id -> int code in FIRST-APPEARANCE order and `next_code` is
+    the next free one; both are carried in so an incremental extend keeps
+    numbering where the cached prefix left off. Returns
+    (mat, r, v, g, end_offset, next_code, last_gid, last_code) — the trailing
+    pair identifies the last real game seen, which is what an extend needs to
+    rejoin a game straddling the cut.
+    """
+    BLOCK = 1 << 20
+    fb, rb, vb, gb, widths = [], [], [], [], []
+    cur = cur_r = cur_v = cur_g = None
+    w = k = 0
+    pos = start
+    last_gid = last_code = None
+
+    def flush():
+        if cur is not None and k:
+            fb.append(cur[:k]); widths.append(w)
+            rb.append(cur_r[:k]); vb.append(cur_v[:k]); gb.append(cur_g[:k])
+
+    with open(path, "rb") as f:
+        f.seek(start)
+        for line in f:  # binary mode: len(line) is the exact byte count consumed
+            pos += len(line)
+            if not line.strip():
+                continue
+            rec = json.loads(line)
+            fr = rec["f"]
+            m = len(fr)
+            if cur is None or k == BLOCK:
+                flush()
+                w = max(m, 1)
+                cur = np.full((BLOCK, w), pad, dtype)
+                cur_r = np.empty(BLOCK, np.float32)
+                cur_v = np.empty(BLOCK, np.float32)
+                cur_g = np.empty(BLOCK, np.int32)
+                k = 0
+            if m > w:  # a longer row than this block was sized for — widen it
+                grown = np.full((BLOCK, m), pad, dtype)
+                grown[:k, :w] = cur[:k]
+                cur, w = grown, m
+            cur[k, :m] = fr
+            cur_r[k] = rec["r"]
+            v = rec.get("v")  # per-position search value (cp) or absent
+            cur_v[k] = np.nan if v is None else v
+            gid = rec.get("g")
+            if gid is None:
+                # No "g" (pre-migration data) -> its own singleton "game", so it
+                # can never leak across the train/val split.
+                cur_g[k] = next_code
+                next_code += 1
+            else:
+                c = codes.get(gid)
+                if c is None:
+                    c = codes[gid] = next_code
+                    next_code += 1
+                cur_g[k] = c
+                last_gid, last_code = gid, int(c)
+            k += 1
+    flush()
+
+    if not fb:
+        z = np.zeros
+        return (z((0, 1), dtype), z(0, np.float32), z(0, np.float32), z(0, np.int32),
+                pos, next_code, last_gid, last_code)
+    width = max(widths)
+    n = sum(len(b) for b in fb)
+    mat = np.full((n, width), pad, dtype)
+    o = 0
+    for i, b in enumerate(fb):
+        mat[o:o + len(b), :widths[i]] = b
+        o += len(b)
+        fb[i] = None  # release each block as it lands, so the peak is ~1 copy
+    return (mat, np.concatenate(rb), np.concatenate(vb), np.concatenate(gb),
+            pos, next_code, last_gid, last_code)
+
+
+def load_data(path, np, num_features, use_cache=True):
+    """Read the featurized JSONL into packed arrays, via the binary cache above.
 
     Feature lists are variable-length, so they are packed into one fixed-width
-    int32 matrix padded with a dedicated padding index (= num_features, filled in
-    by the caller); the model's EmbeddingBag uses padding_idx so the padding
-    contributes exactly zero. A whole batch is then a single tensor indexing op
-    instead of a pure-Python packing loop, which would dominate CPU training time
-    on a millions-of-rows dataset.
+    int matrix padded with a dedicated padding index (= num_features); the
+    model's EmbeddingBag uses padding_idx so the padding contributes exactly
+    zero. A whole batch is then a single tensor indexing op instead of a
+    pure-Python packing loop, which would dominate CPU training time on a
+    millions-of-rows dataset. Indices fit in int16 (768 features today), which
+    halves both the resident matrix and the per-batch gather; the batch is cast
+    to int32 on the way into the EmbeddingBag.
+
+    Returns (mat, targets, values, games, n_games), where `games` is a per-row
+    int32 game code in first-appearance order.
     """
     if not os.path.exists(path):
         sys.exit(f"No training data at {path}. Generate raw positions, then featurize:\n"
                  f"  cd web && npm run train:gen && npm run train:featurize")
-    feats, targets, values, games = [], [], [], []
-    max_f = 1
-    with open(path, "r") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            rec = json.loads(line)
-            fr = rec["f"]
-            feats.append(fr)
-            if len(fr) > max_f:
-                max_f = len(fr)
-            targets.append(float(rec["r"]))
-            v = rec.get("v")  # per-position search value (cp) or absent
-            values.append(float("nan") if v is None else float(v))
-            # No "g" (pre-migration data) -> give the row its own unique id so it
-            # stays a singleton "game"; this can never leak across the split.
-            games.append(rec.get("g", f"_nog_{len(games)}"))
-    if not targets:
+    dtype = np.int16 if num_features < 32767 else np.int32
+    meta_p, f_p, aux_p = _cache_paths(path)
+    st = os.stat(path)
+    size = st.st_size
+
+    meta = None
+    if use_cache and all(os.path.exists(p) for p in (meta_p, f_p, aux_p)):
+        try:
+            with open(meta_p) as f:
+                m = json.load(f)
+            if (m.get("version") == CACHE_VERSION and m.get("num_features") == num_features
+                    and m.get("dtype") == np.dtype(dtype).name
+                    and 0 < m.get("bytes", 0) <= size
+                    and m["tail_hash"] == _tail_hash(path, m["bytes"])):
+                meta = m
+            # An in-place rewrite that happens to land on the same length with the
+            # same last 64 KB would pass the check above; the mtime never does.
+            # (Only for an exact hit — an append moves the mtime legitimately, and
+            # there the prefix hash is what has to hold.)
+            if meta and meta["bytes"] == size and meta.get("mtime_ns") != st.st_mtime_ns:
+                meta = None
+        except (OSError, ValueError, KeyError):
+            meta = None  # unreadable/garbage cache -> just rebuild it
+
+    t0 = time.time()
+    if meta and meta["bytes"] == size:
+        mat = np.load(f_p)
+        # np.load on an .npz is lazy and holds the file handle open, which on
+        # Windows blocks the os.replace that rewrites the cache — so read the
+        # members out and close it.
+        with np.load(aux_p) as aux:
+            targets, values, games = aux["r"], aux["v"], aux["g"]
+        print(f"Feature cache: hit — {len(targets):,} rows, "
+              f"{mat.nbytes / 1e9:.2f} GB, loaded in {fmt_dur(time.time() - t0)}.")
+        return mat, targets, values, games, meta["n_games"]
+
+    if meta:  # append-only growth: parse just the new tail and extend the cache
+        print(f"Feature cache: extending — {(size - meta['bytes']) / 1e6:.1f} MB of new data "
+              f"on {meta['bytes'] / 1e9:.2f} GB already packed.")
+        # Only the game at the cut can straddle the boundary (featurize appends
+        # whole games), so seeding its id is enough to keep a straddling game on
+        # one side of the by-game split instead of splitting it in two. Its code
+        # is stored rather than assumed to be the highest: rows carrying no "g"
+        # take codes of their own, so the last real game need not be the last one
+        # numbered.
+        codes = ({meta["last_gid"]: meta["last_code"]}
+                 if meta.get("last_gid") is not None else {})
+        new = _parse_jsonl(path, meta["bytes"], np, dtype, num_features, codes, meta["n_games"])
+        mat_n, r_n, v_n, g_n, end, next_code, last_gid, last_code = new
+        old_mat = np.load(f_p)
+        with np.load(aux_p) as aux:  # closed before the os.replace below (see above)
+            old_r, old_v, old_g = aux["r"], aux["v"], aux["g"]
+        width = max(old_mat.shape[1], mat_n.shape[1])
+        if len(r_n):
+            mat = np.full((len(old_mat) + len(mat_n), width), num_features, dtype)
+            mat[:len(old_mat), :old_mat.shape[1]] = old_mat
+            mat[len(old_mat):, :mat_n.shape[1]] = mat_n
+            targets = np.concatenate([old_r, r_n])
+            values = np.concatenate([old_v, v_n])
+            games = np.concatenate([old_g, g_n])
+        else:  # trailing whitespace only — nothing new to add
+            mat, targets, values, games = old_mat, old_r, old_v, old_g
+        if last_gid is None:  # the tail added no real game — keep the prefix's
+            last_gid, last_code = meta.get("last_gid"), meta.get("last_code")
+    else:
+        print(f"Feature cache: building from {size / 1e9:.2f} GB of JSONL "
+              f"(one-time per featurized file; appends after this are incremental).")
+        mat, targets, values, games, end, next_code, last_gid, last_code = _parse_jsonl(
+            path, 0, np, dtype, num_features, {}, 0)
+
+    if not len(targets):
         sys.exit(f"{path} has no samples.")
-    return (feats, np.asarray(targets, np.float32), np.asarray(values, np.float32),
-            games, max_f)
+    n_games = int(next_code)
+    print(f"Packed {len(targets):,} rows in {fmt_dur(time.time() - t0)} "
+          f"({mat.nbytes / 1e9:.2f} GB).")
+
+    if use_cache:
+        # Write via temp files + replace so an interrupted run can't leave a cache
+        # that claims to describe more data than it holds.
+        try:
+            np.save(f_p + ".tmp.npy", mat)
+            np.savez(aux_p + ".tmp.npz", r=targets, v=values, g=games)
+            with open(meta_p + ".tmp", "w") as f:
+                json.dump({"version": CACHE_VERSION, "num_features": num_features,
+                           "dtype": np.dtype(dtype).name, "bytes": end,
+                           "tail_hash": _tail_hash(path, end), "rows": len(targets),
+                           "mtime_ns": os.stat(path).st_mtime_ns, "n_games": n_games,
+                           "last_gid": last_gid, "last_code": last_code}, f)
+            os.replace(f_p + ".tmp.npy", f_p)
+            os.replace(aux_p + ".tmp.npz", aux_p)
+            os.replace(meta_p + ".tmp", meta_p)
+            print(f"Feature cache: wrote {os.path.basename(f_p)} — next run skips the parse.")
+        except OSError as e:  # out of disk / read-only data dir: not fatal
+            print(f"Feature cache: could not write ({e}); continuing without it.")
+
+    return mat, targets, values, games, n_games
 
 
 def _widen_map(p, c):
@@ -361,34 +567,26 @@ def main():
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    feats, targets, values, games, max_f = load_data(args.data, np)
+    mat, targets, values, games, n_games = load_data(args.data, np, num_features,
+                                                     use_cache=not args.no_cache)
     n = len(targets)
 
-    # Pack the variable-length feature lists into one padded int32 matrix (see
-    # load_data); index num_features is the padding row.
-    mat = np.full((n, max_f), num_features, dtype=np.int32)
-    for i, fr in enumerate(feats):
-        mat[i, :len(fr)] = fr
-    del feats
-
-    # Split by GAME, not by position (see header): group rows by game id, shuffle
-    # the games, then send whole games to val/train so no game straddles the split.
-    from collections import defaultdict
-    by_game = defaultdict(list)
-    for i, gid in enumerate(games):
-        by_game[gid].append(i)
-    game_ids = list(by_game.keys())
-    order = torch.randperm(len(game_ids)).tolist()
-    game_ids = [game_ids[i] for i in order]
-    n_val_games = max(1, int(len(game_ids) * args.val))
-    val_set = set(game_ids[:n_val_games])
-    val_idx = torch.tensor(
-        [i for gid in game_ids if gid in val_set for i in by_game[gid]], dtype=torch.long)
-    train_idx = torch.tensor(
-        [i for gid in game_ids if gid not in val_set for i in by_game[gid]], dtype=torch.long)
-    n_val = len(val_idx)
-    print(f"Loaded {n:,} positions in {len(game_ids):,} games from {args.data}")
-    print(f"Split by game: {len(game_ids) - n_val_games:,} train / {n_val_games:,} val games "
+    # Split by GAME, not by position (see header): shuffle the games, then send
+    # whole games to val/train so no game straddles the split. `games` is a
+    # per-row game code in first-appearance order, so the randperm below shuffles
+    # exactly the sequence the old dict-keyed version did. Grouping is a stable
+    # argsort (rows ordered by their game's shuffled rank) rather than a
+    # 25M-iteration Python loop building a list per game.
+    perm = torch.randperm(n_games).numpy()
+    n_val_games = max(1, int(n_games * args.val))
+    rank = np.empty(n_games, np.int32)
+    rank[perm] = np.arange(n_games, dtype=np.int32)
+    row_order = np.argsort(rank[games], kind="stable")
+    n_val = int(np.bincount(games, minlength=n_games)[perm[:n_val_games]].sum())
+    val_idx = torch.from_numpy(row_order[:n_val])
+    train_idx = torch.from_numpy(row_order[n_val:])
+    print(f"Loaded {n:,} positions in {n_games:,} games from {args.data}")
+    print(f"Split by game: {n_games - n_val_games:,} train / {n_val_games:,} val games "
           f"({len(train_idx):,} / {n_val:,} positions)")
 
     class Net(nn.Module):
@@ -445,7 +643,9 @@ def main():
             targets).astype(np.float32)
         print(f"TD target: lambda={args.lam}, {int(has_v.sum()):,}/{n:,} positions have a search value")
     # Whole-dataset tensors; batches are plain row-indexing (and a device copy
-    # when training on GPU — a no-op on CPU).
+    # when training on GPU — a no-op on CPU). The feature matrix is int16 (see
+    # load_data), so each batch is cast to int32 for the EmbeddingBag — a ~1 MB
+    # conversion against half the gather traffic of a full-width matrix.
     mat_t = torch.from_numpy(mat).to(device)
     targets_t = torch.from_numpy(blended).to(device)
 
@@ -462,7 +662,7 @@ def main():
             total = 0.0
             for s in range(0, len(idx), args.batch):
                 b = idx[s:s + args.batch].to(device)
-                pred = torch.tanh(model(mat_t[b]))
+                pred = torch.tanh(model(mat_t[b].int()))
                 total += loss_fn(pred, targets_t[b]).item() * len(b)
         return total / len(idx)
 
@@ -483,7 +683,7 @@ def main():
         run = 0.0
         for s in range(0, len(order), args.batch):
             b = order[s:s + args.batch].to(device)
-            pred = torch.tanh(model(mat_t[b]))
+            pred = torch.tanh(model(mat_t[b].int()))
             loss = loss_fn(pred, targets_t[b])
             opt.zero_grad()
             loss.backward()

@@ -390,6 +390,7 @@ const logFile = join(loopDir, 'loop.log');
 // core, so pausing hands the machine back without losing the in-flight gate/generation.
 const pidFile = join(loopDir, 'loop.pid');
 const pauseFlag = join(loopDir, 'PAUSED'); // marker loop-ctl writes while suspended
+const stopFlag = join(loopDir, 'STOP');    // marker `npm run train:stop` writes (see stopRequested)
 const publicNN = resolve(webDir, 'public', 'nn');
 const manifestFile = join(publicNN, 'manifest.json');
 // Champions pruned from the manifest keep their identity here (hash -> name for ledger labels,
@@ -766,6 +767,21 @@ function banner(title) {
 let stopping = false;
 process.on('SIGINT', () => { stopping = true; console.log('\n  Ctrl-C: stopping after this cycle…'); });
 
+// `npm run train:stop` from another terminal drops a STOP marker here. The loop spends
+// nearly all of a cycle blocked inside spawnSync, where its own SIGINT handler (a JS
+// callback) cannot run — so a Ctrl-C is only ever noticed indirectly, via how the child
+// happened to die, and a child that finishes normally right as you press it leaves the
+// loop rolling on. A file the steps check BETWEEN them is the signal that always lands.
+// It stops at the next step boundary, so a running gate still has to play itself out;
+// `train:stop --now` kills the tree instead.
+function stopRequested() {
+  if (stopping) return true;
+  if (!existsSync(stopFlag)) return false;
+  stopping = true;
+  log('  Stop requested (npm run train:stop) — ending after this step.');
+  return true;
+}
+
 // Elo from a win rate (same logarithmic curve the match runner / rank ledger use, so the
 // numbers line up with the ledger Elos we add the gate edge to).
 const eloFromScore = (p) => (p <= 0 ? -800 : p >= 1 ? 800 : -400 * Math.log10(1 / p - 1));
@@ -920,7 +936,7 @@ function foldGateHarvest(promoted, res) {
 // Run a step; return true on success. A SIGINT to a child shows as a null/ signalled
 // status — treat that as "stop", not a hard failure.
 function run(label, cmd, argv, cwd = webDir) {
-  if (stopping) return false;
+  if (stopRequested()) return false;
   console.log(`\n--- ${label} — ${hms()} ---`);
   // Echo the equivalent stand-alone command so the step can be reproduced/resumed by
   // hand (run from web/). Logged too, so the persisted log records exactly what ran.
@@ -1134,11 +1150,16 @@ buildEngine();
 // Archive the starting champion too — it labels the data generated before the first
 // promotion, so its v-contributors must stay reconstructable like every later champion.
 archiveChampion(champion);
-// Publish this loop's PID for the pause/resume control, and drop any stale PAUSED marker
-// from a previous run (a fresh loop starts running). The pidfile is removed on exit.
+// Publish this loop's PID for the pause/resume/stop control, and drop any stale PAUSED or
+// STOP marker from a previous run (a fresh loop starts running, and a STOP left behind by
+// the run you just ended would otherwise stop this one on its first step). Both markers and
+// the pidfile are removed on exit.
 writeFileSync(pidFile, `${process.pid}\n`);
 rmSync(pauseFlag, { force: true });
-process.on('exit', () => { try { rmSync(pidFile, { force: true }); } catch { /* best effort */ } });
+rmSync(stopFlag, { force: true });
+process.on('exit', () => {
+  for (const f of [pidFile, stopFlag]) { try { rmSync(f, { force: true }); } catch { /* best effort */ } }
+});
 // --fresh clears the dataset, which is also the strength pool's body of evidence: the ledger's
 // ratings rebuild from whatever the fresh run plays (plus loop/legacy-pairs.json).
 if (cfg.fresh && existsSync(rawFile)) { rmSync(rawFile); log('Cleared dataset (--fresh).'); }
@@ -1288,7 +1309,7 @@ let cyclesSincePromo = 0;
 // `i` counts THIS launch's cycles (what --cycles bounds and the first-cycle behaviours key
 // on); `c` is the track-cumulative cycle number shown in banners/logs and recorded in the
 // track history — they differ when a warm relaunch continues an earlier run's numbering.
-for (let i = 1; i <= cfg.cycles && !stopping; i++) {
+for (let i = 1; i <= cfg.cycles && !stopRequested(); i++) {
   // Rotate BEFORE doing any work this cycle, so a stalled shape never costs another full
   // featurize/train/gate. Rotation is best-effort maintenance: if the suggester has nothing to
   // offer (or throws), the loop simply carries on with the current recipe rather than stopping.

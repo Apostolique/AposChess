@@ -10,12 +10,21 @@
 //   npm run train:pause     # freeze the running loop (frees all CPU)
 //   npm run train:resume    # thaw it, continue exactly where it stopped
 //   npm run train:status    # is a loop running? paused or active?
+//   npm run train:stop      # end it after the step it's running now
+//   npm run train:stop -- --now   # kill the tree immediately, losing that step
 //
 // The loop (train-loop.mjs) writes its PID to training/data/loop/loop.pid while running;
 // this reads that and suspends/resumes that PID and every descendant. On Windows the freeze
 // goes through ntdll (scripts/win-suspend.ps1); on POSIX it's SIGSTOP/SIGCONT per PID. A
 // PAUSED marker file next to the pidfile records the state so `status` can report it and a
 // double-pause / double-resume is a harmless no-op.
+//
+// `stop` exists because Ctrl-C in the loop's own terminal is not reliable: the loop spends
+// nearly all of a cycle blocked in spawnSync, where its SIGINT handler can't run, so it only
+// infers the interrupt from how the child died — and a child that finished normally right as
+// you pressed it leaves the loop rolling into the next step. The graceful form writes a STOP
+// marker the loop checks between steps, which always lands, though it waits out whatever is
+// running (a 2000-game gate can be hours). `--now` kills the process tree instead.
 
 import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
@@ -28,11 +37,14 @@ const repoDir = resolve(webDir, '..');
 const loopDir = resolve(repoDir, 'training', 'data', 'loop');
 const pidFile = join(loopDir, 'loop.pid');
 const pauseFlag = join(loopDir, 'PAUSED');
+const stopFlag = join(loopDir, 'STOP');
 const isWin = process.platform === 'win32';
 
-const action = (process.argv[2] || '').toLowerCase();
-if (!['pause', 'resume', 'toggle', 'status'].includes(action)) {
-  console.error('Usage: node scripts/loop-ctl.mjs <pause|resume|toggle|status>');
+const argv = process.argv.slice(2);
+const action = (argv[0] || '').toLowerCase();
+const killNow = argv.includes('--now');
+if (!['pause', 'resume', 'toggle', 'status', 'stop'].includes(action)) {
+  console.error('Usage: node scripts/loop-ctl.mjs <pause|resume|toggle|status|stop [--now]>');
   process.exit(2);
 }
 
@@ -93,11 +105,68 @@ function posixTree(root) {
   return out;
 }
 
+// Kill `pid` and every descendant. Windows has no process groups to signal, so taskkill /T
+// walks the tree; POSIX gets SIGKILL per pid, root first so it can't spawn another step
+// while we're working down the list.
+function killTree(pid) {
+  if (isWin) {
+    const r = spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { encoding: 'utf8' });
+    if (r.status !== 0 && alive(pid)) { console.error(r.stderr || r.stdout || '(taskkill failed)'); return false; }
+    return true;
+  }
+  for (const t of posixTree(pid)) { try { process.kill(t, 'SIGKILL'); } catch { /* already gone */ } }
+  return true;
+}
+
+// Sleep synchronously (this script is a one-shot with no event loop to yield to).
+const napMs = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+
 const pid = loopPid();
 
 if (action === 'status') {
-  if (!pid) { console.log('No train:loop is running (no live loop.pid).'); process.exit(0); }
-  console.log(existsSync(pauseFlag) ? `train:loop (pid ${pid}) is PAUSED.` : `train:loop (pid ${pid}) is running.`);
+  if (!pid) {
+    console.log('No train:loop is running (no live loop.pid).');
+    process.exit(0);
+  }
+  const state = existsSync(pauseFlag) ? 'is PAUSED' : 'is running';
+  const pending = existsSync(stopFlag) ? ' — stop requested, it ends after the current step' : '';
+  console.log(`train:loop (pid ${pid}) ${state}${pending}.`);
+  process.exit(0);
+}
+
+if (action === 'stop') {
+  if (!pid) {
+    // Nothing to stop. Clear a stale marker/pidfile anyway so the next launch starts clean
+    // (a hard-killed loop never gets to run its own exit cleanup).
+    rmSync(stopFlag, { force: true });
+    rmSync(pauseFlag, { force: true });
+    rmSync(pidFile, { force: true });
+    console.log('No train:loop is running. Cleared any stale loop.pid / PAUSED / STOP markers.');
+    process.exit(0);
+  }
+  if (killNow) {
+    if (!killTree(pid)) process.exit(1);
+    for (let i = 0; i < 20 && alive(pid); i++) napMs(100);
+    if (alive(pid)) { console.error(`pid ${pid} is still alive after taskkill; stop it by hand.`); process.exit(1); }
+    rmSync(stopFlag, { force: true });
+    rmSync(pauseFlag, { force: true });
+    rmSync(pidFile, { force: true });
+    console.log(`Killed the loop tree (pid ${pid}). The in-flight step is lost; the dataset and the\n`
+      + 'experiment track are unaffected (both are written incrementally / atomically), so a\n'
+      + 'relaunch resumes the track at the next cycle.');
+    process.exit(0);
+  }
+  if (existsSync(pauseFlag)) {
+    // A suspended loop executes nothing, so it can never notice the marker.
+    console.error(`train:loop (pid ${pid}) is PAUSED, so it can't see a stop request.\n`
+      + 'Run `npm run train:resume` first, or `npm run train:stop -- --now` to kill it outright.');
+    process.exit(1);
+  }
+  if (existsSync(stopFlag)) { console.log(`Stop already requested (pid ${pid}).`); process.exit(0); }
+  writeFileSync(stopFlag, `${new Date().toISOString()} requested\n`);
+  console.log(`Stop requested (pid ${pid}). The loop ends after the step it's running now, so a\n`
+    + 'gate match still plays itself out. Watch it with `npm run train:status`, or use\n'
+    + '`npm run train:stop -- --now` to kill it immediately instead.');
   process.exit(0);
 }
 
