@@ -53,6 +53,56 @@
 //                   promotion probability lost on a true +20 (and a futility-stopped
 //                   gainer survives as lineage and re-gates next cycle). The verdict
 //                   stays "inconclusive"; the log line notes the early stop.
+//   --no-screen     turn OFF the shadow-mode low-depth screen, which is ON by default.
+//                   Before the gate, it plays the candidate vs the champion at --screen-depth
+//                   for a fixed --screen-games, converts that edge to a gate-depth-equivalent
+//                   Elo (divide by --screen-ratio), and logs what a screen WOULD have decided
+//                   — then runs the real gate anyway and records both. It never promotes,
+//                   never rejects, and its games never reach the trainer; it exists to measure
+//                   whether a cheap screen could replace most of the gate.
+//                   It is ON by default because a bare `npm run train:loop` is how this loop
+//                   gets run, and an opt-in measurement is one that never happens. It cannot
+//                   change a verdict — the cost is ~4-5 min/cycle (~2% of a full-gate cycle)
+//                   plus ~40 MB/cycle of kept games (--no-screen-save drops that half).
+//                   Why: a full 2000-game gate at depth 6 is ~3.5-4h, most of a cycle, and
+//                   the futility stop only helps the CLEARLY bad candidates — the expensive
+//                   cycles are the ambiguous 51-52% ones. Depth 1 is ~414x cheaper per game
+//                   (0.155s vs 64s), so 20k screen games cost ~5 min and pin the score far
+//                   tighter than the gate does. Across this engine's 21 champions, depth-1
+//                   Elo ranks depth-8 Elo at Spearman 0.974, and the cumulative d1/d6 gain
+//                   ratio has held at 0.62 +/- 0.035 over the last ten champions.
+//                   The open question, and the ONLY reason this is shadow mode rather than a
+//                   cascade: that ratio is a POPULATION slope over well-separated champions.
+//                   What a screen needs is the PER-CANDIDATE residual on near-clones, and the
+//                   ladder cannot measure it (its own +/-31 and +/-35 Elo margins at d1/d6
+//                   already explain more scatter than the observed residual). Rejected
+//                   candidates are never archived, so the only way to get paired data on the
+//                   population a screen would actually face is to measure it in-loop. Run
+//                   ~10 cycles, then `npm run screen:report` (it refuses to conclude below 8).
+//   --screen-depth=D  screen search depth (default 1)
+//   --screen-games=N  screen games, played to a fixed N with NO SPRT — the screen estimates
+//                   an edge rather than testing a hypothesis (default 20000, ~5 min at d1)
+//   --screen-ratio=R  assumed screen-depth:gate-depth Elo ratio (default 0.62). Affects only
+//                   the logged prediction; screen:report re-fits it from the recorded pairs.
+//   --no-screen-save  discard the screen's games instead of keeping them. By default they go
+//                   to loop/screen-games.jsonl — a SEPARATE dataset, never selfplay.jsonl.
+//                   Two reasons to keep them. (1) The ledger can rate from them: the loop
+//                   passes the file to rank:pool as --corpus-extra, so a PROMOTED candidate's
+//                   20k direct games against the champion it dethroned become the densest
+//                   single-pair evidence the pool has (its own per-cycle play budget buys ~28
+//                   games, and 62 rank-adjacent pairs have never met at all). A non-promoted
+//                   candidate isn't archived, so its games get the same ephemeral
+//                   "nn<d>@elo<E>" tag the gate harvest uses — keyed off the SCREEN's edge at
+//                   the SCREEN's depth, since that tag is an absolute Elo at that depth.
+//                   (2) They're real games with real terminal results, so if a use for
+//                   low-depth play is ever found the data is already there.
+//                   What they must NOT do is reach the trainer: depth-1 `v` labels on
+//                   depth-1-play positions are precisely the weak off-distribution cohort
+//                   --filter-weak and refresh-v exist to drain, and at ~20k games/cycle they
+//                   would outnumber the cycle's real data ~10x. Hence the separate file.
+//                   Disk: ~2 KB per game (measured — depth-1 games run ~78 recorded plies vs
+//                   the gate's ~48, since weaker play shuffles longer), so ~40 MB per cycle at
+//                   the default 20k, in git-ignored training/data/loop/.
 //   --lambda=L      TD/bootstrap target mix for training the candidate (default 1 =
 //                   pure game result; <1 leans on the champion's own search value,
 //                   an unbiased bootstrap — recorded because generation uses the net)
@@ -136,28 +186,59 @@
 //   --no-refresh    skip ALL value refreshing (both --refresh-cycle and --refresh-frac),
 //                   regardless of their values. Both default to 0 now, so this only matters
 //                   as a hard override on a command line that also passes a fraction.
-//   --rotate=N      AUTO-ROTATE the architecture: after N cycles on the current track with no
-//                   promotion, ask the experiment registry what to try next (suggestRecipes) and
-//                   switch to it, creating/resuming that recipe's track. 0 = off (default), which
-//                   is the old behaviour of running one recipe until Ctrl-C. This is what makes an
+//   --rotate=auto|N|off  AUTO-ROTATE the architecture: when the current track has stalled, ask
+//                   the experiment registry what to try next (suggestRecipes) and switch to it,
+//                   creating/resuming that recipe's track. **`auto` is the default.**
+//                   `auto` decides from the track's absElo TRAJECTORY, not a raw cycle count,
+//                   because the count alone cannot see the one case that matters: a new or
+//                   grafted architecture routinely loses the gate for many cycles while its
+//                   absolute Elo climbs toward overtaking the champion (the pattern that
+//                   produced Mona), and a fixed counter rotates away from it exactly when it is
+//                   working. So `auto` never rotates before 3 cycles on the track, always
+//                   rotates by 8 (the registry's own advice is that a track which hasn't
+//                   promoted by ~8-10 cycles won't), and in between rotates only when the
+//                   re-anchored absElo trend is flat or falling (< 2 Elo/cycle). Re-anchored
+//                   because a stored absElo drifts as the pool re-fits, so comparing raw
+//                   snapshots would read drift as trend.
+//                   `--rotate=N` keeps the old fixed rule (N cycles without a promotion) and
+//                   `--rotate=off` (or `=0`) disables rotation entirely, running one recipe
+//                   until Ctrl-C. This is what makes an
 //                   unattended multi-day run useful: measured over 120 cycles, a NEW track's first
 //                   cycle promoted ~29% of the time versus ~1.8% for a continuation cycle, so a
 //                   loop that keeps grinding one shape after it stalls is spending ~2h a cycle to
 //                   re-test a net that correlates 0.99 with the champion. A PROMOTION resets the
-//                   counter — a shape that just won has earned more cycles. `--rotate=8` is a
-//                   reasonable default; the registry's suggestions are a space-filling design over
+//                   counter — a shape that just won has earned more cycles.
+//                   The registry's suggestions are a space-filling design over
 //                   architecture space until it has enough tracks to rank on predicted Elo
 //                   (`npm run train:experiments` shows which mode it's in).
 //                   The counter starts at 0 on every launch, so relaunching does NOT immediately
 //                   re-rotate a track that was already stale — the recipe you launch with always
-//                   gets its full N cycles.
+//                   gets its full window.
 //                   A rotation adopts the suggested recipe WHOLE — architecture and knobs — even
 //                   the parts you pinned on the command line. That's the point of asking for it:
 //                   flags decide where the run STARTS, --rotate is you telling the loop to move
 //                   on from there, and a rotation that honoured --hidden could never change the
 //                   architecture. Leave --rotate off to stay on the recipe you launched with.
-//   --rank-cycle=N  refit the Bradley-Terry pool every N cycles instead of EVERY cycle
-//                   (default 1 = every cycle, the historical behaviour). The corpus fold is
+//   --no-link-pass  turn OFF the unrestricted LINK PASS, which is on by default (see runLinkPass).
+//                   `--play-strong` pins the routine rank step's --play to the ~8 strongest nn
+//                   engines at one depth, so it can only ever play games INSIDE that set — while
+//                   the ladder's convergence deficit lives across the whole 184-node pool. That
+//                   is a reachability problem, not a budget one, and it is why the ledger could
+//                   sit permanently un-converged no matter how large --rank-minutes got: measured
+//                   2026-08-06, 62 rank-adjacent pairs had never met and `adjacentUnderLinked-
+//                   Schedulable` was 0, so not one of them could be scheduled. Closing them meant
+//                   stopping the loop and running rank:pool by hand (no --play restriction, which
+//                   is exactly why that worked). The link pass does it automatically: when the
+//                   ledger reports unlinked adjacent pairs AND none are schedulable, it runs a
+//                   short unrestricted rank:pool. Its games go to loop/ladder-link-games.jsonl,
+//                   NOT the dataset — it plays whatever pairs the graph is missing, weak nodes
+//                   included, which is precisely what --play-strong keeps out of training — and
+//                   come back as --corpus-extra so the evidence still accumulates across cycles.
+//   --link-minutes=M  play budget for that pass (default 10, capped at 30).
+//   --rank-cycle=auto|N  refit the Bradley-Terry pool every N cycles instead of EVERY cycle.
+//                   **`auto` is the default**: refit every cycle while the ladder is still short
+//                   of convergence (the ratings are genuinely moving then), dropping to every 3rd
+//                   once it converges, and always on a promotion. The corpus fold is
 //                   free, but the --rank-minutes play budget is not — measured 2026-07-26 it
 //                   was ~35 min of a ~2 h cycle (25-35%) for 28 new ladder games. Between
 //                   promotions that mostly re-confirms a ledger that isn't moving: the
@@ -244,6 +325,7 @@ import { isGameRecord, vsAt, setVsAt, normalizeVs, serializeGameRecord } from '.
 import {
   buildRecipe, parseRecipeExtra, ensureTrack, beginRun, recordCycle, recipeLabel, readState,
   suggestRecipes, recipeToFlags, recipeId, readAllTracks,
+  readHistory, reAnchoredAbsElo, ledgerBestByVersion,
 } from './experiment-registry.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -375,6 +457,22 @@ function archiveChampion(file) {
   return hash;
 }
 const resultFile = join(loopDir, 'match.json');
+// The low-depth SCREEN's result file (--screen; see the flag doc). Separate from the gate's
+// match.json so a screen can never be mistaken for the promotion verdict, and so an aborted
+// screen leaves the gate's own result untouched.
+const screenFile = join(loopDir, 'screen.json');
+// --screen-save: the screen's games, kept in a SEPARATE dataset — never selfplay.jsonl.
+// They're real games with real terminal results, so they're worth keeping, but their `v`
+// labels are depth-1 opinions and their positions come from depth-1 play, which is exactly
+// the off-distribution weak-label cohort --filter-weak and refresh-v exist to drain. Keeping
+// them beside the training set rather than inside it means the ledger can rate from them (see
+// --corpus-extra in runRankPool) without a single depth-1 label reaching the trainer.
+const screenHarvest = join(loopDir, 'screen-harvest.jsonl'); // per-cycle temp, folded below
+const screenArchive = join(loopDir, 'screen-games.jsonl');   // the persistent separate dataset
+// The unrestricted link pass's games (runLinkPass). Rating evidence, not training data — it
+// plays whatever rank-adjacent pairs have never met, which includes the weak nodes that
+// --play-strong deliberately keeps out of the trainer. Read back via --corpus-extra.
+const linkArchive = join(loopDir, 'ladder-link-games.jsonl');
 // The gate's --save-games harvest is written HERE (a temp), not straight into the dataset,
 // so the loop can rewrite a non-promoted candidate's provenance before folding it in (see
 // foldGateHarvest). Cleared before each gate and deleted after folding.
@@ -439,6 +537,26 @@ const cfg = {
   // (Monte Carlo vs the exact walk) is ~20-25% fewer games on even candidates for < 2 points
   // of promotion probability on a true +elo1 — which the lineage recovers next cycle.
   gateFutility: num(args['gate-futility'], 0.05),
+  // Low-depth SCREEN, shadow mode (see the --screen flag doc). ON by default: it measures the
+  // candidate at a cheap depth BEFORE the gate, predicts the gate-depth edge, and logs the
+  // prediction — then runs the real gate regardless. Instrumentation only: nothing here feeds
+  // the promotion decision, and no screen game ever reaches the trainer's dataset
+  // (--screen-save keeps them in a separate file the ledger rates from; see its flag doc).
+  // Default-on because it is answering an open question and a bare `npm run train:loop` is how
+  // this loop actually gets run — an opt-in measurement is a measurement that never happens.
+  // It cannot change a verdict, so the whole cost is ~4-5 min/cycle. --no-screen turns it off.
+  screen: flag(args.screen, true) && !args['no-screen'],
+  screenDepth: num(args['screen-depth'], 1),
+  screenGames: num(args['screen-games'], 20000),
+  // Elo transfer ratio screen-depth : gate-depth. 0.62 is the measured d1/d6 ratio over this
+  // engine's champion sequence (see the flag doc). Only affects the LOGGED prediction — the
+  // paired (screen, gate) observations recorded per cycle let screen:report re-fit it.
+  screenRatio: num(args['screen-ratio'], 0.62),
+  // Keep the screen's games in loop/screen-games.jsonl (a separate dataset — never the
+  // trainer's). On by default when --screen is on: the games are already paid for, and the
+  // ledger can rate from them. --no-screen-save discards them instead (see the flag doc for
+  // the disk cost, which is the only reason you'd want to).
+  screenSave: flag(args['screen-save'], true) && !args['no-screen-save'],
   lam: num(args.lambda, 1), // TD target mix passed to train.py (1 = pure result)
   // Drop tactically loud positions (in check / winning capture available) at featurize time
   // so the static net trains on the quiet-position distribution it's actually queried on at
@@ -483,6 +601,11 @@ const cfg = {
   rank: !args['no-rank'],
   // hc pin depth for the pool (Elo 1500) — every rating lands on this stable scale.
   rankDepth: num(args['rank-depth'], 6),
+  // Unrestricted link-closing pass (runLinkPass). ON by default: without it the ladder can sit
+  // permanently un-converged whenever --play-strong makes the deficient pairs unschedulable,
+  // which is the state the pool was actually found in. --no-link-pass reverts.
+  linkPass: !args['no-link-pass'],
+  linkMinutes: num(args['link-minutes'], 10),
   // Wall-clock the pool plays per cycle, on top of the (free) corpus fold. Short, because the
   // corpus already rates the champion from its gate games and the store accumulates across
   // cycles — each cycle just tightens the most-ambiguous orderings.
@@ -496,13 +619,19 @@ const cfg = {
   // first cycle. A promotion overrides it, so a fresh champion is never left uncalibrated.
   // Non-finite input falls back to 1 rather than propagating NaN — `c % NaN === 0` is never
   // true, which would silently disable the refit for the whole run instead of erroring.
-  rankCycle: Number.isFinite(Math.round(num(args['rank-cycle'], 1)))
-    ? Math.max(1, Math.round(num(args['rank-cycle'], 1))) : 1,
+  // 'auto' (the default) keys the cadence off the ledger's own convergence verdict instead of a
+  // hand-picked N — see rankCadence. A number pins it to the old fixed every-N-cycles rule.
+  rankCycle: args['rank-cycle'] === undefined || args['rank-cycle'] === 'auto' ? 'auto'
+    : (Number.isFinite(Math.round(Number(args['rank-cycle'])))
+      ? Math.max(1, Math.round(Number(args['rank-cycle']))) : 1),
   // Auto-rotate the architecture after this many non-promoting cycles on the current track.
   // 0 = off (run one recipe forever, the historical behaviour). See the --rotate help above for
   // why rotation beats grinding: promotions overwhelmingly land on a NEW track's early cycles.
-  rotate: Number.isFinite(Math.round(num(args.rotate, 0)))
-    ? Math.max(0, Math.round(num(args.rotate, 0))) : 0,
+  // 'auto' (the default) rotates on the track's absElo TREND rather than a raw cycle count —
+  // see rotationDue. A number keeps the old fixed rule, 0/'off' disables rotation entirely.
+  rotate: args.rotate === undefined || args.rotate === 'auto' ? 'auto'
+    : (args.rotate === 'off' || Number(args.rotate) === 0 ? 'off'
+      : Math.max(1, Math.round(Number(args.rotate)))),
   // After a PROMOTION, extend that cycle's rank pass by this many minutes with the NEW champion
   // schedulable at EVERY depth (a bare-hash --play spec), so the ladder's onboard floor anchors
   // its 0-game depth nodes to the scale. Without it a fresh champion is rated only at the depths
@@ -823,6 +952,37 @@ function championLedgerConfidence() {
   return best; // { elo, margin, games, depth }
 }
 
+// The ledger's own CONVERGENCE verdict — the signal that says whether the ladder is keeping up,
+// and the one the loop ignored until 2026-08-06. depth-ladder already computes it every fit
+// (docs/tools.md): how many rank-adjacent pairs are below the direct-link floor, how many have
+// never met at all, how many of those THIS run's --play restriction can actually schedule, and
+// the total mis-order cost. Returns null when the ledger has no convergence block (an older file).
+//
+// `schedulable` is the load-bearing field. --play-strong pins --play to the ~8 strongest nn
+// engines at one depth, so the rank step can only ever play games inside that set — while the
+// link deficit lives across the whole 184-node pool (other depths, hc nodes, retired champions).
+// When `unlinked > 0` and `schedulable === 0`, the ladder is telling us plainly that no amount of
+// --rank-minutes can close the gap, because every deficient pair is outside the play set. That is
+// a REACHABILITY problem wearing a budget problem's clothes, and it's why a hand-run rank:pool
+// (which carries no --play restriction) fixes what a bigger --rank-minutes cannot.
+function ledgerConvergence() {
+  if (!existsSync(ledgerFile)) return null;
+  let ledger; try { ledger = JSON.parse(readFileSync(ledgerFile, 'utf8')); } catch { return null; }
+  const c = ledger.convergence;
+  if (!c) return null;
+  return {
+    converged: !!c.converged,
+    linked: !!c.linked,
+    underLinked: c.adjacentUnderLinked ?? 0,
+    unlinked: c.adjacentUnlinked ?? 0,
+    schedulable: c.adjacentUnderLinkedSchedulable ?? 0,
+    misorderCost: c.misorderCost ?? null,
+    pairs: c.pairs ?? 0,
+    verdict: c.verdict || '',
+    generated: ledger.generated || null,
+  };
+}
+
 // Baseline-anchored, BOUNDED adaptive sizing of this cycle's maintenance budget. Each knob starts
 // at its configured value and moves only within [floor, ceil] on a robust signal, so a neutral or
 // absent signal reproduces today's fixed behaviour and a strong signal shifts — never starves —
@@ -841,6 +1001,11 @@ function adaptiveMaintenance(cyclesSincePromo, rankDue = true) {
   if (!cfg.adaptive) return base;
   const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
 
+  // rank-minutes takes the STRONGER of two signals. The champion's own margin was the original
+  // one, and it turned out to be nearly constant in practice (it printed an identical
+  // "±42 → 1.06×" every cycle for a week, because between promotions the champion's rating
+  // simply isn't what's moving). The ladder's convergence verdict is the signal that actually
+  // varies, and it's the one that matches the observed symptom of the pool falling behind.
   let rankMinutes = cfg.rankMinutes, rankWhy = 'baseline (champion not yet confidently rated)';
   const conf = championLedgerConfidence();
   if (conf) {
@@ -848,6 +1013,29 @@ function adaptiveMaintenance(cyclesSincePromo, rankDue = true) {
     const factor = clamp(conf.margin / 40, 0.5, 3);
     rankMinutes = Math.round(clamp(cfg.rankMinutes * factor, 2, Math.max(20, cfg.rankMinutes * 3)));
     rankWhy = `champion d${conf.depth} margin ±${Math.round(conf.margin)} → ${factor.toFixed(2)}×`;
+  }
+  const conv = ledgerConvergence();
+  if (conv) {
+    // Only SCHEDULABLE link debt justifies more minutes here: an unschedulable deficit is a
+    // reachability problem that the link pass (runLinkPass) handles instead, and inflating this
+    // budget for it would buy more games inside the strong-play set that cannot touch it.
+    // Converged ⇒ back off hard; the pool is done and the minutes are better spent elsewhere.
+    let factor = null, why = null;
+    if (conv.converged) { factor = 0.5; why = 'ladder converged'; }
+    else if (conv.schedulable > 0) {
+      // Scale with how much of the adjacency graph this run can still fix, capped at 3x.
+      factor = clamp(1 + conv.schedulable / 4, 1, 3);
+      why = `${conv.schedulable} schedulable under-linked pair(s)`;
+    } else if (conv.misorderCost != null && conv.pairs > 0) {
+      // No link debt to close: fall back to ordering sharpness, per adjacent pair.
+      const perPair = conv.misorderCost / conv.pairs;
+      factor = clamp(perPair / 1.5, 0.5, 2);
+      why = `${perPair.toFixed(1)} Elo mis-order risk per adjacent pair`;
+    }
+    if (factor != null) {
+      const m = Math.round(clamp(cfg.rankMinutes * factor, 2, Math.max(20, cfg.rankMinutes * 3)));
+      if (m > rankMinutes || conv.converged) { rankMinutes = m; rankWhy = `${why} → ${factor.toFixed(2)}×`; }
+    }
   }
 
   let refreshFrac = cfg.refreshCycle, refreshWhy = 'baseline';
@@ -859,7 +1047,7 @@ function adaptiveMaintenance(cyclesSincePromo, rankDue = true) {
   }
   return {
     rankMinutes, refreshFrac,
-    notes: (rankDue ? `rank ${rankMinutes}m (${rankWhy})` : `rank skipped this cycle (--rank-cycle=${cfg.rankCycle})`)
+    notes: (rankDue ? `rank ${rankMinutes}m (${rankWhy})` : 'rank skipped this cycle')
       + (cfg.refreshCycle > 0 ? `; refresh ${(refreshFrac * 100).toFixed(1)}% (${refreshWhy})` : ''),
   };
 }
@@ -886,10 +1074,21 @@ function foldGateHarvest(promoted, res) {
     const pLo = Math.min(Math.max(p - 1.96 * se, 1e-9), 1 - 1e-9);
     gateEloLo = eloFromScore(pLo);
   }
+  foldHarvest(gateHarvest, rawFile, champElo, gateEloLo, 'gate edge');
+}
+
+// The body shared by the gate harvest and the screen harvest (--screen-save). `champElo` is
+// null when nothing needs relabeling (a promoted candidate is archived, hence rankable, so its
+// lines pass through as-is); otherwise every line tagged with the candidate's content hash is
+// rewritten to the ephemeral "nn<d>@elo<E>" form. `edgeLo` MUST be measured at the same search
+// depth as the harvested games — the tag's E is an absolute Elo at that depth, so pairing a
+// depth-1 harvest with a depth-6 edge would misrate every one of those games.
+function foldHarvest(src, dest, champElo, edgeLo, what) {
+  if (!existsSync(src)) return;
   const candHash = weightsHash(candidate);
   const out = [];
   let folded = 0, relabeled = 0;
-  for (const line of readFileSync(gateHarvest, 'utf8').split('\n')) {
+  for (const line of readFileSync(src, 'utf8').split('\n')) {
     if (!line) continue;
     folded++;
     // Each harvested GAME interleaves both players' positions in its per-position `vs`
@@ -908,7 +1107,7 @@ function foldGateHarvest(promoted, res) {
       if (!m || m[2] !== candHash) continue;
       const depth = m[1];
       const base = champElo.byDepth.has(depth) ? champElo.byDepth.get(depth) : champElo.best;
-      setVsAt(rec, i, `nn${depth}@${ephemeralVersion(base + gateEloLo)}`);
+      setVsAt(rec, i, `nn${depth}@${ephemeralVersion(base + edgeLo)}`);
       relabeled++; changed = true;
     }
     if (changed) normalizeVs(rec);
@@ -921,16 +1120,17 @@ function foldGateHarvest(promoted, res) {
       const pm = /^nn(\d+|t)@([0-9a-f]+)$/.exec((rec.players && rec.players[side]) || '');
       if (!pm || pm[2] !== candHash) continue;
       const base = champElo.byDepth.has(pm[1]) ? champElo.byDepth.get(pm[1]) : champElo.best;
-      rec.players[side] = `nn${pm[1]}@${ephemeralVersion(base + gateEloLo)}`;
+      rec.players[side] = `nn${pm[1]}@${ephemeralVersion(base + edgeLo)}`;
     }
     out.push(serializeGameRecord(rec));
   }
-  if (out.length) appendFileSync(rawFile, out.join('\n') + '\n');
-  rmSync(gateHarvest, { force: true });
+  if (out.length) appendFileSync(dest, out.join('\n') + '\n');
+  rmSync(src, { force: true });
   if (relabeled) {
-    log(`  Folded ${folded} harvested position(s); relabeled ${relabeled} non-promoted-candidate `
-      + `label(s) as ephemeral (gate edge lower-bound ${gateEloLo >= 0 ? '+' : ''}${gateEloLo.toFixed(0)} Elo vs champion).`);
+    log(`  Folded ${folded} harvested game(s); relabeled ${relabeled} non-promoted-candidate `
+      + `label(s) as ephemeral (${what} lower-bound ${edgeLo >= 0 ? '+' : ''}${edgeLo.toFixed(0)} Elo vs champion).`);
   }
+  return { folded, relabeled };
 }
 
 // Run a step; return true on success. A SIGINT to a child shows as a null/ signalled
@@ -958,12 +1158,153 @@ function run(label, cmd, argv, cwd = webDir) {
   return true;
 }
 
+// --- Low-depth screen (shadow mode) -------------------------------------------------------
+// The 95% CI around an Elo edge, from the standard error of the MEAN score mapped through
+// eloFromScore (above) — deliberately the same convention as the match runner's own eloWithCI
+// (engine/src/main_match.zig), so a screen's numbers are directly comparable to a gate's.
+// Reconstructed from the W/D/L counts, which is exact: every game scores 1, 0.5 or 0.
+function eloWithCI(wins, draws, losses) {
+  const n = wins + draws + losses;
+  if (!n) return null;
+  const p = (wins + draws * 0.5) / n;
+  const varSum = wins * (1 - p) ** 2 + draws * (0.5 - p) ** 2 + losses * p ** 2;
+  const se = Math.sqrt(varSum / n / n); // standard error of the mean score
+  return { score: p, elo: eloFromScore(p), lo: eloFromScore(p - 1.96 * se), hi: eloFromScore(p + 1.96 * se) };
+}
+
+// Play the candidate vs the champion at a CHEAP depth and predict the gate-depth edge.
+// Shadow mode: the return value is recorded and logged, and nothing else reads it — the gate
+// below still makes the promotion decision on its own evidence. Three deliberate choices:
+//   - fixed --games, NO --sprt: the screen ESTIMATES an edge (we want the CI, and a decision
+//     rule can be simulated offline from it afterwards); an SPRT would stop early and throw
+//     away exactly the precision that makes the screen worth anything.
+//   - the games NEVER reach selfplay.jsonl. This is the trap in the whole idea: the gate
+//     harvests ~97k positions per 2000 games, so 20k screen games would add ~970k positions
+//     per cycle — 10x the dataset's normal growth, at the worst label quality in the pool (a
+//     depth-1 `v`), landing straight in the cohort --filter-weak and refresh-v exist to drain.
+//     With --screen-save they go to a SEPARATE dataset (screenArchive) instead, which the
+//     ledger can rate from and a future experiment can mine, with no path to the trainer.
+//   - failure is non-fatal. It's instrumentation; a broken screen must never cost a cycle.
+// Returns the record for the track history, or null.
+function runScreen() {
+  if (!cfg.screen) return null;
+  if (existsSync(screenFile)) rmSync(screenFile);
+  if (existsSync(screenHarvest)) rmSync(screenHarvest); // no stale harvest from a prior cycle
+  const t0 = Date.now();
+  if (!run(`Screen (shadow): candidate vs champion @ depth ${cfg.screenDepth}`, matchBin,
+    ['--eval-a=nn', `--weights-a=${candidate}`, '--eval-b=nn', `--weights-b=${champion}`,
+      `--depth=${cfg.screenDepth}`, `--games=${cfg.screenGames}`,
+      `--result-file=${screenFile}`, `--seed=${Date.now()}`,
+      ...(cfg.screenSave ? [`--save-games=${screenHarvest}`] : []), ...jobArg])) return null;
+  let r;
+  try { r = JSON.parse(readFileSync(screenFile, 'utf8')); }
+  catch { log('  Screen produced no readable result; continuing to the gate.'); return null; }
+  const ci = eloWithCI(r.wins, r.draws, r.losses);
+  if (!ci) { log('  Screen played no games; continuing to the gate.'); return null; }
+  // Rescale to a gate-depth-equivalent edge. The ratio compresses low-depth Elo, so dividing
+  // by it also widens the CI proportionally — the screen's precision at the gate's scale is
+  // what matters, not its precision at depth 1.
+  const k = 1 / cfg.screenRatio;
+  const pred = { elo: ci.elo * k, lo: ci.lo * k, hi: ci.hi * k };
+  // The rule a real cascade would use: escalate unless the promotion bound is outside the
+  // prediction's CI. Rejecting on the UPPER bound (not the point estimate) is what keeps a
+  // screen conservative — it only kills a candidate it can rule out.
+  const wouldReject = pred.hi < cfg.elo1;
+  const secs = (Date.now() - t0) / 1000;
+  log(`  Screen: ${(ci.score * 100).toFixed(1)}% / ${ci.elo >= 0 ? '+' : ''}${ci.elo.toFixed(0)} Elo @ depth `
+    + `${cfg.screenDepth} over ${r.games} games in ${fmtDur(secs)} → predicts `
+    + `${pred.elo >= 0 ? '+' : ''}${pred.elo.toFixed(0)} Elo [${pred.lo.toFixed(0)}, ${pred.hi.toFixed(0)}] `
+    + `at depth ${cfg.gateDepth} (ratio ${cfg.screenRatio}). `
+    + `A screen WOULD ${wouldReject ? `REJECT (upper bound < +${cfg.elo1}, skipping the gate)` : 'ESCALATE'}. `
+    + 'Shadow mode — running the real gate anyway.');
+  return {
+    depth: cfg.screenDepth, games: r.games, seconds: Math.round(secs), ratio: cfg.screenRatio,
+    score: ci.score, elo: ci.elo, eloLo: ci.lo, eloHi: ci.hi,
+    predElo: pred.elo, predLo: pred.lo, predHi: pred.hi, wouldReject,
+  };
+}
+
 // The loop rates the SAME full pool as a standalone `npm run rank:pool` — every engine across
 // depth-ladder's default depth spectrum (1-8), not a narrowed slice — so its ledger is the one
 // unified pool, not a loop-specific variant. hc<rankDepth> stays the pinned Elo-1500 node (via
 // --anchor-depth below), so all ratings land on the same stable scale. (The two depths positions
 // are LABELED at, nn6@/nn8@, are just a subset of that spectrum — foldGateHarvest still finds
 // them in the ledger.)
+
+// Game files that are RATING evidence but not training data, passed to every fit as
+// --corpus-extra. Kept out of the dataset on purpose (see each one's flag doc), but a game's
+// players+result rates its pair wherever the file lives.
+function corpusExtraFiles() {
+  return [
+    ...(cfg.screen && cfg.screenSave ? [screenArchive] : []),
+    linkArchive,
+  ].filter((f) => existsSync(f));
+}
+
+// Is a pool refit due this cycle? A PROMOTION always forces one (a fresh champion sits at the
+// placeholder floor at every depth it hasn't played, and the depth-calibration pass only runs
+// here). Otherwise `--rank-cycle=N` is the old fixed every-N rule, and the default 'auto' asks
+// the ledger instead: while the ladder is still short of convergence the ratings are genuinely
+// moving and every cycle earns its refit; once converged the pass mostly re-confirms a ledger
+// that isn't changing, so it drops to every third cycle. The cost is a ledger up to N-1 cycles
+// stale, which only means the weakest-first refresh targets a slightly out-of-date cohort.
+// Keyed on the TRACK-cumulative cycle so a warm relaunch continues the cadence.
+const AUTO_RANK_CYCLE_CONVERGED = 3;
+function rankCadence(c, promoted) {
+  if (promoted) return { due: true, why: 'promotion forces a refit' };
+  if (cfg.rankCycle === 'auto') {
+    const conv = ledgerConvergence();
+    if (!conv || !conv.converged) return { due: true, why: 'ladder not converged — refitting every cycle' };
+    const due = c % AUTO_RANK_CYCLE_CONVERGED === 0;
+    return due
+      ? { due: true, why: `ladder converged — every ${AUTO_RANK_CYCLE_CONVERGED} cycles` }
+      : { due: false, why: `ladder converged, so refitting every ${AUTO_RANK_CYCLE_CONVERGED} cycles (next at ${c + AUTO_RANK_CYCLE_CONVERGED - (c % AUTO_RANK_CYCLE_CONVERGED)}), or sooner on a promotion` };
+  }
+  if (cfg.rankCycle <= 1) return { due: true, why: '--rank-cycle=1' };
+  return c % cfg.rankCycle === 0
+    ? { due: true, why: `--rank-cycle=${cfg.rankCycle}` }
+    : { due: false, why: `--rank-cycle=${cfg.rankCycle}, next at cycle ${c + cfg.rankCycle - (c % cfg.rankCycle)}, or sooner on a promotion` };
+}
+
+// THE LINK PASS — the fix for "the ladder isn't keeping up".
+//
+// The routine rank step runs with --play pinned to the ~8 strongest nn engines at one depth
+// (strongPlaySpec), because at --batch=0 that step is also the data generator and its games
+// should be deep strong-play data. But the pool has 184 nodes, and the ladder's convergence
+// deficit lives outside that set: measured 2026-08-06, 62 rank-adjacent pairs had never met,
+// and `adjacentUnderLinkedSchedulable` was 0 — not one of them could be scheduled under the
+// strong-play restriction. So the budget was being spent where it could not help, the ledger
+// never converged, and closing those links meant stopping the loop and running rank:pool by
+// hand (which carries no --play restriction, which is exactly why it worked).
+//
+// One budget was serving two objectives that want opposite things: data quality wants NARROW
+// and deep, ladder convergence wants BROAD. So they get separate passes. This one is
+// unrestricted, short, and fires only when the deficit is genuinely unreachable otherwise.
+//
+// Its games go to their own file, not the dataset: they're played between whatever pairs the
+// adjacency graph is missing, which includes the weak nodes --play-strong deliberately keeps
+// out of training. They come back as --corpus-extra, so the evidence persists and accumulates
+// across cycles (a --no-save-games pass would inform only the run that played it).
+function runLinkPass(conv) {
+  if (!cfg.rank || !cfg.linkPass || !conv) return;
+  // Only when the deficit is real AND the routine pass cannot reach it. A schedulable deficit
+  // is already handled by adaptiveMaintenance giving the routine pass more minutes.
+  if (conv.converged || conv.unlinked <= 0 || conv.schedulable > 0) return;
+  const minutes = Math.max(2, Math.min(cfg.linkMinutes, 30));
+  log(`  Ladder link deficit: ${conv.unlinked} adjacent pair(s) have never met and NONE are `
+    + `schedulable under the strong-play set — more --rank-minutes cannot close them. `
+    + `Running a ${minutes}m unrestricted link pass (games to ${linkArchive}, rating evidence only).`);
+  run('Rank pool: unrestricted link pass', process.execPath,
+    [rankScript, '--corpus', `--minutes=${minutes}`, `--anchor-depth=${cfg.rankDepth}`,
+      // No --play: every node is schedulable, which is the entire point.
+      // --onboard=0 keeps the budget on EDGES (the link deficit) rather than on under-played
+      // nodes; the routine pass and the promotion calibration already cover node onboarding.
+      '--onboard=0', `--games=${cfg.rankGames}`,
+      `--data=${rawFile}`, `--ledger=${ledgerFile}`,
+      ...(corpusExtraFiles().length ? [`--corpus-extra=${corpusExtraFiles().join(',')}`] : []),
+      `--save-games=${linkArchive}`,
+      '--no-scan', `--seed=${Date.now()}`, ...jobArg]);
+}
 
 // Refit the Bradley-Terry strength pool (rank:pool / depth-ladder.mjs). Runs EVERY cycle:
 //   --corpus folds the whole dataset's harvested games (each record's players + result) into
@@ -1010,6 +1351,12 @@ function runRankPool(label, opts = {}) {
       ...(calib ? ['--onboard=1'] : []), // fill the champion's under-played depths before the ordering objective
       `--games=${cfg.rankGames}`, ...(cfg.rankLink === null ? [] : [`--link=${cfg.rankLink}`]),
       `--data=${rawFile}`, `--ledger=${ledgerFile}`,
+      // Rate from the rating-only game files as well. Neither is in --data, because neither is
+      // meant for the trainer: the screen's games are depth-1 labels, and the link pass plays
+      // whatever pairs the adjacency graph is missing (weak nodes included, which is exactly
+      // what --play-strong exists to keep out of the training set). Both are still perfectly
+      // good EVIDENCE, and --save-games still points at --data, so nothing new is written here.
+      ...(corpusExtraFiles().length ? [`--corpus-extra=${corpusExtraFiles().join(',')}`] : []),
       ...(cfg.harvest ? [] : ['--no-save-games']),
       '--no-scan', `--seed=${Date.now()}`, ...jobArg]);
 }
@@ -1227,6 +1574,66 @@ function adoptRecipe(next, why) {
   return true;
 }
 
+// Should the loop rotate off this track now? `--rotate=N` keeps the old fixed rule (N cycles on
+// this track without a promotion). The default `--rotate=auto` adds the one thing a raw cycle
+// count cannot see: WHERE THE TRACK IS HEADED.
+//
+// A new or grafted architecture can lose the gate for dozens of cycles while its absolute Elo
+// climbs steadily toward overtaking the champion — that is the pattern that produced Mona, and a
+// fixed counter rotates away from it right as it's working. Conversely a track whose absElo has
+// gone flat has told you everything it's going to: the registry measured a new track's cycle 1 at
+// ~29% promotion versus ~1.8% for a continuation cycle, so a flat track is worth abandoning fast.
+//
+// So: never rotate before AUTO_MIN cycles (every shape gets a fair look, and a 2-point trend is
+// noise), always rotate by AUTO_MAX (nothing grinds forever), and in between rotate only when the
+// trend is not climbing. absElo is re-anchored onto today's ledger before comparing, because a
+// stored absElo drifts as the pool re-fits — comparing raw snapshots would read drift as trend.
+// 3 matches the aggressive hand-set cadence this loop has actually been run at; 8 matches the
+// registry's own advice ("a track that hasn't promoted by ~8-10 cycles is far less likely to
+// than a fresh shape is on its first"), and is what stops a climbing-but-never-promoting track
+// from grinding forever the way the 22-cycle 39ef6efc track did.
+const AUTO_ROTATE_MIN = 3, AUTO_ROTATE_MAX = 8;
+function rotationDue() {
+  if (cfg.rotate === 'off') return { due: false };
+  if (cfg.rotate !== 'auto') {
+    return cyclesSinceAdopt >= cfg.rotate
+      ? { due: true, why: `${cyclesSinceAdopt} cycle(s) without a promotion` }
+      : { due: false };
+  }
+  if (!track || cyclesSinceAdopt < AUTO_ROTATE_MIN) return { due: false };
+  if (cyclesSinceAdopt >= AUTO_ROTATE_MAX) {
+    return { due: true, why: `${cyclesSinceAdopt} cycle(s) on this track without a promotion (auto cap)` };
+  }
+  const trend = trackAbsEloTrend();
+  if (trend == null) {
+    return { due: true, why: `${cyclesSinceAdopt} cycle(s) without a promotion, no absElo trend to justify staying` };
+  }
+  if (trend > 2) return { due: false }; // climbing — the Mona pattern; let it run
+  return {
+    due: true,
+    why: `${cyclesSinceAdopt} cycle(s) without a promotion and absElo trend ${trend >= 0 ? '+' : ''}${trend.toFixed(1)} Elo/cycle (flat or falling)`,
+  };
+}
+
+// Least-squares slope of this track's re-anchored absElo against cycle number, in Elo/cycle over
+// the cycles since this track was adopted. null when there aren't enough rated cycles to say.
+function trackAbsEloTrend() {
+  try {
+    const ledgerElo = ledgerBestByVersion(loopDir);
+    const pts = [];
+    for (const h of readHistory(track.dir)) {
+      const e = reAnchoredAbsElo(h, ledgerElo);
+      if (Number.isFinite(e)) pts.push(e);
+    }
+    const tail = pts.slice(-Math.max(AUTO_ROTATE_MIN, cyclesSinceAdopt));
+    if (tail.length < 3) return null;
+    const n = tail.length, mx = (n - 1) / 2, my = tail.reduce((a, b) => a + b, 0) / n;
+    let sxy = 0, sxx = 0;
+    for (let i = 0; i < n; i++) { sxy += (i - mx) * (tail[i] - my); sxx += (i - mx) ** 2; }
+    return sxx > 0 ? sxy / sxx : null;
+  } catch { return null; }
+}
+
 // Pick the next recipe to rotate onto. Prefers an untried one ('new' — the registry's
 // space-filling / UCB design over architecture space), falling back to reviving a past track
 // ('resume') when the candidate pool is exhausted. suggestRecipes already excludes every recipe
@@ -1283,12 +1690,21 @@ function championArchMatches() {
 log(`train:loop start — ${cfg.batch === 0
     ? `no gen (data from gate harvest${cfg.playStrong ? ` + strong --play @ depth ${cfg.playDepth}` : ' + pool'})`
     : `batch ${cfg.batch} @ depth ${cfg.depth}`} | gate ${cfg.gateGames}g @ depth ${cfg.gateDepth} `
-  + `SPRT(0,${cfg.elo1})${cfg.gateFutility > 0 ? ` futility<${cfg.gateFutility}` : ''} | candidate hidden=[${hidden}] λ=${cfg.lam} ${cfg.cold ? 'cold first cycle, warm after' : 'warm'} start`
+  + `SPRT(0,${cfg.elo1})${cfg.gateFutility > 0 ? ` futility<${cfg.gateFutility}` : ''} | `
+  + (cfg.screen
+    ? `screen ${cfg.screenGames}g @ depth ${cfg.screenDepth} ratio ${cfg.screenRatio} (SHADOW — logged, never acted on`
+      + `${cfg.screenSave ? `; games kept in ${screenArchive}` : '; games discarded'}) | `
+    : '')
+  + `candidate hidden=[${hidden}] λ=${cfg.lam} ${cfg.cold ? 'cold first cycle, warm after' : 'warm'} start`
   + `${existsSync(lineage) ? ' (resuming lineage)' : ''} | `
   + `refresh/cycle ${cfg.refreshCycle > 0 ? `${(cfg.refreshCycle * 100).toFixed(1)}% @ depth ${cfg.refreshCycleDepth}` : 'off'} | `
   + `refresh on promotion ${cfg.refreshFrac > 0 ? `${(cfg.refreshFrac * 100).toFixed(0)}% @ depth ${cfg.refreshDepth}` : 'off'} | `
-  + `rank ${cfg.rank ? `full pool every ${cfg.rankCycle > 1 ? `${cfg.rankCycle} cycles` : 'cycle'} (hc${cfg.rankDepth} pin, all depths, corpus + ${cfg.rankMinutes}m play${cfg.adaptive ? ', adaptive' : ''}${cfg.rankCycle > 1 ? ', always on promotion' : ''})` : 'off'} | `
-  + `rotate ${cfg.rotate > 0 ? `after ${cfg.rotate} cycle(s) without a promotion` : 'off'} | `
+  + `rank ${cfg.rank ? `full pool ${cfg.rankCycle === 'auto' ? 'auto-cadence (every cycle until the ladder converges)'
+    : cfg.rankCycle > 1 ? `every ${cfg.rankCycle} cycles` : 'every cycle'} `
+    + `(hc${cfg.rankDepth} pin, all depths, corpus + ${cfg.rankMinutes}m play${cfg.adaptive ? ', adaptive' : ''}, always on promotion`
+    + `${cfg.linkPass ? `; link pass ${cfg.linkMinutes}m when the deficit is unreachable` : ''})` : 'off'} | `
+  + `rotate ${cfg.rotate === 'auto' ? `auto (absElo trend, ${AUTO_ROTATE_MIN}-${AUTO_ROTATE_MAX} cycles)`
+    : cfg.rotate === 'off' ? 'off' : `after ${cfg.rotate} cycle(s) without a promotion`} | `
   + `cycles ${cfg.cycles === Infinity ? '∞' : cfg.cycles}`);
 if (cycleBase > 0) log(`Continuing cycle numbering at ${cycleBase + 1} — this recipe's track already has ${cycleBase} recorded cycle(s).`);
 log('Pause/resume from another terminal: `npm run train:pause` / `npm run train:resume` (frees all CPU, no work lost).');
@@ -1313,12 +1729,13 @@ for (let i = 1; i <= cfg.cycles && !stopRequested(); i++) {
   // Rotate BEFORE doing any work this cycle, so a stalled shape never costs another full
   // featurize/train/gate. Rotation is best-effort maintenance: if the suggester has nothing to
   // offer (or throws), the loop simply carries on with the current recipe rather than stopping.
-  if (cfg.rotate > 0 && cyclesSinceAdopt >= cfg.rotate) {
+  const rot = rotationDue();
+  if (rot.due) {
     const next = nextRotationRecipe();
-    if (next && adoptRecipe(next, `${cyclesSinceAdopt} cycle(s) without a promotion`)) {
+    if (next && adoptRecipe(next, rot.why)) {
       // adoptRecipe reset the counters; nothing else to do.
     } else {
-      log(`  (rotation due after ${cyclesSinceAdopt} cycle(s), but the registry had no untried recipe to switch to — continuing.)`);
+      log(`  (rotation due — ${rot.why} — but the registry had no untried recipe to switch to; continuing.)`);
       cyclesSinceAdopt = 0; // don't re-ask every cycle once the pool is exhausted
     }
   }
@@ -1415,6 +1832,12 @@ for (let i = 1; i <= cfg.cycles && !stopRequested(); i++) {
     log(`  Candidate speed: ${candNs.toFixed(0)} ns/node (~${Math.round(nps / 1000)}k nps) — arch [${archOf(candidate) ?? '?'}].`);
   }
 
+  // 3b. Shadow screen (--screen, off by default): a cheap low-depth read on the candidate,
+  //     logged and recorded but never acted on. Runs BEFORE the gate so the pairs it records
+  //     are (screen prediction, gate truth) on the same candidate, which is the only
+  //     population a real cascade would ever face. See runScreen.
+  const screen = runScreen();
+
   // 4. Gate: candidate (A) vs champion (B), SPRT(0, elo1). Unless --no-harvest,
   //    the gate's games are appended to the dataset (they're already paid for;
   //    every position gets the value from the engine that searched it — the mover's
@@ -1435,6 +1858,13 @@ for (let i = 1; i <= cfg.cycles && !stopRequested(); i++) {
       let r = null; try { r = JSON.parse(readFileSync(resultFile, 'utf8')); } catch { /* no usable result */ }
       foldGateHarvest(r ? r.sprt === 'H1' : false, r);
     }
+    // The screen's games were played before the gate started, so they survive the interrupt
+    // too. No verdict reached, so treat the candidate as unpromoted (the ephemeral tag is the
+    // conservative read — it rates the candidate rather than claiming it's a pool node).
+    if (cfg.screen && cfg.screenSave && existsSync(screenHarvest)) {
+      foldHarvest(screenHarvest, screenArchive, championLedgerElo(),
+        screen ? screen.eloLo : 0, `depth-${cfg.screenDepth} screen edge`);
+    }
     break;
   }
 
@@ -1453,11 +1883,23 @@ for (let i = 1; i <= cfg.cycles && !stopRequested(); i++) {
   const divNote = res.div
     ? ` | divergence ${(res.div.confidentRate * 100).toFixed(1)}% conf-disagree, ${res.div.meanCp.toFixed(0)}cp mean, corr ${res.div.corr.toFixed(2)} (n=${res.div.positions})`
     : '';
+  // How close the gate came to promoting. The SPRT verdict alone can't tell a candidate that
+  // stalled near 50% from one that died a hair short of the bound, and those call for different
+  // next moves (the first says the recipe is flat; the second says it wanted more games). The
+  // LLR walk crosses +llrUpper to promote and -llrLower to reject; the bounds move with
+  // --alpha/--beta so they come from the result file rather than being assumed here. Omitted
+  // for a promotion (it crossed, by definition) and for result files written before the bounds
+  // were reported.
+  const llrNote = res.llr != null && res.llrUpper
+    ? ` LLR ${res.llr.toFixed(2)} of [${res.llrLower.toFixed(2)}, ${res.llrUpper.toFixed(2)}] — `
+      + `${Math.max(0, Math.min(100, (res.llr / res.llrUpper) * 100)).toFixed(0)}% of the way to the promotion bound.`
+    : '';
   // Snapshot the values the track record needs BEFORE the promote branch overwrites the
   // champion file: the candidate's estimated ABSOLUTE Elo (the champion's current ledger Elo
   // + this gate's edge over it) stays comparable across cycles as the champion strengthens,
   // unlike a raw gate score, so it's what "track best" is ranked by. Null until the ledger
   // rates the champion (from cycle 2 on).
+  const gateCI = eloWithCI(res.wins, res.draws, res.losses);
   const gatedVsChampHash = weightsHash(champion);
   const champLedgerNow = championLedgerElo();
   const candAbsElo = champLedgerNow ? champLedgerNow.best + res.elo : null;
@@ -1467,6 +1909,26 @@ for (let i = 1; i <= cfg.cycles && !stopRequested(); i++) {
   // here, before the promote branch copies the candidate over the champion, so weightsHash
   // still identifies the candidate that actually played.
   if (cfg.harvest) foldGateHarvest(res.sprt === 'H1', res);
+  // Same treatment for the screen's games, into their own dataset. A PROMOTED candidate is
+  // archived by hash, so its screen games become directly rateable evidence for the ledger —
+  // and 20k direct games on one pair is worth far more to the fit than the ~28 the pool's
+  // whole per-cycle budget buys (the ladder currently reports 62 rank-adjacent pairs that have
+  // never met at all). Non-promoted candidates get the ephemeral tag, keyed off the SCREEN's
+  // own edge at the SCREEN's depth — screen.eloLo, not the rescaled gate-depth prediction.
+  if (cfg.screen && cfg.screenSave && existsSync(screenHarvest)) {
+    const promoted = res.sprt === 'H1';
+    const fold = foldHarvest(screenHarvest, screenArchive,
+      promoted ? null : championLedgerElo(),
+      screen ? screen.eloLo : 0, `depth-${cfg.screenDepth} screen edge`);
+    // The promoted case relabels nothing (the candidate is archived, so its own hash is a real
+    // ledger node) and would otherwise archive 20k games silently — say so, since that's the
+    // case where the games are worth the most to the pool.
+    if (fold && fold.folded) {
+      log(`  Archived ${fold.folded} depth-${cfg.screenDepth} screen game(s) to ${screenArchive}`
+        + `${promoted ? ' — rateable directly (candidate promoted, hash archived)' : ''}. `
+        + 'Separate dataset: rated by rank:pool, never featurized.');
+    }
+  }
   let promotedChampHash = null; // set on promotion, so the end-of-cycle rank calibrates all its depths
   if (res.sprt === 'H1') {
     const arch = JSON.parse(readFileSync(candidate, 'utf8')).arch;
@@ -1506,15 +1968,15 @@ for (let i = 1; i <= cfg.cycles && !stopRequested(); i++) {
     // the gate still protects it.
     copyFileSync(candidate, lineage);
     log(`cycle ${c}: kept champion — candidate ${pct}% / Elo ${res.elo.toFixed(0)} `
-      + `(SPRT ${res.sprt}${res.futility ? ' by futility stop' : ''}, ${res.games} games, cycle took ${fmtDur((Date.now() - cycleT0) / 1000)}). `
-      + 'Below the gate; candidate kept as lineage for the next cycle.'
+      + `(SPRT ${res.sprt}${res.futility ? ' by futility stop' : ''}, ${res.games} games, cycle took ${fmtDur((Date.now() - cycleT0) / 1000)}).`
+      + `${llrNote} Below the gate; candidate kept as lineage for the next cycle.`
       + divNote);
   } else {
     const hadLineage = existsSync(lineage);
     if (hadLineage) rmSync(lineage);
     log(`cycle ${c}: kept champion — candidate ${pct}% / Elo ${res.elo.toFixed(0)} `
-      + `(SPRT ${res.sprt}${res.futility ? ' by futility stop' : ''}, ${res.games} games, cycle took ${fmtDur((Date.now() - cycleT0) / 1000)}). `
-      + `Not a gain.${hadLineage ? ' Lineage reset (next warm-start falls back to this recipe\'s best net).' : ''}`
+      + `(SPRT ${res.sprt}${res.futility ? ' by futility stop' : ''}, ${res.games} games, cycle took ${fmtDur((Date.now() - cycleT0) / 1000)}).`
+      + `${llrNote} Not a gain.${hadLineage ? ' Lineage reset (next warm-start falls back to this recipe\'s best net).' : ''}`
       + divNote);
   }
 
@@ -1527,7 +1989,17 @@ for (let i = 1; i <= cfg.cycles && !stopRequested(); i++) {
     const rc = recordCycle(track.dir, {
       run: runNo, cycle: c, ts: stamp(),
       score: res.score, edgeElo: res.elo, absElo: candAbsElo,
+      // The gate's OWN 95% CI. `edgeElo` alone hides how much of it is noise, and the spread
+      // is huge on a futility-stopped gate (a 134-game stop carries several times the error
+      // bar of a full 2000-game one). screen:report needs it to separate real screen-vs-gate
+      // disagreement from the gate's own sampling error — without it a screen looks worse
+      // than it is, because the "truth" it's scored against is itself noisy.
+      ...(gateCI ? { edgeLo: gateCI.lo, edgeHi: gateCI.hi } : {}),
       sprt: res.sprt, futility: !!res.futility, promoted: res.sprt === 'H1',
+      // Where the SPRT walk stopped, against the bound it had to cross. Turns a column of
+      // identical "inconclusive" verdicts into a near-miss trend: a track creeping from 0.4 to
+      // 2.5 across cycles is going somewhere, one flat at 0.2 isn't.
+      ...(res.llr != null ? { llr: res.llr, llrUpper: res.llrUpper ?? null } : {}),
       div: res.div ? { corr: res.div.corr, meanCp: res.div.meanCp } : null,
       championHash: gatedVsChampHash,
       // Provenance: when this candidate was grafted from a foreign-arch champion (a new-arch
@@ -1535,6 +2007,10 @@ for (let i = 1; i <= cfg.cycles && !stopRequested(); i++) {
       graftParent: grafting ? gatedVsChampHash : null,
       datasetBytes: existsSync(rawFile) ? statSync(rawFile).size : 0,
       hash: candHashForTrack,
+      // Shadow-screen observation, omitted entirely unless --screen ran. Paired with this
+      // same line's `edgeElo`/`score`, which are the gate's truth for the very same
+      // candidate — that pairing is the point, and `npm run screen:report` reads it back out.
+      ...(screen ? { screen } : {}),
     });
     if (rc.isBest) copyFileSync(candidate, trackBest);
   } catch (e) { log(`  (track record skipped: ${e.message})`); }
@@ -1553,12 +2029,18 @@ for (let i = 1; i <= cfg.cycles && !stopRequested(); i++) {
   // PROMOTION always forces a refit — a fresh champion sits at the placeholder-floor Elo at every
   // depth it hasn't played, and the depth-calibration pass that fixes it only runs here, so
   // deferring it would leave the absElo the loop steers by resting on one or two thin bands.
-  const rankDue = cfg.rankCycle <= 1 || Boolean(promotedChampHash) || c % cfg.rankCycle === 0;
-  const budget = adaptiveMaintenance(cyclesSincePromo, rankDue);
+  const cadence = rankCadence(c, Boolean(promotedChampHash));
+  const budget = adaptiveMaintenance(cyclesSincePromo, cadence.due);
   if (budget.notes) log(`  Adaptive maintenance: ${budget.notes}.`);
-  if (!rankDue) log(`  Pool refit skipped (--rank-cycle=${cfg.rankCycle}) — next at cycle ${c + cfg.rankCycle - (c % cfg.rankCycle)}, or sooner on a promotion. The last fitted ledger still drives the filters/refresh.`);
-  if (!stopping && rankDue) runRankPool('Rank pool (Bradley-Terry, corpus + scheduled play)',
-    { calibrateChamp: promotedChampHash, minutes: budget.rankMinutes });
+  if (!cadence.due) log(`  Pool refit skipped — ${cadence.why}. The last fitted ledger still drives the filters/refresh.`);
+  if (!stopping && cadence.due) {
+    runRankPool('Rank pool (Bradley-Terry, corpus + scheduled play)',
+      { calibrateChamp: promotedChampHash, minutes: budget.rankMinutes });
+    // Re-read AFTER the refit: the pass just rewrote the convergence block, so this sees the
+    // deficit as it stands now rather than last cycle's. The link pass no-ops unless the
+    // remaining deficit is genuinely unreachable from the strong-play set.
+    if (!stopping) runLinkPass(ledgerConvergence());
+  }
 
   // Per-cycle value refresh — the LAST step of the cycle. Re-label a small slice of the
   // dataset with the current champion (most records carry `v` from older champions or

@@ -237,6 +237,15 @@ const cfg = {
   // own games (a what-if switch; see the header).
   corpus: !args['no-corpus'],
   data: typeof args.data === 'string' ? resolve(process.cwd(), args.data) : join(dataDir, 'selfplay.jsonl'),
+  // --corpus-extra=A,B: additional game files to rate from, on top of --data. For games that are
+  // legitimate RATING evidence but deliberately not training data — the loop's low-depth screen
+  // games (train:loop --screen --screen-save) are the motivating case: 20k direct candidate-vs-
+  // champion games per cycle, which is orders of magnitude more direct evidence on that pair than
+  // the pool's own per-cycle play budget buys, but at depth-1 label quality that must never reach
+  // the trainer. Read exactly like --data; a missing file is skipped with a warning.
+  corpusExtra: typeof args['corpus-extra'] === 'string'
+    ? args['corpus-extra'].split(',').map((s) => s.trim()).filter(Boolean).map((s) => resolve(process.cwd(), s))
+    : [],
   // Derived snapshot of the fitted pairwise matrix + seed cursor (an output; see the header).
   pool: typeof args.pool === 'string' ? resolve(process.cwd(), args.pool) : join(loopDir, 'ladder-pool.json'),
   ledger: typeof args.ledger === 'string' ? resolve(process.cwd(), args.ledger) : join(loopDir, 'engine-elo.ladder.json'),
@@ -767,26 +776,38 @@ async function scanDataset() {
 async function scanCorpus() {
   if (!cfg.corpus) return;
   if (!existsSync(cfg.data)) { console.warn(`(no dataset at ${cfg.data} — nothing to rate from)`); return; }
-  console.log(`\nScanning ${cfg.data} for game results...`);
   let skippedSelf = 0, noPlayers = 0;
-  try {
-    const rl = createInterface({ input: createReadStream(cfg.data), crlfDelay: Infinity });
-    for await (const line of rl) {
-      if (!line) continue;
-      let rec; try { rec = JSON.parse(line); } catch { continue; }
-      if (!isGameRecord(rec) || !rec.players) { noPlayers++; continue; }
-      const a = rec.players.w, b = rec.players.b;
-      if (!a || !b || a === '?' || b === '?') { noPlayers++; continue; }
-      if (a === b) { skippedSelf++; continue; } // self-play: uninformative for relative ranking
-      const pointsW = rec.r > 0 ? 1 : (rec.r < 0 ? 0 : 0.5);
-      const key = pairKey(a, b);
-      const e = corpusPairs.get(key) || { games: 0, sumA: 0 };
-      e.games += 1;
-      e.sumA += (a < b) ? pointsW : (1 - pointsW); // sumA tracks the lexically-first id
-      corpusPairs.set(key, e);
-      corpusGames++;
-    }
-  } catch (e) { console.warn(`  corpus scan interrupted (${e.message}); partial.`); }
+  // --data plus any --corpus-extra files. They're read identically: a game record's players +
+  // result is rating evidence wherever it lives, and keeping the extras out of --data is a
+  // TRAINING-set decision, not a rating one.
+  const sources = [cfg.data, ...cfg.corpusExtra.filter((f) => {
+    if (existsSync(f)) return true;
+    console.warn(`(no corpus-extra file at ${f} — skipped)`);
+    return false;
+  })];
+  for (const src of sources) {
+    console.log(`\nScanning ${src} for game results...`);
+    const before = corpusGames;
+    try {
+      const rl = createInterface({ input: createReadStream(src), crlfDelay: Infinity });
+      for await (const line of rl) {
+        if (!line) continue;
+        let rec; try { rec = JSON.parse(line); } catch { continue; }
+        if (!isGameRecord(rec) || !rec.players) { noPlayers++; continue; }
+        const a = rec.players.w, b = rec.players.b;
+        if (!a || !b || a === '?' || b === '?') { noPlayers++; continue; }
+        if (a === b) { skippedSelf++; continue; } // self-play: uninformative for relative ranking
+        const pointsW = rec.r > 0 ? 1 : (rec.r < 0 ? 0 : 0.5);
+        const key = pairKey(a, b);
+        const e = corpusPairs.get(key) || { games: 0, sumA: 0 };
+        e.games += 1;
+        e.sumA += (a < b) ? pointsW : (1 - pointsW); // sumA tracks the lexically-first id
+        corpusPairs.set(key, e);
+        corpusGames++;
+      }
+    } catch (e) { console.warn(`  corpus scan interrupted (${e.message}); partial.`); }
+    if (sources.length > 1) console.log(`  +${corpusGames - before} game(s) from this file.`);
+  }
   console.log(`  corpus: ${corpusGames} mixed-engine games -> ${corpusPairs.size} pair(s) rated `
     + `(${skippedSelf} self-play skipped).`);
 }

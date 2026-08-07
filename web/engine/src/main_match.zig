@@ -163,14 +163,15 @@ fn promoteChance(scores: []const f64, elo0: f64, elo1: f64, upper: f64, remainin
     return t1 + t2;
 }
 
-// Expected number of ADDITIONAL games until the LLR walk hits a decision bound, from its
-// current drift — the same Brownian model promoteChance uses, read the other way (time-to-
-// barrier instead of crossing-probability). It lets the live ETA time the match to its likely
-// SPRT decision instead of always to the --games cap (which SPRT rarely reaches). Uses the
-// OBSERVED mean drift (not the optimistic one) so it's an expectation, not a bound. null when
-// there aren't enough games yet or the drift is ~flat (no clear bound to head toward — let the
-// cap govern). The caller clamps the result to [0, cap − played].
-fn sprtRemainingGames(scores: []const f64, elo0: f64, elo1: f64, upper: f64, lower: f64) ?f64 {
+// Expected number of ADDITIONAL games until the LLR walk hits a decision bound, and WHICH bound
+// it is heading for, from the current drift — the same Brownian model promoteChance uses, read
+// the other way (time-to-barrier instead of crossing-probability). It lets the live ETA time the
+// match to its likely SPRT decision instead of always to the --games cap (which SPRT rarely
+// reaches). Uses the OBSERVED mean drift (not the optimistic one) so it's an expectation, not a
+// bound. null when there aren't enough games yet or the drift is ~flat (no clear bound to head
+// toward — let the cap govern). The caller clamps `games` to [0, cap − played].
+const SprtEta = struct { games: f64, h1: bool };
+fn sprtRemainingGames(scores: []const f64, elo0: f64, elo1: f64, upper: f64, lower: f64) ?SprtEta {
     const n = scores.len;
     if (n < 16) return null;
     const fn_: f64 = @floatFromInt(n);
@@ -186,9 +187,39 @@ fn sprtRemainingGames(scores: []const f64, elo0: f64, elo1: f64, upper: f64, low
     const l = llr(scores, elo0, elo1);
     const mu = c * (mean - (mu0 + mu1) / 2.0); // per-game LLR drift
     const eps = 1e-6;
-    if (mu > eps) return @max(0, (upper - l) / mu); // drifting up -> time to the promotion bound
-    if (mu < -eps) return @max(0, (lower - l) / mu); // drifting down (both terms < 0 -> positive)
+    // drifting up -> time to the promotion bound; down -> to H0 (both terms < 0, so positive)
+    if (mu > eps) return .{ .games = @max(0, (upper - l) / mu), .h1 = true };
+    if (mu < -eps) return .{ .games = @max(0, (lower - l) / mu), .h1 = false };
     return null; // ~no drift: unknowable from drift alone; the cap/futility will govern
+}
+
+// "88% to H1, ~170 games" — how close the match is to a verdict, spelled out. The LLR and its
+// bounds already carry this, but only if you keep the bounds in your head; someone watching a
+// gate wants to read "how close is this candidate to passing" straight off the line. The
+// percentage is the evidence accumulated toward the bound the LLR currently sits on the side of
+// (a positive LLR is evidence for H1), clamped to 100. The game count comes from the same drift
+// model as the ETA, so the two never disagree; it names its target bound only when the drift
+// heads somewhere other than the side the LLR is on — a candidate 88% of the way to H1 that has
+// turned around is exactly the case worth calling out. "cap first" when the bound is further off
+// than the games left. Empty before there are two games to measure. `with_eta = false` drops the
+// game count for the live line, which already carries an ETA built from the same estimate.
+fn fmtSprtProgress(buf: []u8, scores: []const f64, elo0: f64, elo1: f64, upper: f64, lower: f64, cap_remaining: usize, with_eta: bool) []const u8 {
+    if (scores.len < 2) return buf[0..0];
+    const l = llr(scores, elo0, elo1);
+    const toward_h1 = l >= 0;
+    const side: []const u8 = if (toward_h1) "H1" else "H0";
+    const pct = @min(100.0, @abs(l / (if (toward_h1) upper else lower)) * 100.0);
+    if (!with_eta) return std.fmt.bufPrint(buf, "{d:.0}% to {s}", .{ pct, side }) catch buf[0..0];
+    if (sprtRemainingGames(scores, elo0, elo1, upper, lower)) |eta| {
+        if (eta.games <= @as(f64, @floatFromInt(cap_remaining))) {
+            if (eta.h1 == toward_h1)
+                return std.fmt.bufPrint(buf, "{d:.0}% to {s}, ~{d:.0} games", .{ pct, side, eta.games }) catch buf[0..0];
+            return std.fmt.bufPrint(buf, "{d:.0}% to {s} but drifting to {s}, ~{d:.0} games", .{
+                pct, side, if (eta.h1) "H1" else "H0", eta.games,
+            }) catch buf[0..0];
+        }
+    }
+    return std.fmt.bufPrint(buf, "{d:.0}% to {s}, cap first", .{ pct, side }) catch buf[0..0];
 }
 
 // The reported Elo with its 95% confidence interval:
@@ -625,7 +656,7 @@ fn paintLive(sh: *Shared) void {
         if (sh.sprt) {
             if (sprtRemainingGames(sh.scores.items, sh.elo0, sh.elo1, sh.upper, sh.lower)) |rg| {
                 const cap_rem: f64 = @floatFromInt(total - ng);
-                const sprt_eta = @max(@min(rg, cap_rem) * g / jobs_f, @min(drain, g));
+                const sprt_eta = @max(@min(rg.games, cap_rem) * g / jobs_f, @min(drain, g));
                 if (sprt_eta < eta_s) eta_s = sprt_eta;
             }
         }
@@ -634,10 +665,15 @@ fn paintLive(sh: *Shared) void {
         etaseg = std.fmt.bufPrint(&etastore, " | ETA {s}", .{fmtDur(&b2, eta_s)}) catch "";
     }
     var llrseg: []const u8 = "";
-    var llrstore: [64]u8 = undefined;
+    var llrstore: [96]u8 = undefined;
     if (sh.sprt) {
-        llrseg = std.fmt.bufPrint(&llrstore, " | LLR {d:.2} [{d:.2}, {d:.2}]", .{
+        // Short progress form here: the line's ETA already spends the game-count half of the
+        // estimate, so this adds only the "how close to the bound" half.
+        var pbuf: [48]u8 = undefined;
+        const prog = fmtSprtProgress(&pbuf, sh.scores.items, sh.elo0, sh.elo1, sh.upper, sh.lower, total - ng, false);
+        llrseg = std.fmt.bufPrint(&llrstore, " | LLR {d:.2} [{d:.2}, {d:.2}]{s}{s}", .{
             llr(sh.scores.items, sh.elo0, sh.elo1), sh.lower, sh.upper,
+            if (prog.len > 0) " | " else "", prog,
         }) catch "";
     }
     var ebuf: [16]u8 = undefined;
@@ -819,8 +855,15 @@ fn worker(sh: *Shared, idx: usize) void {
             const ci = eloWithCI(sh.scores.items);
             const sign = if (ci.elo >= 0) "+" else "";
             if (sh.sprt) {
-                std.debug.print("  after {d} games  A: +{d} ={d} -{d}  score {d:.1}%  Elo {s}{d:.0} ± {d:.0}  95% CI [{d:.0}, {d:.0}]  LLR {d:.2} [{d:.2}, {d:.2}]\n", .{
-                    ng, w, dr, ls, pp * 100, sign, ci.elo, ci.margin, ci.lo, ci.hi, llr(sh.scores.items, sh.elo0, sh.elo1), sh.lower, sh.upper,
+                // Full progress form: this line is permanent and carries no ETA, so it gets the
+                // game count too — "how many more games until this is decided" at the current rate.
+                var pbuf: [64]u8 = undefined;
+                const total_g = sh.total_pairs * 2;
+                const prog = fmtSprtProgress(&pbuf, sh.scores.items, sh.elo0, sh.elo1, sh.upper, sh.lower, total_g - @min(ng, total_g), true);
+                std.debug.print("  after {d} games  A: +{d} ={d} -{d}  score {d:.1}%  Elo {s}{d:.0} ± {d:.0}  95% CI [{d:.0}, {d:.0}]  LLR {d:.2} [{d:.2}, {d:.2}]{s}{s}{s}\n", .{
+                    ng, w, dr, ls, pp * 100, sign, ci.elo, ci.margin, ci.lo, ci.hi,
+                    llr(sh.scores.items, sh.elo0, sh.elo1), sh.lower, sh.upper,
+                    if (prog.len > 0) "  (" else "", prog, if (prog.len > 0) ")" else "",
                 });
             } else {
                 std.debug.print("  after {d} games  A: +{d} ={d} -{d}  score {d:.1}%  Elo {s}{d:.0} ± {d:.0}  95% CI [{d:.0}, {d:.0}]\n", .{
@@ -1187,6 +1230,15 @@ fn finalizeLocked(sh: *Shared) void {
         });
     }
     const verdict = if (sh.sprt) (sh.decided orelse "inconclusive") else "n/a";
+    // An undecided SPRT ends on a bare "inconclusive", which hides the difference between a
+    // candidate that stalled at the halfway mark and one that died 0.2 short of the promotion
+    // bound. Say how far the evidence actually got, in the same LLR units the live line shows.
+    if (sh.sprt and !std.mem.eql(u8, verdict, "H1") and !std.mem.eql(u8, verdict, "H0")) {
+        const l = llr(sh.scores.items, sh.elo0, sh.elo1);
+        std.debug.print("Undecided: LLR {d:.2} of [{d:.2}, {d:.2}] — {d:.0}% of the way to the promotion bound.\n", .{
+            l, sh.lower, sh.upper, @max(0.0, @min(100.0, l / sh.upper * 100.0)),
+        });
+    }
     std.debug.print("A vs B: {d} games | +{d} ={d} -{d} | score {d:.1}% | Elo {s}{d:.0} ± {d:.0} (95% CI [{d:.0}, {d:.0}]) | SPRT {s} | nodes {d} nps {d}\n", .{
         n, wins, draws, losses, p * 100, sign, ci.elo, ci.margin, ci.lo, ci.hi, verdict, sh.nodes, sh.nodes * 1000 / ms,
     });
@@ -1217,13 +1269,15 @@ fn finalizeLocked(sh: *Shared) void {
     }
 
     if (sh.cfg.result_file) |rf| {
-        var buf: [768]u8 = undefined;
+        var buf: [1024]u8 = undefined; // headroom: a bufPrint overflow here would drop the result file entirely
         const sprt_field = if (sh.sprt) sh.decided orelse "inconclusive" else null;
         const fut_field: []const u8 = if (sh.futility_fired) "true" else "false";
+        // llrLower/llrUpper travel with the llr so a reader (train:loop's cycle line) can say how
+        // close the candidate came without hardcoding bounds that --alpha/--beta can move.
         const json = if (sprt_field) |sf|
             std.fmt.bufPrint(&buf,
-                \\{{"games":{d},"wins":{d},"draws":{d},"losses":{d},"score":{d},"elo":{d},"llr":{d},"sprt":"{s}","futility":{s},"div":{s}}}
-            , .{ n, wins, draws, losses, p, elo, llr(sh.scores.items, sh.elo0, sh.elo1), sf, fut_field, div_json }) catch return
+                \\{{"games":{d},"wins":{d},"draws":{d},"losses":{d},"score":{d},"elo":{d},"llr":{d},"llrLower":{d},"llrUpper":{d},"sprt":"{s}","futility":{s},"div":{s}}}
+            , .{ n, wins, draws, losses, p, elo, llr(sh.scores.items, sh.elo0, sh.elo1), sh.lower, sh.upper, sf, fut_field, div_json }) catch return
         else
             std.fmt.bufPrint(&buf,
                 \\{{"games":{d},"wins":{d},"draws":{d},"losses":{d},"score":{d},"elo":{d},"llr":null,"sprt":null,"div":{s}}}
