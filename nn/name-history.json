@@ -81,6 +81,19 @@
         1
       ],
       "note": "Retired train:loop champion (22577c, 2026-06-18); pruned from the catalog 2026-08-03."
+    },
+    {
+      "name": "Hugo",
+      "hash": "a6baa2",
+      "gen": 8,
+      "arch": [
+        768,
+        64,
+        16,
+        8,
+        1
+      ],
+      "note": "Retired train:loop champion (a6baa2, 2026-06-23); pruned from the catalog 2026-08-07."
     }
   ]
 }

@@ -1,21 +1,6 @@
 {
-  "default": "Tara",
+  "default": "Uma",
   "nets": [
-    {
-      "name": "Hugo",
-      "file": "hugo.json",
-      "arch": [
-        768,
-        64,
-        16,
-        8,
-        1
-      ],
-      "loopChampion": true,
-      "hash": "a6baa2",
-      "gen": 8,
-      "note": "Retired train:loop champion (a6baa2, 2026-06-23)."
-    },
     {
       "name": "Ivy",
       "file": "ivy.json",
@@ -237,7 +222,31 @@
       "loopChampion": true,
       "hash": "4d75b3",
       "gen": 20,
-      "note": "train:loop champion Tara (gen 20, 4d75b3, 2026-08-03).",
+      "note": "train:loop champion Tara (gen 20, 4d75b3, 2026-08-03)."
+    },
+    {
+      "name": "Uma",
+      "file": "uma.json",
+      "arch": [
+        768,
+        256,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        1
+      ],
+      "loopChampion": true,
+      "hash": "cace14",
+      "gen": 21,
+      "note": "train:loop champion Uma (gen 21, cace14, 2026-08-07).",
       "current": true
     }
   ]
