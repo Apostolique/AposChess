@@ -82,10 +82,11 @@
 //   --confirm-elo=E  the confirmation's promotion bar in Elo, strictly greater (default 8).
 //                   Why 8 over 600 games: the two tests are independent, so the joint
 //                   false-positive rate MULTIPLIES — 0.05 (the gate's alpha) x P(a true-0
-//                   candidate measures > +8 over 600 games). 600 games at this draw rate is
-//                   ~+/-28 Elo at 1 sigma, so that second factor is ~0.39 and the joint rate is
-//                   ~0.02: a ~2.5x cut in spurious promotions. The price to a genuine +20
-//                   candidate is P(pass) ~= 0.67, i.e. a real gain promotes in ~1.5 attempts
+//                   candidate measures > +8 over 600 games). The runner prints a 95% half-width,
+//                   not a sigma, so the sigma here is ~12-14 Elo over 600 games (see runConfirm):
+//                   that second factor is ~0.25-0.28 and the joint rate is ~0.014, a ~3.6x cut in
+//                   spurious promotions. The price to a genuine +20
+//                   candidate is P(pass) ~= 0.81, i.e. a real gain promotes in ~1.2 attempts
 //                   instead of 1 — and the failed attempt isn't lost, it re-gates from the
 //                   lineage. Compute cost is ~1 h at the measured gate throughput (2000 games
 //                   is 3h30-3h55), on the ~5% of cycles that reach H1: ~1% of the loop's clock.
@@ -1363,10 +1364,13 @@ function confirmSeed(cycleNo, candHash, champHash) {
 //     measured Elo an unbiased estimate of the true edge.
 //
 // Why 600 games and a bar of +8. The two tests are independent, so the joint false-positive rate
-// MULTIPLIES: 0.05 (the gate's alpha) x P(a true-0 candidate measures > +8 over 600 games). 600
-// games at this draw rate is about +/-28 Elo at 1 sigma, so that second factor is ~0.39 and the
-// joint rate is ~0.02 — a ~2.5x cut in spurious promotions. The price to a genuine +20 candidate
-// is P(pass) = P(measure > +8 | true +20) ~= 0.67, so a real gain needs ~1.5 attempts instead of
+// MULTIPLIES: 0.05 (the gate's alpha) x P(a true-0 candidate measures > +8 over 600 games). Note
+// the match runner prints a 95% HALF-WIDTH, not a standard deviation (verified: it reports +/-91
+// on a 60-game +36 =2 -22 result, and 1.96 sigma there is 86) — so the sigma that matters here is
+// ~12-14 Elo over 600 games depending on the draw rate, not the ~28 the printed interval suggests.
+// That puts the second factor at ~0.25-0.28 and the joint rate at ~0.014 — a ~3.6x cut in spurious
+// promotions. The price to a genuine +20 candidate is P(pass) = P(measure > +8 | true +20) ~= 0.81
+// at a 5% draw rate (0.85 at 30%), so a real gain needs ~1.2 attempts instead of
 // 1 — and a failed confirmation is NOT a lost gain: the candidate stays as this track's lineage
 // and re-gates next cycle from there, so the cost is a delayed promotion, never a forfeited one.
 // The compute cost is small because promotions are rare: 600 games at --gate-depth is ~1 h at the
@@ -2210,7 +2214,7 @@ for (let i = 1; i <= cfg.cycles && !stopRequested(); i++) {
     // to catch. The landing is deliberately the SAME one the loop already uses for a gate winner
     // that didn't promote: the candidate becomes this track's lineage, so the next cycle
     // warm-starts from it and re-gates it. A genuine gain is delayed by a cycle, never discarded
-    // (which is what makes a 0.67 pass rate on a true +20 an acceptable price). The champion file
+    // (which is what makes a ~0.81 pass rate on a true +20 an acceptable price). The champion file
     // is untouched, and the harvest fold above already relabeled the candidate's provenance to the
     // ephemeral nn<d>@elo<E> tag, keyed off the more conservative of the two measured edges.
     // (A --cold run chains from the previous candidate unconditionally, so its lineage slot plays
