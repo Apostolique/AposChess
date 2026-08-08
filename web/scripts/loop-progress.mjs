@@ -136,7 +136,14 @@ for (const raw of readFileSync(logFile, 'utf8').split('\n')) {
       promoted,
       score: Number((body.match(/candidate ([\d.]+)%/) || [, NaN])[1]),
       elo: Number((body.match(/Elo ([+-]?\d+)/) || [, NaN])[1]),
-      sprt: promoted ? 'H1' : (body.match(/SPRT (H0|inconclusive)/) || [, '?'])[1],
+      // A gate that reached H1 but failed its CONFIRMATION match writes no "SPRT <verdict>"
+      // token — the SPRT did decide H1, it just wasn't the last word (train-loop.mjs
+      // runConfirm). Reporting that as '?' would hide the one outcome most worth seeing: the
+      // gate and the rematch disagreed, which is exactly what the confirmation exists to
+      // surface. The track history keeps the raw sprt:"H1" alongside the confirm record.
+      sprt: promoted ? 'H1'
+        : /the gate reached H1/.test(body) ? 'H1 unconfirmed'
+          : (body.match(/SPRT (H0|inconclusive)/) || [, '?'])[1],
       games: num(body.match(/(\d+) games/)),
       dur: (body.match(/cycle took ([^)]+)\)/) || [, '?'])[1],
       tail,
