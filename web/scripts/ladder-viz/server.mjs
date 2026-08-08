@@ -325,7 +325,10 @@ const server = http.createServer((req, res) => {
     return sendJson(res, {
       champions: championIndex(),
       convergence: ledger?.convergence ?? null,
-      meta: ledger ? { generated: ledger.generated, anchor: ledger.anchor, depths: ledger.depths, dataset: ledger.dataset } : null,
+      // `era` + `anchorElo` say which SEARCH these ratings describe and what the pin is worth on
+      // the one persisted scale — a ladder from another era rates engines that no longer exist.
+      meta: ledger ? { generated: ledger.generated, anchor: ledger.anchor, era: ledger.era ?? 1,
+        anchorElo: ledger.anchorElo ?? null, depths: ledger.depths, dataset: ledger.dataset } : null,
       match: readJson(F.match),
       counts: { games: gindex.entries.length, gamesBytes: gindex.size, gamesSkipped: gindex.skipped },
       files: fileStatus(),
