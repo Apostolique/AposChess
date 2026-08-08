@@ -48,6 +48,20 @@ const now = () => Date.now();
 
 let killers; // killers[ply] = [moveKey, moveKey]
 let history; // Int32Array[from*64+to] of cutoff counts
+// Nodes visited by the current search, and the budget that stops it. A NODE IS COUNTED ON
+// ENTRY to search() and to qsearch() — the two disjoint kinds of node this engine visits, and
+// the only point every visited node passes through exactly once. ai.zig counts at exactly the
+// same two entries, so "20000 nodes" names the same tree in both engines; counting cutoffs,
+// applyMoves or leaf evals instead would make a JS/Zig comparison at a fixed budget diverge
+// for no interesting reason.
+//
+// WHY the budget exists: at a fixed DEPTH a pruning or move-ordering gain returns the same move
+// for fewer nodes, so its whole benefit is invisible and a fixed-depth match would reject every
+// correct pruning change; wall-clock movetime prices it but reads machine load into the result.
+// A node budget prices speed and accuracy on one scale and is deterministic. nodeCap = Infinity
+// (the default, mirroring maxMs) means unbounded, so every existing caller is unaffected.
+let nodes = 0;
+let nodeCap = Infinity;
 // Repetition detection: repPath[ply] is the Zobrist hash at each ply of the current
 // search line, with index 0 seeded to the game's current position. A node whose hash
 // matches a same-side-to-move ancestor (or the current position) is scored a draw,
@@ -68,6 +82,15 @@ let repSeen;
 // (graph-history interaction). The flag bubbles up via this module-level var,
 // read by each caller immediately after its recursive search() returns.
 let tainted;
+
+// The search's single stop condition: out of TIME or out of NODES. Both are monotonic (the
+// clock never runs backwards, `nodes` only grows), so once it reads true every ancestor sees it
+// too — which is what makes the unwind safe: in-tree nodes return 0, move loops break, the TT
+// store is skipped so an incomplete score can't poison the persistent table, and the root marks
+// the iteration aborted and keeps the move from the last COMPLETED iteration. Every former
+// `now() > deadline` site checks this instead, so a node budget behaves exactly like a time
+// limit rather than through a parallel path (ai.zig's outOfBudget is the same predicate).
+const outOfBudget = (deadline) => nodes >= nodeCap || now() > deadline;
 
 const keyOf = (m) => m.from * 64 + m.to;
 
@@ -454,6 +477,11 @@ function orderMoves(moves, board, ply, pvKey) {
 
 // Resolve captures/jumps/promotions to a quiet position before evaluating.
 function qsearch(state, alpha, beta, qdepth) {
+  // Counted on entry, before anything can return early (see `nodes`). qsearch itself has no
+  // abort check — QDEPTH bounds it — so a node-capped search overshoots its cap by at most the
+  // quiescence subtree in flight, deterministically (that subtree is a pure function of the
+  // position). Same in ai.zig.
+  nodes++;
   const inCheck = kingAttacked(state.board, state.turn);
   let best, standPat;
   if (inCheck) {
@@ -519,7 +547,8 @@ function qsearch(state, alpha, beta, qdepth) {
 }
 
 function search(state, depth, alpha, beta, ply, canNull, hash, deadline) {
-  if (now() > deadline) { tainted = false; return 0; } // aborted; the root discards this iteration
+  if (outOfBudget(deadline)) { tainted = false; return 0; } // aborted; the root discards this iteration
+  nodes++; // counted on entry, after the abort check — an aborted node is not a visited one
   if (ttEnabled) {
     // Draw by repetition. Two sources, both scored as a draw on the first repeat:
     //   - repSeen: the position already occurred in the real game (so reaching it
@@ -599,18 +628,18 @@ function search(state, depth, alpha, beta, ply, canNull, hash, deadline) {
       }
       break;
     }
-    if (now() > deadline) break;
+    if (outOfBudget(deadline)) break;
   }
 
   // The node's value is tainted if the move that fixed it (the best move, or the one
   // that caused the beta cutoff — both tracked by bestTainted) came back tainted.
   // Skip the store in that case so a path-dependent draw never lands in the
   // persistent table. Also skip past the deadline: a node that broke out of its
-  // move loop on time has an incomplete `best`, and with a persistent table a bogus
-  // entry would survive into later searches. Time is monotonic, so once we're past
-  // the deadline every ancestor's store is skipped too.
+  // move loop on time (or on the node cap) has an incomplete `best`, and with a persistent
+  // table a bogus entry would survive into later searches. Both budgets are monotonic, so once
+  // we're out of budget every ancestor's store is skipped too.
   tainted = bestTainted;
-  if (ttEnabled && !bestTainted && now() <= deadline) {
+  if (ttEnabled && !bestTainted && !outOfBudget(deadline)) {
     const flag = best <= alphaOrig ? UPPER : best >= beta ? LOWER : EXACT;
     ttStore(hash, depth, toTT(best, ply), flag, bestKey);
   }
@@ -618,13 +647,21 @@ function search(state, depth, alpha, beta, ply, canNull, hash, deadline) {
 }
 
 // Choose a move for the side to move, searching up to `maxDepth` plies but never
-// past `maxMs` of wall-clock. `rand` shuffles equal choices so games vary.
-// `useTT` exists for benchmarking the transposition table on/off.
+// past `maxMs` of wall-clock and never past `maxNodes` nodes. `rand` shuffles equal
+// choices so games vary. `useTT` exists for benchmarking the transposition table on/off.
 //
-// Returns { move, ponder, depth }: `move` is the chosen move, `ponder` is the
+// `maxNodes` is the deterministic budget the offline match runner gates search changes on
+// (apos-match --nodes; see `nodes` above for why depth and wall-clock both fail at that). It
+// defaults to Infinity — unbounded, exactly like `maxMs` — and 0 is also read as unbounded, so
+// it accepts ai.zig's `0 = no limit` convention too. Both budgets abort the same way: the
+// partial iteration is discarded and the move from the last completed one is returned.
+//
+// Returns { move, ponder, depth, score, nodes }: `move` is the chosen move, `ponder` is the
 // predicted opponent reply (its { from, to } — what to think about during their
-// turn) read from the table after the search, and `depth` is the deepest
-// iteration completed (used to stop pondering once the line is fully resolved).
+// turn) read from the table after the search, `depth` is the deepest
+// iteration completed (used to stop pondering once the line is fully resolved),
+// and `nodes` is how many nodes it took (the unit `maxNodes` bounds, and what a
+// JS-vs-Zig node comparison reads).
 // The table is NOT cleared here — it persists across calls (see ttReset).
 //
 // `prevHashes` is the Zobrist hashes of positions that already occurred in the real
@@ -633,7 +670,7 @@ function search(state, depth, alpha, beta, ply, canNull, hash, deadline) {
 // Only positions since the last irreversible move (capture/pawn move — i.e. the last
 // `halfmove` plies) can ever recur, so the caller need only pass that window; doing
 // so keeps the per-node repetition lookup set tiny (usually empty).
-export function chooseMoveDetailed(state, maxDepth = 2, rand = Math.random, maxMs = Infinity, useTT = true, prevHashes = [], engine = 'handcrafted', excludeKeys = null, onProgress = null) {
+export function chooseMoveDetailed(state, maxDepth = 2, rand = Math.random, maxMs = Infinity, useTT = true, prevHashes = [], engine = 'handcrafted', excludeKeys = null, onProgress = null, maxNodes = Infinity) {
   // engine is 'handcrafted', 'nn', or 'nn:<slot>' (a specific net). Split off the slot.
   const colon = engine.indexOf(':');
   const evalName = colon < 0 ? engine : engine.slice(0, colon);
@@ -651,7 +688,7 @@ export function chooseMoveDetailed(state, maxDepth = 2, rand = Math.random, maxM
   // instead of reading a bare 0 as an even position: -MATE when checkmated, 0 for
   // stalemate. Mirrors the in-tree terminal handling in search().
   if (root.length === 0) {
-    return { move: null, ponder: null, depth: 0, score: kingAttacked(state.board, state.turn) ? -MATE : 0 };
+    return { move: null, ponder: null, depth: 0, score: kingAttacked(state.board, state.turn) ? -MATE : 0, nodes: 0 };
   }
 
   // Optional opening-variety filter: drop root moves whose key (from*64+to) is in
@@ -677,6 +714,11 @@ export function chooseMoveDetailed(state, maxDepth = 2, rand = Math.random, maxM
   repPath = useTT ? [rootHash] : []; // index 0 = the current (root) position
   repSeen = useTT ? new Set(prevHashes) : new Set(); // positions already seen in the real game
   const deadline = now() + maxMs;
+  // Node budget for this search only, set right beside the deadline and reset with the counter,
+  // so the two budgets stay one mechanism and the cap is per-search (per move) the way movetime
+  // is. `> 0` so 0 reads as unbounded, matching ai.zig's convention.
+  nodes = 0;
+  nodeCap = maxNodes > 0 ? maxNodes : Infinity;
   let bestMove = root[0];
   let completed = 0;
   let rootScore = 0; // side-to-move-relative value (cp) of the last completed depth
@@ -702,7 +744,7 @@ export function chooseMoveDetailed(state, maxDepth = 2, rand = Math.random, maxM
         score = -search(child, depth - 1, -alpha - 1, -alpha, 1, true, childHash, deadline);
         if (score > alpha) score = -search(child, depth - 1, -Infinity, -alpha, 1, true, childHash, deadline);
       }
-      if (now() > deadline) { aborted = true; break; }
+      if (outOfBudget(deadline)) { aborted = true; break; }
       if (minimize ? score < bestScore : score > bestScore) { bestScore = score; localBest = m; }
       if (!minimize && score > alpha) alpha = score;
     }
@@ -722,11 +764,11 @@ export function chooseMoveDetailed(state, maxDepth = 2, rand = Math.random, maxM
     const i = ttProbe(hashAfter(rootHash, state, bestMove));
     if (i >= 0 && ttMove[i]) ponder = { from: (ttMove[i] / 64) | 0, to: ttMove[i] % 64 };
   }
-  return { move: bestMove, ponder, depth: completed, score: rootScore };
+  return { move: bestMove, ponder, depth: completed, score: rootScore, nodes };
 }
 
-export function chooseMove(state, maxDepth, rand, maxMs, useTT, prevHashes, engine, excludeKeys) {
-  return chooseMoveDetailed(state, maxDepth, rand, maxMs, useTT, prevHashes, engine, excludeKeys).move;
+export function chooseMove(state, maxDepth, rand, maxMs, useTT, prevHashes, engine, excludeKeys, maxNodes) {
+  return chooseMoveDetailed(state, maxDepth, rand, maxMs, useTT, prevHashes, engine, excludeKeys, null, maxNodes).move;
 }
 
 // Exposed for tests only: Zobrist hash equivalence check + table reset so a

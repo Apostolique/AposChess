@@ -9,6 +9,11 @@
 // positions — a diversity signal orthogonal to the score:
 // {positions,confident,confidentRate,meanCp,corr}.
 //
+// The SPRT is PENTANOMIAL: its unit of evidence is a completed color-reversed PAIR (the
+// pair's mean score, in {0, 0.25, 0.5, 0.75, 1}), not a single game — see llr below. The
+// reported score%/Elo/CI and every result-file count stay per-GAME; only the stopping
+// decision moves to pairs.
+//
 // --sprt-futility=G adds a third stopping rule to --sprt (0 = off, the default): stop as
 // "inconclusive" once the chance of still reaching the promotion bound before the --games
 // cap drops below G (see promoteChance below). SPRT decides fast at the extremes but burns
@@ -16,9 +21,22 @@
 // promote anyway — so this reclaims exactly those games. The `futility` result field records
 // whether the stop fired (the verdict stays "inconclusive", same as running out the cap).
 //
+// --adjudicate=CP --adjudicate-plies=N ends a decided game early and scores it as a real result
+// (0 = off, the default). It is the cutechess `-resign movecount=N score=T` rule, and here it
+// reads the LOSER's own search only — see the Adjudicator comment for why the mover's-eval form
+// that main_gen.zig uses would be wrong in a two-engine match.
+//
+// A match is paced by exactly ONE instrument: --depth (fixed depth), --movetime (ms/move), or
+// --nodes (nodes/move), each with a `-b` twin for an asymmetric budget. --nodes is the one that
+// can gate a SEARCH change: at a fixed depth a pruning or move-ordering gain returns the same
+// move for fewer nodes, so its whole benefit is invisible and the gate rejects it, while
+// movetime prices it but reads the machine's load into the score. Mixing the flags is an error
+// (exit 2), not a silent precedence — see the resolution in main.
+//
 //   apos-match --games=800 --depth=4 --eval-a=nn --eval-b=nn \
 //     --weights-a=cand.json --weights-b=src/nn-weights.json --sprt --elo1=20 \
 //     --result-file=match.json --save-games=../training/data/selfplay.jsonl --jobs=14
+//   apos-match --games=400 --nodes=200000 --eval-a=nn --eval-b=nn ...   # search-change gate
 // Paths are relative to the current directory (run from web/).
 //
 // --save-games harvests each game as one game-primary record (scripts/gameRecord.mjs:
@@ -97,17 +115,34 @@ fn eloFromScore(p: f64) f64 {
     if (p >= 1) return 800;
     return -400.0 * std.math.log10(1.0 / p - 1.0);
 }
-fn llr(scores: []const f64, elo0: f64, elo1: f64) f64 {
-    const n = scores.len;
+// GSPRT log-likelihood ratio over PAIRS, not games — the pentanomial form.
+//
+// Every opening is played twice with the colors swapped, so the two games of a pair are not
+// independent samples: when the scripted random line happens to favour White, A tends to win
+// the game it has White and lose the one it has Black, and the pair lands on 0.5 either way.
+// That negative within-pair correlation is real information about how much of the observed
+// spread is opening luck rather than strength, and scoring games one at a time throws it away —
+// the per-game variance is inflated by exactly the luck the pairing already cancelled. Feeding
+// each completed pair's MEAN score (one observation in {0, 0.25, 0.5, 0.75, 1}) makes the
+// empirical variance the pair variance instead, which fishtest measured at ~15% below the naive
+// trinomial one; the same decision therefore lands ~15% sooner. Pure upside: the runner was
+// already generating the paired evidence and discarding half its value.
+//
+// The formula itself is unchanged, and so are `upper`/`lower` and `alpha`/`beta`: mu0/mu1 are
+// per-GAME expected scores, and a pair MEAN has that same expectation, so the drift the walk
+// tests is identical — only the noise around it shrinks. `obs` is the completed-pair means; an
+// unpaired tail game (an early stop can leave one) is not in it and contributes nothing.
+fn llr(obs: []const f64, elo0: f64, elo1: f64) f64 {
+    const n = obs.len;
     if (n < 2) return 0;
     const fn_: f64 = @floatFromInt(n);
     const mu0 = scoreFromElo(elo0);
     const mu1 = scoreFromElo(elo1);
     var s: f64 = 0;
-    for (scores) |x| s += x;
+    for (obs) |x| s += x;
     const mean = s / fn_;
     var var_sum: f64 = 0;
-    for (scores) |x| var_sum += (x - mean) * (x - mean);
+    for (obs) |x| var_sum += (x - mean) * (x - mean);
     const variance = @max(var_sum / fn_, 1e-3);
     return ((mu1 - mu0) / variance) * (s - (fn_ * (mu0 + mu1)) / 2.0);
 }
@@ -123,12 +158,14 @@ fn phi(x: f64) f64 {
 }
 
 // Futility stop (stochastic curtailment) for the GSPRT: the probability that the LLR walk
-// still reaches the promotion bound (`upper`) within `remaining` games. SPRT's expected game
-// count peaks when the true strength sits BETWEEN elo0 and elo1 — so a roughly-even match
-// burns the whole --games cap to say "inconclusive", a verdict that was knowable long before.
-// Modeled as Brownian motion with drift: per-game LLR increments have mean c·(p − mid) and
+// still reaches the promotion bound (`upper`) within `remaining` PAIRS. The walk steps once per
+// completed pair (see llr), so its time axis — and therefore `remaining` — is in pairs; the
+// caller converts from its --games cap. SPRT's expected game count peaks when the true strength
+// sits BETWEEN elo0 and elo1 — so a roughly-even match burns the whole --games cap to say
+// "inconclusive", a verdict that was knowable long before.
+// Modeled as Brownian motion with drift: per-pair LLR increments have mean c·(p − mid) and
 // variance c²·var (c = (mu1−mu0)/var, mid = (mu0+mu1)/2 — the same scaling llr() uses), and
-// the probability of a drifted walk crossing barrier `a = upper − LLR` within m games is
+// the probability of a drifted walk crossing barrier `a = upper − LLR` within m pairs is
 //   P = Φ((μm − a)/(σ√m)) + e^(2μa/σ²)·Φ((−a − μm)/(σ√m)).
 // Two deliberate conservatisms, both erring toward PLAYING ON: the drift uses an OPTIMISTIC
 // score — the observed mean + 1 standard error, capped at mu1 — and ignoring the lower (H0)
@@ -137,59 +174,60 @@ fn phi(x: f64) f64 {
 // this cuts a true-even candidate's mean games ~20-25% while costing under 2 points of
 // promotion probability for a true-elo1 candidate (which the train loop's lineage recovers:
 // a futility-stopped gainer is kept, fine-tuned, and re-gated next cycle).
-fn promoteChance(scores: []const f64, elo0: f64, elo1: f64, upper: f64, remaining: usize) f64 {
-    const n = scores.len;
-    if (n < 2 or remaining == 0) return 1;
+fn promoteChance(obs: []const f64, elo0: f64, elo1: f64, upper: f64, remaining_pairs: usize) f64 {
+    const n = obs.len;
+    if (n < 2 or remaining_pairs == 0) return 1;
     const fn_: f64 = @floatFromInt(n);
     const mu0 = scoreFromElo(elo0);
     const mu1 = scoreFromElo(elo1);
     var s: f64 = 0;
-    for (scores) |x| s += x;
+    for (obs) |x| s += x;
     const mean = s / fn_;
     var var_sum: f64 = 0;
-    for (scores) |x| var_sum += (x - mean) * (x - mean);
+    for (obs) |x| var_sum += (x - mean) * (x - mean);
     const variance = @max(var_sum / fn_, 1e-3);
     const c = (mu1 - mu0) / variance;
-    const a = upper - llr(scores, elo0, elo1);
+    const a = upper - llr(obs, elo0, elo1);
     if (a <= 0) return 1; // already across — the H1 branch handles it
     const optimistic = @min(mean + @sqrt(variance / fn_), mu1);
-    const mu = c * (optimistic - (mu0 + mu1) / 2.0); // per-game LLR drift
+    const mu = c * (optimistic - (mu0 + mu1) / 2.0); // per-pair LLR drift
     if (mu >= 0) return 1; // drifting toward the bound — never stop
     const sig2 = c * c * variance;
-    const m: f64 = @floatFromInt(remaining);
+    const m: f64 = @floatFromInt(remaining_pairs);
     const sd = @sqrt(sig2 * m); // > 0: variance is floored and m >= 1
     const t1 = phi((mu * m - a) / sd);
     const t2 = @exp(@max(-700.0, 2.0 * mu * a / sig2)) * phi((-a - mu * m) / sd);
     return t1 + t2;
 }
 
-// Expected number of ADDITIONAL games until the LLR walk hits a decision bound, and WHICH bound
+// Expected number of ADDITIONAL PAIRS until the LLR walk hits a decision bound, and WHICH bound
 // it is heading for, from the current drift — the same Brownian model promoteChance uses, read
 // the other way (time-to-barrier instead of crossing-probability). It lets the live ETA time the
 // match to its likely SPRT decision instead of always to the --games cap (which SPRT rarely
 // reaches). Uses the OBSERVED mean drift (not the optimistic one) so it's an expectation, not a
-// bound. null when there aren't enough games yet or the drift is ~flat (no clear bound to head
-// toward — let the cap govern). The caller clamps `games` to [0, cap − played].
-const SprtEta = struct { games: f64, h1: bool };
-fn sprtRemainingGames(scores: []const f64, elo0: f64, elo1: f64, upper: f64, lower: f64) ?SprtEta {
-    const n = scores.len;
-    if (n < 16) return null;
+// bound. null when there aren't enough pairs yet or the drift is ~flat (no clear bound to head
+// toward — let the cap govern). The walk steps once per pair, so the answer is in pairs: every
+// caller multiplies by 2 to talk games, and clamps to [0, cap − played].
+const SprtEta = struct { pairs: f64, h1: bool };
+fn sprtRemainingPairs(obs: []const f64, elo0: f64, elo1: f64, upper: f64, lower: f64) ?SprtEta {
+    const n = obs.len;
+    if (n < 8) return null; // 8 pairs = the 16 games the per-game version waited for
     const fn_: f64 = @floatFromInt(n);
     const mu0 = scoreFromElo(elo0);
     const mu1 = scoreFromElo(elo1);
     var s: f64 = 0;
-    for (scores) |x| s += x;
+    for (obs) |x| s += x;
     const mean = s / fn_;
     var var_sum: f64 = 0;
-    for (scores) |x| var_sum += (x - mean) * (x - mean);
+    for (obs) |x| var_sum += (x - mean) * (x - mean);
     const variance = @max(var_sum / fn_, 1e-3);
     const c = (mu1 - mu0) / variance; // beta-units per unit score, as in llr()
-    const l = llr(scores, elo0, elo1);
-    const mu = c * (mean - (mu0 + mu1) / 2.0); // per-game LLR drift
+    const l = llr(obs, elo0, elo1);
+    const mu = c * (mean - (mu0 + mu1) / 2.0); // per-pair LLR drift
     const eps = 1e-6;
     // drifting up -> time to the promotion bound; down -> to H0 (both terms < 0, so positive)
-    if (mu > eps) return .{ .games = @max(0, (upper - l) / mu), .h1 = true };
-    if (mu < -eps) return .{ .games = @max(0, (lower - l) / mu), .h1 = false };
+    if (mu > eps) return .{ .pairs = @max(0, (upper - l) / mu), .h1 = true };
+    if (mu < -eps) return .{ .pairs = @max(0, (lower - l) / mu), .h1 = false };
     return null; // ~no drift: unknowable from drift alone; the cap/futility will govern
 }
 
@@ -201,21 +239,24 @@ fn sprtRemainingGames(scores: []const f64, elo0: f64, elo1: f64, upper: f64, low
 // model as the ETA, so the two never disagree; it names its target bound only when the drift
 // heads somewhere other than the side the LLR is on — a candidate 88% of the way to H1 that has
 // turned around is exactly the case worth calling out. "cap first" when the bound is further off
-// than the games left. Empty before there are two games to measure. `with_eta = false` drops the
+// than the games left. Empty before there are two pairs to measure. `with_eta = false` drops the
 // game count for the live line, which already carries an ETA built from the same estimate.
-fn fmtSprtProgress(buf: []u8, scores: []const f64, elo0: f64, elo1: f64, upper: f64, lower: f64, cap_remaining: usize, with_eta: bool) []const u8 {
-    if (scores.len < 2) return buf[0..0];
-    const l = llr(scores, elo0, elo1);
+// `obs` is the completed-pair means (the SPRT's unit); `cap_remaining` stays in GAMES, since the
+// count this prints is what a reader watching "game 240/800" needs — hence the ×2.
+fn fmtSprtProgress(buf: []u8, obs: []const f64, elo0: f64, elo1: f64, upper: f64, lower: f64, cap_remaining: usize, with_eta: bool) []const u8 {
+    if (obs.len < 2) return buf[0..0];
+    const l = llr(obs, elo0, elo1);
     const toward_h1 = l >= 0;
     const side: []const u8 = if (toward_h1) "H1" else "H0";
     const pct = @min(100.0, @abs(l / (if (toward_h1) upper else lower)) * 100.0);
     if (!with_eta) return std.fmt.bufPrint(buf, "{d:.0}% to {s}", .{ pct, side }) catch buf[0..0];
-    if (sprtRemainingGames(scores, elo0, elo1, upper, lower)) |eta| {
-        if (eta.games <= @as(f64, @floatFromInt(cap_remaining))) {
+    if (sprtRemainingPairs(obs, elo0, elo1, upper, lower)) |eta| {
+        const eta_games = eta.pairs * 2.0; // the walk counts pairs; the reader counts games
+        if (eta_games <= @as(f64, @floatFromInt(cap_remaining))) {
             if (eta.h1 == toward_h1)
-                return std.fmt.bufPrint(buf, "{d:.0}% to {s}, ~{d:.0} games", .{ pct, side, eta.games }) catch buf[0..0];
+                return std.fmt.bufPrint(buf, "{d:.0}% to {s}, ~{d:.0} games", .{ pct, side, eta_games }) catch buf[0..0];
             return std.fmt.bufPrint(buf, "{d:.0}% to {s} but drifting to {s}, ~{d:.0} games", .{
-                pct, side, if (eta.h1) "H1" else "H0", eta.games,
+                pct, side, if (eta.h1) "H1" else "H0", eta_games,
             }) catch buf[0..0];
         }
     }
@@ -342,16 +383,72 @@ fn divProbe(probe: *const DivProbe, st: *const State) void {
     if (!same_sign and @abs(ea) >= probe.margin and @abs(eb) >= probe.margin) acc.confident += 1;
 }
 
-// Per-side search budget: a fixed depth (depth > 0) OR a per-move time budget (depth ==
-// 0, search to `movetime` ms). Engine A and B each carry their own, so the rank gauntlet
+// Per-side search budget — exactly ONE of three instruments (see the --nodes semantics note
+// in main): a fixed depth (`depth` > 0), a per-move time budget (`movetime` ms), or a
+// per-move NODE budget (`nodes`). Engine A and B each carry their own, so the rank gauntlet
 // can pit cheap fixed-depth contenders against a deep stable anchor (--depth-b).
-const Budget = struct { depth: u32, movetime: i64 };
+//
+// The node instrument exists because the other two can't gate a SEARCH change. At a fixed
+// depth a pruning or move-ordering gain returns the same move for fewer nodes, so its whole
+// benefit is invisible and the gate would reject every correct pruning change; movetime does
+// price it, but wall-clock on a box that also runs training and a 12-job match is noisy and
+// non-reproducible. A node budget prices speed and accuracy on one scale and is
+// deterministic, so the same seed replays the same match under any load.
+const Budget = struct { depth: u32, movetime: i64, nodes: u64 = 0 };
 
 fn searchBudget(s: *ai.Searcher, st: *const State, b: Budget, seen: []const u64, no_tt: bool) ai.Result {
+    // depth 0 => the search runs to the iterative-deepening backstop (99) and is stopped by
+    // whichever budget is set; a node budget leaves ms at 0 so the clock is never read at all.
     const d: u32 = if (b.depth > 0) b.depth else 99;
     const ms: i64 = if (b.depth > 0) 0 else b.movetime;
-    return if (no_tt) s.chooseMoveNoTT(st, d, ms, seen) else s.chooseMove(st, d, ms, seen);
+    return if (no_tt) s.chooseMoveNoTT(st, d, ms, b.nodes, seen) else s.chooseMove(st, d, ms, b.nodes, seen);
 }
+
+// --- Win adjudication (--adjudicate=CP --adjudicate-plies=N) --------------------------------
+// Resign / decided-game cutoff, the cutechess `-resign movecount=N score=T` shape: score the game
+// as a LOSS for a side once THAT SIDE'S OWN search has reported at or below −cp on `plies`
+// consecutive of ITS OWN moves. `cp == 0` disables every branch and is the default, so an
+// existing seed replays byte for byte.
+//
+// It pays for itself because most of a played-out game is already over. `npm run data:audit` on
+// the 372,459-game / 34.8M-position corpus: at ±400 cp, 96.0% of games reach a point past which
+// |v| never changes sign again, and 40.3% of ALL recorded plies come after that point. The
+// threefold claim in playGame is the same idea for drawn games, and it was only worth ~3%.
+//
+// WHY THE LOSER'S OWN EVAL AND NOT THE MOVER'S — the divergence from main_gen.zig is deliberate.
+// `main_gen.zig` runs the simpler rule: fold each mover's score to White's view and require one
+// consistent sign for N plies. That is fine there because self-play puts ONE engine on both
+// sides. Here the movers are two DIFFERENT nets, and a rule that reads whoever is to move hands
+// the verdict to whichever net is more optimistic — A's scores cross +cp sooner, so games end as
+// "A wins" on A's own say-so, and the gate would pay Elo for optimism drift instead of for play.
+// A candidate is a fine-tuned relative of the champion, which is exactly the population where
+// that drift is plausible. Requiring the loser's own concession takes the winner's opinion out of
+// the rule: an engine only ever loses a game it has itself said, `plies` moves running, it is
+// losing. It fires later than the mover's-eval form, so it saves less — measured over the corpus
+// at 500 cp / 4: 22.1% of plies against 25.8%, at a 1.11% false-adjudication rate against 1.28%.
+//
+// SIGN CONVENTION, the thing that is easy to get wrong: the searched score is
+// SIDE-TO-MOVE-relative and flips every ply, which is precisely what this form sidesteps —
+// `score <= -cp` already reads as "the MOVER says the mover is losing", so nothing needs folding
+// to White's view. Each side's counter only ever advances on that side's own moves, which is what
+// makes `plies` count moves by one player rather than plies of the game (N = 4 spans ~8 plies).
+// Verified: with `--adjudicate=500` the reported score, the harvested `r`, and the White/Black
+// win split all stay on the same side as the un-adjudicated run of the same seed.
+const Adjudicator = struct {
+    cp: i32, // threshold in centipawns; 0 = off
+    plies: u32, // consecutive own-moves a side has to concede
+    concede: [2]u32 = .{ 0, 0 }, // 0 = White's current streak, 1 = Black's
+
+    // Feed one searched position. `score` is the mover's own value. Returns the WHITE-view result
+    // (+1 White wins / −1 Black wins) on the ply the mover's streak completes, null otherwise.
+    fn feed(self: *Adjudicator, score: i32, white_to_move: bool) ?i32 {
+        if (self.cp == 0) return null;
+        const side: usize = if (white_to_move) 0 else 1;
+        if (score <= -self.cp) self.concede[side] += 1 else self.concede[side] = 0;
+        if (self.concede[side] < self.plies) return null;
+        return if (white_to_move) -1 else 1; // the side that conceded is the one that loses
+    }
+};
 
 // Build a random opening as a MOVE SEQUENCE from the standard start. Returned (not applied)
 // so both color-reversed games of a pair replay the identical line. If a random ply ends the
@@ -389,9 +486,12 @@ fn playGame(
     nodes: *u64,
     recs: ?*std.ArrayList(PlyRec),
     dp: ?*const DivProbe, // static-eval divergence probe (both sides nn); null otherwise
+    adj_cfg: Adjudicator, // win-adjudication thresholds (.cp == 0 = off); copied, state is per-game
+    adjudicated: *bool,
 ) !i32 {
     var seen: std.ArrayList(u64) = .empty;
     defer seen.deinit(alloc);
+    var adj = adj_cfg;
     var st = board.newGameState();
     var result_white: i32 = 0;
     var plies: u32 = 0;
@@ -438,6 +538,22 @@ fn playGame(
             });
         }
 
+        // Win adjudication: the game is over, so stop searching it and score the adjudicated
+        // result like a real one (the caller reads only this return value, and the loop below
+        // stamps it onto every harvested position). The streaks accumulate through the scripted
+        // opening but can only FIRE past it — those plies are one shared random line replayed by
+        // both games of the pair, so ending a game inside it would measure the line, not the
+        // engines. The record stays valid without extra work: writeHarvest always drops the last
+        // position's move, so len(v) == len(moves) + 1 whether the game ended here or naturally.
+        const decided = adj.feed(res.score, st.turn == .white);
+        if (plies >= opening.len) {
+            if (decided) |winner| {
+                result_white = winner;
+                adjudicated.* = true;
+                break;
+            }
+        }
+
         try seen.append(alloc, h);
         const next = engine.applyMove(&st, m);
         if (next.halfmove == 0) seen.clearRetainingCapacity();
@@ -465,6 +581,7 @@ const Cfg = struct {
     div_enabled: bool,
     div_margin: f64, // --div-margin: confident-disagreement threshold (cp)
     div_decided: f64, // --div-decided: agreed-decided cutoff, skipped (cp)
+    adj: Adjudicator, // win adjudication (--adjudicate); .cp == 0 = off, the default
     save_games: bool,
     // When set, the heartbeat thread polls this path; once it exists, the match finalizes
     // IMMEDIATELY — it writes the result-file + harvest from the games already COMPLETED and
@@ -490,6 +607,13 @@ const Cfg = struct {
 // lengths (quick draws vs 200-move grinds) without lagging a real speed change.
 const DUR_WIN: usize = 32;
 
+// One color-reversed pair's running total, indexed by pair id. Games finish out of ORDER across
+// workers (and a `--jobs=14` run has 14 of them in flight at once), so the pentanomial SPRT can
+// never chunk the append-ordered `scores` list two at a time — a pair's two halves have to find
+// each other by identity. `n` reaches 2 exactly once per pair, which is when the pair's mean
+// score is appended to `pair_scores` as one SPRT observation.
+const PairAcc = struct { sum: f64 = 0, n: u8 = 0 };
+
 const Shared = struct {
     mutex: std.Io.Mutex = .init,
     // Work is dispatched one GAME at a time (not one color-reversed pair), so the tail of a
@@ -499,11 +623,19 @@ const Shared = struct {
     // share one seeded opening, so the color-reversed balance is unchanged.
     next_game: usize = 0,
     total_pairs: usize,
-    scores: *std.ArrayList(f64),
+    scores: *std.ArrayList(f64), // per-GAME scores: the reported score%/Elo/CI and result-file
+    // --- pentanomial SPRT evidence (per PAIR) ---------------------------------------------
+    // `pair_acc[pair]` collects a pair's two game scores as they land (any order, any worker);
+    // `pair_scores` holds one observation per COMPLETED pair — its mean score. An unpaired tail
+    // game (an early stop, or an odd --games cap) leaves an entry at n == 1 and contributes no
+    // observation, the same reasoning writeHarvest uses to drop half-pairs from the harvest.
+    pair_acc: []PairAcc = &.{},
+    pair_scores: std.ArrayList(f64) = .empty,
     games: *std.ArrayList(Game), // harvested games (--save-games)
     div: DivAccum = .{}, // eval-divergence stats (both sides nn), merged per game under the mutex
     alloc: std.mem.Allocator,
     nodes: u64 = 0,
+    adjudicated: u64 = 0, // games ended by the --adjudicate cutoff rather than played out
     stop: bool = false,
     decided: ?[]const u8 = null,
     sprt: bool,
@@ -654,9 +786,10 @@ fn paintLive(sh: *Shared) void {
         // the two clocks. Floor the decision ETA at the soonest possible completion so it never
         // predicts a stop faster than a game can finish and register it.
         if (sh.sprt) {
-            if (sprtRemainingGames(sh.scores.items, sh.elo0, sh.elo1, sh.upper, sh.lower)) |rg| {
+            if (sprtRemainingPairs(sh.pair_scores.items, sh.elo0, sh.elo1, sh.upper, sh.lower)) |rg| {
                 const cap_rem: f64 = @floatFromInt(total - ng);
-                const sprt_eta = @max(@min(rg.games, cap_rem) * g / jobs_f, @min(drain, g));
+                const rem_games = rg.pairs * 2.0; // the walk counts pairs; the clock counts games
+                const sprt_eta = @max(@min(rem_games, cap_rem) * g / jobs_f, @min(drain, g));
                 if (sprt_eta < eta_s) eta_s = sprt_eta;
             }
         }
@@ -670,9 +803,9 @@ fn paintLive(sh: *Shared) void {
         // Short progress form here: the line's ETA already spends the game-count half of the
         // estimate, so this adds only the "how close to the bound" half.
         var pbuf: [48]u8 = undefined;
-        const prog = fmtSprtProgress(&pbuf, sh.scores.items, sh.elo0, sh.elo1, sh.upper, sh.lower, total - ng, false);
+        const prog = fmtSprtProgress(&pbuf, sh.pair_scores.items, sh.elo0, sh.elo1, sh.upper, sh.lower, total - ng, false);
         llrseg = std.fmt.bufPrint(&llrstore, " | LLR {d:.2} [{d:.2}, {d:.2}]{s}{s}", .{
-            llr(sh.scores.items, sh.elo0, sh.elo1), sh.lower, sh.upper,
+            llr(sh.pair_scores.items, sh.elo0, sh.elo1), sh.lower, sh.upper,
             if (prog.len > 0) " | " else "", prog,
         }) catch "";
     }
@@ -770,16 +903,17 @@ fn worker(sh: *Shared, idx: usize) void {
         // identical regardless of which worker plays it (the persistent TT still makes exact
         // games order-sensitive, as before).
         var r: i32 = undefined;
+        var adjudicated = false;
         if (a_is_white) {
             sa.reseed(sh.cfg.seed +% pair *% 4 +% 0);
             sb.reseed(sh.cfg.seed +% pair *% 4 +% 1);
             // A = White: White's budget is A's, Black's is B's.
-            r = playGame(&sa, &sb, true, &opening, sh.cfg.budget_a, sh.cfg.budget_b, sh.cfg.max_plies, pa, &nodes, pr, dp) catch 0;
+            r = playGame(&sa, &sb, true, &opening, sh.cfg.budget_a, sh.cfg.budget_b, sh.cfg.max_plies, pa, &nodes, pr, dp, sh.cfg.adj, &adjudicated) catch 0;
         } else {
             sb.reseed(sh.cfg.seed +% pair *% 4 +% 2);
             sa.reseed(sh.cfg.seed +% pair *% 4 +% 3);
             // A = Black: White's budget is B's, Black's is A's.
-            r = playGame(&sb, &sa, false, &opening, sh.cfg.budget_b, sh.cfg.budget_a, sh.cfg.max_plies, pa, &nodes, pr, dp) catch 0;
+            r = playGame(&sb, &sa, false, &opening, sh.cfg.budget_b, sh.cfg.budget_a, sh.cfg.max_plies, pa, &nodes, pr, dp, sh.cfg.adj, &adjudicated) catch 0;
         }
 
         // A's score for this game: +1 win / 0.5 draw / 0 loss, from A's color this game.
@@ -798,7 +932,15 @@ fn worker(sh: *Shared, idx: usize) void {
         sh.dur_sum_all += dur_s;
         sh.slot_start[idx] = 0; // idle until the next game is dispatched
         sh.scores.append(sh.alloc, s) catch {};
+        // Fold the game into its PAIR for the pentanomial SPRT, keyed on the pair id (never on
+        // append order — see PairAcc). The pair becomes one observation, its mean score, only
+        // once both color-reversed halves are in.
+        const acc = &sh.pair_acc[pair];
+        acc.sum += s;
+        acc.n += 1;
+        if (acc.n == 2) sh.pair_scores.append(sh.alloc, acc.sum / 2.0) catch {};
         sh.nodes += nodes;
+        if (adjudicated) sh.adjudicated += 1;
         if (sh.cfg.div_enabled) sh.div.add(game_div);
         if (sh.cfg.save_games) {
             // The game shares its pair's scripted opening line and begins at the standard
@@ -807,8 +949,10 @@ fn worker(sh: *Shared, idx: usize) void {
             const g = Game{ .pair = pair, .color = if (a_is_white) 'w' else 'b', .result_white = r, .recs = recs };
             sh.games.append(sh.alloc, g) catch {};
         }
-        if (sh.sprt and sh.decided == null and sh.scores.items.len >= 16) {
-            const l = llr(sh.scores.items, sh.elo0, sh.elo1);
+        // The SPRT walk only advances when a pair completes, so everything here counts pairs:
+        // 8 pairs is the 16 games the per-game version waited for.
+        if (sh.sprt and sh.decided == null and sh.pair_scores.items.len >= 8) {
+            const l = llr(sh.pair_scores.items, sh.elo0, sh.elo1);
             if (l >= sh.upper) {
                 sh.decided = "H1";
                 sh.stop = true;
@@ -819,11 +963,12 @@ fn worker(sh: *Shared, idx: usize) void {
                 // Futility: from 30% of the cap on (earlier, the score estimate is too noisy
                 // to write a candidate off), stop once even an optimistic read of the observed
                 // rate leaves < --sprt-futility chance of reaching the promotion bound in the
-                // games left. Same verdict the cap would have produced, reached early.
-                const total_g = sh.total_pairs * 2;
-                const played = sh.scores.items.len;
-                if (played >= @max(100, total_g * 3 / 10) and played < total_g and
-                    promoteChance(sh.scores.items, sh.elo0, sh.elo1, sh.upper, total_g - played) < sh.futility)
+                // pairs left. Same verdict the cap would have produced, reached early. The
+                // thresholds are the old game counts halved (100 games = 50 pairs), so the stop
+                // fires at the same point in the match as before.
+                const played = sh.pair_scores.items.len;
+                if (played >= @max(50, sh.total_pairs * 3 / 10) and played < sh.total_pairs and
+                    promoteChance(sh.pair_scores.items, sh.elo0, sh.elo1, sh.upper, sh.total_pairs - played) < sh.futility)
                 {
                     sh.decided = "inconclusive";
                     sh.futility_fired = true;
@@ -859,10 +1004,10 @@ fn worker(sh: *Shared, idx: usize) void {
                 // game count too — "how many more games until this is decided" at the current rate.
                 var pbuf: [64]u8 = undefined;
                 const total_g = sh.total_pairs * 2;
-                const prog = fmtSprtProgress(&pbuf, sh.scores.items, sh.elo0, sh.elo1, sh.upper, sh.lower, total_g - @min(ng, total_g), true);
+                const prog = fmtSprtProgress(&pbuf, sh.pair_scores.items, sh.elo0, sh.elo1, sh.upper, sh.lower, total_g - @min(ng, total_g), true);
                 std.debug.print("  after {d} games  A: +{d} ={d} -{d}  score {d:.1}%  Elo {s}{d:.0} ± {d:.0}  95% CI [{d:.0}, {d:.0}]  LLR {d:.2} [{d:.2}, {d:.2}]{s}{s}{s}\n", .{
                     ng, w, dr, ls, pp * 100, sign, ci.elo, ci.margin, ci.lo, ci.hi,
-                    llr(sh.scores.items, sh.elo0, sh.elo1), sh.lower, sh.upper,
+                    llr(sh.pair_scores.items, sh.elo0, sh.elo1), sh.lower, sh.upper,
                     if (prog.len > 0) "  (" else "", prog, if (prog.len > 0) ")" else "",
                 });
             } else {
@@ -890,8 +1035,18 @@ fn evalTag(k: ai.EvalKind) []const u8 {
     };
 }
 
-// One side's key signature: eval tag, nn layer widths (if any), and the search budget (depth dN
-// or movetime tN). Written into `buf`.
+// The pacing half of a signature: "d6" fixed depth, "n200000" node budget, "t50" movetime —
+// exactly one is set (see Budget). Shared by the timing-store key and the startup line, so the
+// two can never disagree about what a run's budget was.
+fn budgetSig(buf: []u8, b: Budget) []const u8 {
+    if (b.depth > 0) return std.fmt.bufPrint(buf, "d{d}", .{b.depth}) catch buf[0..0];
+    if (b.nodes > 0) return std.fmt.bufPrint(buf, "n{d}", .{b.nodes}) catch buf[0..0];
+    return std.fmt.bufPrint(buf, "t{d}", .{b.movetime}) catch buf[0..0];
+}
+
+// One side's key signature: eval tag, nn layer widths (if any), and the search budget (see
+// budgetSig — a node-paced game takes a very different sec/game from a depth- or time-paced one,
+// so it must not share the other's ETA prior). Written into `buf`.
 fn sideSig(buf: []u8, k: ai.EvalKind, b: Budget, net: ?*const nn.Net) []const u8 {
     var n: usize = 0;
     const tag = evalTag(k);
@@ -914,10 +1069,7 @@ fn sideSig(buf: []u8, k: ai.EvalKind, b: Budget, net: ?*const nn.Net) []const u8
         buf[n] = ']';
         n += 1;
     }
-    const bud = if (b.depth > 0)
-        std.fmt.bufPrint(buf[n..], "d{d}", .{b.depth}) catch buf[n..n]
-    else
-        std.fmt.bufPrint(buf[n..], "t{d}", .{b.movetime}) catch buf[n..n];
+    const bud = budgetSig(buf[n..], b);
     n += bud.len;
     return buf[0..n];
 }
@@ -1041,7 +1193,12 @@ fn weightsHash(io: std.Io, gpa: std.mem.Allocator, path: []const u8) [6]u8 {
 }
 
 // Provenance tag "<engine><depth>@<version>" (vtag.mjs) into `buf`. depth == 0 means a
-// time-based search, marked 't' (matching vtag.mjs).
+// search that wasn't paced by a fixed depth — time OR node budget — marked 't' (matching
+// vtag.mjs, whose grammar is `(nn|hc)(\d+|t)@`). A node-paced search deliberately reuses 't'
+// rather than inventing an 'n' family: parseVtag lives in vtag.mjs and every consumer of it
+// (rank:pool node identity, merge-data's provenance ranking, refresh-v) would have to learn
+// the new letter, and a node budget is a search-development instrument, not a data-generation
+// mode — --nodes runs are gated on --result-file, not harvested.
 fn vtagFmt(buf: []u8, kind: ai.EvalKind, depth: u32, io: std.Io, gpa: std.mem.Allocator, weights: []const u8) []const u8 {
     if (kind == .nn) {
         const h = weightsHash(io, gpa, weights);
@@ -1234,9 +1391,17 @@ fn finalizeLocked(sh: *Shared) void {
     // candidate that stalled at the halfway mark and one that died 0.2 short of the promotion
     // bound. Say how far the evidence actually got, in the same LLR units the live line shows.
     if (sh.sprt and !std.mem.eql(u8, verdict, "H1") and !std.mem.eql(u8, verdict, "H0")) {
-        const l = llr(sh.scores.items, sh.elo0, sh.elo1);
+        const l = llr(sh.pair_scores.items, sh.elo0, sh.elo1);
         std.debug.print("Undecided: LLR {d:.2} of [{d:.2}, {d:.2}] — {d:.0}% of the way to the promotion bound.\n", .{
             l, sh.lower, sh.upper, @max(0.0, @min(100.0, l / sh.upper * 100.0)),
+        });
+    }
+    // How many results the rule produced rather than the board. Printed only when the rule is on,
+    // and kept out of the result-file JSON, so an --adjudicate=0 run's output stays byte-identical
+    // to what the runner printed and wrote before the flag existed.
+    if (sh.cfg.adj.cp > 0) {
+        std.debug.print("Adjudicated {d}/{d} game(s) at {d} cp over {d} consecutive own moves by the losing side.\n", .{
+            sh.adjudicated, n, sh.cfg.adj.cp, sh.cfg.adj.plies,
         });
     }
     std.debug.print("A vs B: {d} games | +{d} ={d} -{d} | score {d:.1}% | Elo {s}{d:.0} ± {d:.0} (95% CI [{d:.0}, {d:.0}]) | SPRT {s} | nodes {d} nps {d}\n", .{
@@ -1277,7 +1442,7 @@ fn finalizeLocked(sh: *Shared) void {
         const json = if (sprt_field) |sf|
             std.fmt.bufPrint(&buf,
                 \\{{"games":{d},"wins":{d},"draws":{d},"losses":{d},"score":{d},"elo":{d},"llr":{d},"llrLower":{d},"llrUpper":{d},"sprt":"{s}","futility":{s},"div":{s}}}
-            , .{ n, wins, draws, losses, p, elo, llr(sh.scores.items, sh.elo0, sh.elo1), sh.lower, sh.upper, sf, fut_field, div_json }) catch return
+            , .{ n, wins, draws, losses, p, elo, llr(sh.pair_scores.items, sh.elo0, sh.elo1), sh.lower, sh.upper, sf, fut_field, div_json }) catch return
         else
             std.fmt.bufPrint(&buf,
                 \\{{"games":{d},"wins":{d},"draws":{d},"losses":{d},"score":{d},"elo":{d},"llr":null,"sprt":null,"div":{s}}}
@@ -1303,7 +1468,23 @@ pub fn main(init: std.process.Init) !void {
     var depth_a: ?u32 = null;
     var depth_b_opt: ?u32 = null;
     var movetime_a: i64 = 50; // selfplay's default think time when no depth is given
+    var movetime_given = false; // --movetime was actually passed (50 is also the default)
     var movetime_b_opt: ?i64 = null;
+    // --nodes=N / --nodes-b=N: a fixed NODE budget per move (B inherits A's unless --nodes-b),
+    // the instrument for gating a SEARCH change — see Budget.
+    //
+    // SEMANTICS: --nodes is a THIRD, EXCLUSIVE pacing mode. If either --nodes flag is given,
+    // none of --depth/--depth-b/--movetime/--movetime-b may be, and the runner exits 2 rather
+    // than picking one silently. Two reasons it is exclusive rather than combined:
+    //   * with a depth cap the search can no longer spend its saved nodes on extra depth, which
+    //     is the entire benefit a pruning change is supposed to show — the cap would silence
+    //     exactly the signal being measured;
+    //   * with movetime the wall clock could stop the search first, putting the machine's load
+    //     back into the result and destroying the reproducibility --nodes exists to provide.
+    // A whole match is therefore depth-paced, time-paced, or node-paced; asymmetry inside the
+    // chosen mode stays available through the -b flag (--nodes=20000 --nodes-b=40000).
+    var nodes_a_opt: ?u64 = null;
+    var nodes_b_opt: ?u64 = null;
     var seed: u64 = 1;
     var openings: u32 = 6; // matches the JS `npm run match` default
     var maxmoves: u32 = 200;
@@ -1328,6 +1509,10 @@ pub fn main(init: std.process.Init) !void {
     // Eval-divergence probe thresholds (active only when both sides are nn).
     var div_margin: f64 = 75; // both nets past ±this cp, opposite sign = a "confident" disagreement
     var div_decided: f64 = 600; // both nets agree by >= this cp = decided, skipped (no judgment signal)
+    // Win adjudication, OFF by default (0): it changes what a game's result means, so it has to be
+    // gated like any other change to the measurement. See the Adjudicator comment.
+    var adjudicate: i32 = 0;
+    var adjudicate_plies: u32 = 4;
     // Cross-run timing store for the live ETA (see updateTiming). Default resolves to the loop dir
     // (cwd = web/); persistence is skipped when that dir is absent. `--timing-file=` overrides or,
     // set empty, disables it.
@@ -1338,8 +1523,13 @@ pub fn main(init: std.process.Init) !void {
         if (argStr(arg, "--games=")) |v| games = std.fmt.parseInt(u32, v, 10) catch games;
         if (argStr(arg, "--depth=")) |v| depth_a = std.fmt.parseInt(u32, v, 10) catch depth_a;
         if (argStr(arg, "--depth-b=")) |v| depth_b_opt = std.fmt.parseInt(u32, v, 10) catch depth_b_opt;
-        if (argStr(arg, "--movetime=")) |v| movetime_a = std.fmt.parseInt(i64, v, 10) catch movetime_a;
+        if (argStr(arg, "--movetime=")) |v| {
+            movetime_a = std.fmt.parseInt(i64, v, 10) catch movetime_a;
+            movetime_given = true; // 50 is the DEFAULT, so the value alone can't say it was asked for
+        }
         if (argStr(arg, "--movetime-b=")) |v| movetime_b_opt = std.fmt.parseInt(i64, v, 10) catch movetime_b_opt;
+        if (argStr(arg, "--nodes=")) |v| nodes_a_opt = std.fmt.parseInt(u64, v, 10) catch nodes_a_opt;
+        if (argStr(arg, "--nodes-b=")) |v| nodes_b_opt = std.fmt.parseInt(u64, v, 10) catch nodes_b_opt;
         if (argStr(arg, "--seed=")) |v| seed = std.fmt.parseInt(u64, v, 10) catch seed;
         if (argStr(arg, "--openings=")) |v| openings = std.fmt.parseInt(u32, v, 10) catch openings;
         if (argStr(arg, "--maxmoves=")) |v| maxmoves = std.fmt.parseInt(u32, v, 10) catch maxmoves;
@@ -1359,14 +1549,49 @@ pub fn main(init: std.process.Init) !void {
         if (argStr(arg, "--stop-file=")) |v| stop_file = v;
         if (argStr(arg, "--div-margin=")) |v| div_margin = std.fmt.parseFloat(f64, v) catch div_margin;
         if (argStr(arg, "--div-decided=")) |v| div_decided = std.fmt.parseFloat(f64, v) catch div_decided;
+        if (argStr(arg, "--adjudicate=")) |v| adjudicate = std.fmt.parseInt(i32, v, 10) catch adjudicate;
+        if (argStr(arg, "--adjudicate-plies=")) |v| adjudicate_plies = std.fmt.parseInt(u32, v, 10) catch adjudicate_plies;
         if (argStr(arg, "--timing-file=")) |v| timing_file = v;
     }
     if (jobs < 1) jobs = 1;
+    if (adjudicate < 0) adjudicate = 0; // a negative threshold can't be met; read it as "off"
+    if (adjudicate_plies < 1) adjudicate_plies = 1;
 
-    // Resolve each side's budget. A fixed depth wins over movetime; B inherits A's depth
-    // when only --depth was given, A's movetime when only --movetime was given.
-    const budget_a: Budget = if (depth_a) |d| .{ .depth = d, .movetime = 0 } else .{ .depth = 0, .movetime = movetime_a };
-    const budget_b: Budget = if (depth_b_opt orelse depth_a) |d|
+    // A node budget is a pacing MODE, not a modifier: reject a mixed pacing loudly instead of
+    // silently dropping one of the two (the depth-over-movetime precedence below already
+    // quietly ignores a --movetime-b that a --depth overrode; repeating that for --nodes would
+    // hide the difference between a reproducible node-paced gate and a load-sensitive timed one).
+    if (nodes_a_opt != null or nodes_b_opt != null) {
+        if (depth_a != null or depth_b_opt != null or movetime_given or movetime_b_opt != null) {
+            std.debug.print("error: --nodes/--nodes-b cannot be combined with --depth/--movetime — a match is depth-paced, time-paced, or node-paced.\n" ++
+                "  A depth cap would hide the extra depth a pruning gain buys (the signal --nodes exists to measure), and the wall\n" ++
+                "  clock would put machine load back into a result --nodes exists to make reproducible. Use --nodes-b for asymmetry.\n", .{});
+            std.process.exit(2);
+        }
+        if (nodes_a_opt == null) {
+            std.debug.print("error: --nodes-b requires --nodes — it sets B's share of a node-paced match, it does not pace one side alone\n" ++
+                "  (without --nodes, A would silently fall back to the 50 ms default and the match would be half timed).\n", .{});
+            std.process.exit(2);
+        }
+        if (nodes_a_opt.? == 0 or (nodes_b_opt orelse 1) == 0) {
+            std.debug.print("error: --nodes must be > 0 (0 means 'unlimited' inside the searcher, which here would search to depth 99).\n", .{});
+            std.process.exit(2);
+        }
+    }
+
+    // Resolve each side's budget. A node budget wins over both (it is exclusive — validated
+    // above); otherwise a fixed depth wins over movetime. B inherits A's nodes when only
+    // --nodes was given, A's depth when only --depth was given, A's movetime when only
+    // --movetime was given.
+    const budget_a: Budget = if (nodes_a_opt) |n|
+        .{ .depth = 0, .movetime = 0, .nodes = n }
+    else if (depth_a) |d|
+        .{ .depth = d, .movetime = 0 }
+    else
+        .{ .depth = 0, .movetime = movetime_a };
+    const budget_b: Budget = if (nodes_a_opt) |n|
+        .{ .depth = 0, .movetime = 0, .nodes = nodes_b_opt orelse n }
+    else if (depth_b_opt orelse depth_a) |d|
         .{ .depth = d, .movetime = 0 }
     else
         .{ .depth = 0, .movetime = movetime_b_opt orelse movetime_a };
@@ -1423,6 +1648,7 @@ pub fn main(init: std.process.Init) !void {
             .div_enabled = eval_a == .nn and eval_b == .nn,
             .div_margin = div_margin,
             .div_decided = div_decided,
+            .adj = .{ .cp = adjudicate, .plies = adjudicate_plies },
             .save_games = save_games != null,
             .stop_file = stop_file,
             .weights_a = weights_a orelse "",
@@ -1440,8 +1666,26 @@ pub fn main(init: std.process.Init) !void {
     shared.slot_start = try gpa.alloc(i128, jobs);
     @memset(shared.slot_start, 0);
     shared.prior_g = loadPriorG(io, gpa, timing_file, timing_key);
+    // One accumulator slot per pair, indexed by pair id, so a finished game can find its
+    // color-reversed partner regardless of which worker played it or when (see PairAcc).
+    shared.pair_acc = try gpa.alloc(PairAcc, shared.total_pairs);
+    @memset(shared.pair_acc, .{});
 
-    std.debug.print("Playing {d} games | openings {d} | jobs {d} | seed {d}\n", .{ games, openings, jobs, seed });
+    // Echo the resolved pacing, so a log makes plain WHICH instrument produced the result —
+    // "d6/d6" vs "n200000/n200000" is the difference between a measurement that can see a
+    // pruning gain and one that can't, and the -b twins make asymmetry easy to typo.
+    var pace_a_buf: [24]u8 = undefined;
+    var pace_b_buf: [24]u8 = undefined;
+    const pace_a = budgetSig(&pace_a_buf, budget_a);
+    const pace_b = budgetSig(&pace_b_buf, budget_b);
+    // Echo the adjudication rule when it's on: it changes what the score MEANS, so a log that
+    // doesn't say whether it was active can't be compared against one that was.
+    var adjbuf: [56]u8 = undefined;
+    const adjseg: []const u8 = if (adjudicate > 0)
+        (std.fmt.bufPrint(&adjbuf, " | adjudicate {d}cp x{d} own moves", .{ adjudicate, adjudicate_plies }) catch "")
+    else
+        "";
+    std.debug.print("Playing {d} games | budget {s}/{s} | openings {d} | jobs {d} | seed {d}{s}\n", .{ games, pace_a, pace_b, openings, jobs, seed, adjseg });
 
     const t0 = std.Io.Clock.now(.awake, io).nanoseconds;
     shared.t0_ns = @intCast(t0); // so the live progress line can show elapsed/ETA

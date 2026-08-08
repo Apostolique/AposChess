@@ -8,7 +8,7 @@
 //
 //   apos-gen --games=200 --depth=6 --eval=nn --openings=8 [--opening-topk=N] \
 //     [--movetime=MS] [--maxmoves=200] [--out=../training/data/selfplay.jsonl] \
-//     [--seed=S] [--jobs=N]
+//     [--seed=S] [--jobs=N] [--adjudicate=CP] [--adjudicate-plies=N]
 // Paths are relative to the current directory (run from web/). With --eval=nn the
 // teacher is the champion at src/nn-weights.json.
 //
@@ -37,11 +37,67 @@ const Cfg = struct {
     openings: u32,
     opening_topk: u32,
     maxmoves: u32,
+    adj: Adjudicator, // win adjudication (--adjudicate); .cp == 0 = off, the default
     kind: ai.EvalKind,
     net: ?*const nn.Net,
     seed: u64,
     vtag: []const u8,
     io: std.Io,
+};
+
+// --- Win adjudication (--adjudicate=CP --adjudicate-plies=N) --------------------------------
+// Resign / decided-game cutoff, the cutechess `-resign movecount=N score=T` shape: end
+// the game as a win for the leading side once the search value has stayed at or past `cp`
+// centipawns with ONE consistent sign for `plies` consecutive plies. `cp == 0` disables every
+// branch and is the default, so an existing seed replays byte for byte.
+//
+// It pays for itself because most of a generated game is already over. `npm run data:audit` on
+// the 372,459-game / 34.8M-position corpus: at ±400 cp, 96.0% of games reach a point past which
+// |v| never changes sign again, and 40.3% of ALL recorded plies come after that point. Those
+// plies each cost a search, and the eval's sign is right 99.3% of the time. The threefold claim
+// below is the same idea for drawn games, and it was only worth ~3%.
+//
+// SIGN CONVENTION, the thing that is easy to get wrong here: the searched score is
+// SIDE-TO-MOVE-relative and flips every ply, so a position won for White reads +520 on White's
+// move and −520 on Black's. The run therefore folds every score to WHITE's view before comparing
+// (negate on a Black-to-move ply) — the same fold `scripts/data-audit.mjs` applies to the
+// recorded `v` arrays. Verified two ways: a `--adjudicate=500` run's W/B/D split matches the
+// un-adjudicated run's (an inverted fold would swap White wins for Black wins), and every
+// adjudicated record's `r` matches the White-view sign of its own last `v`.
+//
+// With `plies >= 2` the fold makes the rule two-sided for free, since the movers alternate: a
+// White-view run of 4 means White's own search said "White is up ≥ cp" twice AND Black's own
+// search said "Black is down ≥ cp" twice. That only holds because self-play runs ONE engine on
+// both sides. `main_match.zig` has two different nets alternating, where this rule would let the
+// more optimistic one decide games, so it uses the loser's-own-concession form instead. The
+// divergence between the two files is deliberate — see the Adjudicator comment there.
+const Adjudicator = struct {
+    cp: i32, // threshold in centipawns; 0 = off
+    plies: u32, // consecutive plies the run has to reach
+    sign: i32 = 0, // WHITE-view sign of the current run (0 = no run)
+    run: u32 = 0,
+
+    // Feed one searched position. `score` is the mover's own value and `white_to_move` says
+    // whose view that is. Returns the WHITE-view result (+1 White wins / −1 Black wins) on the
+    // ply the rule fires, null otherwise.
+    fn feed(self: *Adjudicator, score: i32, white_to_move: bool) ?i32 {
+        if (self.cp == 0) return null;
+        const w: i32 = if (white_to_move) score else -score;
+        const a: i32 = if (w < 0) -w else w;
+        const s: i32 = if (w > 0) 1 else if (w < 0) -1 else 0;
+        if (s == 0 or a < self.cp) {
+            self.sign = 0;
+            self.run = 0;
+            return null;
+        }
+        if (s == self.sign) {
+            self.run += 1;
+        } else {
+            self.sign = s;
+            self.run = 1;
+        }
+        return if (self.run >= self.plies) s else null;
+    }
 };
 
 const Shared = struct {
@@ -56,6 +112,7 @@ const Shared = struct {
     wins: u64 = 0,
     draws: u64 = 0,
     losses: u64 = 0,
+    adjudicated: u64 = 0, // games ended by the --adjudicate cutoff rather than played out
     nodes: u64 = 0,
     t0_ns: i128 = 0, // generation start, for live elapsed/ETA
     live_len: usize = 0, // chars in the current in-place status line (for repaint padding)
@@ -189,9 +246,10 @@ fn appendMoveToken(out: *std.ArrayList(u8), alloc: std.mem.Allocator, m: engine.
 
 // Play one game with the given searcher (same eval on both sides — self-play), append
 // the game's JSONL record to `out`. Returns the White-view result (+1/0/-1).
-fn playGame(s: *ai.Searcher, cfg: *const Cfg, g: u64, alloc: std.mem.Allocator, out: *std.ArrayList(u8), positions: *u64, nodes: *u64) !i32 {
+fn playGame(s: *ai.Searcher, cfg: *const Cfg, g: u64, alloc: std.mem.Allocator, out: *std.ArrayList(u8), positions: *u64, nodes: *u64, adjudicated: *bool) !i32 {
     var prng = std.Random.DefaultPrng.init(gameSeed(cfg.seed, g));
     const rng = prng.random();
+    var adj = cfg.adj; // per-game run state (cfg.adj carries only the thresholds)
 
     var states: std.ArrayList(State) = .empty;
     defer states.deinit(alloc);
@@ -230,9 +288,24 @@ fn playGame(s: *ai.Searcher, cfg: *const Cfg, g: u64, alloc: std.mem.Allocator, 
 
         try states.append(alloc, st);
 
-        const r = s.chooseMove(&st, depth, max_ms, prev);
+        const r = s.chooseMove(&st, depth, max_ms, 0, prev); // 0 nodes = no node budget (gen paces by depth/time)
         nodes.* += r.nodes;
         try scores.append(alloc, r.score);
+
+        // Win adjudication: the game is over, so stop searching it and record the adjudicated
+        // result. The run accumulates through the opening but can only FIRE past it — the
+        // opening move is random rather than the engine's choice, so a random line that hangs a
+        // queen on ply 3 would otherwise end the game before the diversity window even ran, and
+        // leave a 5-ply record behind. Breaking here (after `scores`, before `moves_played`)
+        // is what keeps the record valid: len(v) == len(moves) + 1.
+        const decided = adj.feed(r.score, st.turn == .white);
+        if (ply >= cfg.openings) {
+            if (decided) |winner| {
+                result = winner;
+                adjudicated.* = true;
+                break;
+            }
+        }
 
         // Pick the move: normal play uses the engine's best; opening plies vary for
         // diversity (uniform-random, or uniform over the top-K best when requested).
@@ -248,7 +321,7 @@ fn playGame(s: *ai.Searcher, cfg: *const Cfg, g: u64, alloc: std.mem.Allocator, 
                 exclude[nex] = @as(i32, r.move.?.from) * 64 + @as(i32, r.move.?.to);
                 nex += 1;
                 while (ncand < cfg.opening_topk and ncand < cands.len) {
-                    const nx = s.chooseMoveExcl(&st, depth, max_ms, prev, exclude[0..nex]);
+                    const nx = s.chooseMoveExcl(&st, depth, max_ms, 0, prev, exclude[0..nex]);
                     const m = nx.move orelse break;
                     cands[ncand] = m;
                     ncand += 1;
@@ -335,7 +408,8 @@ fn worker(sh: *Shared) void {
         out.clearRetainingCapacity();
         var positions: u64 = 0;
         var nodes: u64 = 0;
-        const result = playGame(&s, &sh.cfg, g, pa, &out, &positions, &nodes) catch 0;
+        var adjudicated = false;
+        const result = playGame(&s, &sh.cfg, g, pa, &out, &positions, &nodes, &adjudicated) catch 0;
 
         sh.mutex.lockUncancelable(sh.cfg.io);
         if (out.items.len > 0) {
@@ -344,6 +418,7 @@ fn worker(sh: *Shared) void {
         }
         sh.done_games += 1;
         sh.total_positions += positions;
+        if (adjudicated) sh.adjudicated += 1;
         sh.nodes += nodes;
         if (result > 0) sh.wins += 1 else if (result < 0) sh.losses += 1 else sh.draws += 1;
         // Live in-place line after every finished game (and ~1×/s by the heartbeat thread in
@@ -391,6 +466,10 @@ pub fn main(init: std.process.Init) !void {
     var openings: u32 = 8;
     var opening_topk: u32 = 0;
     var maxmoves: u32 = 200;
+    // Win adjudication, OFF by default (0): the loop has to gate it like any other change to
+    // what the dataset contains. See the Adjudicator comment for the measured prize.
+    var adjudicate: i32 = 0;
+    var adjudicate_plies: u32 = 4;
     var eval_name: ai.EvalKind = .handcrafted;
     var out_path: []const u8 = "../training/data/selfplay.jsonl";
     // Default seed varies per run (clock-derived); --seed overrides for reproducibility.
@@ -408,6 +487,8 @@ pub fn main(init: std.process.Init) !void {
         if (argStr(arg, "--openings=")) |v| openings = std.fmt.parseInt(u32, v, 10) catch openings;
         if (argStr(arg, "--opening-topk=")) |v| opening_topk = std.fmt.parseInt(u32, v, 10) catch opening_topk;
         if (argStr(arg, "--maxmoves=")) |v| maxmoves = std.fmt.parseInt(u32, v, 10) catch maxmoves;
+        if (argStr(arg, "--adjudicate=")) |v| adjudicate = std.fmt.parseInt(i32, v, 10) catch adjudicate;
+        if (argStr(arg, "--adjudicate-plies=")) |v| adjudicate_plies = std.fmt.parseInt(u32, v, 10) catch adjudicate_plies;
         if (argStr(arg, "--eval=")) |v| eval_name = if (std.mem.eql(u8, v, "nn")) .nn else .handcrafted;
         if (argStr(arg, "--out=")) |v| out_path = v;
         if (argStr(arg, "--seed=")) |v| seed = std.fmt.parseInt(u64, v, 10) catch seed;
@@ -415,6 +496,8 @@ pub fn main(init: std.process.Init) !void {
     }
     if (jobs < 1) jobs = 1;
     if (jobs > games) jobs = @intCast(@max(1, games));
+    if (adjudicate < 0) adjudicate = 0; // a negative threshold can't be met; read it as "off"
+    if (adjudicate_plies < 1) adjudicate_plies = 1;
     // --movetime overrides depth (depth==0 sentinel means "use movetime").
     const search_depth: u32 = if (use_movetime) 0 else depth;
 
@@ -457,12 +540,19 @@ pub fn main(init: std.process.Init) !void {
     const start_offset: u64 = (file.stat(io) catch unreachable).size;
     const fresh = start_offset == 0;
 
-    std.debug.print("Generating {d} games -> {s}{s}\n  {s} | eval {s} | openings {d}{s} | jobs {d} | seed {d}\n", .{
+    // Echo the adjudication rule when it's on, so a log says plainly whether a batch was played
+    // out or cut short — the two produce different-length games from the same seed.
+    var adjbuf: [48]u8 = undefined;
+    const adjseg: []const u8 = if (adjudicate > 0)
+        (std.fmt.bufPrint(&adjbuf, " | adjudicate {d}cp x{d} plies", .{ adjudicate, adjudicate_plies }) catch "")
+    else
+        "";
+    std.debug.print("Generating {d} games -> {s}{s}\n  {s} | eval {s} | openings {d}{s} | jobs {d} | seed {d}{s}\n", .{
         games,                                                   out_path,
         if (fresh) "" else " (appending)",                       if (use_movetime) "movetime" else "depth",
         if (eval_name == .nn) "nn" else "handcrafted",           openings,
         if (opening_topk > 0) " (topk)" else " (random)",        jobs,
-        seed,
+        seed,                                                    adjseg,
     });
 
     var shared = Shared{
@@ -473,6 +563,7 @@ pub fn main(init: std.process.Init) !void {
             .openings = openings,
             .opening_topk = opening_topk,
             .maxmoves = maxmoves,
+            .adj = .{ .cp = adjudicate, .plies = adjudicate_plies },
             .kind = eval_name,
             .net = net,
             .seed = seed,
@@ -499,7 +590,12 @@ pub fn main(init: std.process.Init) !void {
     const ms: u64 = @intCast(@max(1, @divTrunc(std.Io.Clock.now(.awake, io).nanoseconds - t0, 1_000_000)));
 
     const gpm: f64 = @as(f64, @floatFromInt(shared.done_games)) / (@as(f64, @floatFromInt(ms)) / 60000.0);
-    std.debug.print("Done: {d} games, {d} positions in {d}ms ({d:.1} games/min). Results: W {d} B {d} D {d}. nps {d}\n", .{
-        shared.done_games, shared.total_positions, ms, gpm, shared.wins, shared.losses, shared.draws, shared.nodes * 1000 / ms,
+    var donebuf: [64]u8 = undefined;
+    const doneadj: []const u8 = if (adjudicate > 0)
+        (std.fmt.bufPrint(&donebuf, " Adjudicated {d}/{d} games.", .{ shared.adjudicated, shared.done_games }) catch "")
+    else
+        "";
+    std.debug.print("Done: {d} games, {d} positions in {d}ms ({d:.1} games/min). Results: W {d} B {d} D {d}.{s} nps {d}\n", .{
+        shared.done_games, shared.total_positions, ms, gpm, shared.wins, shared.losses, shared.draws, doneadj, shared.nodes * 1000 / ms,
     });
 }

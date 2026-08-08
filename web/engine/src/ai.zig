@@ -127,6 +127,17 @@ pub const Searcher = struct {
     // clock is never read (fixed-depth search — the gen/gate path — pays nothing).
     deadline_ns: i96 = std.math.maxInt(i96),
     nodes: u64 = 0,
+    // Fixed-NODE budget: the search aborts once `nodes` reaches `node_cap`, exactly the way
+    // it aborts on `deadline_ns` (see outOfBudget). maxInt(u64) means "no node limit" — the
+    // default, and unreachable by a u64 counter, so every existing fixed-depth / movetime
+    // path behaves bit-for-bit as before and pays one u64 compare per abort check.
+    //
+    // WHY a node budget exists at all: at a fixed DEPTH a pruning or move-ordering gain is
+    // invisible (the same tree, the same move — only cheaper), so a fixed-depth gate rejects
+    // every correct pruning change; and wall-clock movetime on a machine that is also
+    // training is too noisy to gate on. A node budget prices the speed gain and the accuracy
+    // loss on one scale AND is deterministic, so a match is reproducible under load.
+    node_cap: u64 = std.math.maxInt(u64),
     prng: std.Random.DefaultPrng,
     // Optional progress hook: called with (score, depth) after each completed root depth
     // (the browser worker streams it to the live eval bar). callconv(.c) so a wasm host
@@ -249,6 +260,20 @@ pub const Searcher = struct {
         return self.monoNs() > self.deadline_ns;
     }
 
+    // The search's single stop condition: out of TIME or out of NODES. Both are monotonic
+    // (the clock never runs backwards, `nodes` only grows), so once it reads true every
+    // ancestor sees it too — which is what makes the unwind safe: in-tree nodes return 0,
+    // move loops break, the TT store is skipped so an incomplete score can't poison the
+    // persistent table, and the root marks the iteration aborted and keeps the move from the
+    // last COMPLETED iteration. Every former timeUp() call site checks this instead, so a
+    // node budget behaves exactly like a time limit rather than through a parallel path.
+    // The node compare comes first because it is the cheap one: against the maxInt default it
+    // is a single always-false u64 comparison, and the no-time-limit test behind it still
+    // returns without reading the clock — so an unlimited search pays one extra compare.
+    fn outOfBudget(self: *Searcher) bool {
+        return self.nodes >= self.node_cap or self.timeUp();
+    }
+
     fn repSeenHas(self: *Searcher, hash: u64) bool {
         for (self.rep_seen) |h| if (h == hash) return true;
         return false;
@@ -310,6 +335,16 @@ pub const Searcher = struct {
     }
 
     fn qsearch(self: *Searcher, state: *State, alpha0: i32, beta: i32, qdepth: i32) i32 {
+        // A NODE IS COUNTED ON ENTRY, once, before anything can return early — here for
+        // quiescence nodes and at the top of search() for full-width ones, the two disjoint
+        // kinds of node this engine visits. Entry is the only point every visited node passes
+        // through exactly once, so it is the only definition the JS reference (ai.js, same two
+        // places) can mirror without ambiguity; counting cutoffs, make/unmakes or leaf evals
+        // instead would make "20000 nodes" mean different trees in the two engines and a
+        // JS/Zig comparison at a fixed budget would diverge for no interesting reason.
+        // qsearch itself has no abort check (QDEPTH bounds it), so a node-capped search
+        // overshoots its cap by at most the quiescence subtree in flight — deterministically,
+        // since that subtree is a pure function of the position.
         self.nodes += 1;
         var alpha = alpha0;
         const in_check = engine.kingAttacked(&state.board, state.turn);
@@ -375,11 +410,11 @@ pub const Searcher = struct {
     }
 
     fn search(self: *Searcher, state: *State, depth0: i32, alpha0: i32, beta: i32, ply: usize, can_null: bool, hash: u64) i32 {
-        if (self.timeUp()) {
+        if (self.outOfBudget()) {
             self.tainted = false;
             return 0;
         }
-        self.nodes += 1;
+        self.nodes += 1; // counted on entry, after the abort check — an aborted node is not a visited one
         var alpha = alpha0;
         var depth = depth0;
         if (self.tt_enabled) {
@@ -497,11 +532,11 @@ pub const Searcher = struct {
                 }
                 break;
             }
-            if (self.timeUp()) break;
+            if (self.outOfBudget()) break;
         }
 
         self.tainted = best_tainted;
-        if (self.tt_enabled and !best_tainted and !self.timeUp()) {
+        if (self.tt_enabled and !best_tainted and !self.outOfBudget()) {
             const flag: u8 = if (best <= alpha_orig) UPPER else if (best >= beta) LOWER else EXACT;
             self.ttStore(hash, depth, toTT(best, ply), flag, best_key);
         }
@@ -509,16 +544,17 @@ pub const Searcher = struct {
     }
 
     // Choose a move: iterative deepening to `max_depth`, never past `max_ms`
-    // (<= 0 means no time limit). `prev_hashes` are positions already seen in the
-    // real game (repetition awareness). Mirrors chooseMoveDetailed.
-    pub fn chooseMove(self: *Searcher, state: *const State, max_depth: u32, max_ms: i64, prev_hashes: []const u64) Result {
-        return self.chooseMoveExcl(state, max_depth, max_ms, prev_hashes, &.{});
+    // (<= 0 means no time limit) and never past `max_nodes` (0 means no node limit — the
+    // same "non-positive = unbounded" convention as max_ms). `prev_hashes` are positions
+    // already seen in the real game (repetition awareness). Mirrors chooseMoveDetailed.
+    pub fn chooseMove(self: *Searcher, state: *const State, max_depth: u32, max_ms: i64, max_nodes: u64, prev_hashes: []const u64) Result {
+        return self.chooseMoveExcl(state, max_depth, max_ms, max_nodes, prev_hashes, &.{});
     }
 
     // As `chooseMove`, but ignores any root move whose `keyOf` (from*64+to) is in
     // `exclude`. Used by gen's `--opening-topk`: re-searching with the best moves so
     // far excluded yields the Nth-best, the same idiom as the JS puzzle miner.
-    pub fn chooseMoveExcl(self: *Searcher, state: *const State, max_depth: u32, max_ms: i64, prev_hashes: []const u64, exclude: []const i32) Result {
+    pub fn chooseMoveExcl(self: *Searcher, state: *const State, max_depth: u32, max_ms: i64, max_nodes: u64, prev_hashes: []const u64, exclude: []const i32) Result {
         var root: engine.MoveList = .{};
         engine.legalMoves(state, &root);
         if (exclude.len > 0) {
@@ -570,6 +606,10 @@ pub const Searcher = struct {
         else
             self.monoNs() + @as(i96, max_ms) * 1_000_000;
         self.nodes = 0;
+        // Node cap for this search only, set right beside the deadline and from the same kind
+        // of argument, so the two budgets stay one mechanism. `nodes` is reset above, so the
+        // cap is per-search (per move), not per game — the way movetime is.
+        self.node_cap = if (max_nodes == 0) std.math.maxInt(u64) else max_nodes;
 
         var best_move = root.items[0];
         var completed: u32 = 0;
@@ -605,7 +645,7 @@ pub const Searcher = struct {
                     if (score > alpha) score = -self.search(&work, d, -INF, -alpha, 1, true, child_hash);
                 }
                 self.nnUnmake(&work, m, u);
-                if (self.timeUp()) {
+                if (self.outOfBudget()) {
                     aborted = true;
                     break;
                 }
@@ -644,9 +684,9 @@ pub const Searcher = struct {
     // Score a position WITHOUT reading or writing the transposition table, so the probe
     // can't perturb this engine's real games (used once per game by the match harvest to
     // value the one opening ply the winner didn't search).
-    pub fn chooseMoveNoTT(self: *Searcher, state: *const State, max_depth: u32, max_ms: i64, prev_hashes: []const u64) Result {
+    pub fn chooseMoveNoTT(self: *Searcher, state: *const State, max_depth: u32, max_ms: i64, max_nodes: u64, prev_hashes: []const u64) Result {
         self.tt_enabled = false;
         defer self.tt_enabled = true;
-        return self.chooseMoveExcl(state, max_depth, max_ms, prev_hashes, &.{});
+        return self.chooseMoveExcl(state, max_depth, max_ms, max_nodes, prev_hashes, &.{});
     }
 };

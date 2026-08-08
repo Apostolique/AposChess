@@ -114,7 +114,9 @@ fn run(fen: []const u8, depth: u32, max_ms: u32, prev: []const u64, excl: []cons
     ensureSearcher();
     var s = &searcher.?;
     const st = board.parseFen(fen);
-    const res = s.chooseMoveExcl(&st, depth, @intCast(max_ms), prev, excl);
+    // 0 nodes = no node budget: the browser paces itself by depth/movetime, and the node
+    // budget exists for the offline match gate (see ai.zig's node_cap).
+    const res = s.chooseMoveExcl(&st, depth, @intCast(max_ms), 0, prev, excl);
     out_score = res.score;
     out_reached = res.depth;
     out_ponder = if (res.ponder) |pm| (@as(u32, pm.from) << 8) | pm.to else 0xFFFF;

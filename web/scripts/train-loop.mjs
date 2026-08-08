@@ -3,9 +3,14 @@
 //
 // Gated self-play improvement loop ("expert iteration"). Each cycle:
 //   generate games with the CHAMPION  ->  featurize  ->  train a CANDIDATE
-//   ->  play CANDIDATE vs CHAMPION (SPRT)  ->  promote the candidate ONLY if it wins.
-// Promotion is gated on a statistically-significant head-to-head win, so the champion
-// can NEVER regress — it either improves or stays put. Runs until --cycles or Ctrl-C.
+//   ->  play CANDIDATE vs CHAMPION (SPRT)  ->  CONFIRM the win on a fresh independent match
+//   ->  promote the candidate ONLY if both agree.
+// Promotion is gated on a statistically-significant head-to-head win that then survives an
+// independent fixed-length rematch, so the champion can NEVER regress — it either improves or
+// stays put. The second test is there because the first one alone is not enough: an SPRT at
+// alpha = 0.05 promotes a candidate whose true edge is ~0 one time in twenty, this loop has now
+// run 497 gates, and nothing else in it controls for that (see runConfirm for the numbers and
+// the ledger evidence). Runs until --cycles or Ctrl-C.
 //
 // The champion is web/src/nn-weights.json (what `gen --eval=nn` plays with, and the
 // Node-tools default). On each promotion it's also published to the web catalog under the
@@ -30,6 +35,48 @@
 //   --opening-topk=N  forwarded to gen: 0 (default) = uniform-random openings; N>=1
 //                   samples among the engine's N best opening moves (sound but varied).
 //                   Off by default, so the loop's data is unchanged unless you set it.
+//   --adjudicate=CP  WIN ADJUDICATION (resign cutoff), forwarded to BOTH game producers: the
+//                   generation step AND the gate. 0 = OFF and that is the default, so nothing
+//                   about the loop changes until this is gated. A game ends as a win for the
+//                   leading side once the search score has held at or past CP centipawns for
+//                   --adjudicate-plies consecutive plies.
+//                   Why it is worth a gating run: `npm run data:audit` over the 372,459-game /
+//                   34.8M-position dataset found that 40.3% of every RECORDED PLY comes after
+//                   the point where |v| stops changing sign at +/-400 cp, and that sign agrees
+//                   with the game's own result 99.3% of the time. Each of those plies costs a
+//                   search, in generation and in every gate game alike. It is the largest
+//                   throughput lever measured on this project. The threefold-repetition claim
+//                   both playGames already make is the same idea for DRAWN games, and that one
+//                   was only worth ~3% of plies.
+//                   The retrospective 99.3% does NOT carry over to a live rule, which has to
+//                   decide without seeing the rest of the game. Simulated prospectively over the
+//                   same corpus, the generation form at 500 cp x 4 plies skips 25.8% of plies and
+//                   adjudicates 92.2% of games at a 1.28% FALSE-adjudication rate (the credited
+//                   winner is not the game's actual winner, counting a draw as a disagreement);
+//                   400 x 4 skips 45.2% at 4.53% false; 300 x 2 skips 58.5% at 9.58% false. The
+//                   gate runs a stricter form of the rule — the LOSING side has to concede on its
+//                   own N moves, so a net that evaluates optimistically cannot win games on its
+//                   own say-so — which fires later and saves less: 22.1% of plies at 500 x 4, at
+//                   1.11% false. Both halves of that trade are real: in generation a false
+//                   adjudication writes the wrong `r` onto every position of the game, and at
+//                   --lambda=1 `r` IS the whole training target; in the gate it adds symmetric
+//                   noise to a measurement whose job is resolving ~20 Elo.
+//                   Recommended first gating run: --adjudicate=500. CP is measured against the
+//                   net's own tanh ceiling (`scale`, 600 for every champion so far), so 500 is
+//                   0.83 x scale and a --scale track would change what a given CP means.
+//                   It is deliberately NOT forwarded to the confirmation match or to the screen.
+//                   That leaves the confirmation an unmodified yardstick: a candidate that clears
+//                   an adjudicating gate still has to survive a played-out rematch, which is the
+//                   check you want while the rule itself is the thing on trial.
+//   --adjudicate-plies=N  consecutive plies the score has to hold (default 4). Generation counts
+//                   GAME plies; the gate counts the losing side's OWN moves, so N=4 spans 4 plies
+//                   there and ~8 in the gate. 4 rather than 2 because the movers alternate: at
+//                   N>=2 the losing side has itself agreed it is losing, and at N=4 it has agreed
+//                   twice, which is what a one- or two-ply horizon mirage cannot fake. Larger N
+//                   buys accuracy at a worsening rate — measured on the corpus at 500 cp, going
+//                   2->4 costs 2.9 points of ply savings for 0.24 points of false rate, 4->6
+//                   costs 2.4 for 0.16, and 6->8 costs 2.2 for 0.11 — so 4 is the last step where
+//                   the exchange is still cheap. Inert while --adjudicate is 0.
 //   --cycles=N      stop after N cycles (default: run forever until Ctrl-C)
 //   --gate-games=N  max games in the candidate-vs-champion match (default 2000 — mature
 //                   gains are small, and small edges need many games to clear the SPRT:
@@ -53,6 +100,40 @@
 //                   promotion probability lost on a true +20 (and a futility-stopped
 //                   gainer survives as lineage and re-gates next cycle). The verdict
 //                   stays "inconclusive"; the log line notes the early stop.
+//   --confirm-games=N  CONFIRMATION MATCH: games in the second, independent match a gate winner
+//                   must survive before it is allowed to promote (default 600; 0 disables
+//                   confirmation entirely and restores the old promote-immediately-on-H1
+//                   behaviour, as does --no-confirm). An H1 gate is NOT a promotion by itself.
+//                   The gate is an SPRT with alpha=0.05, so a candidate whose TRUE edge is ~0
+//                   clears it 5% of the time, and nothing in the loop controls for the fact that
+//                   it runs that same test every single cycle. Over the 497 gates this loop has
+//                   played, with roughly 40% of cycles producing a candidate in that
+//                   true-edge-~0 zone, the EXPECTED number of spurious promotions is
+//                   0.05 x 0.4 x 497 ~= 10 — against 23 actual promotions. The strength ledger
+//                   agrees that something is wrong (champion-by-champion numbers at runConfirm).
+//                   So on H1 the loop replays candidate vs champion at --gate-depth as a
+//                   FIXED-LENGTH match on a FRESH SEED, with no SPRT and no futility stop, and
+//                   promotes only if that match measures more than --confirm-elo. Independence
+//                   is the whole point: a different seed means different opening lines (reusing
+//                   the gate's would replay the gate's own games and confirm nothing), and a
+//                   fixed length means the measured Elo is an UNBIASED estimate of the edge
+//                   rather than one selected for having crossed a promotion bound.
+//                   A failed confirmation costs a cycle, not a gain: the candidate is kept as
+//                   this track's lineage and re-gates next cycle, exactly like any other gate
+//                   winner that didn't promote.
+//   --confirm-elo=E  the confirmation's promotion bar in Elo, strictly greater (default 8).
+//                   Why 8 over 600 games: the two tests are independent, so the joint
+//                   false-positive rate MULTIPLIES — 0.05 (the gate's alpha) x P(a true-0
+//                   candidate measures > +8 over 600 games). The runner prints a 95% half-width,
+//                   not a sigma, so the sigma here is ~12-14 Elo over 600 games (see runConfirm):
+//                   that second factor is ~0.25-0.28 and the joint rate is ~0.014, a ~3.6x cut in
+//                   spurious promotions. The price to a genuine +20
+//                   candidate is P(pass) ~= 0.81, i.e. a real gain promotes in ~1.2 attempts
+//                   instead of 1 — and the failed attempt isn't lost, it re-gates from the
+//                   lineage. Compute cost is ~1 h at the measured gate throughput (2000 games
+//                   is 3h30-3h55), on the ~5% of cycles that reach H1: ~1% of the loop's clock.
+//   --no-confirm    alias for --confirm-games=0 — promote on the gate alone, as the loop did
+//                   before 2026-08-07. Use it to reproduce an older run, not to go faster.
 //   --no-screen     turn OFF the shadow-mode low-depth screen, which is ON by default.
 //                   Before the gate, it plays the candidate vs the champion at --screen-depth
 //                   for a fixed --screen-games, converts that edge to a gate-depth-equivalent
@@ -309,6 +390,9 @@
 // until the lineage clears the gate, instead of being re-derived and discarded every
 // cycle. The champion is still protected by the gate; a candidate scoring < 50% (or a
 // decided H0) resets the lineage, and the next warm-start falls back to this recipe's best net.
+// A gate winner whose CONFIRMATION match failed (--confirm-games) lands in exactly the same
+// place: it becomes the lineage and re-gates next cycle, so the confirmation delays a real gain
+// by a cycle rather than throwing one away.
 
 import { spawnSync } from 'node:child_process';
 import {
@@ -410,7 +494,12 @@ function friendlyCmd(cmd, argv) {
     const eq = tok.indexOf('=');
     const key = (eq < 0 ? tok : tok.slice(0, eq)).replace(/^--/, '');
     const val = eq < 0 ? null : tok.slice(eq + 1);
-    if (key === 'seed') continue;            // clock-seeded each run, never reproducible
+    // Nearly every step seeds from the clock (Date.now()), which can never be reproduced, so
+    // echoing it is noise. The CONFIRMATION match is the exception: its seed is derived, not
+    // clocked, and it is the whole substance of the invocation (it's what makes that match
+    // independent of the gate), so a hand-run copy of the command has to carry it. Those seeds
+    // sit at or above CONFIRM_SEED_HI by construction — see confirmSeed.
+    if (key === 'seed' && !(Number(val) >= CONFIRM_SEED_HI)) continue;
     if (val !== null && def[key] === val) continue; // restates the script's own default
     flags.push(relArg(tok));
   }
@@ -477,6 +566,12 @@ const linkArchive = join(loopDir, 'ladder-link-games.jsonl');
 // so the loop can rewrite a non-promoted candidate's provenance before folding it in (see
 // foldGateHarvest). Cleared before each gate and deleted after folding.
 const gateHarvest = join(loopDir, 'gate-harvest.jsonl');
+// The CONFIRMATION match's result file and harvest temp (see runConfirm). Its own result file so
+// a confirmation can never be read as the gate's verdict (match.json), and its own harvest temp
+// for the same reason the gate needs one: a non-promoted candidate's provenance is rewritten
+// before those games are folded into the dataset.
+const confirmFile = join(loopDir, 'confirm.json');
+const confirmHarvest = join(loopDir, 'confirm-harvest.jsonl');
 // Bradley-Terry pool ledger (npm run rank:pool): the fitted Elo the refreshes consume. rank:pool
 // harvests its games straight into the dataset and re-derives its ratings from it every run, so
 // there's nothing to fold or keep in lockstep here — a standalone rank:pool between cycles is
@@ -529,6 +624,14 @@ const cfg = {
   depth: num(args.depth, 8),
   openings: args.openings !== undefined ? Number(args.openings) : null, // null = gen default (8)
   openingTopk: num(args['opening-topk'], 0), // 0 = uniform-random opening (gen default)
+  // WIN ADJUDICATION (resign cutoff), forwarded to generation AND the gate — the two steps that
+  // spend the loop's search budget playing games. 0 = off (the default), so the dataset and the
+  // gate verdict are byte-for-byte what they were until someone gates this. See the --adjudicate
+  // flag doc above for the measured prize (40.3% of recorded plies are post-decision at +/-400 cp)
+  // and for the prospective T x N grid, which is the honest sizing — the retrospective number
+  // can't be used as a rule.
+  adjudicate: num(args.adjudicate, 0),
+  adjudicatePlies: num(args['adjudicate-plies'], 4),
   cycles: args.cycles !== undefined ? Number(args.cycles) : Infinity,
   gateGames: num(args['gate-games'], 2000),
   gateDepth: num(args['gate-depth'], 6),
@@ -537,6 +640,14 @@ const cfg = {
   // (Monte Carlo vs the exact walk) is ~20-25% fewer games on even candidates for < 2 points
   // of promotion probability on a true +elo1 — which the lineage recovers next cycle.
   gateFutility: num(args['gate-futility'], 0.05),
+  // CONFIRMATION MATCH before promotion (2026-08-07). An H1 gate is only the FIRST of two tests
+  // now: the loop replays the candidate vs the champion as a fixed-length, fresh-seeded match at
+  // gateDepth and promotes only if THAT measures > confirmElo. 0 games (or --no-confirm) restores
+  // the old promote-on-H1 path exactly. The full argument — 23 promotions against ~10 expected
+  // spurious ones over 497 gates, and the ledger's disagreement with the gate's credited gains —
+  // is at runConfirm, along with why 600 games and +8 Elo are the defaults.
+  confirmGames: args['no-confirm'] ? 0 : num(args['confirm-games'], 600),
+  confirmElo: num(args['confirm-elo'], 8),
   // Low-depth SCREEN, shadow mode (see the --screen flag doc). ON by default: it measures the
   // candidate at a cheap depth BEFORE the gate, predicts the gate-depth edge, and logs the
   // prediction — then runs the real gate regardless. Instrumentation only: nothing here feeds
@@ -1052,29 +1163,56 @@ function adaptiveMaintenance(cyclesSincePromo, rankDue = true) {
   };
 }
 
-// Fold the gate's harvested games (in the temp file) into the dataset. The match runner
-// stamps every position with the MOVER's vs tag (the engine that searched it). The
+// Lower bound of the candidate-vs-champion Elo edge implied by a match summary — its score and
+// game count, which is all the result file guarantees. The cautious read the ephemeral provenance
+// tag is keyed off. Null when there's no usable summary.
+function edgeLoOf(res) {
+  if (!res || !(res.games > 0)) return null;
+  const p = res.score, se = Math.sqrt(Math.max(p * (1 - p), 0) / res.games);
+  const pLo = Math.min(Math.max(p - 1.96 * se, 1e-9), 1 - 1e-9);
+  return eloFromScore(pLo);
+}
+
+// Fold a candidate-vs-champion harvest (the gate's, or the confirmation's) into the dataset. The
+// match runner stamps every position with the MOVER's vs tag (the engine that searched it). The
 // candidate's own plies thus carry its content hash — an engine we never archive or rank,
 // so refresh-v/merge would read it as −∞ "unrecoverable" and relabel it on sight (the
 // champion's plies already carry a ranked tag and pass through). When the candidate WASN'T
-// promoted (the common lineage / sub-threshold case), we rewrite its lines' vs to a
+// promoted (the common lineage / sub-threshold case, and now also a gate winner whose
+// confirmation didn't hold up), we rewrite its lines' vs to a
 // self-describing ephemeral tag "nn<d>@elo<E>", where E is the candidate's absolute Elo on the
-// hc-anchored ledger scale: the champion's ledger Elo at that depth plus the LOWER bound of the gate's measured
-// edge (so a short or early-stopped gate is treated cautiously — weaker, hence refreshed
+// hc-anchored ledger scale: the champion's ledger Elo at that depth plus the LOWER bound of the measured
+// edge (so a short or early-stopped match is treated cautiously — weaker, hence refreshed
 // sooner — rather than over-credited on thin evidence). A promoted candidate (its hash is
 // archived + ranked) or a champion-won gate is already tagged with a ranked engine, so it
 // passes through untouched.
-function foldGateHarvest(promoted, res) {
-  if (!existsSync(gateHarvest)) return;
-  const champElo = (!promoted && res && res.games > 0) ? championLedgerElo() : null;
-  // Lower bound of the candidate-vs-champion Elo edge from this gate's score + game count.
-  let gateEloLo = null;
+function foldCandidateHarvest(src, promoted, res, confirmRes) {
+  if (!existsSync(src)) return undefined;
+  const gateLo = edgeLoOf(res);
+  const confLo = confirmRes && confirmRes.ran ? edgeLoOf(confirmRes) : null;
+  const champElo = (!promoted && (gateLo != null || confLo != null)) ? championLedgerElo() : null;
+  // WHICH measured edge labels a non-promoted candidate, now that there can be two of them: the
+  // lower bound of whichever match read it WEAKER. Two reasons, and neither needs us to decide
+  // which match is the better measurement. (1) E is an absolute-Elo strength CLAIM on the ledger
+  // scale, and over-claiming is the expensive error — refresh-v skips a label it believes is
+  // strong, so an inflated E parks weak labels in the dataset indefinitely, while an understated
+  // one only gets them relabeled sooner than strictly necessary. (2) The gate's edge is the one
+  // estimate here that is biased UPWARD by construction: the SPRT stopped precisely because the
+  // LLR walk crossed the promotion bound, so its endpoint is selected for looking good. The
+  // confirmation is unbiased but shorter, hence wider. Taking the min of the two lower bounds is
+  // the conservative read either way, and in practice it is usually the confirmation's.
+  let lo = null, what = 'gate edge';
   if (champElo) {
-    const p = res.score, se = Math.sqrt(Math.max(p * (1 - p), 0) / res.games);
-    const pLo = Math.min(Math.max(p - 1.96 * se, 1e-9), 1 - 1e-9);
-    gateEloLo = eloFromScore(pLo);
+    lo = gateLo;
+    if (confLo != null && (lo == null || confLo < lo)) { lo = confLo; what = 'confirmation edge'; }
   }
-  foldHarvest(gateHarvest, rawFile, champElo, gateEloLo, 'gate edge');
+  return foldHarvest(src, rawFile, champElo, lo, what);
+}
+function foldGateHarvest(promoted, res, confirmRes = null) {
+  return foldCandidateHarvest(gateHarvest, promoted, res, confirmRes);
+}
+function foldConfirmHarvest(promoted, res, confirmRes = null) {
+  return foldCandidateHarvest(confirmHarvest, promoted, res, confirmRes);
 }
 
 // The body shared by the gate harvest and the screen harvest (--screen-save). `champElo` is
@@ -1224,6 +1362,115 @@ function runScreen() {
   };
 }
 
+// --- Confirmation match (the promotion's second opinion) ----------------------------------
+// The confirmation's --seed. Deterministic — no clock in it — so re-running a cycle's
+// confirmation replays the same match. NOT the cycle number alone, though, for two reasons:
+//   1. Openings come from `DefaultPrng.init(seed + pair)` (main_match.zig), so two matches whose
+//      seeds are merely DIFFERENT still share most of their opening lines when the seeds are
+//      within a pair count of each other. Sitting the confirmation's seeds up at 2^45 keeps them
+//      unreachably far from the millisecond clock (~1.75e12) that every other step seeds with,
+//      so the gate's opening stream and the confirmation's cannot overlap even partially — which
+//      is the independence this whole step is buying.
+//   2. A harvested game's id is `base36(seed)-<pair index>` and train:merge dedups on it, on the
+//      documented invariant that the same id IS the same game. Two different matches sharing a
+//      seed would claim the same ids and the merge would collapse genuinely different games into
+//      one. Mixing the two nets' content hashes in makes the seed identify (cycle, candidate,
+//      champion), so a repeat is a rematch of the same two nets from the same cycle — the same
+//      games, which is exactly what the id asserts.
+const CONFIRM_SEED_HI = 2 ** 45; // 3.52e13 — far above any Date.now(), well under 2^53
+function confirmSeed(cycleNo, candHash, champHash) {
+  let h = 0x811c9dc5; // FNV-1a, 32 bits: plenty of room under CONFIRM_SEED_HI
+  for (const ch of `${cycleNo}:${candHash}:${champHash}`) {
+    h ^= ch.charCodeAt(0);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return CONFIRM_SEED_HI + h;
+}
+
+// An H1 gate is NOT a promotion. The gate is an SPRT with alpha = beta = 0.05, so by construction
+// a candidate whose TRUE edge is ~0 clears it 5% of the time — and the loop has now played 497
+// gates, with roughly 40% of cycles producing a candidate in exactly that true-edge-~0 zone (34%
+// of recorded gate scores land in 48-51%, and the zone is wider than the observed band, since an
+// observed score carries its own sampling noise). Expected spurious promotions:
+// 0.05 x 0.4 x 497 ~= 10, against 23 actual promotions. There is no multiple-comparisons control
+// anywhere else in the loop — every cycle is a fresh test of a fresh candidate against one bar.
+//
+// The strength ledger corroborates it. On the Bradley-Terry pool (loop/engine-elo.ladder.json,
+// depth-8 nodes, read 2026-08-07) the recent champion sequence rates Mona 1997, Nash 1997, Olga
+// 2004, Pia 2037, Quinn 2052, Rosa 2050, Sven 2064, Tara 2068 — and the CURRENT champion Uma
+// (cace14) 2018 +/-111, BELOW its own predecessor. The gates that produced those promotions
+// credited them with about +174 Elo in total; the ledger separates the endpoints by ~+70. Two of
+// the links (Nash over Mona, Rosa over Quinn) show no separation at all. That is the signature of
+// the 5%: each spurious promotion is permanent, and because the champion is BOTH the gate
+// opponent AND the warm-start source, a bad one raises the bar and suppresses every later
+// candidate's measured score.
+//
+// So a gate winner has to say it twice. This is a FIXED-LENGTH rematch whose independence is the
+// entire point:
+//   - a DIFFERENT --seed (confirmSeed above). Reusing the gate's would replay the gate's own
+//     opening lines and confirm nothing but its own sample.
+//   - NO --sprt and NO --sprt-futility. Both stop when the evidence looks good, which is exactly
+//     the selection that biases the gate's endpoint estimate upward; a fixed length makes the
+//     measured Elo an unbiased estimate of the true edge.
+//
+// Why 600 games and a bar of +8. The two tests are independent, so the joint false-positive rate
+// MULTIPLIES: 0.05 (the gate's alpha) x P(a true-0 candidate measures > +8 over 600 games). Note
+// the match runner prints a 95% HALF-WIDTH, not a standard deviation (verified: it reports +/-91
+// on a 60-game +36 =2 -22 result, and 1.96 sigma there is 86) — so the sigma that matters here is
+// ~12-14 Elo over 600 games depending on the draw rate, not the ~28 the printed interval suggests.
+// That puts the second factor at ~0.25-0.28 and the joint rate at ~0.014 — a ~3.6x cut in spurious
+// promotions. The price to a genuine +20 candidate is P(pass) = P(measure > +8 | true +20) ~= 0.81
+// at a 5% draw rate (0.85 at 30%), so a real gain needs ~1.2 attempts instead of
+// 1 — and a failed confirmation is NOT a lost gain: the candidate stays as this track's lineage
+// and re-gates next cycle from there, so the cost is a delayed promotion, never a forfeited one.
+// The compute cost is small because promotions are rare: 600 games at --gate-depth is ~1 h at the
+// measured gate throughput (2000 games = 3h30-3h55), and only on the ~5% of cycles that reach H1
+// — about 1% of the loop's wall clock.
+//
+// Returns null when confirmation is OFF (--confirm-games=0 / --no-confirm); the caller then
+// promotes on H1 exactly as it did before this existed. Otherwise a record for the log and the
+// track history, with `ran` false when the match could not produce a verdict (a crash, or a
+// Ctrl-C / `npm run train:stop` landing inside it). A `ran:false` never promotes: promoting on
+// evidence nobody read is the failure mode this step exists to prevent, and the candidate still
+// survives as lineage, so the worst case is a promotion deferred to the next launch.
+function runConfirm(cycleNo, candHash, champHash) {
+  if (cfg.confirmGames <= 0) return null;
+  if (existsSync(confirmFile)) rmSync(confirmFile);
+  if (existsSync(confirmHarvest)) rmSync(confirmHarvest); // no stale harvest from a prior cycle
+  const seed = confirmSeed(cycleNo, candHash, champHash);
+  const t0 = Date.now();
+  // Same engines, same depth, same harvest as the gate — only the stopping rule and the seed
+  // differ. --seed is passed unconditionally (the gate only passes one alongside --save-games)
+  // because here the seed IS the measurement's independence, not a harvest detail.
+  const label = `Confirm: candidate vs champion @ depth ${cfg.gateDepth} `
+    + `(${cfg.confirmGames} games, fresh seed, no SPRT)`;
+  const ok = run(label, matchBin,
+    ['--eval-a=nn', `--weights-a=${candidate}`, '--eval-b=nn', `--weights-b=${champion}`,
+      `--depth=${cfg.gateDepth}`, `--games=${cfg.confirmGames}`,
+      `--result-file=${confirmFile}`, `--seed=${seed}`,
+      ...(cfg.harvest ? [`--save-games=${confirmHarvest}`] : []), ...jobArg]);
+  const base = { depth: cfg.gateDepth, seed, games: 0, threshold: cfg.confirmElo,
+    seconds: Math.round((Date.now() - t0) / 1000) };
+  if (!ok) return { ...base, ran: false, passed: false, reason: 'interrupted or failed' };
+  let r;
+  try { r = JSON.parse(readFileSync(confirmFile, 'utf8')); }
+  catch { return { ...base, ran: false, passed: false, reason: 'no readable result file' }; }
+  const ci = eloWithCI(r.wins, r.draws, r.losses);
+  if (!ci) return { ...base, ran: false, passed: false, reason: 'played no games' };
+  // Strictly greater, per --confirm-elo: the bar is the promotion condition, not a tie-break.
+  // The POINT estimate is what's tested — the CI is logged and recorded for reading the result,
+  // but requiring the lower bound to clear +8 would reject nearly every real gain at 600 games.
+  const passed = ci.elo > cfg.confirmElo;
+  const rec = { ...base, ran: true, passed, games: r.games, score: ci.score,
+    elo: ci.elo, eloLo: ci.lo, eloHi: ci.hi, seconds: Math.round((Date.now() - t0) / 1000) };
+  log(`  Confirmation: ${(ci.score * 100).toFixed(1)}% / ${ci.elo >= 0 ? '+' : ''}${ci.elo.toFixed(0)} Elo `
+    + `[${ci.lo.toFixed(0)}, ${ci.hi.toFixed(0)}] over ${r.games} games at depth ${cfg.gateDepth} in `
+    + `${fmtDur(rec.seconds)} (seed ${seed} — independent of the gate's openings) → `
+    + `${passed ? `HOLDS UP (> +${cfg.confirmElo} Elo) — promoting`
+      : `REJECTED (not above +${cfg.confirmElo} Elo) — champion stays`}.`);
+  return rec;
+}
+
 // The loop rates the SAME full pool as a standalone `npm run rank:pool` — every engine across
 // depth-ladder's default depth spectrum (1-8), not a narrowed slice — so its ledger is the one
 // unified pool, not a loop-specific variant. hc<rankDepth> stays the pinned Elo-1500 node (via
@@ -1359,6 +1606,18 @@ function runRankPool(label, opts = {}) {
       ...(corpusExtraFiles().length ? [`--corpus-extra=${corpusExtraFiles().join(',')}`] : []),
       ...(cfg.harvest ? [] : ['--no-save-games']),
       '--no-scan', `--seed=${Date.now()}`, ...jobArg]);
+}
+
+// Win-adjudication args for the two steps that play games (generation and the gate). Empty while
+// --adjudicate is 0, which is the default — an empty array means the child's command line is
+// exactly what it was before the flag existed, so an off run can't drift from the old behaviour.
+// The two binaries read the same two flags but apply slightly different rules: apos-gen folds the
+// mover's score to White's view (self-play, one engine on both sides), apos-match requires the
+// LOSING side's own concession (two different nets, so the mover's-eval form would pay the more
+// optimistic one). See the Adjudicator comment in each.
+function adjudicateArgs() {
+  if (cfg.adjudicate <= 0) return [];
+  return [`--adjudicate=${cfg.adjudicate}`, `--adjudicate-plies=${cfg.adjudicatePlies}`];
 }
 
 // Featurize args for this recipe's dataset filters. --drop-conflicts forwards as-is.
@@ -1691,6 +1950,14 @@ log(`train:loop start — ${cfg.batch === 0
     ? `no gen (data from gate harvest${cfg.playStrong ? ` + strong --play @ depth ${cfg.playDepth}` : ' + pool'})`
     : `batch ${cfg.batch} @ depth ${cfg.depth}`} | gate ${cfg.gateGames}g @ depth ${cfg.gateDepth} `
   + `SPRT(0,${cfg.elo1})${cfg.gateFutility > 0 ? ` futility<${cfg.gateFutility}` : ''} | `
+  // Silent when off (the default), so an existing run's start line reads exactly as before.
+  + (cfg.adjudicate > 0
+    ? `adjudicate ${cfg.adjudicate}cp x${cfg.adjudicatePlies} — gen + gate only, NOT the confirmation | `
+    : '')
+  + (cfg.confirmGames > 0
+    ? `confirm ${cfg.confirmGames}g @ depth ${cfg.gateDepth} on a fresh seed, no SPRT — promote only `
+      + `above +${cfg.confirmElo} Elo | `
+    : 'confirm OFF — promoting on the gate alone (--no-confirm) | ')
   + (cfg.screen
     ? `screen ${cfg.screenGames}g @ depth ${cfg.screenDepth} ratio ${cfg.screenRatio} (SHADOW — logged, never acted on`
       + `${cfg.screenSave ? `; games kept in ${screenArchive}` : '; games discarded'}) | `
@@ -1764,6 +2031,7 @@ for (let i = 1; i <= cfg.cycles && !stopRequested(); i++) {
     [`--games=${cfg.batch}`, `--depth=${cfg.depth}`, '--eval=nn',
       ...(cfg.openings !== null ? [`--openings=${cfg.openings}`] : []),
       ...(cfg.openingTopk > 0 ? [`--opening-topk=${cfg.openingTopk}`] : []),
+      ...adjudicateArgs(),
       `--seed=${Date.now()}`, ...jobArg])) break;
 
   // 2. Featurize the raw positions for the current feature set, into THIS recipe's featurized
@@ -1812,10 +2080,21 @@ for (let i = 1; i <= cfg.cycles && !stopRequested(); i++) {
   // (~1cp); warm_start dequantizes an int --init so the float fine-tune is unaffected. --float
   // forks a non-quantized track. --scale/--lr/--wd are passed only when set (else train.py's
   // defaults). --data points the trainer at this recipe's featurized file.
+  //
+  // --scale rides with --rescale, and it has to: train.py ADOPTS the --init file's scale and
+  // discards --scale, so on the loop's default warm path a scale trial would hash its own track
+  // (it keys the recipe, and shows up as `s1200` in the track name), log its own command line,
+  // and then train at the inherited scale for every cycle of its life. Because every warm-start
+  // source resolves to a net that itself warm-started, the scale is frozen by inheritance — all
+  // 22 archived champions carry scale=600, unchanged across 497 cycles and 29 tracks, so the knob
+  // has never actually moved. --rescale honours the requested value and compensates the head so
+  // the child still starts from the champion's centipawn function (measured: 0.16 cp mean
+  // deviation inside +/-100 cp, growing only in the saturated tail, which is the point — see
+  // train.py --rescale). Unset scale stays unset: no flag, no behaviour change.
   if (!run(`Train candidate${initLabel}`, python,
     [trainPy, `--hidden=${hidden}`, `--data=${featFile}`, `--out=${candidate}`, `--lambda=${cfg.lam}`,
       ...(cfg.quant ? ['--quant'] : []),
-      ...(cfg.scale !== undefined ? [`--scale=${cfg.scale}`] : []),
+      ...(cfg.scale !== undefined ? [`--scale=${cfg.scale}`, '--rescale'] : []),
       ...(cfg.lr !== undefined ? [`--lr=${cfg.lr}`] : []),
       ...(cfg.wd !== undefined ? [`--wd=${cfg.wd}`] : []),
       ...(cfg.epochs !== undefined ? [`--epochs=${cfg.epochs}`] : []),
@@ -1849,6 +2128,7 @@ for (let i = 1; i <= cfg.cycles && !stopRequested(); i++) {
     ['--eval-a=nn', `--weights-a=${candidate}`, '--eval-b=nn', `--weights-b=${champion}`,
       `--depth=${cfg.gateDepth}`, '--sprt', '--elo0=0', `--elo1=${cfg.elo1}`,
       ...(cfg.gateFutility > 0 ? [`--sprt-futility=${cfg.gateFutility}`] : []),
+      ...adjudicateArgs(),
       `--games=${cfg.gateGames}`, `--result-file=${resultFile}`,
       ...(cfg.harvest ? [`--save-games=${gateHarvest}`, `--seed=${Date.now()}`] : []), ...jobArg])) {
     // Ctrl-C / failure mid-gate: the runner still drained its played games to the harvest
@@ -1856,7 +2136,10 @@ for (let i = 1; i <= cfg.cycles && !stopRequested(); i++) {
     // already-played games aren't lost, then end the loop.
     if (cfg.harvest) {
       let r = null; try { r = JSON.parse(readFileSync(resultFile, 'utf8')); } catch { /* no usable result */ }
-      foldGateHarvest(r ? r.sprt === 'H1' : false, r);
+      // With confirmation on, an interrupted gate can NEVER have promoted — the confirmation
+      // never ran — so the candidate is relabeled as unpromoted even if a complete H1 verdict
+      // happens to be readable. (With --no-confirm this stays exactly the old behaviour.)
+      foldGateHarvest(cfg.confirmGames > 0 ? false : (r ? r.sprt === 'H1' : false), r);
     }
     // The screen's games were played before the gate started, so they survive the interrupt
     // too. No verdict reached, so treat the candidate as unpromoted (the ephemeral tag is the
@@ -1868,7 +2151,8 @@ for (let i = 1; i <= cfg.cycles && !stopRequested(); i++) {
     break;
   }
 
-  // 5. Promote only on a significant win (SPRT accepted H1). Never regress.
+  // 5. Read the gate's verdict. Promotion needs a significant win (SPRT H1) that then survives
+  //    the confirmation match in 5b. Never regress.
   let res;
   try { res = JSON.parse(readFileSync(resultFile, 'utf8')); }
   catch {
@@ -1899,16 +2183,47 @@ for (let i = 1; i <= cfg.cycles && !stopRequested(); i++) {
   // + this gate's edge over it) stays comparable across cycles as the champion strengthens,
   // unlike a raw gate score, so it's what "track best" is ranked by. Null until the ledger
   // rates the champion (from cycle 2 on).
+  // Deliberately still the GATE's edge, even when a confirmation also measured one: absElo ranks
+  // a track's nets and feeds the --rotate=auto trend, and re-basing it on a match only ~5% of
+  // cycles ever play would make the series inconsistent with itself. The confirmation's own
+  // numbers ride along in the history's `confirm` block for anyone who wants to compare them.
   const gateCI = eloWithCI(res.wins, res.draws, res.losses);
   const gatedVsChampHash = weightsHash(champion);
   const champLedgerNow = championLedgerElo();
   const candAbsElo = champLedgerNow ? champLedgerNow.best + res.elo : null;
   const candHashForTrack = weightsHash(candidate);
+
+  // 5b. CONFIRMATION MATCH — an H1 gate is not a promotion yet (see runConfirm for the whole
+  //     argument: 23 promotions against ~10 expected spurious ones over 497 gates, and a ledger
+  //     that credits the recent champion chain with ~+70 Elo where the gates claimed ~+174).
+  //     Fresh seed, fixed length, no SPRT: an independent second reading of the same pair.
+  //     It runs ONLY on H1, so it costs nothing on the ~95% of cycles that don't win, and it
+  //     returns null when confirmation is off (--confirm-games=0 / --no-confirm), which is what
+  //     restores the old promote-immediately-on-H1 path.
+  const gateWon = res.sprt === 'H1';
+  const confirm = gateWon ? runConfirm(c, candHashForTrack, gatedVsChampHash) : null;
+  // The promotion decision: both tests have to agree. A confirmation that could not produce a
+  // verdict (crash, or a Ctrl-C / train:stop landing inside it) counts as NOT confirmed —
+  // promoting on evidence nobody read is precisely the failure this step exists to prevent, and
+  // the candidate survives as lineage either way, so the cost is a deferred promotion.
+  const promote = gateWon && (confirm === null || confirm.passed);
+  // The confirmation phrased once for whichever cycle-log line ends up being written.
+  const confirmSay = confirm && confirm.ran
+    ? `${confirm.elo >= 0 ? '+' : ''}${confirm.elo.toFixed(0)} Elo [${confirm.eloLo.toFixed(0)}, `
+      + `${confirm.eloHi.toFixed(0)}] over ${confirm.games} independent games at depth ${confirm.depth} `
+      + `(bar > +${cfg.confirmElo}, seed ${confirm.seed})`
+    : null;
   // Fold the gate's harvested games into the dataset, relabeling a non-promoted gate-winning
   // candidate's provenance to a self-describing ephemeral Elo first (foldGateHarvest). Done
   // here, before the promote branch copies the candidate over the champion, so weightsHash
-  // still identifies the candidate that actually played.
-  if (cfg.harvest) foldGateHarvest(res.sprt === 'H1', res);
+  // still identifies the candidate that actually played. `promote` — not the raw gate verdict —
+  // is what decides: a candidate the confirmation rejected is never archived, so its labels need
+  // the ephemeral tag exactly like any other non-promoted gate winner's.
+  if (cfg.harvest) foldGateHarvest(promote, res, confirm);
+  // The confirmation's own games get harvested on identical terms: same two engines, same
+  // --gate-depth, real strong-play data already paid for, and the same provenance rewrite. There
+  // is no reason to throw away 600 deep games because the candidate they judged didn't promote.
+  if (cfg.harvest) foldConfirmHarvest(promote, res, confirm);
   // Same treatment for the screen's games, into their own dataset. A PROMOTED candidate is
   // archived by hash, so its screen games become directly rateable evidence for the ledger —
   // and 20k direct games on one pair is worth far more to the fit than the ~28 the pool's
@@ -1916,7 +2231,7 @@ for (let i = 1; i <= cfg.cycles && !stopRequested(); i++) {
   // never met at all). Non-promoted candidates get the ephemeral tag, keyed off the SCREEN's
   // own edge at the SCREEN's depth — screen.eloLo, not the rescaled gate-depth prediction.
   if (cfg.screen && cfg.screenSave && existsSync(screenHarvest)) {
-    const promoted = res.sprt === 'H1';
+    const promoted = promote; // the FINAL decision — a confirmation-rejected candidate isn't archived
     const fold = foldHarvest(screenHarvest, screenArchive,
       promoted ? null : championLedgerElo(),
       screen ? screen.eloLo : 0, `depth-${cfg.screenDepth} screen edge`);
@@ -1930,7 +2245,7 @@ for (let i = 1; i <= cfg.cycles && !stopRequested(); i++) {
     }
   }
   let promotedChampHash = null; // set on promotion, so the end-of-cycle rank calibrates all its depths
-  if (res.sprt === 'H1') {
+  if (promote) {
     const arch = JSON.parse(readFileSync(candidate, 'utf8')).arch;
     copyFileSync(champion, prevChampion);   // backup for safety
     copyFileSync(candidate, champion);      // candidate becomes champion
@@ -1945,6 +2260,8 @@ for (let i = 1; i <= cfg.cycles && !stopRequested(); i++) {
     promotions++;
     log(`cycle ${c}: PROMOTED ✓  candidate ${pct}% / Elo +${res.elo.toFixed(0)} over champion `
       + `(${res.games} games, cycle took ${fmtDur((Date.now() - cycleT0) / 1000)}). `
+      + (confirmSay ? `Confirmed on an independent rematch: ${confirmSay}. `
+        : cfg.confirmGames > 0 ? '' : 'No confirmation match (--no-confirm). ')
       + `New champion named '${champName}' in the catalog (archived ${champHash}.json). Total promotions: ${promotions}.`
       + divNote);
     // (The strength pool is refit at the end of every cycle — runRankPool below. --corpus rates
@@ -1960,6 +2277,28 @@ for (let i = 1; i <= cfg.cycles && !stopRequested(); i++) {
       run(`Refresh v (${(cfg.refreshFrac * 100).toFixed(0)}% ${refreshMode()} @ depth ${cfg.refreshDepth}, new champion)`,
         process.execPath, refreshArgs(cfg.refreshFrac, cfg.refreshDepth));
     }
+  } else if (gateWon) {
+    // The gate said H1 and the CONFIRMATION did not back it up — the case this second test exists
+    // to catch. The landing is deliberately the SAME one the loop already uses for a gate winner
+    // that didn't promote: the candidate becomes this track's lineage, so the next cycle
+    // warm-starts from it and re-gates it. A genuine gain is delayed by a cycle, never discarded
+    // (which is what makes a ~0.81 pass rate on a true +20 an acceptable price). The champion file
+    // is untouched, and the harvest fold above already relabeled the candidate's provenance to the
+    // ephemeral nn<d>@elo<E> tag, keyed off the more conservative of the two measured edges.
+    // (A --cold run chains from the previous candidate unconditionally, so its lineage slot plays
+    // no part — nothing to write there.)
+    const kept = !cfg.cold;
+    if (kept) copyFileSync(candidate, lineage);
+    log(`cycle ${c}: kept champion — the gate reached H1 (candidate ${pct}% / Elo `
+      + `+${res.elo.toFixed(0)}, ${res.games} games, cycle took ${fmtDur((Date.now() - cycleT0) / 1000)}) `
+      + 'but the CONFIRMATION '
+      + (confirm.ran ? `measured only ${confirmSay} — it does not hold up, so the champion stays. `
+        : `could not be read (${confirm.reason}), so nothing independently confirms the gate and `
+          + 'the champion stays. ')
+      + (kept ? 'Candidate kept as lineage for the next cycle, which re-gates it — a real gain is '
+        + 'delayed, never lost.'
+        : 'Nothing written to the lineage (--cold chains from this candidate anyway).')
+      + divNote);
   } else if (!cfg.cold && res.sprt !== 'H0' && res.score >= 0.5) {
     // Inconclusive but not losing: keep the candidate as the lineage so the next
     // cycle builds on its (sub-threshold) gain instead of rederiving it from the
@@ -1995,7 +2334,12 @@ for (let i = 1; i <= cfg.cycles && !stopRequested(); i++) {
       // disagreement from the gate's own sampling error — without it a screen looks worse
       // than it is, because the "truth" it's scored against is itself noisy.
       ...(gateCI ? { edgeLo: gateCI.lo, edgeHi: gateCI.hi } : {}),
-      sprt: res.sprt, futility: !!res.futility, promoted: res.sprt === 'H1',
+      // `sprt` stays the GATE's verdict; `promoted` is the final decision, so an H1 whose
+      // confirmation failed records as `sprt: "H1", promoted: false` with the `confirm` block
+      // below saying why. That keeps the track's promotion count meaning "the champion actually
+      // changed" (experiment-registry increments it off this field), and keeps the difference
+      // between the two readable rather than hidden.
+      sprt: res.sprt, futility: !!res.futility, promoted: promote,
       // Where the SPRT walk stopped, against the bound it had to cross. Turns a column of
       // identical "inconclusive" verdicts into a near-miss trend: a track creeping from 0.4 to
       // 2.5 across cycles is going somewhere, one flat at 0.2 isn't.
@@ -2011,6 +2355,12 @@ for (let i = 1; i <= cfg.cycles && !stopRequested(); i++) {
       // same line's `edgeElo`/`score`, which are the gate's truth for the very same
       // candidate — that pairing is the point, and `npm run screen:report` reads it back out.
       ...(screen ? { screen } : {}),
+      // Confirmation match, omitted entirely unless one ran (so a cycle from before this existed,
+      // a --no-confirm cycle, and a non-H1 cycle all record exactly what they always did). Paired
+      // with this line's `edgeElo`/`edgeLo`/`edgeHi`, these are two independent measurements of
+      // the same pair at the same depth — the record needed to check, later and offline, how often
+      // an H1 gate actually reproduces.
+      ...(confirm ? { confirm } : {}),
     });
     if (rc.isBest) copyFileSync(candidate, trackBest);
   } catch (e) { log(`  (track record skipped: ${e.message})`); }
