@@ -33,6 +33,8 @@ import {
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 
+import { SEARCH_ERA } from '../src/ai.js';
+
 export function experimentsDir(loopDir) { return join(loopDir, 'experiments'); }
 
 // --- Recipe construction & identity --------------------------------------------------
@@ -210,12 +212,15 @@ export function beginRun(dir, ts) {
 
 // Record one gate cycle: append the history line and roll it into state. `entry` fields:
 //   { run, cycle, ts, score, edgeElo, absElo, sprt, promoted, div, championHash, datasetBytes, hash }
+// plus `era`, stamped here rather than by the caller: absElo is a number on the ladder's scale and
+// the ladder rates one search era, so the entry has to say which one it belongs to (reAnchoredAbsElo).
 // "best" is tracked by estimated ABSOLUTE Elo (championLedgerElo + gate edge) when available
 // — a raw gate score isn't comparable across cycles because the champion opponent strengthens
 // over time. Falls back to raw score when no ledger Elo is known yet. Returns { st, isBest };
 // the caller copies the candidate weights over best.json when isBest is true.
 export function recordCycle(dir, entry) {
   const paths = trackPaths(dir);
+  entry = { ...entry, era: SEARCH_ERA };
   appendFileSync(paths.history, JSON.stringify(entry) + '\n');
   let st = readState(dir) || { cycles: 0, promotions: 0, runs: 0, best: null, createdTs: entry.ts };
   st.cycles = (st.cycles || 0) + 1;
@@ -277,6 +282,15 @@ export function readHistory(dir) {
 // score, no drift. These helpers are the single source of truth for the reports (loop-progress /
 // loop-experiments / suggestRecipes), so the fix can't drift back apart across them.
 
+// A SEARCH change re-scopes all of this on top of the drift. The ledger rates one search era at a
+// time (rank:pool --era), so once the engine's search changes, a stored absElo from before it is a
+// number on another scale — for the nn eval the same net at the same depth measured ~380 Elo apart
+// across the 2026-08-08 change. Re-anchoring handles that by itself for any champion the current
+// era's pool has re-rated (its ledger Elo is era-current, so the sum is too). What it cannot fix is
+// the FALLBACK: an off-era stored absElo would silently enter a trend or the suggester's surrogate
+// as if it were comparable, so it reads NaN instead and the point drops out until the pool re-rates
+// that champion. History entries carry `era` from 2026-08-08 on; older ones are era 1.
+
 // Best CURRENT ledger Elo per engine version (nn weights hash), across depths. Read once, passed in.
 export function ledgerBestByVersion(loopDir) {
   const map = new Map();
@@ -284,8 +298,10 @@ export function ledgerBestByVersion(loopDir) {
   if (!existsSync(file)) return map;
   let ledger;
   try { ledger = JSON.parse(readFileSync(file, 'utf8')); } catch { return map; }
+  if ((ledger.era == null ? 1 : ledger.era) !== SEARCH_ERA) return map; // rates another engine
   for (const e of ledger.ranking || []) {
     if (e.eng !== 'nn' || e.version == null || e.elo == null) continue;
+    if (e.anchored === false) continue; // no chain of games to the pin: a placeholder, not a rating
     const cur = map.get(e.version);
     if (cur == null || e.elo > cur) map.set(e.version, e.elo);
   }
@@ -293,11 +309,14 @@ export function ledgerBestByVersion(loopDir) {
 }
 
 // Re-anchor one history entry's absElo onto today's ledger (see block comment). Falls back to the
-// stored absElo only when that cycle's champion is no longer rated (old, dropped-off tracks).
+// stored absElo only when that cycle's champion is no longer rated (old, dropped-off tracks) AND
+// that cycle ran the search this engine runs — otherwise the stored number is off-scale and the
+// entry reads NaN, which every consumer already filters out.
 export function reAnchoredAbsElo(h, ledgerElo) {
   if (h && h.championHash && Number.isFinite(h.edgeElo) && ledgerElo && ledgerElo.has(h.championHash)) {
     return ledgerElo.get(h.championHash) + h.edgeElo;
   }
+  if ((h?.era == null ? 1 : h.era) !== SEARCH_ERA) return NaN;
   return Number.isFinite(h?.absElo) ? h.absElo : NaN;
 }
 
