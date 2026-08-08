@@ -21,6 +21,11 @@
 // promote anyway — so this reclaims exactly those games. The `futility` result field records
 // whether the stop fired (the verdict stays "inconclusive", same as running out the cap).
 //
+// --adjudicate=CP --adjudicate-plies=N ends a decided game early and scores it as a real result
+// (0 = off, the default). It is the cutechess `-resign movecount=N score=T` rule, and here it
+// reads the LOSER's own search only — see the Adjudicator comment for why the mover's-eval form
+// that main_gen.zig uses would be wrong in a two-engine match.
+//
 // A match is paced by exactly ONE instrument: --depth (fixed depth), --movetime (ms/move), or
 // --nodes (nodes/move), each with a `-b` twin for an asymmetric budget. --nodes is the one that
 // can gate a SEARCH change: at a fixed depth a pruning or move-ordering gain returns the same
@@ -399,6 +404,52 @@ fn searchBudget(s: *ai.Searcher, st: *const State, b: Budget, seen: []const u64,
     return if (no_tt) s.chooseMoveNoTT(st, d, ms, b.nodes, seen) else s.chooseMove(st, d, ms, b.nodes, seen);
 }
 
+// --- Win adjudication (--adjudicate=CP --adjudicate-plies=N) --------------------------------
+// Resign / decided-game cutoff, the cutechess `-resign movecount=N score=T` shape: score the game
+// as a LOSS for a side once THAT SIDE'S OWN search has reported at or below −cp on `plies`
+// consecutive of ITS OWN moves. `cp == 0` disables every branch and is the default, so an
+// existing seed replays byte for byte.
+//
+// It pays for itself because most of a played-out game is already over. `npm run data:audit` on
+// the 372,459-game / 34.8M-position corpus: at ±400 cp, 96.0% of games reach a point past which
+// |v| never changes sign again, and 40.3% of ALL recorded plies come after that point. The
+// threefold claim in playGame is the same idea for drawn games, and it was only worth ~3%.
+//
+// WHY THE LOSER'S OWN EVAL AND NOT THE MOVER'S — the divergence from main_gen.zig is deliberate.
+// `main_gen.zig` runs the simpler rule: fold each mover's score to White's view and require one
+// consistent sign for N plies. That is fine there because self-play puts ONE engine on both
+// sides. Here the movers are two DIFFERENT nets, and a rule that reads whoever is to move hands
+// the verdict to whichever net is more optimistic — A's scores cross +cp sooner, so games end as
+// "A wins" on A's own say-so, and the gate would pay Elo for optimism drift instead of for play.
+// A candidate is a fine-tuned relative of the champion, which is exactly the population where
+// that drift is plausible. Requiring the loser's own concession takes the winner's opinion out of
+// the rule: an engine only ever loses a game it has itself said, `plies` moves running, it is
+// losing. It fires later than the mover's-eval form, so it saves less — measured over the corpus
+// at 500 cp / 4: 22.1% of plies against 25.8%, at a 1.11% false-adjudication rate against 1.28%.
+//
+// SIGN CONVENTION, the thing that is easy to get wrong: the searched score is
+// SIDE-TO-MOVE-relative and flips every ply, which is precisely what this form sidesteps —
+// `score <= -cp` already reads as "the MOVER says the mover is losing", so nothing needs folding
+// to White's view. Each side's counter only ever advances on that side's own moves, which is what
+// makes `plies` count moves by one player rather than plies of the game (N = 4 spans ~8 plies).
+// Verified: with `--adjudicate=500` the reported score, the harvested `r`, and the White/Black
+// win split all stay on the same side as the un-adjudicated run of the same seed.
+const Adjudicator = struct {
+    cp: i32, // threshold in centipawns; 0 = off
+    plies: u32, // consecutive own-moves a side has to concede
+    concede: [2]u32 = .{ 0, 0 }, // 0 = White's current streak, 1 = Black's
+
+    // Feed one searched position. `score` is the mover's own value. Returns the WHITE-view result
+    // (+1 White wins / −1 Black wins) on the ply the mover's streak completes, null otherwise.
+    fn feed(self: *Adjudicator, score: i32, white_to_move: bool) ?i32 {
+        if (self.cp == 0) return null;
+        const side: usize = if (white_to_move) 0 else 1;
+        if (score <= -self.cp) self.concede[side] += 1 else self.concede[side] = 0;
+        if (self.concede[side] < self.plies) return null;
+        return if (white_to_move) -1 else 1; // the side that conceded is the one that loses
+    }
+};
+
 // Build a random opening as a MOVE SEQUENCE from the standard start. Returned (not applied)
 // so both color-reversed games of a pair replay the identical line. If a random ply ends the
 // game, the whole opening is abandoned (len 0) and the pair plays from the standard start.
@@ -435,9 +486,12 @@ fn playGame(
     nodes: *u64,
     recs: ?*std.ArrayList(PlyRec),
     dp: ?*const DivProbe, // static-eval divergence probe (both sides nn); null otherwise
+    adj_cfg: Adjudicator, // win-adjudication thresholds (.cp == 0 = off); copied, state is per-game
+    adjudicated: *bool,
 ) !i32 {
     var seen: std.ArrayList(u64) = .empty;
     defer seen.deinit(alloc);
+    var adj = adj_cfg;
     var st = board.newGameState();
     var result_white: i32 = 0;
     var plies: u32 = 0;
@@ -484,6 +538,22 @@ fn playGame(
             });
         }
 
+        // Win adjudication: the game is over, so stop searching it and score the adjudicated
+        // result like a real one (the caller reads only this return value, and the loop below
+        // stamps it onto every harvested position). The streaks accumulate through the scripted
+        // opening but can only FIRE past it — those plies are one shared random line replayed by
+        // both games of the pair, so ending a game inside it would measure the line, not the
+        // engines. The record stays valid without extra work: writeHarvest always drops the last
+        // position's move, so len(v) == len(moves) + 1 whether the game ended here or naturally.
+        const decided = adj.feed(res.score, st.turn == .white);
+        if (plies >= opening.len) {
+            if (decided) |winner| {
+                result_white = winner;
+                adjudicated.* = true;
+                break;
+            }
+        }
+
         try seen.append(alloc, h);
         const next = engine.applyMove(&st, m);
         if (next.halfmove == 0) seen.clearRetainingCapacity();
@@ -511,6 +581,7 @@ const Cfg = struct {
     div_enabled: bool,
     div_margin: f64, // --div-margin: confident-disagreement threshold (cp)
     div_decided: f64, // --div-decided: agreed-decided cutoff, skipped (cp)
+    adj: Adjudicator, // win adjudication (--adjudicate); .cp == 0 = off, the default
     save_games: bool,
     // When set, the heartbeat thread polls this path; once it exists, the match finalizes
     // IMMEDIATELY — it writes the result-file + harvest from the games already COMPLETED and
@@ -564,6 +635,7 @@ const Shared = struct {
     div: DivAccum = .{}, // eval-divergence stats (both sides nn), merged per game under the mutex
     alloc: std.mem.Allocator,
     nodes: u64 = 0,
+    adjudicated: u64 = 0, // games ended by the --adjudicate cutoff rather than played out
     stop: bool = false,
     decided: ?[]const u8 = null,
     sprt: bool,
@@ -831,16 +903,17 @@ fn worker(sh: *Shared, idx: usize) void {
         // identical regardless of which worker plays it (the persistent TT still makes exact
         // games order-sensitive, as before).
         var r: i32 = undefined;
+        var adjudicated = false;
         if (a_is_white) {
             sa.reseed(sh.cfg.seed +% pair *% 4 +% 0);
             sb.reseed(sh.cfg.seed +% pair *% 4 +% 1);
             // A = White: White's budget is A's, Black's is B's.
-            r = playGame(&sa, &sb, true, &opening, sh.cfg.budget_a, sh.cfg.budget_b, sh.cfg.max_plies, pa, &nodes, pr, dp) catch 0;
+            r = playGame(&sa, &sb, true, &opening, sh.cfg.budget_a, sh.cfg.budget_b, sh.cfg.max_plies, pa, &nodes, pr, dp, sh.cfg.adj, &adjudicated) catch 0;
         } else {
             sb.reseed(sh.cfg.seed +% pair *% 4 +% 2);
             sa.reseed(sh.cfg.seed +% pair *% 4 +% 3);
             // A = Black: White's budget is B's, Black's is A's.
-            r = playGame(&sb, &sa, false, &opening, sh.cfg.budget_b, sh.cfg.budget_a, sh.cfg.max_plies, pa, &nodes, pr, dp) catch 0;
+            r = playGame(&sb, &sa, false, &opening, sh.cfg.budget_b, sh.cfg.budget_a, sh.cfg.max_plies, pa, &nodes, pr, dp, sh.cfg.adj, &adjudicated) catch 0;
         }
 
         // A's score for this game: +1 win / 0.5 draw / 0 loss, from A's color this game.
@@ -867,6 +940,7 @@ fn worker(sh: *Shared, idx: usize) void {
         acc.n += 1;
         if (acc.n == 2) sh.pair_scores.append(sh.alloc, acc.sum / 2.0) catch {};
         sh.nodes += nodes;
+        if (adjudicated) sh.adjudicated += 1;
         if (sh.cfg.div_enabled) sh.div.add(game_div);
         if (sh.cfg.save_games) {
             // The game shares its pair's scripted opening line and begins at the standard
@@ -1322,6 +1396,14 @@ fn finalizeLocked(sh: *Shared) void {
             l, sh.lower, sh.upper, @max(0.0, @min(100.0, l / sh.upper * 100.0)),
         });
     }
+    // How many results the rule produced rather than the board. Printed only when the rule is on,
+    // and kept out of the result-file JSON, so an --adjudicate=0 run's output stays byte-identical
+    // to what the runner printed and wrote before the flag existed.
+    if (sh.cfg.adj.cp > 0) {
+        std.debug.print("Adjudicated {d}/{d} game(s) at {d} cp over {d} consecutive own moves by the losing side.\n", .{
+            sh.adjudicated, n, sh.cfg.adj.cp, sh.cfg.adj.plies,
+        });
+    }
     std.debug.print("A vs B: {d} games | +{d} ={d} -{d} | score {d:.1}% | Elo {s}{d:.0} ± {d:.0} (95% CI [{d:.0}, {d:.0}]) | SPRT {s} | nodes {d} nps {d}\n", .{
         n, wins, draws, losses, p * 100, sign, ci.elo, ci.margin, ci.lo, ci.hi, verdict, sh.nodes, sh.nodes * 1000 / ms,
     });
@@ -1427,6 +1509,10 @@ pub fn main(init: std.process.Init) !void {
     // Eval-divergence probe thresholds (active only when both sides are nn).
     var div_margin: f64 = 75; // both nets past ±this cp, opposite sign = a "confident" disagreement
     var div_decided: f64 = 600; // both nets agree by >= this cp = decided, skipped (no judgment signal)
+    // Win adjudication, OFF by default (0): it changes what a game's result means, so it has to be
+    // gated like any other change to the measurement. See the Adjudicator comment.
+    var adjudicate: i32 = 0;
+    var adjudicate_plies: u32 = 4;
     // Cross-run timing store for the live ETA (see updateTiming). Default resolves to the loop dir
     // (cwd = web/); persistence is skipped when that dir is absent. `--timing-file=` overrides or,
     // set empty, disables it.
@@ -1463,9 +1549,13 @@ pub fn main(init: std.process.Init) !void {
         if (argStr(arg, "--stop-file=")) |v| stop_file = v;
         if (argStr(arg, "--div-margin=")) |v| div_margin = std.fmt.parseFloat(f64, v) catch div_margin;
         if (argStr(arg, "--div-decided=")) |v| div_decided = std.fmt.parseFloat(f64, v) catch div_decided;
+        if (argStr(arg, "--adjudicate=")) |v| adjudicate = std.fmt.parseInt(i32, v, 10) catch adjudicate;
+        if (argStr(arg, "--adjudicate-plies=")) |v| adjudicate_plies = std.fmt.parseInt(u32, v, 10) catch adjudicate_plies;
         if (argStr(arg, "--timing-file=")) |v| timing_file = v;
     }
     if (jobs < 1) jobs = 1;
+    if (adjudicate < 0) adjudicate = 0; // a negative threshold can't be met; read it as "off"
+    if (adjudicate_plies < 1) adjudicate_plies = 1;
 
     // A node budget is a pacing MODE, not a modifier: reject a mixed pacing loudly instead of
     // silently dropping one of the two (the depth-over-movetime precedence below already
@@ -1558,6 +1648,7 @@ pub fn main(init: std.process.Init) !void {
             .div_enabled = eval_a == .nn and eval_b == .nn,
             .div_margin = div_margin,
             .div_decided = div_decided,
+            .adj = .{ .cp = adjudicate, .plies = adjudicate_plies },
             .save_games = save_games != null,
             .stop_file = stop_file,
             .weights_a = weights_a orelse "",
@@ -1587,7 +1678,14 @@ pub fn main(init: std.process.Init) !void {
     var pace_b_buf: [24]u8 = undefined;
     const pace_a = budgetSig(&pace_a_buf, budget_a);
     const pace_b = budgetSig(&pace_b_buf, budget_b);
-    std.debug.print("Playing {d} games | budget {s}/{s} | openings {d} | jobs {d} | seed {d}\n", .{ games, pace_a, pace_b, openings, jobs, seed });
+    // Echo the adjudication rule when it's on: it changes what the score MEANS, so a log that
+    // doesn't say whether it was active can't be compared against one that was.
+    var adjbuf: [56]u8 = undefined;
+    const adjseg: []const u8 = if (adjudicate > 0)
+        (std.fmt.bufPrint(&adjbuf, " | adjudicate {d}cp x{d} own moves", .{ adjudicate, adjudicate_plies }) catch "")
+    else
+        "";
+    std.debug.print("Playing {d} games | budget {s}/{s} | openings {d} | jobs {d} | seed {d}{s}\n", .{ games, pace_a, pace_b, openings, jobs, seed, adjseg });
 
     const t0 = std.Io.Clock.now(.awake, io).nanoseconds;
     shared.t0_ns = @intCast(t0); // so the live progress line can show elapsed/ETA

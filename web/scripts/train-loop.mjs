@@ -35,6 +35,48 @@
 //   --opening-topk=N  forwarded to gen: 0 (default) = uniform-random openings; N>=1
 //                   samples among the engine's N best opening moves (sound but varied).
 //                   Off by default, so the loop's data is unchanged unless you set it.
+//   --adjudicate=CP  WIN ADJUDICATION (resign cutoff), forwarded to BOTH game producers: the
+//                   generation step AND the gate. 0 = OFF and that is the default, so nothing
+//                   about the loop changes until this is gated. A game ends as a win for the
+//                   leading side once the search score has held at or past CP centipawns for
+//                   --adjudicate-plies consecutive plies.
+//                   Why it is worth a gating run: `npm run data:audit` over the 372,459-game /
+//                   34.8M-position dataset found that 40.3% of every RECORDED PLY comes after
+//                   the point where |v| stops changing sign at +/-400 cp, and that sign agrees
+//                   with the game's own result 99.3% of the time. Each of those plies costs a
+//                   search, in generation and in every gate game alike. It is the largest
+//                   throughput lever measured on this project. The threefold-repetition claim
+//                   both playGames already make is the same idea for DRAWN games, and that one
+//                   was only worth ~3% of plies.
+//                   The retrospective 99.3% does NOT carry over to a live rule, which has to
+//                   decide without seeing the rest of the game. Simulated prospectively over the
+//                   same corpus, the generation form at 500 cp x 4 plies skips 25.8% of plies and
+//                   adjudicates 92.2% of games at a 1.28% FALSE-adjudication rate (the credited
+//                   winner is not the game's actual winner, counting a draw as a disagreement);
+//                   400 x 4 skips 45.2% at 4.53% false; 300 x 2 skips 58.5% at 9.58% false. The
+//                   gate runs a stricter form of the rule — the LOSING side has to concede on its
+//                   own N moves, so a net that evaluates optimistically cannot win games on its
+//                   own say-so — which fires later and saves less: 22.1% of plies at 500 x 4, at
+//                   1.11% false. Both halves of that trade are real: in generation a false
+//                   adjudication writes the wrong `r` onto every position of the game, and at
+//                   --lambda=1 `r` IS the whole training target; in the gate it adds symmetric
+//                   noise to a measurement whose job is resolving ~20 Elo.
+//                   Recommended first gating run: --adjudicate=500. CP is measured against the
+//                   net's own tanh ceiling (`scale`, 600 for every champion so far), so 500 is
+//                   0.83 x scale and a --scale track would change what a given CP means.
+//                   It is deliberately NOT forwarded to the confirmation match or to the screen.
+//                   That leaves the confirmation an unmodified yardstick: a candidate that clears
+//                   an adjudicating gate still has to survive a played-out rematch, which is the
+//                   check you want while the rule itself is the thing on trial.
+//   --adjudicate-plies=N  consecutive plies the score has to hold (default 4). Generation counts
+//                   GAME plies; the gate counts the losing side's OWN moves, so N=4 spans 4 plies
+//                   there and ~8 in the gate. 4 rather than 2 because the movers alternate: at
+//                   N>=2 the losing side has itself agreed it is losing, and at N=4 it has agreed
+//                   twice, which is what a one- or two-ply horizon mirage cannot fake. Larger N
+//                   buys accuracy at a worsening rate — measured on the corpus at 500 cp, going
+//                   2->4 costs 2.9 points of ply savings for 0.24 points of false rate, 4->6
+//                   costs 2.4 for 0.16, and 6->8 costs 2.2 for 0.11 — so 4 is the last step where
+//                   the exchange is still cheap. Inert while --adjudicate is 0.
 //   --cycles=N      stop after N cycles (default: run forever until Ctrl-C)
 //   --gate-games=N  max games in the candidate-vs-champion match (default 2000 — mature
 //                   gains are small, and small edges need many games to clear the SPRT:
@@ -582,6 +624,14 @@ const cfg = {
   depth: num(args.depth, 8),
   openings: args.openings !== undefined ? Number(args.openings) : null, // null = gen default (8)
   openingTopk: num(args['opening-topk'], 0), // 0 = uniform-random opening (gen default)
+  // WIN ADJUDICATION (resign cutoff), forwarded to generation AND the gate — the two steps that
+  // spend the loop's search budget playing games. 0 = off (the default), so the dataset and the
+  // gate verdict are byte-for-byte what they were until someone gates this. See the --adjudicate
+  // flag doc above for the measured prize (40.3% of recorded plies are post-decision at +/-400 cp)
+  // and for the prospective T x N grid, which is the honest sizing — the retrospective number
+  // can't be used as a rule.
+  adjudicate: num(args.adjudicate, 0),
+  adjudicatePlies: num(args['adjudicate-plies'], 4),
   cycles: args.cycles !== undefined ? Number(args.cycles) : Infinity,
   gateGames: num(args['gate-games'], 2000),
   gateDepth: num(args['gate-depth'], 6),
@@ -1558,6 +1608,18 @@ function runRankPool(label, opts = {}) {
       '--no-scan', `--seed=${Date.now()}`, ...jobArg]);
 }
 
+// Win-adjudication args for the two steps that play games (generation and the gate). Empty while
+// --adjudicate is 0, which is the default — an empty array means the child's command line is
+// exactly what it was before the flag existed, so an off run can't drift from the old behaviour.
+// The two binaries read the same two flags but apply slightly different rules: apos-gen folds the
+// mover's score to White's view (self-play, one engine on both sides), apos-match requires the
+// LOSING side's own concession (two different nets, so the mover's-eval form would pay the more
+// optimistic one). See the Adjudicator comment in each.
+function adjudicateArgs() {
+  if (cfg.adjudicate <= 0) return [];
+  return [`--adjudicate=${cfg.adjudicate}`, `--adjudicate-plies=${cfg.adjudicatePlies}`];
+}
+
 // Featurize args for this recipe's dataset filters. --drop-conflicts forwards as-is.
 // --filter-weak resolves to an ABSOLUTE ledger-scale cutoff each cycle: the champion's
 // current ledger Elo minus the delta, quantized to 50-Elo steps so the cutoff (recorded in
@@ -1888,6 +1950,10 @@ log(`train:loop start — ${cfg.batch === 0
     ? `no gen (data from gate harvest${cfg.playStrong ? ` + strong --play @ depth ${cfg.playDepth}` : ' + pool'})`
     : `batch ${cfg.batch} @ depth ${cfg.depth}`} | gate ${cfg.gateGames}g @ depth ${cfg.gateDepth} `
   + `SPRT(0,${cfg.elo1})${cfg.gateFutility > 0 ? ` futility<${cfg.gateFutility}` : ''} | `
+  // Silent when off (the default), so an existing run's start line reads exactly as before.
+  + (cfg.adjudicate > 0
+    ? `adjudicate ${cfg.adjudicate}cp x${cfg.adjudicatePlies} — gen + gate only, NOT the confirmation | `
+    : '')
   + (cfg.confirmGames > 0
     ? `confirm ${cfg.confirmGames}g @ depth ${cfg.gateDepth} on a fresh seed, no SPRT — promote only `
       + `above +${cfg.confirmElo} Elo | `
@@ -1965,6 +2031,7 @@ for (let i = 1; i <= cfg.cycles && !stopRequested(); i++) {
     [`--games=${cfg.batch}`, `--depth=${cfg.depth}`, '--eval=nn',
       ...(cfg.openings !== null ? [`--openings=${cfg.openings}`] : []),
       ...(cfg.openingTopk > 0 ? [`--opening-topk=${cfg.openingTopk}`] : []),
+      ...adjudicateArgs(),
       `--seed=${Date.now()}`, ...jobArg])) break;
 
   // 2. Featurize the raw positions for the current feature set, into THIS recipe's featurized
@@ -2061,6 +2128,7 @@ for (let i = 1; i <= cfg.cycles && !stopRequested(); i++) {
     ['--eval-a=nn', `--weights-a=${candidate}`, '--eval-b=nn', `--weights-b=${champion}`,
       `--depth=${cfg.gateDepth}`, '--sprt', '--elo0=0', `--elo1=${cfg.elo1}`,
       ...(cfg.gateFutility > 0 ? [`--sprt-futility=${cfg.gateFutility}`] : []),
+      ...adjudicateArgs(),
       `--games=${cfg.gateGames}`, `--result-file=${resultFile}`,
       ...(cfg.harvest ? [`--save-games=${gateHarvest}`, `--seed=${Date.now()}`] : []), ...jobArg])) {
     // Ctrl-C / failure mid-gate: the runner still drained its played games to the harvest
