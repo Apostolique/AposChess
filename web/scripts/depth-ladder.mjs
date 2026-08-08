@@ -101,6 +101,16 @@
 //   --data=FILE     the dataset: the single source of every game, both for the ratings and for
 //                   the vs-tag record counts (default selfplay.jsonl). --no-scan skips the
 //                   tag scan only; the game-results scan is what the ratings ARE.
+//   --era=N|all     rate from games played by search era N only (default: the current
+//                   SEARCH_ERA, src/ai.js). A pool node is (engine, depth) and carries nothing
+//                   about the SEARCH, but the search decides what a depth is WORTH — with the nn
+//                   eval, era 2 loses a fixed-depth-6 match to era 1 by ~380 Elo while reaching
+//                   depth 8 on a quarter of the nodes — so pooling both under one id would fit a
+//                   weighted blend of two engines and call it one. It does not average out
+//                   either: the same match with the handcrafted eval reads -76, because the
+//                   pruning margins are sized to the nn's +/-600 cp range and barely bite on an
+//                   eval that ranges past +/-2000. Records written before the `se` field existed
+//                   are era 1. `all` mixes them for forensics only, and pins at era 1.
 //   --no-corpus     rate ONLY from the games this run plays (plus legacy-pairs.json), instead of
 //                   from the whole dataset. Debug/what-if switch: the dataset's games are the
 //                   pool's evidence, so this normally throws away almost everything. The scan
@@ -135,8 +145,8 @@ import { cpus } from 'node:os';
 import { weightsHash } from './vtag.mjs';
 import { installStop, printStopHint } from './stop.mjs';
 import { fmtDur } from './fmt.mjs';
-import { HC_VERSION } from '../src/ai.js';
-import { isGameRecord, tallyVs } from './gameRecord.mjs';
+import { HC_VERSION, SEARCH_ERA } from '../src/ai.js';
+import { isGameRecord, tallyVs, gameEra } from './gameRecord.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const webDir = resolve(here, '..');
@@ -236,6 +246,10 @@ const cfg = {
   // both sides) carry no relative signal and are skipped. --no-corpus rates only from this run's
   // own games (a what-if switch; see the header).
   corpus: !args['no-corpus'],
+  // Which search era's games count as evidence. Not a filter you tune — a node's identity is
+  // (engine, depth) and the search is the missing third coordinate, so rating two eras together
+  // fits one number to two engines. 'all' is for looking at the old pool, not for steering by.
+  era: args.era === 'all' ? 'all' : num(args.era, SEARCH_ERA),
   data: typeof args.data === 'string' ? resolve(process.cwd(), args.data) : join(dataDir, 'selfplay.jsonl'),
   // --corpus-extra=A,B: additional game files to rate from, on top of --data. For games that are
   // legitimate RATING evidence but deliberately not training data — the loop's low-depth screen
@@ -323,12 +337,57 @@ if (!engines.some((e) => `${e.eng}@${e.version}` === `hc@${HC_VERSION}`)) engine
 const node = (e, d) => ({ id: `${e.eng}${d}@${e.version}`, eng: e.eng, eval: e.eval, weights: e.weights, version: e.version, depth: d });
 const competitors = [];
 for (const e of engines) for (const d of cfg.depths) competitors.push(node(e, d));
-// The pin node hc<anchor-depth> is ALWAYS present, even if anchor-depth ∉ --depths.
-// Its rating is fixed at PIN_ELO — 1500 rather than 0 so the whole pool reads on a familiar
-// all-positive scale. Every persisted ABSOLUTE Elo (the ledger, the dataset's ephemeral
-// `elo<N>` provenance tags, the experiment tracks' absElo) lives on this scale; changing
-// PIN_ELO requires migrating all of them together.
-const PIN_ELO = 1500;
+// The pin node hc<anchor-depth> is ALWAYS present, even if anchor-depth ∉ --depths. Its rating is
+// FIXED, and that is what makes every other rating absolute: every persisted ABSOLUTE Elo (the
+// ledger, the dataset's ephemeral `elo<N>` provenance tags, the experiment tracks' absElo) lives on
+// the scale it sets, so changing a value here without migrating all of them breaks the lot.
+//
+// The value is per SEARCH ERA, because hc6 is not the same competitor across a search change — same
+// eval, different search, and at a FIXED depth it plays measurably differently. Era 1 fixes the
+// scale at 1500 by convention (it was 0 until 2026-07-17, when every persisted absolute Elo was
+// migrated +1500 in one shot). Each later era's value is the previous era's MINUS what the new
+// search costs at the pin's own depth, measured head-to-head — so a number recorded before the
+// change still means the same thing after it. Without that bridge each era would sit on its own
+// floating scale and every cross-era comparison in the repo would quietly become nonsense.
+// The offsets are measured at depth 6 (the default --anchor-depth); a different anchor depth would
+// need its own bridge, since the cost of the new search is depth-dependent.
+const PIN_ELO_BY_ERA = {
+  1: 1500, // by convention. Search: base alpha-beta (`--search=none`).
+  2: 1360, // 1500 − 140: hc6 era 2 scored 30.9% over 400 games against hc6 era 1, both at depth 6
+           // (−140 ± 36, 2026-08-08). Search: rfp,lmr,nullr,asp. Note this is the HANDCRAFTED
+           // eval's cost; the nn eval loses ~380 at the same depth, so an era shift is not one
+           // number you could have applied to the old ladder — every node is re-measured.
+};
+// Scheduling prior from the PREVIOUS era's archived ladder. Never evidence — it decides who plays
+// whom, never what anyone is rated. A node with no games in this era sits at the flat prior, so
+// "nearest Elo" can't tell a 2000-strength net from an 800 one, and every node's first matchup is
+// a blowout that measures almost nothing. The old ladder still knows their rough order, and order
+// is all an opponent choice needs. Values are shifted by the two eras' pin difference so they
+// compare against this era's fitted numbers; the shift is approximate (the search costs each eval
+// a different amount) but it only has to be right to a few hundred Elo to pick a sane opponent.
+const priorEraElo = (() => {
+  const m = new Map();
+  const prev = typeof cfg.era === 'number' ? cfg.era - 1 : 0;
+  if (!(prev >= 1)) return m;
+  const file = cfg.ledger.replace(/\.json$/, '') + `.era${prev}.json`;
+  if (!existsSync(file)) return m;
+  try {
+    const led = JSON.parse(readFileSync(file, 'utf8'));
+    const shift = PIN_ELO_BY_ERA[cfg.era] - (led.anchorElo ?? PIN_ELO_BY_ERA[prev] ?? 1500);
+    for (const e of led.ranking || []) if (e.tag && e.elo != null) m.set(e.tag, e.elo + shift);
+    m.note = `${m.size} node(s) from the era-${prev} ladder, shifted ${shift >= 0 ? '+' : ''}${shift.toFixed(0)}`;
+  } catch { /* unreadable archive -> no prior, everyone starts flat */ }
+  return m;
+})();
+
+const PIN_ELO = PIN_ELO_BY_ERA[cfg.era === 'all' ? 1 : cfg.era];
+if (PIN_ELO == null) {
+  console.error(`No measured pin for search era ${cfg.era}. Bridge it to the previous era first:\n`
+    + `  apos-match --eval-a=handcrafted --eval-b=handcrafted --depth=${cfg.anchorDepth} `
+    + `--depth-b=${cfg.anchorDepth} --search-b=<previous era's spec> --games=400\n`
+    + `then add (previous era's pin + the reported Elo) to PIN_ELO_BY_ERA in scripts/depth-ladder.mjs.`);
+  process.exit(1);
+}
 const pinId = `hc${cfg.anchorDepth}@${HC_VERSION}`;
 if (!competitors.some((c) => c.id === pinId)) competitors.push(node(makeEngine('hc'), cfg.anchorDepth));
 // A depth-qualified --play node may name a depth outside --depths; force that exact node in
@@ -382,10 +441,11 @@ const sessionPairs = new Map();
 
 // The frozen remainder of the old pairwise store: 37 pairs / 2256 games the pool played before it
 // harvested its games, which therefore exist nowhere else. Additive and never rewritten, so it
-// needs none of the reconciliation the old store did. --fresh ignores it.
+// needs none of the reconciliation the old store did. All of it is era-1 play, so it only counts
+// when era 1 is what's being rated. --fresh ignores it.
 const legacyPairs = new Map();
 const legacyFile = join(loopDir, 'legacy-pairs.json');
-if (!cfg.fresh && existsSync(legacyFile)) {
+if (!cfg.fresh && (cfg.era === 'all' || cfg.era === 1) && existsSync(legacyFile)) {
   try {
     const l = JSON.parse(readFileSync(legacyFile, 'utf8'));
     for (const [k, v] of Object.entries(l.pairs || {})) legacyPairs.set(k, { games: v.games, sumA: v.sumA });
@@ -440,6 +500,38 @@ function directLinks() {
   const m = new Map();
   for (const [k, v] of combinedPairs()) m.set(k, v.games);
   return m;
+}
+
+// Connected components of the played-games graph, as a find(id) -> root. A rating is only
+// ABSOLUTE if a chain of games reaches the pin; without one the fit just shrinks the node toward
+// the pool mean and reports an ordinary-looking Elo with an ordinary-looking margin for something
+// that has never been measured against the scale at all. Every other signal here (mis-order cost,
+// the link floor, the depth curves) quietly assumes that chain exists, because on a warm pool it
+// always does.
+//
+// Measured 2026-08-08 on the era-2 rebuild, which started from an empty corpus: 3 hours, 96
+// matchups, and the graph came out a perfect MATCHING — 192 nodes, 96 pairs, not one node in two
+// pairs, the pin touching only hc5. The link branch plays the least-linked rank-ADJACENT pair, and
+// when every node sits at the same prior Elo "adjacent" just walks the sorted array, so it plays
+// (0,1), then (2,3), then (4,5); one matchup clears each pair's floor and it never comes back. It
+// pairs the pool off instead of stringing it together. Hence the connectivity branch in
+// pickMatchup, which is inert once everything is in one component.
+function componentOf() {
+  const parent = new Map();
+  const add = (x) => { if (!parent.has(x)) parent.set(x, x); };
+  const find = (x) => {
+    add(x);
+    while (parent.get(x) !== x) { parent.set(x, parent.get(parent.get(x))); x = parent.get(x); }
+    return x;
+  };
+  for (const c of ratedNodes()) add(c.id);
+  for (const [key, v] of combinedPairs()) {
+    if (!(v.games > 0)) continue;
+    const [i, j] = key.split('|');
+    const ri = find(i), rj = find(j);
+    if (ri !== rj) parent.set(ri, rj);
+  }
+  return find;
 }
 
 // --- rated pool = competitors + every node the dataset already knows -------------
@@ -621,6 +713,36 @@ const ONBOARD_BAND = 25;
 function pickMatchup(elo, varDiff, iter, gamesOf) {
   const links = directLinks();
   const linked = (a, b) => links.get(pairKey(a, b)) || 0;
+  // CONNECTIVITY comes before everything else. A node with no chain of games to the pin isn't
+  // badly rated, it's UNRATED — the number next to it is the prior. So grow the pin's component
+  // one node at a time, taking the cheapest link available each time (the outside node whose
+  // provisional strength sits closest to something already inside), which both anchors that node
+  // and keeps the game in the informative 30-70% band. Provisional strength comes from the
+  // previous era's ladder when this era has no games for the node yet; without it every outside
+  // node looks identical and the first matchup is a coin-flip about who to play. Inert as soon as
+  // the pool is one component, which is every warm run — it fires after a re-baseline or on a
+  // fresh clone. See componentOf for the measurement that made this necessary.
+  if (schedulable.length > 1) {
+    const find = componentOf();
+    const home = find(pinId);
+    // Inside the pin's component the fitted Elo is a measurement, so use it. OUTSIDE it the fitted
+    // Elo is fiction whether or not the node has games: an island of two nodes that only played
+    // each other gets a confident-looking number that is really the prior plus their head-to-head,
+    // floating free of the scale. So an unanchored node is placed by the previous era's ladder
+    // when there is one, which is the difference between anchoring nn7 against hc5 (a ~100% score
+    // that measures almost nothing) and against something its own size.
+    const provisional = (c, isHome) => (isHome ? elo.get(c.id) : (priorEraElo.get(c.id) ?? elo.get(c.id)));
+    const inside = [], outside = [];
+    for (const c of schedulable) (find(c.id) === home ? inside : outside).push(c);
+    if (inside.length && outside.length) {
+      let pair = null, best = Infinity;
+      for (const o of outside) for (const i of inside) {
+        const d = Math.abs(provisional(o, false) - provisional(i, true));
+        if (d < best) { best = d; pair = [o, i]; }
+      }
+      if (pair) return { pair, reason: 'connect', metric: outside.length, floor: 0 };
+    }
+  }
   if (cfg.onboard > 0 && schedulable.length > 1) {
     const avg = schedulable.reduce((s, c) => s + gamesOf(c.id), 0) / schedulable.length;
     const floor = cfg.onboard * avg;
@@ -776,7 +898,7 @@ async function scanDataset() {
 async function scanCorpus() {
   if (!cfg.corpus) return;
   if (!existsSync(cfg.data)) { console.warn(`(no dataset at ${cfg.data} — nothing to rate from)`); return; }
-  let skippedSelf = 0, noPlayers = 0;
+  let skippedSelf = 0, noPlayers = 0, skippedEra = 0;
   // --data plus any --corpus-extra files. They're read identically: a game record's players +
   // result is rating evidence wherever it lives, and keeping the extras out of --data is a
   // TRAINING-set decision, not a rating one.
@@ -794,6 +916,7 @@ async function scanCorpus() {
         if (!line) continue;
         let rec; try { rec = JSON.parse(line); } catch { continue; }
         if (!isGameRecord(rec) || !rec.players) { noPlayers++; continue; }
+        if (cfg.era !== 'all' && gameEra(rec) !== cfg.era) { skippedEra++; continue; } // another engine's games
         const a = rec.players.w, b = rec.players.b;
         if (!a || !b || a === '?' || b === '?') { noPlayers++; continue; }
         if (a === b) { skippedSelf++; continue; } // self-play: uninformative for relative ranking
@@ -809,7 +932,8 @@ async function scanCorpus() {
     if (sources.length > 1) console.log(`  +${corpusGames - before} game(s) from this file.`);
   }
   console.log(`  corpus: ${corpusGames} mixed-engine games -> ${corpusPairs.size} pair(s) rated `
-    + `(${skippedSelf} self-play skipped).`);
+    + `(${skippedSelf} self-play skipped`
+    + `${cfg.era === 'all' ? ', ALL eras pooled — forensic only' : `, ${skippedEra} from another search era`}).`);
 }
 const parseTag = (tag) => { const m = /^(nn|hc)(\d+|t)@(.+)$/.exec(tag); return m ? { eng: m[1], depth: m[2], version: m[3] } : null; };
 
@@ -834,6 +958,12 @@ const median = (xs) => { if (!xs.length) return null; const s = [...xs].sort((a,
 const RESOLVED_COST = 5; // Elo; mis-order risk below this is beneath the ledger's decision granularity
 function convergenceReport(elo, varDiff) {
   const links = directLinks();
+  // Signal 0a, ahead of the link floor: is each node even ON the scale? An unanchored node has no
+  // chain of games to the pin, so its Elo is the prior wearing a fitted number's clothes, and every
+  // signal below it (gaps, mis-order cost, depth curves) is computed from that fiction.
+  const findComp = componentOf();
+  const pinComp = findComp(pinId);
+  const unanchored = competitors.filter((c) => findComp(c.id) !== pinComp);
   const sorted = [...competitors].sort((a, b) => elo.get(a.id) - elo.get(b.id));
   const pairs = [];
   for (let i = 1; i < sorted.length; i++) {
@@ -880,11 +1010,14 @@ function convergenceReport(elo, varDiff) {
   const confInvTotal = curves.reduce((s, c) => s + c.confInv, 0);
   const nonMono = curves.filter((c) => c.inv > 0).sort((a, b) => b.worst - a.worst);
 
+  const anchored = unanchored.length === 0;
   const linkedOk = cfg.link === 0 || underLinked.length === 0;
   const resolved = worstPair == null || worstPair.cost < RESOLVED_COST;
   const ordered = confInvTotal === 0;
   let verdict;
-  if (!linkedOk) verdict = `NOT converged — ${underLinked.length} adjacent pair(s) under the ${cfg.link}-game direct-link floor (${unlinked.length} have never met), so their order rests on transitivity. `
+  if (!anchored) verdict = `NOT converged — ${unanchored.length} of ${competitors.length} node(s) have no chain of games to ${pinId}, `
+    + `so their Elo is the prior rather than a measurement (nearest unanchored: ${unanchored[0].id}). The scheduler anchors them first.`;
+  else if (!linkedOk) verdict = `NOT converged — ${underLinked.length} adjacent pair(s) under the ${cfg.link}-game direct-link floor (${unlinked.length} have never met), so their order rests on transitivity. `
     + `${fixableLinks ? `Keep running (${fixableLinks} schedulable here).` : 'None are schedulable by this run — widen --depths/--play.'}`;
   else if (!resolved) verdict = `NOT converged — worst adjacent pair risks ${worstPair.cost.toFixed(1)} Elo of mis-order (want < ${RESOLVED_COST}). Keep running.`;
   else if (!ordered) verdict = `RESOLVED but ${confInvTotal} confident depth inversion(s) — possible non-transitivity/bug, inspect.`;
@@ -893,10 +1026,11 @@ function convergenceReport(elo, varDiff) {
   return {
     summary: {
       pairs: pairs.length, medPairMargin, medGap, misorderCost, worstPair,
+      unanchored: unanchored.length, anchored,
       linkFloor: cfg.link, adjacentUnderLinked: underLinked.length, adjacentUnlinked: unlinked.length,
       adjacentUnderLinkedSchedulable: fixableLinks, worstLinkPair,
       versionsMonotonic: monotonic, versionsWithDepthCurve: curves.length, confidentInversions: confInvTotal,
-      linked: linkedOk, resolved, ordered, converged: linkedOk && resolved && ordered, verdict,
+      linked: linkedOk, resolved, ordered, converged: anchored && linkedOk && resolved && ordered, verdict,
     },
     nonMono, elo,
   };
@@ -908,6 +1042,8 @@ function printConvergence(rep) {
   const pairLbl = (id) => { const c = byId.get(id); return c ? nodeLabel(c) : id; };
   const wl = s.worstLinkPair;
   console.log(`\n===== Convergence check =====`);
+  console.log(`  on the scale: ${s.pairs + 1 - s.unanchored}/${s.pairs + 1} node(s) have a chain of games to the pin`
+    + `${s.unanchored ? `  |  ${s.unanchored} still rated at the prior, not measured` : ''}`);
   console.log(`  direct links: ${s.adjacentUnderLinked} of ${s.pairs} adjacent pair(s) below the ${s.linkFloor}-game floor, ${s.adjacentUnlinked} never met`
     + `${s.adjacentUnderLinked === s.adjacentUnderLinkedSchedulable ? '' : ` (${s.adjacentUnderLinkedSchedulable} schedulable this run)`}`
     + `${wl == null ? '' : `  |  highest-ranked: ${pairLbl(wl.a)} vs ${pairLbl(wl.b)} (${wl.direct} direct, gap ${wl.gap.toFixed(0)})`}`);
@@ -932,9 +1068,17 @@ function writeRankLedger(verbose) {
   const ranked = [...rated].sort((a, b) => elo.get(a.id) - elo.get(b.id));
   const recordsByVersion = new Map();
   for (const [tag, n] of tagCounts) { const t = parseTag(tag); if (!t) continue; const k = `${t.eng}@${t.version}`; recordsByVersion.set(k, (recordsByVersion.get(k) || 0) + n); }
+  // `anchored` separates a MEASURED rating from a placeholder. Without a chain of games to the pin
+  // a node's row still carries an Elo and a margin, and it reads exactly like a real one — which
+  // matters because consumers take the MAX across a version's depths (ledgerBestByVersion,
+  // championLedgerElo), so a placeholder sitting near the pool mean can outrank the depths that
+  // were actually played and get consumed as that champion's strength.
+  const findComp = componentOf();
+  const pinComp = findComp(pinId);
   const ranking = ranked.map((c) => ({
     tag: c.id, eng: c.eng, version: c.version, name: niceName(c.version), depth: String(c.depth),
     anchor: c.id === pinId, elo: elo.get(c.id), score: null,
+    anchored: findComp(c.id) === pinComp,
     margin: ci.get(c.id) ?? null, games: gamesOf(c.id),
     // No eval means the dataset has games for a node this run can't build an engine for, so its
     // rating stands but nothing can play it again until its weights are back in the archive.
@@ -959,6 +1103,9 @@ function writeRankLedger(verbose) {
   const conv = convergenceReport(elo, varDiff);
   const ledger = {
     generated: new Date().toISOString(), anchor: pinId, method: 'bradley-terry-pool',
+    // Which engine these ratings describe. A consumer comparing a stored absElo against this
+    // ledger is comparing across eras unless they match (see --era and src/ai.js SEARCH_ERA).
+    era: cfg.era, anchorElo: PIN_ELO,
     depths: cfg.depths, games: cfg.games, seed: cfg.seed,
     // The regularizer belongs to the fit, not to the run: it sits on the diagonal of the Fisher
     // information, so anything that wants to rebuild a contrast variance from `ranking` + the pool
@@ -1001,7 +1148,8 @@ function writeRankLedger(verbose) {
 
 console.log(`Engine ranking pool (active scheduler)`);
 console.log(`  ${competitors.length} node(s): ${competitors.map((c) => `${c.id.split('@')[0]}@${c.version.slice(0, 6)}${niceName(c.version) ? ` (${niceName(c.version)})` : ''}`).join(', ')}`);
-console.log(`  pin ${pinId} | ${cfg.games} games/matchup | onboard ${cfg.onboard ? `${cfg.onboard}×avg` : 'off'} | link floor ${cfg.link || 'off'} | ${cfg.jobs} parallel job(s)`);
+console.log(`  pin ${pinId} := ${PIN_ELO} | search era ${cfg.era}${cfg.era === 'all' ? ' (MIXED — forensic only)' : ''} | ${cfg.games} games/matchup | onboard ${cfg.onboard ? `${cfg.onboard}×avg` : 'off'} | link floor ${cfg.link || 'off'} | ${cfg.jobs} parallel job(s)`);
+if (priorEraElo.note) console.log(`  scheduling prior: ${priorEraElo.note} (picks opponents for unrated nodes, never a rating)`);
 if (playMatch) console.log(`  --play: new games only among ${schedulable.map(nodeLabel).join(', ')} (rest rated from existing data)`);
 if (!cfg.pinPlay) console.log(`  --no-pin-play: ${pinId} is rated but plays nothing new (${schedulable.length} schedulable node(s))`);
 else if (!cfg.depths.includes(cfg.anchorDepth)) console.log(`  note: the pin is at depth ${cfg.anchorDepth}, outside --depths, so it plays cross-depth games (--no-pin-play keeps new games inside --depths)`);
@@ -1083,6 +1231,7 @@ if (cfg.rounds === 0) {
     const why = reason === 'ordering' ? `ordering: gap ${gap.toFixed(0)} Elo at P(mis-order) ${(amb * 100).toFixed(0)}% — matchup buys ${metric.toFixed(2)} Elo`
       : reason === 'onboard' ? `onboard: ${metric} game(s), below floor ${floor.toFixed(0)} (${cfg.onboard}×pool avg), ${direct} direct game(s) with this opponent`
       : reason === 'link' ? `link: rank-adjacent on ${metric} direct game(s), below the ${floor}-game floor`
+      : reason === 'connect' ? `connect: ${metric} node(s) still have no chain of games to the pin, so their Elo is the prior — anchoring the closest one`
       : `rigidity: ±${metric.toFixed(0)} Elo`;
     // Announce with each node's CURRENT fitted Elo ±95 (the ledger's real estimate), so the
     // matchup reads on the stable hc scale up front — the match runner's own live Elo is only
