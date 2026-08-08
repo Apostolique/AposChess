@@ -39,6 +39,35 @@ zig build gen    -Doptimize=ReleaseFast -- --games=200 --depth=6 --eval=nn
 zig build wasm                         # -> zig-out/bin/apos.wasm
 ```
 
+## Gating a search change (`--search`)
+
+`ai.SearchOpts` is a switch per search refinement above the base alpha-beta —
+`rfp`, `fp`, `lmp`, `lmr`, `hist`, `nullr`, `asp` (see `ai.zig` for what each is, and
+for the gate numbers that decided which are on). `apos-match` takes `--search-a=SPEC` /
+`--search-b=SPEC` and `apos-bench` takes `--search=SPEC`, so **one binary plays its new
+search against its own predecessor** and the two sides provably differ in nothing else.
+A spec that names features (`rfp,lmr`) enables exactly those; a spec that only subtracts
+(`-rfp`) starts from the shipped set; `none` is every switch off (the search before any
+of these existed, and what a change is gated against), `all` is every switch on
+including the ones that lost, `default` is the shipped set. An unknown name is a hard
+error, because a typo would otherwise play the shipped search against itself and report
+"no change" — the one answer a search gate must never produce by accident.
+
+**A fixed-DEPTH match cannot gate a search change**, and the failure is not subtle:
+a selective search visits ~10× fewer nodes at the same nominal depth, so it loses a
+depth-paced match by hundreds of Elo while being several times faster to that depth.
+Pace the gate by `--nodes` (equal work, deterministic) or `--movetime` (equal time,
+but reads machine load into the score). `--nodes` with the `-b` twin also prices an
+uneven per-node cost: a refinement that adds a static eval per interior node buys its
+tree reduction with nodes/sec, so giving the baseline proportionally more nodes turns
+an equal-work match into an equal-time one without leaving the deterministic budget.
+
+`apos-bench --search=SPEC` is the cheap screen that comes first: at a fixed depth it
+reports how much smaller the tree got, and (with `--nodes=N`) how much deeper the same
+budget reaches. Run it over a spread of real midgame positions rather than the start
+position — this variant's opening is unusually closed and reads nothing like the
+middlegame the loop actually plays.
+
 From `web/`, `npm run build:wasm` rebuilds + copies `apos.wasm` into `public/` (so the
 GitHub Pages deploy needs no Zig toolchain), and `npm run match` / `npm run train:gen`
 run the native binaries through their shims.
