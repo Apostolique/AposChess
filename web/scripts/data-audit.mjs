@@ -79,7 +79,7 @@ import { fileURLToPath } from 'node:url';
 
 import { fmtDur, fmtNum, fmtMB, printWrapped, liveStatus, everyMs } from './fmt.mjs';
 import { expandPositions } from './gameRecord.mjs';
-import { _internal } from '../src/ai.js';
+import { _internal, SEARCH_ERA } from '../src/ai.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const webDir = resolve(here, '..');
@@ -164,6 +164,7 @@ const binOf = (a) => (ceilAligned && a === scale ? ceilBin : Math.min(Math.floor
 const bins = new Array(nBins + 1).fill(0);
 let games = 0, plies = 0, valued = 0, missingV = 0;
 let resW = 0, resD = 0, resL = 0;
+const eraGames = new Map(), eraPlies = new Map(); // search era -> games / recorded plies
 let sgnPos = 0, sgnNeg = 0, sgnZero = 0;
 let within100 = 0, mates = 0, saturated = 0, beyond = 0, atCeiling = 0;
 let gainSum = 0; // Σ 1 − (v/scale)² over non-mate labels
@@ -232,6 +233,11 @@ for await (const line of rl) {
     games++;
     plies += n;
     if (rec.r > 0) resW++; else if (rec.r < 0) resL++; else resD++;
+    // Which search played it. A depth is worth a different amount under a different search, so
+    // this is the split that says how much of the corpus describes the engine running today.
+    const era = rec.se == null ? 1 : rec.se;
+    eraGames.set(era, (eraGames.get(era) || 0) + 1);
+    eraPlies.set(era, (eraPlies.get(era) || 0) + n);
 
     if (v) {
       for (let i = 0; i < n; i++) {
@@ -332,6 +338,14 @@ console.log(`  Recorded plies per game: ${(plies / Math.max(1, games)).toFixed(1
 console.log(`  Results (White view):    win ${p1(resW, games)}   draw ${p1(resD, games)}   loss ${p1(resL, games)}`);
 console.log(`    → White scores ${(100 * whiteScore).toFixed(1)}% (win=1, draw=½)`
   + `${Number.isFinite(scoreElo) ? `, about ${scoreElo >= 0 ? '+' : ''}${scoreElo.toFixed(0)} Elo of first-move advantage` : ''}.`);
+{
+  // Search era (record `se`, absent = 1). The rating pool rates one era at a time, so this is
+  // how much evidence the CURRENT engine's ladder actually has to work with.
+  const eras = [...eraGames.keys()].sort((a, b) => a - b);
+  const parts = eras.map((e) => `era ${e} ${p1(eraGames.get(e), games)}`
+    + ` (${fmtNum(eraPlies.get(e))} plies)${e === SEARCH_ERA ? ' ← this engine' : ''}`);
+  console.log(`  Search era:             ${parts.join('   ')}`);
+}
 
 // --- 1. Saturation against the net's own scale. -------------------------------------------
 console.log(`\n=== 1. Eval saturation against the net's own scale (${scale} cp) ===\n`);
