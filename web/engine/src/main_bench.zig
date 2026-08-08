@@ -7,9 +7,14 @@
 // cost that (for a given arch+quant) is independent of the weights, so it says how many
 // nodes the net can search in the browser's per-move budget — read it like a frame-time
 // meter, not against another net.
-//   zig build bench -- --depth=8 [--nn | --weights=PATH] [--fen="..."]
+//   zig build bench -- --depth=8 [--nn | --weights=PATH] [--fen="..."] [--nodes=N] [--search=SPEC]
 // --weights=PATH benches an arbitrary net (implies --nn); pass an absolute path when
 // running from outside the engine dir (the --nn default is relative to cwd).
+// --search=SPEC picks which search refinements run (ai.SearchOpts: rfp,fp,lmp,lmr,hist,
+// nullr,asp, plus all/none), and --nodes=N paces by nodes instead of depth. Together they
+// read out what a pruning change actually bought, which a match can only measure
+// statistically: at a fixed DEPTH, fewer nodes for the same move; at a fixed NODE budget,
+// a deeper completed iteration.
 
 const std = @import("std");
 const board = @import("board.zig");
@@ -40,6 +45,8 @@ pub fn main(init: std.process.Init) !void {
     var use_nn = false;
     var weights_path: []const u8 = "../src/nn-weights.json";
     var fen: []const u8 = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+    var max_nodes: u64 = 0; // 0 = no node budget (pure fixed depth)
+    var opts: ai.SearchOpts = .{};
 
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
     for (argv[1..]) |arg| {
@@ -52,6 +59,14 @@ pub fn main(init: std.process.Init) !void {
             use_nn = true;
         } else if (std.mem.startsWith(u8, arg, "--fen=")) {
             fen = arg["--fen=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--nodes=")) {
+            max_nodes = std.fmt.parseInt(u64, arg["--nodes=".len..], 10) catch max_nodes;
+            if (depth == 8) depth = 99; // a node budget paces the search; let it iterate freely
+        } else if (std.mem.startsWith(u8, arg, "--search=")) {
+            opts = ai.SearchOpts.parse(arg["--search=".len..]) orelse {
+                std.debug.print("unknown --search feature in '{s}'\n", .{arg["--search=".len..]});
+                std.process.exit(2);
+            };
         }
     }
 
@@ -66,10 +81,11 @@ pub fn main(init: std.process.Init) !void {
 
     var s = try ai.Searcher.init(gpa, io, if (use_nn) .nn else .handcrafted, net_ptr, 1);
     defer s.deinit();
+    s.opts = opts;
 
     const st = board.parseFen(fen);
     const t0 = std.Io.Clock.now(.awake, io).nanoseconds;
-    const res = s.chooseMove(&st, depth, 0, 0, &.{}); // 0 ms, 0 nodes = pure fixed depth
+    const res = s.chooseMove(&st, depth, 0, max_nodes, &.{}); // 0 ms; 0 nodes = pure fixed depth
     const elapsed_ns = std.Io.Clock.now(.awake, io).nanoseconds - t0;
     const ms: u64 = @intCast(@max(1, @divTrunc(elapsed_ns, 1_000_000)));
 

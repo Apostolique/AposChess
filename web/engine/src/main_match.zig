@@ -576,6 +576,11 @@ const Cfg = struct {
     kind_b: ai.EvalKind,
     net_a: ?*const nn.Net,
     net_b: ?*const nn.Net,
+    // Which search refinements each side runs (--search-a/--search-b). This is what makes a
+    // SEARCH change gateable: one binary plays its new search against its own predecessor,
+    // so the two sides differ in exactly the named features and in nothing else.
+    opts_a: ai.SearchOpts,
+    opts_b: ai.SearchOpts,
     // Eval-divergence probe (only when both sides are nn). Static-eval both nets on every
     // midgame position to measure how differently they judge the game — a diversity signal.
     div_enabled: bool,
@@ -859,6 +864,8 @@ fn worker(sh: *Shared, idx: usize) void {
     defer sa.deinit();
     var sb = ai.Searcher.init(pa, sh.cfg.io, sh.cfg.kind_b, sh.cfg.net_b, 1) catch return;
     defer sb.deinit();
+    sa.opts = sh.cfg.opts_a;
+    sb.opts = sh.cfg.opts_b;
 
     while (true) {
         sh.mutex.lockUncancelable(sh.cfg.io);
@@ -1497,6 +1504,11 @@ pub fn main(init: std.process.Init) !void {
     // as the champion. Non-nn evals (handcrafted/hc3/material) need no net and leave it null.
     var weights_a: ?[]const u8 = null;
     var weights_b: ?[]const u8 = null;
+    // Search refinements per side, both at the full shipped set unless --search-a/-b says
+    // otherwise. `--search-b=none` is the pre-refinement search, which is what a search
+    // change is gated against.
+    var opts_a: ai.SearchOpts = .{};
+    var opts_b: ai.SearchOpts = .{};
     var sprt = false;
     var elo0: f64 = 0;
     var elo1: f64 = 15;
@@ -1538,6 +1550,16 @@ pub fn main(init: std.process.Init) !void {
         if (argStr(arg, "--eval-b=")) |v| eval_b = parseEval(v);
         if (argStr(arg, "--weights-a=")) |v| weights_a = v;
         if (argStr(arg, "--weights-b=")) |v| weights_b = v;
+        // A typo here would silently play the full search against itself and report "no
+        // change", which is the one answer a search gate must never produce by accident.
+        if (argStr(arg, "--search-a=")) |v| opts_a = ai.SearchOpts.parse(v) orelse {
+            std.debug.print("unknown --search-a feature in '{s}' (known: rfp,fp,lmp,lmr,hist,nullr,asp, plus all/none)\n", .{v});
+            std.process.exit(2);
+        };
+        if (argStr(arg, "--search-b=")) |v| opts_b = ai.SearchOpts.parse(v) orelse {
+            std.debug.print("unknown --search-b feature in '{s}' (known: rfp,fp,lmp,lmr,hist,nullr,asp, plus all/none)\n", .{v});
+            std.process.exit(2);
+        };
         if (std.mem.eql(u8, arg, "--sprt")) sprt = true;
         if (argStr(arg, "--elo0=")) |v| elo0 = std.fmt.parseFloat(f64, v) catch elo0;
         if (argStr(arg, "--elo1=")) |v| elo1 = std.fmt.parseFloat(f64, v) catch elo1;
@@ -1644,6 +1666,8 @@ pub fn main(init: std.process.Init) !void {
             .kind_b = eval_b,
             .net_a = net_a,
             .net_b = net_b,
+            .opts_a = opts_a,
+            .opts_b = opts_b,
             // Divergence probe runs only when BOTH sides are nn (it compares two nets' judgment).
             .div_enabled = eval_a == .nn and eval_b == .nn,
             .div_margin = div_margin,
@@ -1685,7 +1709,16 @@ pub fn main(init: std.process.Init) !void {
         (std.fmt.bufPrint(&adjbuf, " | adjudicate {d}cp x{d} own moves", .{ adjudicate, adjudicate_plies }) catch "")
     else
         "";
-    std.debug.print("Playing {d} games | budget {s}/{s} | openings {d} | jobs {d} | seed {d}{s}\n", .{ games, pace_a, pace_b, openings, jobs, seed, adjseg });
+    // Echo the per-side search sets whenever they are not both the full one — a search gate's
+    // whole meaning is which features each side ran, and it must be legible in the log.
+    var sa_buf: [64]u8 = undefined;
+    var sb_buf: [64]u8 = undefined;
+    var searchbuf: [160]u8 = undefined;
+    const searchseg: []const u8 = if (std.meta.eql(opts_a, ai.SearchOpts{}) and std.meta.eql(opts_b, ai.SearchOpts{}))
+        ""
+    else
+        (std.fmt.bufPrint(&searchbuf, " | search {s}/{s}", .{ opts_a.describe(&sa_buf), opts_b.describe(&sb_buf) }) catch "");
+    std.debug.print("Playing {d} games | budget {s}/{s} | openings {d} | jobs {d} | seed {d}{s}{s}\n", .{ games, pace_a, pace_b, openings, jobs, seed, adjseg, searchseg });
 
     const t0 = std.Io.Clock.now(.awake, io).nanoseconds;
     shared.t0_ns = @intCast(t0); // so the live progress line can show elapsed/ETA
