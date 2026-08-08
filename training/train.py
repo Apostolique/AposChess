@@ -141,7 +141,28 @@ def parse_args():
                         "the first-layer upgrade plan relies on this (docs/"
                         "first-layer-strategy.md).")
     p.add_argument("--scale", type=float, default=600.0,
-                   help="centipawns at tanh saturation (written into the weights)")
+                   help="centipawns at tanh saturation (written into the weights). "
+                        "NOTE: a warm start ADOPTS the --init file's scale and ignores "
+                        "this, so on the loop's default warm path --scale is inert; pass "
+                        "--rescale to actually move it.")
+    p.add_argument("--rescale", action="store_true",
+                   help="honour --scale even on a warm start, compensating the head so the "
+                        "child begins from (approximately) the parent's centipawn function. "
+                        "Without this, --scale is silently overridden by the --init file's "
+                        "value, and since every warm-start source resolves to a net that "
+                        "itself warm-started, the scale is frozen by inheritance: all 22 "
+                        "archived champions carry scale=600, unchanged across 496 cycles "
+                        "and 29 experiment tracks. That matters because the squash also "
+                        "CAPS the eval: tanh(z)*600 can never report more than 600 cp, "
+                        "less than a queen (900) in a variant where knight ~= rook ~= 500, "
+                        "so 'up a rook' and 'up a queen and a rook' are the same number. "
+                        "Measured on the 34.8M-position set (2026-08-08): |v| piles up "
+                        "against the ceiling — 6.3%% in 400-450, 10.4%% in 450-500, 12.2%% "
+                        "in 500-550, 9.7%% in 550-600, then 0.11%% past 600 — so 32.3%% of "
+                        "positions sit in tanh's saturation zone (plus 7.7%% mate scores), "
+                        "where the (1 - tanh^2) gradient factor collapses. Those positions "
+                        "contribute loss but almost no gradient, which is also the simplest "
+                        "explanation for val loss having stopped tracking strength.")
     p.add_argument("--quant", action="store_true",
                    help="export INTEGER (quantized) weights instead of float: layer-0 "
                         "weights/bias at fixed-point scale QA, dense weights at QW (biases "
@@ -626,8 +647,38 @@ def main():
                                 graft_noise=args.graft_noise, allow_graft=not args.no_graft,
                                 seed=args.seed)
         if init_scale is not None and init_scale != args.scale:
-            print(f"Adopting scale {init_scale} from --init (was {args.scale}).")
-            args.scale = init_scale
+            if args.rescale:
+                # Keep the requested --scale and rescale the HEAD so the child starts from
+                # the parent's function rather than from a net whose output is suddenly
+                # mis-calibrated by the ratio of the two scales.
+                #
+                # Output in centipawns is tanh(z) * scale, so preserving it exactly across a
+                # scale change would need z_c = atanh(tanh(z_p) * s_p / s_c) — not a linear
+                # reparametrization, so no weight edit achieves it everywhere. But tanh is
+                # linear near 0, so scaling the head's weight and bias by s_p/s_c makes the
+                # two agree to first order, exactly where the eval needs its resolution.
+                # The error grows only in the tails — and in the direction we want: when
+                # s_c > s_p the factor shrinks z, pulling the previously-saturated 400-600
+                # band back into the gradient-carrying part of the tanh. That is the point
+                # of the flag, not a side effect. (Same spirit as the Net2WiderNet graft
+                # above: start the child on the parent's function, then fine-tune.)
+                factor = init_scale / args.scale
+                with torch.no_grad():
+                    head = model.lins[-1]
+                    head.weight.mul_(factor)
+                    head.bias.mul_(factor)
+                print(f"Rescaling {init_scale} -> {args.scale}: head scaled by "
+                      f"{factor:.4f} (function-preserving to first order).")
+            else:
+                print(f"Adopting scale {init_scale} from --init (was {args.scale}).")
+                # An explicit --scale that gets silently overridden is a footgun: the loop
+                # treats scale as a recipe knob (it keys its own experiment track and shows
+                # up as `s1200` in the track name), so a scale trial would appear to run,
+                # hash a new track, and train at the inherited scale the whole time. Say so.
+                if any(a == "--scale" or a.startswith("--scale=") for a in sys.argv[1:]):
+                    print(f"  WARNING: --scale={args.scale:g} was IGNORED in favour of the "
+                          f"--init file's {init_scale:g}. Pass --rescale to honour it.")
+                args.scale = init_scale
 
     # TD/bootstrap target: blend the game result with the recorded search value
     # (target = lam*result + (1-lam)*tanh(v/scale)). lam=1 -> pure result (unchanged).
