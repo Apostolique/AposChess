@@ -35,12 +35,29 @@
 //   --opening-topk=N  forwarded to gen: 0 (default) = uniform-random openings; N>=1
 //                   samples among the engine's N best opening moves (sound but varied).
 //                   Off by default, so the loop's data is unchanged unless you set it.
-//   --adjudicate=CP  WIN ADJUDICATION (resign cutoff), forwarded to BOTH game producers: the
-//                   generation step AND the gate. 0 = OFF and that is the default, so nothing
-//                   about the loop changes until this is gated. A game ends as a win for the
-//                   leading side once the search score has held at or past CP centipawns for
-//                   --adjudicate-plies consecutive plies.
-//                   Why it is worth a gating run: `npm run data:audit` over the 372,459-game /
+//   --adjudicate=CP  WIN ADJUDICATION (resign cutoff) for the GATE. Default 500; 0 = off.
+//                   A game is scored as a loss for a side once that side's OWN search has
+//                   reported at or past -CP for --adjudicate-plies consecutive of its own
+//                   moves. It is ON by default because it was A/B'd (2026-08-08): the same
+//                   600-game matchup, same seed, played with and without it measured
+//                   +139 +/- 29 Elo and +140 +/- 29 Elo — exactly ONE game of 600 differed
+//                   (a draw became a win) — while cutting nodes 15.2% (2.19e9 -> 1.86e9).
+//                   535 of the 600 games adjudicated. That is the whole trade: the gate's
+//                   verdict is unchanged and the gate gets ~15% cheaper.
+//                   It is deliberately NOT forwarded to the confirmation match or the screen,
+//                   which leaves the confirmation an unmodified played-out yardstick.
+//   --gen-adjudicate=CP  the same rule for the GENERATION step, 0 = off and that is the
+//                   default. Generation is NOT gated for this and must not inherit the gate's
+//                   default: the two steps run different rules and carry different risk. The
+//                   gate reads the LOSING side's own concession, so its errors are symmetric
+//                   noise on a measurement; generation folds the mover's score to White's view
+//                   (correct for self-play, one engine on both sides) and a false call there
+//                   writes the wrong `r` onto EVERY position of the game — and at --lambda=1
+//                   `r` is the entire training target. Simulated over the corpus, the
+//                   generation form at 500 x 4 skips 25.8% of plies at a 1.28% false rate.
+//                   Note --batch defaults to 0, so the generation step does not run at all
+//                   unless you ask for it, and this flag is inert until you do.
+//                   Background for both: `npm run data:audit` over the 372,459-game /
 //                   34.8M-position dataset found that 40.3% of every RECORDED PLY comes after
 //                   the point where |v| stops changing sign at +/-400 cp, and that sign agrees
 //                   with the game's own result 99.3% of the time. Each of those plies costs a
@@ -61,13 +78,9 @@
 //                   adjudication writes the wrong `r` onto every position of the game, and at
 //                   --lambda=1 `r` IS the whole training target; in the gate it adds symmetric
 //                   noise to a measurement whose job is resolving ~20 Elo.
-//                   Recommended first gating run: --adjudicate=500. CP is measured against the
-//                   net's own tanh ceiling (`scale`, 600 for every champion so far), so 500 is
-//                   0.83 x scale and a --scale track would change what a given CP means.
-//                   It is deliberately NOT forwarded to the confirmation match or to the screen.
-//                   That leaves the confirmation an unmodified yardstick: a candidate that clears
-//                   an adjudicating gate still has to survive a played-out rematch, which is the
-//                   check you want while the rule itself is the thing on trial.
+//                   CP is measured against the net's own tanh ceiling (`scale`, 600 for every
+//                   champion so far), so 500 sits at 0.83 x scale — a --scale track would
+//                   change what a given CP means and both defaults would need re-deriving.
 //   --adjudicate-plies=N  consecutive plies the score has to hold (default 4). Generation counts
 //                   GAME plies; the gate counts the losing side's OWN moves, so N=4 spans 4 plies
 //                   there and ~8 in the gate. 4 rather than 2 because the movers alternate: at
@@ -331,10 +344,24 @@
 //                   out-of-date cohort. A PROMOTION always forces a refit regardless of N,
 //                   so a fresh champion is rated and depth-calibrated immediately.
 //   --calibrate-minutes=M  after a PROMOTION, extend that cycle's rank pass by M minutes
-//                   (default 10) with the new champion schedulable at EVERY depth, so the pool's
+//                   (default 30) with the new champion schedulable at EVERY depth, so the pool's
 //                   onboard floor rates its 0-game depth bands instead of leaving them at the
 //                   placeholder floor (the "best across depths" absElo the loop steers by then
 //                   rests on real games at each depth, not just the gate/play depths).
+//                   30, not the original 10, because 10 was measured short. Read off the ledger
+//                   for champion Uma (2026-08-08), the depth bands it had NOT played were
+//                   d2 ±263, d3 ±238, d4 ±153, d5 ±143, d7 ±138, d8 ±111 — 28-42 games each,
+//                   one scheduled matchup per band, against 900-3800 games and ±27-33 on every
+//                   hc band. That matters more than a wide CI usually would, because the number
+//                   the loop steers by is the MAXIMUM over the eight bands, and a maximum over
+//                   noisy estimates is biased upward by roughly the noise itself: Uma's d7 read
+//                   2063 ±138 while its d8 read 2018, a non-monotonic curve that the depth
+//                   ordering says cannot be real. That inflated absElo then propagates into
+//                   --filter-weak's cutoff, the ephemeral nn<d>@elo<E> tags, and the
+//                   promising-track ranking. The budget is a time budget spread over the bands,
+//                   so 3x the minutes is ~3x the matchups and ~half the margin. It is paid only
+//                   on a PROMOTION (~1 cycle in 20) and a cycle runs hours, so the extra 20
+//                   minutes is well under 1% of the loop's wall clock.
 //   --no-calibrate  disable that post-promotion depth calibration (M=0).
 //   --no-adaptive   disable the adaptive maintenance budget (ON by default): revert to the FIXED
 //                   --rank-minutes / --refresh-cycle every cycle. On, each is bounded-scaled per
@@ -624,13 +651,14 @@ const cfg = {
   depth: num(args.depth, 8),
   openings: args.openings !== undefined ? Number(args.openings) : null, // null = gen default (8)
   openingTopk: num(args['opening-topk'], 0), // 0 = uniform-random opening (gen default)
-  // WIN ADJUDICATION (resign cutoff), forwarded to generation AND the gate — the two steps that
-  // spend the loop's search budget playing games. 0 = off (the default), so the dataset and the
-  // gate verdict are byte-for-byte what they were until someone gates this. See the --adjudicate
-  // flag doc above for the measured prize (40.3% of recorded plies are post-decision at +/-400 cp)
-  // and for the prospective T x N grid, which is the honest sizing — the retrospective number
-  // can't be used as a rule.
-  adjudicate: num(args.adjudicate, 0),
+  // WIN ADJUDICATION (resign cutoff). Two separate knobs on purpose — see the flag docs above.
+  // The GATE's is on at 500 because it was A/B'd: same matchup, same seed, with and without,
+  // measured +139 vs +140 Elo over 600 games (one game differed) for 15.2% fewer nodes. The
+  // GENERATION one is off because it has NOT been gated and its failure mode is different in
+  // kind: a false call there stamps the wrong `r` on every position of the game, and at
+  // --lambda=1 `r` is the whole training target.
+  adjudicate: num(args.adjudicate, 500),
+  genAdjudicate: num(args['gen-adjudicate'], 0),
   adjudicatePlies: num(args['adjudicate-plies'], 4),
   cycles: args.cycles !== undefined ? Number(args.cycles) : Infinity,
   gateGames: num(args['gate-games'], 2000),
@@ -749,7 +777,10 @@ const cfg = {
   // it actually played — the gate depth and the strong-play depth — leaving its ledger Elo at the
   // placeholder floor for every other depth, so the "best across depths" absElo the loop steers by
   // (see loop-progress) rests on one or two thin bands. 0 / --no-calibrate disables it.
-  calibrateMinutes: args['no-calibrate'] ? 0 : num(args['calibrate-minutes'], 10),
+  // 30 rather than the original 10: at 10 the un-played bands came out of calibration with one
+  // matchup each (28-42 games, ±111 to ±263 Elo), and since absElo is the MAX over the bands
+  // that noise is biased upward, not averaged away. Full numbers at the flag doc above.
+  calibrateMinutes: args['no-calibrate'] ? 0 : num(args['calibrate-minutes'], 30),
   // Adaptive maintenance budget (ON by default; --no-adaptive reverts to fixed knobs). Each
   // per-cycle maintenance knob starts at its configured value and shifts only within a bounded
   // band around it, driven by a robust signal — so a neutral signal reproduces today's fixed
@@ -1608,16 +1639,16 @@ function runRankPool(label, opts = {}) {
       '--no-scan', `--seed=${Date.now()}`, ...jobArg]);
 }
 
-// Win-adjudication args for the two steps that play games (generation and the gate). Empty while
-// --adjudicate is 0, which is the default — an empty array means the child's command line is
-// exactly what it was before the flag existed, so an off run can't drift from the old behaviour.
-// The two binaries read the same two flags but apply slightly different rules: apos-gen folds the
-// mover's score to White's view (self-play, one engine on both sides), apos-match requires the
-// LOSING side's own concession (two different nets, so the mover's-eval form would pay the more
-// optimistic one). See the Adjudicator comment in each.
-function adjudicateArgs() {
-  if (cfg.adjudicate <= 0) return [];
-  return [`--adjudicate=${cfg.adjudicate}`, `--adjudicate-plies=${cfg.adjudicatePlies}`];
+// Win-adjudication args for a step that plays games. `cp <= 0` yields an empty array, so that
+// step's command line is exactly what it was before the flag existed and an off run can't drift.
+// The two binaries read the same two flags but apply DIFFERENT rules, which is why the loop
+// keeps two separate cutoffs (cfg.adjudicate for the gate, cfg.genAdjudicate for generation):
+// apos-gen folds the mover's score to White's view (correct for self-play, one engine on both
+// sides), apos-match requires the LOSING side's own concession (two different nets, so the
+// mover's-eval form would pay the more optimistic one). See the Adjudicator comment in each.
+function adjudicateArgs(cp) {
+  if (cp <= 0) return [];
+  return [`--adjudicate=${cp}`, `--adjudicate-plies=${cfg.adjudicatePlies}`];
 }
 
 // Featurize args for this recipe's dataset filters. --drop-conflicts forwards as-is.
@@ -1950,9 +1981,13 @@ log(`train:loop start — ${cfg.batch === 0
     ? `no gen (data from gate harvest${cfg.playStrong ? ` + strong --play @ depth ${cfg.playDepth}` : ' + pool'})`
     : `batch ${cfg.batch} @ depth ${cfg.depth}`} | gate ${cfg.gateGames}g @ depth ${cfg.gateDepth} `
   + `SPRT(0,${cfg.elo1})${cfg.gateFutility > 0 ? ` futility<${cfg.gateFutility}` : ''} | `
-  // Silent when off (the default), so an existing run's start line reads exactly as before.
+  // Each cutoff names the step it applies to: they are separate knobs with separate rules
+  // and separate evidence, and a start line that blurred them would misreport the run.
   + (cfg.adjudicate > 0
-    ? `adjudicate ${cfg.adjudicate}cp x${cfg.adjudicatePlies} — gen + gate only, NOT the confirmation | `
+    ? `adjudicate gate ${cfg.adjudicate}cp x${cfg.adjudicatePlies} (NOT the confirmation) | `
+    : '')
+  + (cfg.genAdjudicate > 0
+    ? `adjudicate gen ${cfg.genAdjudicate}cp x${cfg.adjudicatePlies} (ungated) | `
     : '')
   + (cfg.confirmGames > 0
     ? `confirm ${cfg.confirmGames}g @ depth ${cfg.gateDepth} on a fresh seed, no SPRT — promote only `
@@ -2031,7 +2066,7 @@ for (let i = 1; i <= cfg.cycles && !stopRequested(); i++) {
     [`--games=${cfg.batch}`, `--depth=${cfg.depth}`, '--eval=nn',
       ...(cfg.openings !== null ? [`--openings=${cfg.openings}`] : []),
       ...(cfg.openingTopk > 0 ? [`--opening-topk=${cfg.openingTopk}`] : []),
-      ...adjudicateArgs(),
+      ...adjudicateArgs(cfg.genAdjudicate),
       `--seed=${Date.now()}`, ...jobArg])) break;
 
   // 2. Featurize the raw positions for the current feature set, into THIS recipe's featurized
@@ -2128,7 +2163,7 @@ for (let i = 1; i <= cfg.cycles && !stopRequested(); i++) {
     ['--eval-a=nn', `--weights-a=${candidate}`, '--eval-b=nn', `--weights-b=${champion}`,
       `--depth=${cfg.gateDepth}`, '--sprt', '--elo0=0', `--elo1=${cfg.elo1}`,
       ...(cfg.gateFutility > 0 ? [`--sprt-futility=${cfg.gateFutility}`] : []),
-      ...adjudicateArgs(),
+      ...adjudicateArgs(cfg.adjudicate),
       `--games=${cfg.gateGames}`, `--result-file=${resultFile}`,
       ...(cfg.harvest ? [`--save-games=${gateHarvest}`, `--seed=${Date.now()}`] : []), ...jobArg])) {
     // Ctrl-C / failure mid-gate: the runner still drained its played games to the harvest
