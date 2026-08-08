@@ -8,6 +8,7 @@
 //
 //   { "g":"m5l-27",
 //     "players":{"w":"nn8@a14d52","b":"nn8@a14d52"},  // engine×depth vtag per colour
+//     "se":2,                                         // search era both sides played (absent = 1)
 //     "r":1,                                          // WHITE-view result 1/0/-1
 //     "moves":["e2e4","e7e5","g1f3",...],             // compact from+to[promo]
 //     "v":[-28,42,-11,...],                           // per-position cp, side-to-move view
@@ -19,6 +20,12 @@
 //     search). vs is parallel to v.
 //   - `start` (a FEN) is omitted for the standard start position (the only current case);
 //     readers default to newGameState().
+//   - `se` is the SEARCH era both sides played (src/ai.js SEARCH_ERA), omitted for era 1 —
+//     everything recorded before 2026-08-08, when the field didn't exist. The players tag says
+//     which net at which depth, not which search, and a depth is worth a very different amount
+//     under a different search, so ratings must not pool two eras under one id (see gameEra and
+//     rank:pool's --era). apos-match refuses --save-games with --search-a/--search-b set, so a
+//     record's two sides always agree on it.
 //   - A move is "<from><to>[promo]" (e.g. "e2e4", "e7e8q"); castling is the KING's
 //     from→to. from+to+promo uniquely identifies a legal move (asserted by the parity
 //     harness), so replay matches it against legalMoves — no extra flags stored.
@@ -50,6 +57,10 @@ export const isGameRecord = (rec) => rec != null && Array.isArray(rec.moves);
 
 // The provenance tag for position i (scalar vs applies to the whole game).
 export const vsAt = (rec, i) => (Array.isArray(rec.vs) ? rec.vs[i] : rec.vs);
+
+// Which search played this game. Records written before the field existed are era 1 by
+// definition — nothing else was ever in the dataset when it was added.
+export const gameEra = (rec) => (rec.se == null ? 1 : rec.se);
 
 // Set the provenance for position i, promoting a scalar vs to a per-position array the
 // moment two positions disagree (a partial refresh). Keeps vs scalar while it stays
@@ -102,6 +113,7 @@ export function serializeGameRecord(rec) {
   const out = { g: rec.g };
   if (rec.start) out.start = rec.start;
   if (rec.players) out.players = rec.players;
+  if (rec.se != null) out.se = rec.se; // era 1 stays unstamped, so a rewrite doesn't grow the file
   out.r = rec.r;
   out.moves = rec.moves;
   if (rec.v) out.v = rec.v;

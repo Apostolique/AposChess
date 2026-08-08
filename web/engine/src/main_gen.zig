@@ -343,7 +343,7 @@ fn playGame(s: *ai.Searcher, cfg: *const Cfg, g: u64, alloc: std.mem.Allocator, 
         st = engine.applyMove(&st, m);
     }
 
-    // Serialize the whole game as ONE record { g, players, r, moves, v, vs }. `moves`
+    // Serialize the whole game as ONE record { g, players, se, r, moves, v, vs }. `moves`
     // connects consecutive recorded positions, so there is one fewer than positions (the
     // final move leads to the unrecorded terminal); `v` is per recorded position, the
     // search value (side-to-move view). `vs` is a scalar tag — self-play uses one eval.
@@ -357,7 +357,10 @@ fn playGame(s: *ai.Searcher, cfg: *const Cfg, g: u64, alloc: std.mem.Allocator, 
     try out.appendSlice(alloc, cfg.vtag);
     try out.appendSlice(alloc, "\",\"b\":\"");
     try out.appendSlice(alloc, cfg.vtag);
-    try out.appendSlice(alloc, "\"},\"r\":");
+    // se: which search played it (ai.SEARCH_ERA) — gen always runs the shipped set.
+    try out.appendSlice(alloc, "\"},\"se\":");
+    try fmtInt(out, alloc, @as(i64, ai.SEARCH_ERA));
+    try out.appendSlice(alloc, ",\"r\":");
     try fmtInt(out, alloc, result);
     try out.appendSlice(alloc, ",\"moves\":[");
     var mi: usize = 0;

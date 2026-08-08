@@ -120,6 +120,16 @@ fn lmpCount(depth: i32) i32 {
 // only when `lmp` is off, and then costs 12% of nodes/ms for it. `hist` is off on its own
 // gate below. Everything shipped is FREE per node — the set measures 371 nodes/ms against
 // the baseline's 373 — so its equal-work gate is also its equal-time gate.
+// Which search the games were played by, stamped into every harvested game record as `se`
+// (scripts/gameRecord.mjs) so the rating pool never averages two different engines under one
+// (engine, depth) label. A pool node is (engine, depth) and says nothing about the search, but
+// the search decides what a depth is WORTH: era 2 loses a fixed-depth-6 match to era 1 by ~380
+// Elo while reaching depth 8 on a quarter of the nodes. Mixing them silently is a measurement
+// bug, not drift. BUMP on any change to what the shipped search does — the defaults below, the
+// margins, or the code they gate. Era 1 = the search before 2026-08-08 (unstamped in old data);
+// era 2 = rfp+lmr+nullr+asp. Mirrored by SEARCH_ERA in src/ai.js.
+pub const SEARCH_ERA: u32 = 2;
+
 pub const SearchOpts = struct {
     rfp: bool = true, // reverse futility pruning (static null move)
     fp: bool = false, // frontier futility pruning of quiet moves — see the note above

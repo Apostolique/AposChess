@@ -1312,7 +1312,11 @@ fn writeHarvest(sh: *Shared, gpa: std.mem.Allocator, io: std.Io, path: []const u
         try out.appendSlice(gpa, pw);
         try out.appendSlice(gpa, "\",\"b\":\"");
         try out.appendSlice(gpa, pb);
-        try out.appendSlice(gpa, "\"},\"r\":");
+        // se: which search played it (ai.SEARCH_ERA). Both sides ran the shipped set — saving
+        // games is refused otherwise — so one field covers the game.
+        try out.appendSlice(gpa, "\"},\"se\":");
+        try appendInt(&out, gpa, @as(i64, ai.SEARCH_ERA));
+        try out.appendSlice(gpa, ",\"r\":");
         try appendInt(&out, gpa, g.result_white);
         // moves connect consecutive recorded positions (one fewer than positions).
         try out.appendSlice(gpa, ",\"moves\":[");
@@ -1599,6 +1603,17 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("error: --nodes must be > 0 (0 means 'unlimited' inside the searcher, which here would search to depth 99).\n", .{});
             std.process.exit(2);
         }
+    }
+
+    // A harvested record stamps ONE search era (`se`) for the whole game, and a search gate is
+    // exactly the match whose two sides disagree about it. Rather than write a record that lies
+    // about who played, refuse the combination: a search experiment's games are an instrument
+    // reading, not training data or rating evidence.
+    if (save_games != null and (!std.meta.eql(opts_a, ai.SearchOpts{}) or !std.meta.eql(opts_b, ai.SearchOpts{}))) {
+        std.debug.print("error: --save-games needs the shipped search on both sides (--search-a/--search-b change it).\n" ++
+            "  A game record carries one search era, so a mixed-search game would be filed under a label it didn't play\n" ++
+            "  with, and the rating pool would average two engines under one id. Drop --save-games for a search gate.\n", .{});
+        std.process.exit(2);
     }
 
     // Resolve each side's budget. A node budget wins over both (it is exclusive — validated

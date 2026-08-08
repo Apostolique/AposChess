@@ -50,6 +50,14 @@ const VALUE = { p: 100, n: 500, b: 330, r: 500, q: 900, k: 0 };
 // handcrafted eval changes (VALUE, PST, MOB, evalStm). v1 = the pre-2026-06-13 table
 // (knight=300, untagged in old data); v2 = knight=500.
 export const HC_VERSION = 2;
+// Which search played a game, stamped into every harvested record as `se` (scripts/gameRecord.mjs)
+// so the Bradley-Terry pool never averages two different engines under one (engine, depth) label.
+// The node id carries no search, but the search decides what a depth is worth: era 2 loses a
+// fixed-depth-6 match to era 1 by ~380 Elo while reaching depth 8 on a quarter of the nodes. BUMP
+// on any change to what the shipped search does — the `searchOpts` defaults below, the margins, or
+// the code they gate. Era 1 = the search before 2026-08-08 (unstamped in old data); era 2 =
+// rfp+lmr+nullr+asp. Mirrored by SEARCH_ERA in engine/src/ai.zig.
+export const SEARCH_ERA = 2;
 const MATE = 1_000_000;
 const MATE_THRESH = MATE - 1000; // scores beyond this magnitude encode a forced mate
 const MAX_PLY = 64;
