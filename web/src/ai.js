@@ -20,7 +20,18 @@
 //                            reduced, so the variant's tactics aren't missed.
 //   - Killer + history     — order quiet moves that previously caused cutoffs
 //                            first, which makes the pruning above far more
-//                            effective.
+//                            effective. History is bounded and carries a malus,
+//                            and a countermove table remembers what refuted the
+//                            opponent's last move.
+//   - Reverse futility     — a node whose static eval is far enough above beta
+//                            fails high without a search (the null-move idea,
+//                            without the search).
+//   - Late move pruning    — at shallow depth, quiet moves past a move-count
+//                            threshold are not searched at all.
+//   - Futility pruning     — near the frontier, a quiet move that can't lift a
+//                            far-below-alpha static eval into the window is skipped.
+//   - Aspiration windows   — each root iteration searches a narrow window around
+//                            the previous score, re-searching wider when it misses.
 // Legality is guaranteed regardless: every move comes from legalMoves(), so
 // pruning only changes which legal move is chosen, never whether it is legal.
 
@@ -46,8 +57,53 @@ const QDEPTH = 6; // quiescence depth cap
 const DELTA_MARGIN = 200; // qsearch: skip a capture if even winning it stays this far below alpha
 const now = () => Date.now();
 
+// --- search-refinement tuning ------------------------------------------------
+// Every margin below is in centipawns and is sized against the NN EVAL'S RANGE,
+// not against standard-chess practice: the nn eval is tanh-squashed × `scale`, so
+// it is hard capped at ±600 cp for every champion so far. A textbook "150 cp per
+// ply" margin is a quarter of the whole scale here, which would make these fire
+// either always or never. Keep in sync with ai.zig (same names, same values).
+const RFP_MAX_DEPTH = 5;  // reverse futility applies at depth ≤ this
+const RFP_MARGIN = 60;    // ...with this much slack per remaining ply
+const FP_MAX_DEPTH = 2;   // frontier futility applies at depth ≤ this
+const FP_MARGIN = 80;     // ...per remaining ply,
+const FP_BASE = 60;       // ...plus a fixed floor
+const LMP_MAX_DEPTH = 4;  // late-move pruning applies at depth ≤ this
+const LMR_DIV = 2.25;     // late-move reduction: r = 0.5 + ln(d)·ln(mc)/LMR_DIV
+const HIST_MAX = 16384;   // history stays in [-HIST_MAX, HIST_MAX] via the gravity term
+const HIST_GOOD = HIST_MAX / 4; // above this a quiet move is reduced one ply less
+const ASP_DELTA = 30;     // first aspiration half-window around the previous score
+const MAX_QUIETS = 48;    // quiet moves per node remembered for the history malus
+
+// Late-move reduction table, r = 0.5 + ln(depth)·ln(moveCount)/LMR_DIV, saturating
+// at 63. Built once so the search reads an entry instead of two logarithms.
+const LMR = Array.from({ length: 64 }, (_, d) =>
+  Array.from({ length: 64 }, (_, m) =>
+    d === 0 || m === 0 ? 0 : Math.max(0, Math.floor(0.5 + (Math.log(d) * Math.log(m)) / LMR_DIV))));
+
+// Move-count threshold for late-move pruning: 3 + d² (4, 7, 12, 19).
+const lmpCount = (depth) => 3 + depth * depth;
+
+// Which refinements are active. Mirrors ai.zig's SearchOpts — the Zig match runner
+// exposes it as --search-a/--search-b so a search change can be played against its
+// own predecessor in one binary; here it exists so the reference can be run in the
+// same configurations. `true` = shipped; `false` = implemented but lost its gate.
+//
+// Measured 2026-08-08 at --nodes=50000 over 600 games against all-off (the search
+// before any of these existed): rfp+nullr+asp+lmr scored **+74 ± 28 Elo** while
+// cutting 75% of the nodes to depth 8 at an unchanged 371 nodes/ms; adding lmp, fp
+// and hist dropped that to +17 ± 24 at 284 nodes/ms. `lmp` is the whole difference —
+// biggest tree cut of the seven and the only one that costs nodes/*second* (pruning
+// quiet moves shifts the surviving mix toward eval-heavy quiescence), and the least
+// accurate (it agreed with the unpruned search on 9 of 12 midgame positions where the
+// others managed 11–12). Blind move-count pruning is a bad trade in a variant whose
+// quiet moves carry the jumps. See ai.zig's SearchOpts for the full table.
+const searchOpts = { rfp: true, fp: false, lmp: false, lmr: true, hist: false, nullr: true, asp: true };
+export function setSearchOpts(o) { Object.assign(searchOpts, o); }
+
 let killers; // killers[ply] = [moveKey, moveKey]
-let history; // Int32Array[from*64+to] of cutoff counts
+let history; // Int32Array[from*64+to], bounded cutoff score (see histBump)
+let counter; // Int32Array[previous move's key] = the quiet reply that refuted it
 // Nodes visited by the current search, and the budget that stops it. A NODE IS COUNTED ON
 // ENTRY to search() and to qsearch() — the two disjoint kinds of node this engine visits, and
 // the only point every visited node passes through exactly once. ai.zig counts at exactly the
@@ -456,7 +512,7 @@ function hasNonPawn(board, color) {
   return false;
 }
 
-function scoreMove(m, board, ply, pvKey) {
+function scoreMove(m, board, ply, pvKey, counterKey) {
   const key = keyOf(m);
   if (key === pvKey) return 2e6;
   if (m.capture) {
@@ -467,11 +523,22 @@ function scoreMove(m, board, ply, pvKey) {
   if (m.jump) return 8e5; // non-capturing jump: tactical, try it early
   const k = killers[ply];
   if (k && (k[0] === key || k[1] === key)) return 7e5;
+  if (key === counterKey) return 6.5e5; // countermove: below the killers, above history
   return Math.min(history[key], 6e5); // capped so quiet history never outranks the above
 }
 
-function orderMoves(moves, board, ply, pvKey) {
-  for (const m of moves) m._o = scoreMove(m, board, ply, pvKey);
+// Bounded history update ("gravity"): the correction term pulls the entry toward 0
+// in proportion to how far it already is, so the table stays inside
+// [-HIST_MAX, HIST_MAX] and a move that stopped working decays instead of coasting
+// on an old score. The unbounded `+= depth*depth` it replaces let early cutoffs
+// dominate move ordering forever.
+function histBump(key, bonus) {
+  const b = Math.max(-HIST_MAX, Math.min(HIST_MAX, bonus));
+  history[key] += b - Math.trunc((history[key] * Math.abs(b)) / HIST_MAX);
+}
+
+function orderMoves(moves, board, ply, pvKey, counterKey) {
+  for (const m of moves) m._o = scoreMove(m, board, ply, pvKey, counterKey);
   moves.sort((a, b) => b._o - a._o);
 }
 
@@ -498,7 +565,7 @@ function qsearch(state, alpha, beta, qdepth) {
   if (inCheck) {
     const moves = legalMoves(state);
     if (moves.length === 0) return -MATE;
-    orderMoves(moves, state.board, 0, 0);
+    orderMoves(moves, state.board, 0, 0, 0);
     for (const m of moves) {
       const score = -qsearch(applyMove(state, m), -beta, -alpha, qdepth - 1);
       if (score > best) best = score;
@@ -517,7 +584,7 @@ function qsearch(state, alpha, beta, qdepth) {
   const pseudo = generatePseudoMoves(state.board, state.turn);
   const moves = [];
   for (const m of pseudo) if (m.capture || m.promotion || m.jump) moves.push(m);
-  orderMoves(moves, state.board, 0, 0);
+  orderMoves(moves, state.board, 0, 0, 0);
 
   let sawLegal = false;
   for (const m of moves) {
@@ -546,7 +613,7 @@ function qsearch(state, alpha, beta, qdepth) {
   return best;
 }
 
-function search(state, depth, alpha, beta, ply, canNull, hash, deadline) {
+function search(state, depth, alpha, beta, ply, canNull, hash, deadline, prevKey = 0) {
   if (outOfBudget(deadline)) { tainted = false; return 0; } // aborted; the root discards this iteration
   nodes++; // counted on entry, after the abort check — an aborted node is not a visited one
   if (ttEnabled) {
@@ -582,14 +649,45 @@ function search(state, depth, alpha, beta, ply, canNull, hash, deadline) {
     }
   }
 
+  // Static evaluation of THIS node, computed once and shared by the three refinements
+  // that need it (reverse futility, the null-move reduction, frontier futility). It's
+  // only taken where one of them can fire: in check none apply, and above
+  // RFP_MAX_DEPTH only the null move reads it.
+  const wantsNull = canNull && depth >= 3 && beta < MATE_THRESH;
+  const wantsStatic = !inCheck &&
+    ((searchOpts.rfp && depth <= RFP_MAX_DEPTH) ||
+     (searchOpts.fp && depth <= FP_MAX_DEPTH) ||
+     (searchOpts.nullr && wantsNull));
+  const staticEval = wantsStatic ? activeEval(state.board, state.turn) : 0;
+
+  // Reverse futility pruning ("static null move"): if the side to move is so far ahead
+  // that giving up RFP_MARGIN per remaining ply still fails high, the node isn't worth
+  // a search. It's the null-move idea without the search — and unlike the null move it
+  // needs no zugzwang guard, because it never claims a line, only that the margin is
+  // out of reach. Skipped near mate scores, where a centipawn margin means nothing.
+  if (searchOpts.rfp && !inCheck && depth <= RFP_MAX_DEPTH &&
+      beta > -MATE_THRESH && beta < MATE_THRESH &&
+      staticEval - RFP_MARGIN * depth >= beta) {
+    tainted = false;
+    return staticEval;
+  }
+
   // Null-move pruning: pass the move; if we're still ≥ beta, this node fails high.
-  if (canNull && !inCheck && depth >= 3 && beta < MATE_THRESH && hasNonPawn(state.board, state.turn)) {
+  // The reduction is flat 3 in the base search; with `nullr` it grows with depth (a
+  // deeper node can afford to give up more) and with how far the static eval already
+  // is above beta — and the node must be at or above beta to try it at all, which is
+  // what gives that eval term its meaning.
+  if (wantsNull && !inCheck && hasNonPawn(state.board, state.turn) &&
+      (!searchOpts.nullr || staticEval >= beta)) {
+    const rNull = searchOpts.nullr
+      ? Math.max(3, Math.min(depth - 1, 3 + Math.trunc(depth / 5) + Math.min(Math.trunc((staticEval - beta) / 160), 2)))
+      : 3;
     const nm = {
       board: state.board, turn: opponent(state.turn),
       castling: state.castling, halfmove: state.halfmove, fullmove: state.fullmove,
     };
     const nh = ttEnabled ? hash ^ SIDE_KEY : 0n;
-    const score = -search(nm, depth - 3, -beta, -beta + 1, ply + 1, false, nh, deadline);
+    const score = -search(nm, depth - rNull, -beta, -beta + 1, ply + 1, false, nh, deadline, 0);
     // A fail-high resting on a repetition draw is itself path-dependent; leave the
     // child's `tainted` in place (we don't store on this path) and bail out.
     if (score >= beta) return beta;
@@ -597,34 +695,70 @@ function search(state, depth, alpha, beta, ply, canNull, hash, deadline) {
 
   const legal = legalMoves(state);
   if (legal.length === 0) { tainted = false; return inCheck ? -MATE - depth : 0; }
-  orderMoves(legal, state.board, ply, ttMoveKey);
+  const counterKey = searchOpts.hist && prevKey ? counter[prevKey] : 0;
+  orderMoves(legal, state.board, ply, ttMoveKey, counterKey);
 
   let best = -Infinity, bestKey = 0, moveCount = 0, bestTainted = false;
+  const quiets = []; // quiet moves already tried here, for the history malus on a cutoff
   for (const m of legal) {
     moveCount++;
+    const quiet = !m.capture && !m.promotion && !m.jump;
+    // Shallow-depth pruning of QUIET moves only — the variant's tactics live in
+    // captures, promotions and jumps, and none of those is ever skipped here. Both
+    // rules require a real score in hand (`best > -MATE_THRESH`), so the first move is
+    // always searched and a node can never come back empty.
+    if (quiet && !inCheck && best > -MATE_THRESH) {
+      // Late move pruning: past lmpCount(depth) quiet moves at a shallow depth, the
+      // rest almost never beat what move ordering already put first.
+      if (searchOpts.lmp && depth <= LMP_MAX_DEPTH && moveCount > lmpCount(depth)) continue;
+      // Frontier futility: a quiet move can't lift a static eval this far below alpha
+      // into the window in the plies that are left.
+      if (searchOpts.fp && depth <= FP_MAX_DEPTH &&
+          staticEval + FP_MARGIN * depth + FP_BASE <= alpha) continue;
+    }
+    const key = keyOf(m);
+    if (quiet && quiets.length < MAX_QUIETS) quiets.push(key);
     const child = applyMove(state, m);
     const childHash = ttEnabled ? hashAfter(hash, state, m) : 0n;
-    const quiet = !m.capture && !m.promotion && !m.jump;
     let score, sTainted;
     if (moveCount === 1) {
-      score = -search(child, depth - 1, -beta, -alpha, ply + 1, true, childHash, deadline);
+      score = -search(child, depth - 1, -beta, -alpha, ply + 1, true, childHash, deadline, key);
       sTainted = tainted;
     } else {
       // Late move reduction for quiet, late moves (never jumps/captures/promotions).
-      const r = (quiet && depth >= 3 && moveCount > 3 && !inCheck) ? 1 : 0;
-      score = -search(child, depth - 1 - r, -alpha - 1, -alpha, ply + 1, true, childHash, deadline);
+      let r = 0;
+      if (quiet && depth >= 3 && moveCount > 3 && !inCheck) {
+        if (searchOpts.lmr) {
+          r = LMR[Math.min(depth, 63)][Math.min(moveCount, 63)];
+          // A quiet move with a strong history is reduced one ply less: the table
+          // already says it works, so the late-move assumption is weaker.
+          if (searchOpts.hist && history[key] > HIST_GOOD) r--;
+          r = Math.max(0, Math.min(r, depth - 2)); // never reduce into qsearch
+        } else r = 1;
+      }
+      score = -search(child, depth - 1 - r, -alpha - 1, -alpha, ply + 1, true, childHash, deadline, key);
       sTainted = tainted;
-      if (score > alpha && r > 0) { score = -search(child, depth - 1, -alpha - 1, -alpha, ply + 1, true, childHash, deadline); sTainted = tainted; }
-      if (score > alpha && score < beta) { score = -search(child, depth - 1, -beta, -alpha, ply + 1, true, childHash, deadline); sTainted = tainted; }
+      if (score > alpha && r > 0) { score = -search(child, depth - 1, -alpha - 1, -alpha, ply + 1, true, childHash, deadline, key); sTainted = tainted; }
+      if (score > alpha && score < beta) { score = -search(child, depth - 1, -beta, -alpha, ply + 1, true, childHash, deadline, key); sTainted = tainted; }
     }
-    if (score > best) { best = score; bestKey = keyOf(m); bestTainted = sTainted; }
+    if (score > best) { best = score; bestKey = key; bestTainted = sTainted; }
     if (best > alpha) alpha = best;
     if (alpha >= beta) {
       if (quiet) {
-        const key = keyOf(m);
         const k = killers[ply] || (killers[ply] = [0, 0]);
         if (k[0] !== key) { k[1] = k[0]; k[0] = key; }
-        history[key] += depth * depth;
+        if (searchOpts.hist) {
+          // Bonus to the move that cut, MALUS to every quiet move tried before it.
+          // Rewarding only the winner teaches the table which moves are good but never
+          // which are bad, so a quiet move that keeps getting searched early and keeps
+          // failing holds its slot forever.
+          const bonus = Math.min(depth * depth * 16 + 32 * depth, HIST_MAX / 4);
+          histBump(key, bonus);
+          for (const qk of quiets) if (qk !== key) histBump(qk, -bonus);
+          if (prevKey) counter[prevKey] = key;
+        } else {
+          history[key] += depth * depth;
+        }
       }
       break;
     }
@@ -708,6 +842,7 @@ export function chooseMoveDetailed(state, maxDepth = 2, rand = Math.random, maxM
 
   killers = [];
   history = new Int32Array(64 * 64);
+  counter = new Int32Array(64 * 64);
   ttEnabled = useTT;
   if (useTT) ttBumpGen();
   const rootHash = useTT ? hashOf(state) : 0n;
@@ -725,28 +860,80 @@ export function chooseMoveDetailed(state, maxDepth = 2, rand = Math.random, maxM
 
   // Backstop so an unbounded (maxDepth = Infinity) search still terminates even
   // if the deadline were also infinite; real searches abort on time long before.
-  const depthCap = Math.min(maxDepth, 99);
-  for (let depth = 1; depth <= depthCap; depth++) {
-    orderMoves(root, state.board, 0, keyOf(bestMove));
-    let alpha = -Infinity, bestScore = minimize ? Infinity : -Infinity, localBest = root[0], aborted = false, moveCount = 0;
+  // One root pass over the (already ordered) root list inside the window [lo, hi], so the
+  // aspiration loop below can call it again with a wider window when its guess was wrong.
+  // `hi` is a real beta: a move that beats it ends the pass, since there's no point proving
+  // how much better it is under a window that's about to be reopened. With lo = -Infinity
+  // and hi = Infinity this is exactly the full-width root PVS pass search has always done.
+  const rootWindow = (lo, hi) => {
+    let alpha = lo, bestScore = -Infinity, localBest = root[0], moveCount = 0;
     for (const m of root) {
       moveCount++;
       const child = applyMove(state, m);
       const childHash = useTT ? hashAfter(rootHash, state, m) : 0n;
+      const key = keyOf(m);
       let score;
-      if (minimize) {
-        // Loser mode: every root move needs its TRUE score (so the worst is exact), so
-        // search each with a full window — no alpha tightening, no PVS — and keep the min.
-        score = -search(child, depth - 1, -Infinity, Infinity, 1, true, childHash, deadline);
-      } else if (moveCount === 1) {
-        score = -search(child, depth - 1, -Infinity, -alpha, 1, true, childHash, deadline);
+      if (moveCount === 1) {
+        score = -search(child, depth - 1, -hi, -alpha, 1, true, childHash, deadline, key);
       } else {
-        score = -search(child, depth - 1, -alpha - 1, -alpha, 1, true, childHash, deadline);
-        if (score > alpha) score = -search(child, depth - 1, -Infinity, -alpha, 1, true, childHash, deadline);
+        score = -search(child, depth - 1, -alpha - 1, -alpha, 1, true, childHash, deadline, key);
+        if (score > alpha && score < hi) score = -search(child, depth - 1, -hi, -alpha, 1, true, childHash, deadline, key);
       }
-      if (outOfBudget(deadline)) { aborted = true; break; }
-      if (minimize ? score < bestScore : score > bestScore) { bestScore = score; localBest = m; }
-      if (!minimize && score > alpha) alpha = score;
+      if (outOfBudget(deadline)) return { aborted: true, score: 0, move: localBest };
+      if (score > bestScore) { bestScore = score; localBest = m; }
+      if (score > alpha) alpha = score;
+      if (alpha >= hi) break; // fail high — the caller reopens the window
+    }
+    return { aborted: false, score: bestScore, move: localBest };
+  };
+
+  const depthCap = Math.min(maxDepth, 99);
+  let depth = 1;
+  for (; depth <= depthCap; depth++) {
+    orderMoves(root, state.board, 0, keyOf(bestMove), 0);
+    let bestScore = minimize ? Infinity : -Infinity, localBest = root[0], aborted = false;
+    if (minimize) {
+      // Loser mode: every root move needs its TRUE score (so the worst is exact), so
+      // search each with a full window — no alpha tightening, no PVS, and no aspiration
+      // window (which is an assumption about the BEST move's score).
+      for (const m of root) {
+        const child = applyMove(state, m);
+        const childHash = useTT ? hashAfter(rootHash, state, m) : 0n;
+        const score = -search(child, depth - 1, -Infinity, Infinity, 1, true, childHash, deadline, keyOf(m));
+        if (outOfBudget(deadline)) { aborted = true; break; }
+        if (score < bestScore) { bestScore = score; localBest = m; }
+      }
+    } else {
+      // Aspiration window: the score at depth d is usually close to the score at d-1, so
+      // searching [prev-delta, prev+delta] instead of the full window makes every node's
+      // window narrower and cuts the tree. The cost is a re-search when the guess is
+      // wrong, which is why it only opens once there's a previous score to guess from and
+      // the position isn't already a forced mate.
+      let lo = -Infinity, hi = Infinity, delta = ASP_DELTA;
+      if (searchOpts.asp && depth >= 4 && completed > 0 && Math.abs(rootScore) < MATE_THRESH) {
+        lo = rootScore - delta; hi = rootScore + delta;
+      }
+      for (;;) {
+        const rr = rootWindow(lo, hi);
+        if (rr.aborted) { aborted = true; break; }
+        // Fail low: the true score is below the window, so the move that came back isn't
+        // trustworthy — widen downward and keep the previous best.
+        if (rr.score <= lo && lo !== -Infinity) {
+          hi = Math.trunc((lo + hi) / 2);
+          lo = rr.score - delta;
+          delta += Math.trunc(delta / 2) + 5;
+          continue;
+        }
+        // Fail high: a move beat the window, so it IS the new best; widen upward.
+        if (rr.score >= hi && hi !== Infinity) {
+          localBest = rr.move;
+          hi = rr.score + delta;
+          delta += Math.trunc(delta / 2) + 5;
+          continue;
+        }
+        bestScore = rr.score; localBest = rr.move;
+        break;
+      }
     }
     if (!aborted) {
       bestMove = localBest; completed = depth; rootScore = bestScore;
