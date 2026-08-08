@@ -21,9 +21,9 @@ const ui = {
   mode: 'human-human', // 'human-human' | 'human-ai' | 'ai-ai' | 'online' | 'puzzle' | 'analysis' | 'editor'
   humanColor: 'white', // which side the human controls in 'human-ai'
   // AI strength per slot: a preset depth string '1'..'7', or 'custom'.
-  strengthAi: '6',     // opponent strength in 'human-ai'
-  strengthWhite: '6',  // per-colour strength in 'ai-ai'
-  strengthBlack: '6',
+  strengthAi: '7',     // opponent strength in 'human-ai'
+  strengthWhite: '7',  // per-colour strength in 'ai-ai'
+  strengthBlack: '7',
   // Which engine family drives each AI slot: 'handcrafted' or 'nn' (neural net).
   // Orthogonal to strength — the chosen engine still searches to the depth/time above.
   // Defaults to the neural net (our strongest eval).
@@ -872,8 +872,7 @@ function lineTreeTo(node) {
 }
 
 async function copyVariationPgn(node) {
-  const text = exportPgn(lineTreeTo(node), gameStatus(node.state),
-    { white: playerName('white'), black: playerName('black') });
+  const text = exportPgn(lineTreeTo(node), gameStatus(node.state), { white: playerName('white'), black: playerName('black') });
   try { await navigator.clipboard.writeText(text); } catch { downloadPgn(text); }
 }
 
@@ -2220,40 +2219,53 @@ function aiParams(turn) {
   return { depth: depth === 0 ? Infinity : depth, maxMs: ms === 0 ? Infinity : ms, engine, net };
 }
 
-// A PGN player name for one side: "Human" for a human-controlled slot, or a
-// description of the engine driving that colour, incl. which eval it used
-// ("AI (Neural net, depth 7, 6000ms)"). human-human / online / editor are all
-// people on both sides.
-function playerName(color) {
-  const isAi = ui.mode === 'ai-ai' || (ui.mode === 'human-ai' && color !== ui.humanColor);
-  if (!isAi) return 'Human';
-  const { depth, maxMs, engine } = aiParams(color);
-  const slot = ui.mode === 'ai-ai' ? color : 'ai';
-  const e = engine === 'nn' ? `Neural net (${netOf(slot) || '?'})`
-    : engine === 'handcrafted3' ? 'Handcrafted v3'
-    : engine === 'material' ? 'Material'
-    : engine === 'loser' ? 'Lemming' : 'Handcrafted';
-  const d = depth === Infinity ? 'unlimited' : depth;
-  const t = maxMs === Infinity ? 'no time limit' : `${maxMs}ms`;
-  return `AI (${e}, depth ${d}, ${t})`;
+// What to call the engine driving `slot`. Nets carry their own name in the catalog
+// ("Uma", "Kara"), which identifies the engine far better than the family it belongs
+// to — so the family ("Neural net", "Handcrafted") only shows up where it *is* the
+// distinguishing bit. Matches the wording of the engine pickers in index.html.
+function engineName(slot) {
+  switch (engineOf(slot)) {
+    case 'nn': return netOf(slot) || 'Neural net';
+    case 'handcrafted3': return 'Handcrafted v3';
+    case 'material': return 'Material only';
+    case 'loser': return 'Lemming';
+    default: return 'Handcrafted v2';
+  }
 }
 
-// A compact version of playerName for the cramped tray: the engine's name (the net id
-// for nn, the handcrafted version, or "Human") followed by its strength — the depth cap
-// and/or the time cap, whichever are set ("d7", "6s", "d7 6s"; nothing if both unbounded).
-function playerLabel(color) {
+const msLabel = (ms) => (ms % 1000 === 0 ? `${ms / 1000}s` : `${ms}ms`);
+
+// { name, depth, maxMs } for the engine playing `color`, or null when a person does
+// (human-human / online / editor are people on both sides).
+function playerEngine(color) {
   const isAi = ui.mode === 'ai-ai' || (ui.mode === 'human-ai' && color !== ui.humanColor);
-  if (!isAi) return 'Human';
-  const { depth, maxMs, engine } = aiParams(color);
-  const slot = ui.mode === 'ai-ai' ? color : 'ai';
-  const name = engine === 'nn' ? (netOf(slot) || 'Neural net')
-    : engine === 'handcrafted3' ? 'Handcrafted v3'
-    : engine === 'material' ? 'Material'
-    : engine === 'loser' ? 'Lemming' : 'Handcrafted';
+  if (!isAi) return null;
+  const { depth, maxMs } = aiParams(color);
+  return { name: engineName(ui.mode === 'ai-ai' ? color : 'ai'), depth, maxMs };
+}
+
+// The PGN White/Black tag for one side: "Human", or the engine's name with the search
+// limits that actually applied ("Uma (depth 7, 6s)"); an unbounded limit is simply left
+// out, so an unlimited search on both is a bare "Uma".
+function playerName(color) {
+  const p = playerEngine(color);
+  if (!p) return 'Human';
+  const limits = [];
+  if (p.depth !== Infinity) limits.push(`depth ${p.depth}`);
+  if (p.maxMs !== Infinity) limits.push(msLabel(p.maxMs));
+  return limits.length ? `${p.name} (${limits.join(', ')})` : p.name;
+}
+
+// A compact version of playerName for the cramped tray: the engine's name followed by
+// its strength — the depth cap and/or the time cap, whichever are set ("d7", "6s",
+// "d7 6s"; nothing if both unbounded).
+function playerLabel(color) {
+  const p = playerEngine(color);
+  if (!p) return 'Human';
   const meta = [];
-  if (depth !== Infinity) meta.push(`d${depth}`);
-  if (maxMs !== Infinity) meta.push(maxMs % 1000 === 0 ? `${maxMs / 1000}s` : `${maxMs}ms`);
-  return meta.length ? `${name} · ${meta.join(' ')}` : name;
+  if (p.depth !== Infinity) meta.push(`d${p.depth}`);
+  if (p.maxMs !== Infinity) meta.push(msLabel(p.maxMs));
+  return meta.length ? `${p.name} · ${meta.join(' ')}` : p.name;
 }
 
 function clampInt(value, min, max, fallback) {

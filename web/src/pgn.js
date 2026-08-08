@@ -80,7 +80,7 @@ function renderSeq(node, needNum) {
 // Build a .pgn string from main.js's move-tree `root` (a node with `.state`/`.children`,
 // each child a ply with `.lastMove`) and the final game `status`. Variations are written
 // as nested `(…)` blocks. `players` carries the White/Black names (e.g. "Human" or
-// "AI (depth 7, 6000ms)"); unknown sides fall back to PGN's "?".
+// "Uma (depth 7, 6s)"); unknown sides fall back to PGN's "?".
 export function exportPgn(root, status, players = {}) {
   const start = root.state;
   const result = resultToken(status);
