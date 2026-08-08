@@ -53,6 +53,29 @@ including the ones that lost, `default` is the shipped set. An unknown name is a
 error, because a typo would otherwise play the shipped search against itself and report
 "no change" — the one answer a search gate must never produce by accident.
 
+`--search-a`/`--search-b` and `--save-games` are mutually exclusive (exit 2). A harvested
+record stamps one search era (`se` = `ai.SEARCH_ERA`) for the whole game, so a mixed-search
+game would be filed under a player label it never played with, and the rating pool would
+then average two engines under one `(engine, depth)` id. **Bump `SEARCH_ERA` (`ai.zig` and
+`src/ai.js`, they must match) whenever the shipped search changes what it does** — the
+defaults, the margins, or the code they gate. Everything the ladder knows is scoped by it:
+`rank:pool --era` rates one era at a time, and the era-2 pin is a measured offset from
+era 1 rather than a fresh 1500, so absolute Elo survives the change (`docs/tools.md`).
+
+Shipping era N+1 is three steps beyond the gate itself:
+
+```
+# 1. bump SEARCH_ERA in ai.zig and src/ai.js (they must match), then rebuild
+# 2. measure the new pin — A is the new search, B is era N's spec, no --save-games
+apos-match --eval-a=handcrafted --eval-b=handcrafted --depth=6 --depth-b=6 \
+           --search-b=rfp,lmr,nullr,asp --games=400
+# 3. add `pin(N) + that Elo` to PIN_ELO_BY_ERA in scripts/depth-ladder.mjs, and
+#    archive the old ledger as loop/engine-elo.ladder.era<N>.json
+```
+
+The ladder then re-measures itself from era N+1 games as they arrive. Nothing is deleted:
+the old games stay training data, the archived ledger keeps rating them.
+
 **A fixed-DEPTH match cannot gate a search change**, and the failure is not subtle:
 a selective search visits ~10× fewer nodes at the same nominal depth, so it loses a
 depth-paced match by hundreds of Elo while being several times faster to that depth.
