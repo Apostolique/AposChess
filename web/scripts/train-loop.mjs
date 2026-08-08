@@ -95,7 +95,13 @@
 //                   gains are small, and small edges need many games to clear the SPRT:
 //                   a true +20 candidate clears an 800g gate only ~1/3 of the time but
 //                   ~80% at 2000g, with the false-reject rate pinned at beta throughout)
-//   --gate-depth=D  search depth for the gating match (default 6)
+//   --gate-depth=D  search depth for the gating match (default 6). Deliberately CHEAPER than the
+//                   depth the engine is deployed at, because the gate runs every cycle while the
+//                   confirmation (--confirm-depth, default 8) runs only on H1. A 40-game matchup
+//                   costs d6 73 s / d7 285 s / d8 494 s (jobs=14, over 50 era-2 matchups), which
+//                   would turn the observed ~62 min cycle into ~108 if the gate moved to 8 —
+//                   1.7x fewer promotion attempts, every cycle, to sharpen a measurement whose
+//                   per-candidate error at d6 has never been shown to matter.
 //   --elo1=E        SPRT H1 promotion threshold in Elo (default 20; elo0 is 0). This
 //                   is the SMALLEST gain worth promoting; it must be wide enough that
 //                   the SPRT can actually decide within --gate-games. A too-small band
@@ -124,13 +130,22 @@
 //                   true-edge-~0 zone, the EXPECTED number of spurious promotions is
 //                   0.05 x 0.4 x 497 ~= 10 — against 23 actual promotions. The strength ledger
 //                   agrees that something is wrong (champion-by-champion numbers at runConfirm).
-//                   So on H1 the loop replays candidate vs champion at --gate-depth as a
+//                   So on H1 the loop replays candidate vs champion at --confirm-depth as a
 //                   FIXED-LENGTH match on a FRESH SEED, with no SPRT and no futility stop, and
 //                   promotes only if that match measures more than --confirm-elo. Independence
 //                   is the whole point: a different seed means different opening lines (reusing
-//                   the gate's would replay the gate's own games and confirm nothing), and a
-//                   fixed length means the measured Elo is an UNBIASED estimate of the edge
-//                   rather than one selected for having crossed a promotion bound.
+//                   the gate's would replay the gate's own games and confirm nothing), a fixed
+//                   length means the measured Elo is an UNBIASED estimate of the edge rather than
+//                   one selected for having crossed a promotion bound, and a deeper search means
+//                   the candidate faces a question it cannot have been tuned toward.
+//   --confirm-depth=D  search depth for the confirmation match (default 8, vs the gate's 6).
+//                   Deep search is affordable here and not in the gate because this only runs on
+//                   the ~5% of cycles that reach H1 (~1% of the loop's wall clock). It puts the
+//                   irreversible decision at the depth the engine is deployed at, and it makes
+//                   every promotion attempt log a paired (gate d6, confirm d8) edge — the
+//                   per-candidate depth-transfer residual on near-clones, which is exactly the
+//                   quantity the d1 screen cannot measure and the reason it stays shadow-only.
+//                   Set 6 to restore the same-depth confirmation.
 //                   A failed confirmation costs a cycle, not a gain: the candidate is kept as
 //                   this track's lineage and re-gates next cycle, exactly like any other gate
 //                   winner that didn't promote.
@@ -178,6 +193,9 @@
 //                   an edge rather than testing a hypothesis (default 20000, ~5 min at d1)
 //   --screen-ratio=R  assumed screen-depth:gate-depth Elo ratio (default 0.62). Affects only
 //                   the logged prediction; screen:report re-fits it from the recorded pairs.
+//                   STALE since 2026-08-08: 0.62 is a d1:d6 transfer measured under the era-1
+//                   search, and pruning compounds with depth, so era 2's d1:d6 curve is a
+//                   different shape. Re-fit before believing the shadow line.
 //   --no-screen-save  discard the screen's games instead of keeping them. By default they go
 //                   to loop/screen-games.jsonl — a SEPARATE dataset, never selfplay.jsonl.
 //                   Two reasons to keep them. (1) The ledger can rate from them: the loop
@@ -223,8 +241,8 @@
 //                   selfplay.jsonl via the match runner's --save-games, with the
 //                   search value `v` kept only from the engine the gate proved
 //                   stronger; the next cycle's (incremental) featurize folds them
-//                   in. They're played at --gate-depth (default 6), a notch below the
-//                   generation --depth (8); refresh-v walks these labels up over cycles.
+//                   in. They're played at --gate-depth, which since 2026-08-08 matches the
+//                   generation --depth (8), so the harvest's labels no longer need walking up.
 //   --jobs=N        parallel workers for gen + match
 //   --quiet-only    featurize only QUIET positions (drop side-to-move-in-check and
 //                   positions with a winning capture available). NNUE is a static eval
@@ -663,6 +681,15 @@ const cfg = {
   adjudicatePlies: num(args['adjudicate-plies'], 4),
   cycles: args.cycles !== undefined ? Number(args.cycles) : Infinity,
   gateGames: num(args['gate-games'], 2000),
+  // GATE DEPTH stays 6, and the CONFIRMATION goes deep instead (--confirm-depth, below). The
+  // temptation on 2026-08-08 was to move the gate to 8, where the engine is actually played (the
+  // app's default preset is d7, generation runs d6-8), since the era-2 search reaches a given
+  // depth on ~a quarter of the nodes. The cost says otherwise: a 40-game matchup measures d6 73 s
+  // / d7 285 s / d8 494 s (jobs=14, fitted over 50 era-2 matchups), and against the observed cycle
+  // shape — 48 min training, ~26 min gate, 6 min screen, the gate usually stopped early by SPRT —
+  // a d8 gate turns a ~62 min cycle into ~108. That is 1.7x fewer attempts at ~13.5 Elo per
+  // promotion, paid on EVERY cycle, to sharpen a measurement whose per-candidate error at d6 has
+  // never been shown to matter. Gate cheap and often, confirm deep and rarely.
   gateDepth: num(args['gate-depth'], 6),
   elo1: num(args.elo1, 20), // wide enough that SPRT can decide within --gate-games
   // Futility stop for the gate SPRT (0 = off). See the flag doc above; the measured trade
@@ -677,6 +704,19 @@ const cfg = {
   // is at runConfirm, along with why 600 games and +8 Elo are the defaults.
   confirmGames: args['no-confirm'] ? 0 : num(args['confirm-games'], 600),
   confirmElo: num(args['confirm-elo'], 8),
+  // The confirmation runs DEEPER than the gate (8 vs 6) as of 2026-08-08. It only fires on H1, so
+  // depth-8 search is paid on the ~5% of cycles that reach a promotion decision rather than on
+  // every gate, which is what makes it affordable: ~1.7x the cycle time if the gate moved to 8,
+  // against ~1% of the loop's wall clock here. Three things fall out of it. The irreversible
+  // decision gets made at the depth the engine is actually deployed at. A candidate that only
+  // looks good at d6 is caught by a test it cannot have been tuned toward, which the same-depth
+  // confirmation could not do (it re-measured the gate's own question with new dice). And every
+  // promotion attempt logs a paired (d6 gate edge, d8 confirm edge) observation into the track
+  // history — the per-candidate depth-transfer residual on NEAR-CLONES, which is the number the
+  // d1 screen could never get at and the reason it is still shadow-only. Ten of those settle
+  // whether the gate belongs at 6 or 8, with data instead of a population correlation.
+  // Set --confirm-depth=6 to restore the same-depth confirmation.
+  confirmDepth: num(args['confirm-depth'], 8),
   // Low-depth SCREEN, shadow mode (see the --screen flag doc). ON by default: it measures the
   // candidate at a cheap depth BEFORE the gate, predicts the gate-depth edge, and logs the
   // prediction — then runs the real gate regardless. Instrumentation only: nothing here feeds
@@ -688,7 +728,10 @@ const cfg = {
   screen: flag(args.screen, true) && !args['no-screen'],
   screenDepth: num(args['screen-depth'], 1),
   screenGames: num(args['screen-games'], 20000),
-  // Elo transfer ratio screen-depth : gate-depth. 0.62 is the measured d1/d6 ratio over this
+  // Elo transfer ratio screen-depth : gate-depth. STALE as of 2026-08-08: 0.62 was fitted under
+  // the era-1 search, and pruning compounds with depth, so era 2's d1:d6 transfer is a different
+  // shape. Re-fit from the in-loop pairs (`npm run screen:report`) before reading the shadow
+  // prediction as anything. 0.62 is the measured d1/d6 ratio over this
   // engine's champion sequence (see the flag doc). Only affects the LOGGED prediction — the
   // paired (screen, gate) observations recorded per cycle let screen:report re-fit it.
   screenRatio: num(args['screen-ratio'], 0.62),
@@ -1255,7 +1298,9 @@ function foldCandidateHarvest(src, promoted, res, confirmRes) {
   // estimate here that is biased UPWARD by construction: the SPRT stopped precisely because the
   // LLR walk crossed the promotion bound, so its endpoint is selected for looking good. The
   // confirmation is unbiased but shorter, hence wider. Taking the min of the two lower bounds is
-  // the conservative read either way, and in practice it is usually the confirmation's.
+  // the conservative read either way, and in practice it is usually the confirmation's. The two
+  // now sit at different depths (6 and 8), so the min crosses a depth boundary — see foldHarvest's
+  // header for why that costs only the transfer residual, not the depth-matched base.
   let lo = null, what = 'gate edge';
   if (champElo) {
     lo = gateLo;
@@ -1273,9 +1318,17 @@ function foldConfirmHarvest(promoted, res, confirmRes = null) {
 // The body shared by the gate harvest and the screen harvest (--screen-save). `champElo` is
 // null when nothing needs relabeling (a promoted candidate is archived, hence rankable, so its
 // lines pass through as-is); otherwise every line tagged with the candidate's content hash is
-// rewritten to the ephemeral "nn<d>@elo<E>" form. `edgeLo` MUST be measured at the same search
-// depth as the harvested games — the tag's E is an absolute Elo at that depth, so pairing a
-// depth-1 harvest with a depth-6 edge would misrate every one of those games.
+// rewritten to the ephemeral "nn<d>@elo<E>" form.
+//
+// E = the champion's ledger Elo AT THAT RECORD'S OWN DEPTH (read per line from the `vs` tag, so a
+// mixed-depth harvest stays correct) plus `edgeLo`. The base is therefore always depth-matched;
+// `edgeLo` is not, since 2026-08-08 split the gate (d6) from the confirmation (d8) and the fold
+// takes the lower of the two bounds. An EDGE transfers across depths far better than an absolute
+// rating does, so the error is the per-candidate depth-transfer residual — small enough to accept
+// against the selection-bias protection the min buys, and the exact quantity the paired
+// (gate, confirm) rows now accumulate. Revisit once ~10 of them exist. What would genuinely
+// misrate a harvest is pairing it with an edge from a WILDLY different depth: the screen's d1
+// games must never be folded with a gate-depth edge.
 function foldHarvest(src, dest, champElo, edgeLo, what) {
   if (!existsSync(src)) return;
   const candHash = weightsHash(candidate);
@@ -1494,17 +1547,17 @@ function runConfirm(cycleNo, candHash, champHash) {
   if (existsSync(confirmHarvest)) rmSync(confirmHarvest); // no stale harvest from a prior cycle
   const seed = confirmSeed(cycleNo, candHash, champHash);
   const t0 = Date.now();
-  // Same engines, same depth, same harvest as the gate — only the stopping rule and the seed
-  // differ. --seed is passed unconditionally (the gate only passes one alongside --save-games)
-  // because here the seed IS the measurement's independence, not a harvest detail.
-  const label = `Confirm: candidate vs champion @ depth ${cfg.gateDepth} `
+  // Same engines and harvest as the gate; the stopping rule, the seed and the DEPTH differ.
+  // --seed is passed unconditionally (the gate only passes one alongside --save-games) because
+  // here the seed IS the measurement's independence, not a harvest detail.
+  const label = `Confirm: candidate vs champion @ depth ${cfg.confirmDepth} `
     + `(${cfg.confirmGames} games, fresh seed, no SPRT)`;
   const ok = run(label, matchBin,
     ['--eval-a=nn', `--weights-a=${candidate}`, '--eval-b=nn', `--weights-b=${champion}`,
-      `--depth=${cfg.gateDepth}`, `--games=${cfg.confirmGames}`,
+      `--depth=${cfg.confirmDepth}`, `--games=${cfg.confirmGames}`,
       `--result-file=${confirmFile}`, `--seed=${seed}`,
       ...(cfg.harvest ? [`--save-games=${confirmHarvest}`] : []), ...jobArg]);
-  const base = { depth: cfg.gateDepth, seed, games: 0, threshold: cfg.confirmElo,
+  const base = { depth: cfg.confirmDepth, seed, games: 0, threshold: cfg.confirmElo,
     seconds: Math.round((Date.now() - t0) / 1000) };
   if (!ok) return { ...base, ran: false, passed: false, reason: 'interrupted or failed' };
   let r;
@@ -1519,7 +1572,7 @@ function runConfirm(cycleNo, candHash, champHash) {
   const rec = { ...base, ran: true, passed, games: r.games, score: ci.score,
     elo: ci.elo, eloLo: ci.lo, eloHi: ci.hi, seconds: Math.round((Date.now() - t0) / 1000) };
   log(`  Confirmation: ${(ci.score * 100).toFixed(1)}% / ${ci.elo >= 0 ? '+' : ''}${ci.elo.toFixed(0)} Elo `
-    + `[${ci.lo.toFixed(0)}, ${ci.hi.toFixed(0)}] over ${r.games} games at depth ${cfg.gateDepth} in `
+    + `[${ci.lo.toFixed(0)}, ${ci.hi.toFixed(0)}] over ${r.games} games at depth ${cfg.confirmDepth} in `
     + `${fmtDur(rec.seconds)} (seed ${seed} — independent of the gate's openings) → `
     + `${passed ? `HOLDS UP (> +${cfg.confirmElo} Elo) — promoting`
       : `REJECTED (not above +${cfg.confirmElo} Elo) — champion stays`}.`);
@@ -2016,7 +2069,7 @@ log(`train:loop start — ${cfg.batch === 0
     ? `adjudicate gen ${cfg.genAdjudicate}cp x${cfg.adjudicatePlies} (ungated) | `
     : '')
   + (cfg.confirmGames > 0
-    ? `confirm ${cfg.confirmGames}g @ depth ${cfg.gateDepth} on a fresh seed, no SPRT — promote only `
+    ? `confirm ${cfg.confirmGames}g @ depth ${cfg.confirmDepth} on a fresh seed, no SPRT — promote only `
       + `above +${cfg.confirmElo} Elo | `
     : 'confirm OFF — promoting on the gate alone (--no-confirm) | ')
   + (cfg.screen
@@ -2419,8 +2472,10 @@ for (let i = 1; i <= cfg.cycles && !stopRequested(); i++) {
       // Confirmation match, omitted entirely unless one ran (so a cycle from before this existed,
       // a --no-confirm cycle, and a non-H1 cycle all record exactly what they always did). Paired
       // with this line's `edgeElo`/`edgeLo`/`edgeHi`, these are two independent measurements of
-      // the same pair at the same depth — the record needed to check, later and offline, how often
-      // an H1 gate actually reproduces.
+      // the same pair — the record needed to check, later and offline, how often an H1 gate
+      // actually reproduces. Since 2026-08-08 they are also at DIFFERENT depths (gate 6, confirm
+      // 8), so the pair doubles as the per-candidate depth-transfer residual on near-clones: the
+      // number that decides whether the gate belongs at 6 or 8, accumulating one row at a time.
       ...(confirm ? { confirm } : {}),
     });
     if (rc.isBest) copyFileSync(candidate, trackBest);
