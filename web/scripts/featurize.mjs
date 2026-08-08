@@ -53,7 +53,10 @@
 //                kept the raw unrankable hash) — counts as weakest and the game is dropped.
 //                Recorded in the meta sidecar; changing it forces a full re-featurize.
 //   --ledger=F   the Elo ledger --min-elo resolves players against
-//                (default ../training/data/loop/engine-elo.ladder.json, from rank:pool)
+//                (default ../training/data/loop/engine-elo.ladder.json, from rank:pool).
+//                Each game is judged by the ledger for its OWN search era: this file when its
+//                `era` matches, else the sibling `<F>.era<N>.json` a re-baseline archived. An
+//                era no ledger covers is an error, not a default.
 //   --drop-conflicts=CP  drop POSITIONS where the recorded search value contradicts the
 //                game result: |v| >= CP centipawns but the mover did not go on to win
 //                (v >= CP with r <= 0, or v <= -CP with r >= 0). A clearly-winning
@@ -74,7 +77,7 @@ import { fileURLToPath } from 'node:url';
 import { parseFen } from '../src/board.js';
 import { featureIndices, PIECE_SQUARE_FEATURES, NUM_FEATURES } from '../src/nn.js';
 import { generatePseudoMoves, kingAttacked } from '../src/engine.js';
-import { expandPositions, isGameRecord } from './gameRecord.mjs';
+import { expandPositions, isGameRecord, gameEra } from './gameRecord.mjs';
 import { ledgerEloResolver, ephemeralElo, parseVtag } from './vtag.mjs';
 import { fmtDur, fmtNum, fmtMB, liveStatus, everyMs } from './fmt.mjs';
 
@@ -152,14 +155,33 @@ if (!existsSync(inFile)) {
 // is judged by the game's own ephemeral `vs` evidence. Only foldGateHarvest ever writes
 // "elo<N>" tags (refresh-v/gen never do), so an ephemeral vs IS that candidate's measured
 // strength at the time it played — never a refresh artifact.
-let playerElo = null;
+//
+// A rating only means something for the search that earned it, so a game is judged by the ledger
+// of ITS OWN search era (gameEra): the named --ledger when its `era` matches, else the sibling
+// `<ledger>.era<N>.json` archive left behind by a re-baseline. An era with no ledger is a hard
+// error rather than a default — dropping every game of it (strict) or keeping every game of it
+// (lenient) are both silent, and one of them would quietly throw away most of the corpus.
+const ledgerPath = typeof args.ledger === 'string'
+  ? resolve(process.cwd(), args.ledger)
+  : resolve(here, '../../training/data/loop/engine-elo.ladder.json');
+const resolverByEra = new Map();
+function playerEloForEra(era) {
+  if (resolverByEra.has(era)) return resolverByEra.get(era);
+  const sibling = ledgerPath.replace(/\.json$/, '') + `.era${era}.json`;
+  let resolver = null;
+  for (const p of [ledgerPath, sibling]) {
+    if (!existsSync(p)) continue;
+    let led; try { led = JSON.parse(readFileSync(p, 'utf8')); } catch { continue; }
+    if ((led.era == null ? 1 : led.era) !== era) continue;
+    resolver = ledgerEloResolver(p);
+    break;
+  }
+  resolverByEra.set(era, resolver);
+  return resolver;
+}
 if (minElo !== null) {
-  const ledgerPath = typeof args.ledger === 'string'
-    ? resolve(process.cwd(), args.ledger)
-    : resolve(here, '../../training/data/loop/engine-elo.ladder.json');
-  try { playerElo = ledgerEloResolver(ledgerPath); }
-  catch (e) {
-    console.error(`--min-elo needs a readable ledger (${ledgerPath}): ${e.message}. Run 'npm run rank:pool' first.`);
+  if (!existsSync(ledgerPath)) {
+    console.error(`--min-elo needs a readable ledger (${ledgerPath}). Run 'npm run rank:pool' first.`);
     process.exit(1);
   }
 }
@@ -177,7 +199,15 @@ function ephemeralVsElo(rec) {
   return min;
 }
 function isWeakGame(rec) {
-  if (!playerElo || !isGameRecord(rec)) return false;
+  if (minElo === null || !isGameRecord(rec)) return false;
+  const era = gameEra(rec);
+  const playerElo = playerEloForEra(era);
+  if (!playerElo) {
+    console.error(`--min-elo: no ledger rates search era ${era}, which game ${rec.g} was played in.`
+      + `\n  Point --ledger at that era's ledger, or archive it beside this one as`
+      + ` ${ledgerPath.replace(/\.json$/, '')}.era${era}.json.`);
+    process.exit(1);
+  }
   if (!rec.players) return true; // no provenance at all -> weakest, drop
   let weakest = Infinity;
   for (const tag of Object.values(rec.players)) {
