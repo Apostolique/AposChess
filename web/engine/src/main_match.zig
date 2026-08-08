@@ -21,9 +21,17 @@
 // promote anyway — so this reclaims exactly those games. The `futility` result field records
 // whether the stop fired (the verdict stays "inconclusive", same as running out the cap).
 //
+// A match is paced by exactly ONE instrument: --depth (fixed depth), --movetime (ms/move), or
+// --nodes (nodes/move), each with a `-b` twin for an asymmetric budget. --nodes is the one that
+// can gate a SEARCH change: at a fixed depth a pruning or move-ordering gain returns the same
+// move for fewer nodes, so its whole benefit is invisible and the gate rejects it, while
+// movetime prices it but reads the machine's load into the score. Mixing the flags is an error
+// (exit 2), not a silent precedence — see the resolution in main.
+//
 //   apos-match --games=800 --depth=4 --eval-a=nn --eval-b=nn \
 //     --weights-a=cand.json --weights-b=src/nn-weights.json --sprt --elo1=20 \
 //     --result-file=match.json --save-games=../training/data/selfplay.jsonl --jobs=14
+//   apos-match --games=400 --nodes=200000 --eval-a=nn --eval-b=nn ...   # search-change gate
 // Paths are relative to the current directory (run from web/).
 //
 // --save-games harvests each game as one game-primary record (scripts/gameRecord.mjs:
@@ -370,15 +378,25 @@ fn divProbe(probe: *const DivProbe, st: *const State) void {
     if (!same_sign and @abs(ea) >= probe.margin and @abs(eb) >= probe.margin) acc.confident += 1;
 }
 
-// Per-side search budget: a fixed depth (depth > 0) OR a per-move time budget (depth ==
-// 0, search to `movetime` ms). Engine A and B each carry their own, so the rank gauntlet
+// Per-side search budget — exactly ONE of three instruments (see the --nodes semantics note
+// in main): a fixed depth (`depth` > 0), a per-move time budget (`movetime` ms), or a
+// per-move NODE budget (`nodes`). Engine A and B each carry their own, so the rank gauntlet
 // can pit cheap fixed-depth contenders against a deep stable anchor (--depth-b).
-const Budget = struct { depth: u32, movetime: i64 };
+//
+// The node instrument exists because the other two can't gate a SEARCH change. At a fixed
+// depth a pruning or move-ordering gain returns the same move for fewer nodes, so its whole
+// benefit is invisible and the gate would reject every correct pruning change; movetime does
+// price it, but wall-clock on a box that also runs training and a 12-job match is noisy and
+// non-reproducible. A node budget prices speed and accuracy on one scale and is
+// deterministic, so the same seed replays the same match under any load.
+const Budget = struct { depth: u32, movetime: i64, nodes: u64 = 0 };
 
 fn searchBudget(s: *ai.Searcher, st: *const State, b: Budget, seen: []const u64, no_tt: bool) ai.Result {
+    // depth 0 => the search runs to the iterative-deepening backstop (99) and is stopped by
+    // whichever budget is set; a node budget leaves ms at 0 so the clock is never read at all.
     const d: u32 = if (b.depth > 0) b.depth else 99;
     const ms: i64 = if (b.depth > 0) 0 else b.movetime;
-    return if (no_tt) s.chooseMoveNoTT(st, d, ms, seen) else s.chooseMove(st, d, ms, seen);
+    return if (no_tt) s.chooseMoveNoTT(st, d, ms, b.nodes, seen) else s.chooseMove(st, d, ms, b.nodes, seen);
 }
 
 // Build a random opening as a MOVE SEQUENCE from the standard start. Returned (not applied)
@@ -943,8 +961,18 @@ fn evalTag(k: ai.EvalKind) []const u8 {
     };
 }
 
-// One side's key signature: eval tag, nn layer widths (if any), and the search budget (depth dN
-// or movetime tN). Written into `buf`.
+// The pacing half of a signature: "d6" fixed depth, "n200000" node budget, "t50" movetime —
+// exactly one is set (see Budget). Shared by the timing-store key and the startup line, so the
+// two can never disagree about what a run's budget was.
+fn budgetSig(buf: []u8, b: Budget) []const u8 {
+    if (b.depth > 0) return std.fmt.bufPrint(buf, "d{d}", .{b.depth}) catch buf[0..0];
+    if (b.nodes > 0) return std.fmt.bufPrint(buf, "n{d}", .{b.nodes}) catch buf[0..0];
+    return std.fmt.bufPrint(buf, "t{d}", .{b.movetime}) catch buf[0..0];
+}
+
+// One side's key signature: eval tag, nn layer widths (if any), and the search budget (see
+// budgetSig — a node-paced game takes a very different sec/game from a depth- or time-paced one,
+// so it must not share the other's ETA prior). Written into `buf`.
 fn sideSig(buf: []u8, k: ai.EvalKind, b: Budget, net: ?*const nn.Net) []const u8 {
     var n: usize = 0;
     const tag = evalTag(k);
@@ -967,10 +995,7 @@ fn sideSig(buf: []u8, k: ai.EvalKind, b: Budget, net: ?*const nn.Net) []const u8
         buf[n] = ']';
         n += 1;
     }
-    const bud = if (b.depth > 0)
-        std.fmt.bufPrint(buf[n..], "d{d}", .{b.depth}) catch buf[n..n]
-    else
-        std.fmt.bufPrint(buf[n..], "t{d}", .{b.movetime}) catch buf[n..n];
+    const bud = budgetSig(buf[n..], b);
     n += bud.len;
     return buf[0..n];
 }
@@ -1094,7 +1119,12 @@ fn weightsHash(io: std.Io, gpa: std.mem.Allocator, path: []const u8) [6]u8 {
 }
 
 // Provenance tag "<engine><depth>@<version>" (vtag.mjs) into `buf`. depth == 0 means a
-// time-based search, marked 't' (matching vtag.mjs).
+// search that wasn't paced by a fixed depth — time OR node budget — marked 't' (matching
+// vtag.mjs, whose grammar is `(nn|hc)(\d+|t)@`). A node-paced search deliberately reuses 't'
+// rather than inventing an 'n' family: parseVtag lives in vtag.mjs and every consumer of it
+// (rank:pool node identity, merge-data's provenance ranking, refresh-v) would have to learn
+// the new letter, and a node budget is a search-development instrument, not a data-generation
+// mode — --nodes runs are gated on --result-file, not harvested.
 fn vtagFmt(buf: []u8, kind: ai.EvalKind, depth: u32, io: std.Io, gpa: std.mem.Allocator, weights: []const u8) []const u8 {
     if (kind == .nn) {
         const h = weightsHash(io, gpa, weights);
@@ -1356,7 +1386,23 @@ pub fn main(init: std.process.Init) !void {
     var depth_a: ?u32 = null;
     var depth_b_opt: ?u32 = null;
     var movetime_a: i64 = 50; // selfplay's default think time when no depth is given
+    var movetime_given = false; // --movetime was actually passed (50 is also the default)
     var movetime_b_opt: ?i64 = null;
+    // --nodes=N / --nodes-b=N: a fixed NODE budget per move (B inherits A's unless --nodes-b),
+    // the instrument for gating a SEARCH change — see Budget.
+    //
+    // SEMANTICS: --nodes is a THIRD, EXCLUSIVE pacing mode. If either --nodes flag is given,
+    // none of --depth/--depth-b/--movetime/--movetime-b may be, and the runner exits 2 rather
+    // than picking one silently. Two reasons it is exclusive rather than combined:
+    //   * with a depth cap the search can no longer spend its saved nodes on extra depth, which
+    //     is the entire benefit a pruning change is supposed to show — the cap would silence
+    //     exactly the signal being measured;
+    //   * with movetime the wall clock could stop the search first, putting the machine's load
+    //     back into the result and destroying the reproducibility --nodes exists to provide.
+    // A whole match is therefore depth-paced, time-paced, or node-paced; asymmetry inside the
+    // chosen mode stays available through the -b flag (--nodes=20000 --nodes-b=40000).
+    var nodes_a_opt: ?u64 = null;
+    var nodes_b_opt: ?u64 = null;
     var seed: u64 = 1;
     var openings: u32 = 6; // matches the JS `npm run match` default
     var maxmoves: u32 = 200;
@@ -1391,8 +1437,13 @@ pub fn main(init: std.process.Init) !void {
         if (argStr(arg, "--games=")) |v| games = std.fmt.parseInt(u32, v, 10) catch games;
         if (argStr(arg, "--depth=")) |v| depth_a = std.fmt.parseInt(u32, v, 10) catch depth_a;
         if (argStr(arg, "--depth-b=")) |v| depth_b_opt = std.fmt.parseInt(u32, v, 10) catch depth_b_opt;
-        if (argStr(arg, "--movetime=")) |v| movetime_a = std.fmt.parseInt(i64, v, 10) catch movetime_a;
+        if (argStr(arg, "--movetime=")) |v| {
+            movetime_a = std.fmt.parseInt(i64, v, 10) catch movetime_a;
+            movetime_given = true; // 50 is the DEFAULT, so the value alone can't say it was asked for
+        }
         if (argStr(arg, "--movetime-b=")) |v| movetime_b_opt = std.fmt.parseInt(i64, v, 10) catch movetime_b_opt;
+        if (argStr(arg, "--nodes=")) |v| nodes_a_opt = std.fmt.parseInt(u64, v, 10) catch nodes_a_opt;
+        if (argStr(arg, "--nodes-b=")) |v| nodes_b_opt = std.fmt.parseInt(u64, v, 10) catch nodes_b_opt;
         if (argStr(arg, "--seed=")) |v| seed = std.fmt.parseInt(u64, v, 10) catch seed;
         if (argStr(arg, "--openings=")) |v| openings = std.fmt.parseInt(u32, v, 10) catch openings;
         if (argStr(arg, "--maxmoves=")) |v| maxmoves = std.fmt.parseInt(u32, v, 10) catch maxmoves;
@@ -1416,10 +1467,41 @@ pub fn main(init: std.process.Init) !void {
     }
     if (jobs < 1) jobs = 1;
 
-    // Resolve each side's budget. A fixed depth wins over movetime; B inherits A's depth
-    // when only --depth was given, A's movetime when only --movetime was given.
-    const budget_a: Budget = if (depth_a) |d| .{ .depth = d, .movetime = 0 } else .{ .depth = 0, .movetime = movetime_a };
-    const budget_b: Budget = if (depth_b_opt orelse depth_a) |d|
+    // A node budget is a pacing MODE, not a modifier: reject a mixed pacing loudly instead of
+    // silently dropping one of the two (the depth-over-movetime precedence below already
+    // quietly ignores a --movetime-b that a --depth overrode; repeating that for --nodes would
+    // hide the difference between a reproducible node-paced gate and a load-sensitive timed one).
+    if (nodes_a_opt != null or nodes_b_opt != null) {
+        if (depth_a != null or depth_b_opt != null or movetime_given or movetime_b_opt != null) {
+            std.debug.print("error: --nodes/--nodes-b cannot be combined with --depth/--movetime — a match is depth-paced, time-paced, or node-paced.\n" ++
+                "  A depth cap would hide the extra depth a pruning gain buys (the signal --nodes exists to measure), and the wall\n" ++
+                "  clock would put machine load back into a result --nodes exists to make reproducible. Use --nodes-b for asymmetry.\n", .{});
+            std.process.exit(2);
+        }
+        if (nodes_a_opt == null) {
+            std.debug.print("error: --nodes-b requires --nodes — it sets B's share of a node-paced match, it does not pace one side alone\n" ++
+                "  (without --nodes, A would silently fall back to the 50 ms default and the match would be half timed).\n", .{});
+            std.process.exit(2);
+        }
+        if (nodes_a_opt.? == 0 or (nodes_b_opt orelse 1) == 0) {
+            std.debug.print("error: --nodes must be > 0 (0 means 'unlimited' inside the searcher, which here would search to depth 99).\n", .{});
+            std.process.exit(2);
+        }
+    }
+
+    // Resolve each side's budget. A node budget wins over both (it is exclusive — validated
+    // above); otherwise a fixed depth wins over movetime. B inherits A's nodes when only
+    // --nodes was given, A's depth when only --depth was given, A's movetime when only
+    // --movetime was given.
+    const budget_a: Budget = if (nodes_a_opt) |n|
+        .{ .depth = 0, .movetime = 0, .nodes = n }
+    else if (depth_a) |d|
+        .{ .depth = d, .movetime = 0 }
+    else
+        .{ .depth = 0, .movetime = movetime_a };
+    const budget_b: Budget = if (nodes_a_opt) |n|
+        .{ .depth = 0, .movetime = 0, .nodes = nodes_b_opt orelse n }
+    else if (depth_b_opt orelse depth_a) |d|
         .{ .depth = d, .movetime = 0 }
     else
         .{ .depth = 0, .movetime = movetime_b_opt orelse movetime_a };
@@ -1498,7 +1580,14 @@ pub fn main(init: std.process.Init) !void {
     shared.pair_acc = try gpa.alloc(PairAcc, shared.total_pairs);
     @memset(shared.pair_acc, .{});
 
-    std.debug.print("Playing {d} games | openings {d} | jobs {d} | seed {d}\n", .{ games, openings, jobs, seed });
+    // Echo the resolved pacing, so a log makes plain WHICH instrument produced the result —
+    // "d6/d6" vs "n200000/n200000" is the difference between a measurement that can see a
+    // pruning gain and one that can't, and the -b twins make asymmetry easy to typo.
+    var pace_a_buf: [24]u8 = undefined;
+    var pace_b_buf: [24]u8 = undefined;
+    const pace_a = budgetSig(&pace_a_buf, budget_a);
+    const pace_b = budgetSig(&pace_b_buf, budget_b);
+    std.debug.print("Playing {d} games | budget {s}/{s} | openings {d} | jobs {d} | seed {d}\n", .{ games, pace_a, pace_b, openings, jobs, seed });
 
     const t0 = std.Io.Clock.now(.awake, io).nanoseconds;
     shared.t0_ns = @intCast(t0); // so the live progress line can show elapsed/ETA

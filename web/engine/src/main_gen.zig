@@ -230,7 +230,7 @@ fn playGame(s: *ai.Searcher, cfg: *const Cfg, g: u64, alloc: std.mem.Allocator, 
 
         try states.append(alloc, st);
 
-        const r = s.chooseMove(&st, depth, max_ms, prev);
+        const r = s.chooseMove(&st, depth, max_ms, 0, prev); // 0 nodes = no node budget (gen paces by depth/time)
         nodes.* += r.nodes;
         try scores.append(alloc, r.score);
 
@@ -248,7 +248,7 @@ fn playGame(s: *ai.Searcher, cfg: *const Cfg, g: u64, alloc: std.mem.Allocator, 
                 exclude[nex] = @as(i32, r.move.?.from) * 64 + @as(i32, r.move.?.to);
                 nex += 1;
                 while (ncand < cfg.opening_topk and ncand < cands.len) {
-                    const nx = s.chooseMoveExcl(&st, depth, max_ms, prev, exclude[0..nex]);
+                    const nx = s.chooseMoveExcl(&st, depth, max_ms, 0, prev, exclude[0..nex]);
                     const m = nx.move orelse break;
                     cands[ncand] = m;
                     ncand += 1;

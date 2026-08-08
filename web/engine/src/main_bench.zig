@@ -69,7 +69,7 @@ pub fn main(init: std.process.Init) !void {
 
     const st = board.parseFen(fen);
     const t0 = std.Io.Clock.now(.awake, io).nanoseconds;
-    const res = s.chooseMove(&st, depth, 0, &.{});
+    const res = s.chooseMove(&st, depth, 0, 0, &.{}); // 0 ms, 0 nodes = pure fixed depth
     const elapsed_ns = std.Io.Clock.now(.awake, io).nanoseconds - t0;
     const ms: u64 = @intCast(@max(1, @divTrunc(elapsed_ns, 1_000_000)));
 
