@@ -430,6 +430,7 @@ import { fileURLToPath } from 'node:url';
 import { cpus } from 'node:os';
 
 import { fmtDur, fmtMB } from './fmt.mjs';
+import { SEARCH_ERA } from '../src/ai.js';
 import { weightsHash, ephemeralVersion } from './vtag.mjs';
 import { STOP_EXIT_CODE } from './stop.mjs';
 import { isGameRecord, vsAt, setVsAt, normalizeVs, serializeGameRecord } from './gameRecord.mjs';
@@ -1057,19 +1058,42 @@ function stopRequested() {
 // numbers line up with the ledger Elos we add the gate edge to).
 const eloFromScore = (p) => (p <= 0 ? -800 : p >= 1 ? 800 : -400 * Math.log10(1 / p - 1));
 
+// The rank ledger, but only if it rates the search we are actually running. A ledger's ratings
+// are (engine, depth) numbers with no search in the id, and a depth is worth a very different
+// amount under a different search — so a ledger from another era describes engines that no longer
+// exist. Reading it anyway would silently steer by a stale scale, which is the failure the `se`
+// stamp exists to prevent. Missing era = pre-2026-08-08 = era 1.
+let eraWarned = false;
+function readLedger() {
+  if (!existsSync(ledgerFile)) return null;
+  let ledger; try { ledger = JSON.parse(readFileSync(ledgerFile, 'utf8')); } catch { return null; }
+  const era = ledger.era == null ? 1 : ledger.era;
+  if (era !== SEARCH_ERA) {
+    if (!eraWarned) {
+      eraWarned = true;
+      log(`  Ledger ${ledgerFile} rates search era ${era}, this engine is era ${SEARCH_ERA} — ignoring it`
+        + ` (absElo, adaptive sizing and ephemeral Elo tags stay unrated until rank:pool re-measures).`);
+    }
+    return null;
+  }
+  return ledger;
+}
+
 // The current champion's Elo (vs the rank ledger's stable hc anchor) per search depth, plus
 // its best across depths. Returns null unless the ledger exists and actually ranks this
 // champion — without it we can't place an ephemeral candidate on the hc scale, so the gate
 // harvest is folded in unchanged (its candidate-hash labels stay −∞ "unrecoverable", as before).
 function championLedgerElo() {
-  if (!existsSync(ledgerFile)) return null;
-  let ledger;
-  try { ledger = JSON.parse(readFileSync(ledgerFile, 'utf8')); } catch { return null; }
+  const ledger = readLedger();
+  if (!ledger) return null;
   const champHash = weightsHash(champion);
   const byDepth = new Map();
   let best = -Infinity;
   for (const e of ledger.ranking || []) {
     if (e.eng !== 'nn' || e.version !== champHash || e.elo == null) continue;
+    // An unanchored node has no chain of games to the pin, so its Elo is the pool prior. Taking
+    // the max across depths would happily pick one of those over a depth that was really played.
+    if (e.anchored === false) continue;
     byDepth.set(String(e.depth), e.elo);
     best = Math.max(best, e.elo);
   }
@@ -1082,12 +1106,12 @@ function championLedgerElo() {
 // baseline instead of reacting to a noisy margin — a freshly promoted champion with thin games is
 // handled by the calibration pass, not by inflating the routine rank budget.
 function championLedgerConfidence() {
-  if (!existsSync(ledgerFile)) return null;
-  let ledger; try { ledger = JSON.parse(readFileSync(ledgerFile, 'utf8')); } catch { return null; }
+  const ledger = readLedger();
+  if (!ledger) return null;
   const champHash = weightsHash(champion);
   let best = null;
   for (const e of ledger.ranking || []) {
-    if (e.eng !== 'nn' || e.version !== champHash || e.elo == null) continue;
+    if (e.eng !== 'nn' || e.version !== champHash || e.elo == null || e.anchored === false) continue;
     if (!best || e.elo > best.elo) best = { elo: e.elo, margin: e.margin ?? null, games: e.games ?? 0, depth: e.depth };
   }
   if (!best || best.margin == null || best.games < 30) return null;
@@ -1108,8 +1132,8 @@ function championLedgerConfidence() {
 // a REACHABILITY problem wearing a budget problem's clothes, and it's why a hand-run rank:pool
 // (which carries no --play restriction) fixes what a bigger --rank-minutes cannot.
 function ledgerConvergence() {
-  if (!existsSync(ledgerFile)) return null;
-  let ledger; try { ledger = JSON.parse(readFileSync(ledgerFile, 'utf8')); } catch { return null; }
+  const ledger = readLedger();
+  if (!ledger) return null;
   const c = ledger.convergence;
   if (!c) return null;
   return {
@@ -1678,11 +1702,13 @@ function filterArgs() {
 // the classic random-fraction refresh with the champion.
 function refreshArgs(frac, depth) {
   const a = [refreshScript, `--frac=${frac}`, `--depth=${depth}`, `--seed=${Date.now()}`, ...jobArg];
-  return (cfg.rank && existsSync(ledgerFile))
+  return (cfg.rank && readLedger())
     ? [...a, `--ledger=${ledgerFile}`, '--eval=nn', `--weights=${champion}`]
     : [...a, '--refresh', `--weights=${champion}`];
 }
-const refreshMode = () => (cfg.rank && existsSync(ledgerFile)) ? 'weakest-first' : 'random';
+// Weakest-first needs a ledger that rates THIS search (readLedger); an off-era one would order
+// the cohorts by strengths the engine no longer has, so the fallback is the random fraction.
+const refreshMode = () => (cfg.rank && readLedger()) ? 'weakest-first' : 'random';
 
 // Human names for champions, handed out in order (the first eight — Ada..Hugo — were the
 // initial hand-published lineage). Names are permanent: a pruned champion's name moves to
