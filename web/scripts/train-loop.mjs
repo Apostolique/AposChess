@@ -44,8 +44,8 @@
 //                   (a draw became a win) — while cutting nodes 15.2% (2.19e9 -> 1.86e9).
 //                   535 of the 600 games adjudicated. That is the whole trade: the gate's
 //                   verdict is unchanged and the gate gets ~15% cheaper.
-//                   It is deliberately NOT forwarded to the confirmation match or the screen,
-//                   which leaves the confirmation an unmodified played-out yardstick.
+//                   It is deliberately NOT forwarded to the confirmation match, which leaves
+//                   the confirmation an unmodified played-out yardstick.
 //   --gen-adjudicate=CP  the same rule for the GENERATION step, 0 = off and that is the
 //                   default. Generation is NOT gated for this and must not inherit the gate's
 //                   default: the two steps run different rules and carry different risk. The
@@ -144,8 +144,8 @@
 //                   40-game matchup), which amortizes to ~6 min per cycle. It puts the
 //                   irreversible decision at the depth the engine is deployed at, and it makes
 //                   every promotion attempt log a paired (gate d6, confirm d8) edge — the
-//                   per-candidate depth-transfer residual on near-clones, which is exactly the
-//                   quantity the d1 screen cannot measure and the reason it stays shadow-only.
+//                   per-candidate depth-transfer residual on near-clones, which is the number
+//                   that settles whether the gate belongs at 6 or 8.
 //                   Set 6 to restore the same-depth confirmation.
 //                   A failed confirmation costs a cycle, not a gain: the candidate is kept as
 //                   this track's lineage and re-gates next cycle, exactly like any other gate
@@ -164,59 +164,6 @@
 //                   observed 62-76 min cycles rather than the ~1% claimed while it ran at d6.
 //   --no-confirm    alias for --confirm-games=0 — promote on the gate alone, as the loop did
 //                   before 2026-08-07. Use it to reproduce an older run, not to go faster.
-//   --no-screen     turn OFF the shadow-mode low-depth screen, which is ON by default.
-//                   Before the gate, it plays the candidate vs the champion at --screen-depth
-//                   for a fixed --screen-games, converts that edge to a gate-depth-equivalent
-//                   Elo (divide by --screen-ratio), and logs what a screen WOULD have decided
-//                   — then runs the real gate anyway and records both. It never promotes,
-//                   never rejects, and its games never reach the trainer; it exists to measure
-//                   whether a cheap screen could replace most of the gate.
-//                   It is ON by default because a bare `npm run train:loop` is how this loop
-//                   gets run, and an opt-in measurement is one that never happens. It cannot
-//                   change a verdict — the cost is ~4-5 min/cycle (~2% of a full-gate cycle)
-//                   plus ~40 MB/cycle of kept games (--no-screen-save drops that half).
-//                   Why: a full 2000-game gate at depth 6 is ~3.5-4h, most of a cycle, and
-//                   the futility stop only helps the CLEARLY bad candidates — the expensive
-//                   cycles are the ambiguous 51-52% ones. Depth 1 is ~414x cheaper per game
-//                   (0.155s vs 64s), so 20k screen games cost ~5 min and pin the score far
-//                   tighter than the gate does. Across this engine's 21 champions, depth-1
-//                   Elo ranks depth-8 Elo at Spearman 0.974, and the cumulative d1/d6 gain
-//                   ratio has held at 0.62 +/- 0.035 over the last ten champions.
-//                   The open question, and the ONLY reason this is shadow mode rather than a
-//                   cascade: that ratio is a POPULATION slope over well-separated champions.
-//                   What a screen needs is the PER-CANDIDATE residual on near-clones, and the
-//                   ladder cannot measure it (its own +/-31 and +/-35 Elo margins at d1/d6
-//                   already explain more scatter than the observed residual). Rejected
-//                   candidates are never archived, so the only way to get paired data on the
-//                   population a screen would actually face is to measure it in-loop. Run
-//                   ~10 cycles, then `npm run screen:report` (it refuses to conclude below 8).
-//   --screen-depth=D  screen search depth (default 1)
-//   --screen-games=N  screen games, played to a fixed N with NO SPRT — the screen estimates
-//                   an edge rather than testing a hypothesis (default 20000, ~5 min at d1)
-//   --screen-ratio=R  assumed screen-depth:gate-depth Elo ratio (default 0.62). Affects only
-//                   the logged prediction; screen:report re-fits it from the recorded pairs.
-//                   STALE since 2026-08-08: 0.62 is a d1:d6 transfer measured under the era-1
-//                   search, and pruning compounds with depth, so era 2's d1:d6 curve is a
-//                   different shape. Re-fit before believing the shadow line.
-//   --no-screen-save  discard the screen's games instead of keeping them. By default they go
-//                   to loop/screen-games.jsonl — a SEPARATE dataset, never selfplay.jsonl.
-//                   Two reasons to keep them. (1) The ledger can rate from them: the loop
-//                   passes the file to rank:pool as --corpus-extra, so a PROMOTED candidate's
-//                   20k direct games against the champion it dethroned become the densest
-//                   single-pair evidence the pool has (its own per-cycle play budget buys ~28
-//                   games, and 186 of the era-2 ladder's 191 adjacencies have never met).
-//                   A non-promoted candidate isn't archived, so its games get the same ephemeral
-//                   "nn<d>@elo<E>" tag the gate harvest uses — keyed off the SCREEN's edge at
-//                   the SCREEN's depth, since that tag is an absolute Elo at that depth.
-//                   (2) They're real games with real terminal results, so if a use for
-//                   low-depth play is ever found the data is already there.
-//                   What they must NOT do is reach the trainer: depth-1 `v` labels on
-//                   depth-1-play positions are precisely the weak off-distribution cohort
-//                   --filter-weak and refresh-v exist to drain, and at ~20k games/cycle they
-//                   would outnumber the cycle's real data ~10x. Hence the separate file.
-//                   Disk: ~2 KB per game (measured — depth-1 games run ~78 recorded plies vs
-//                   the gate's ~48, since weaker play shuffles longer), so ~40 MB per cycle at
-//                   the default 20k, in git-ignored training/data/loop/.
 //   --lambda=L      TD/bootstrap target mix for training the candidate (default 1 =
 //                   pure game result; <1 leans on the champion's own search value,
 //                   an unbiased bootstrap — recorded because generation uses the net)
@@ -598,18 +545,6 @@ function archiveChampion(file) {
   return hash;
 }
 const resultFile = join(loopDir, 'match.json');
-// The low-depth SCREEN's result file (--screen; see the flag doc). Separate from the gate's
-// match.json so a screen can never be mistaken for the promotion verdict, and so an aborted
-// screen leaves the gate's own result untouched.
-const screenFile = join(loopDir, 'screen.json');
-// --screen-save: the screen's games, kept in a SEPARATE dataset — never selfplay.jsonl.
-// They're real games with real terminal results, so they're worth keeping, but their `v`
-// labels are depth-1 opinions and their positions come from depth-1 play, which is exactly
-// the off-distribution weak-label cohort --filter-weak and refresh-v exist to drain. Keeping
-// them beside the training set rather than inside it means the ledger can rate from them (see
-// --corpus-extra in runRankPool) without a single depth-1 label reaching the trainer.
-const screenHarvest = join(loopDir, 'screen-harvest.jsonl'); // per-cycle temp, folded below
-const screenArchive = join(loopDir, 'screen-games.jsonl');   // the persistent separate dataset
 // The unrestricted link pass's games (runLinkPass). Rating evidence, not training data — it
 // plays whatever rank-adjacent pairs have never met, which includes the weak nodes that
 // --play-strong deliberately keeps out of the trainer. Read back via --corpus-extra.
@@ -723,34 +658,10 @@ const cfg = {
   // looks good at d6 is caught by a test it cannot have been tuned toward, which the same-depth
   // confirmation could not do (it re-measured the gate's own question with new dice). And every
   // promotion attempt logs a paired (d6 gate edge, d8 confirm edge) observation into the track
-  // history — the per-candidate depth-transfer residual on NEAR-CLONES, which is the number the
-  // d1 screen could never get at and the reason it is still shadow-only. Ten of those settle
+  // history — the per-candidate depth-transfer residual on NEAR-CLONES. Ten of those settle
   // whether the gate belongs at 6 or 8, with data instead of a population correlation.
   // Set --confirm-depth=6 to restore the same-depth confirmation.
   confirmDepth: num(args['confirm-depth'], 8),
-  // Low-depth SCREEN, shadow mode (see the --screen flag doc). ON by default: it measures the
-  // candidate at a cheap depth BEFORE the gate, predicts the gate-depth edge, and logs the
-  // prediction — then runs the real gate regardless. Instrumentation only: nothing here feeds
-  // the promotion decision, and no screen game ever reaches the trainer's dataset
-  // (--screen-save keeps them in a separate file the ledger rates from; see its flag doc).
-  // Default-on because it is answering an open question and a bare `npm run train:loop` is how
-  // this loop actually gets run — an opt-in measurement is a measurement that never happens.
-  // It cannot change a verdict, so the whole cost is ~4-5 min/cycle. --no-screen turns it off.
-  screen: flag(args.screen, true) && !args['no-screen'],
-  screenDepth: num(args['screen-depth'], 1),
-  screenGames: num(args['screen-games'], 20000),
-  // Elo transfer ratio screen-depth : gate-depth. STALE as of 2026-08-08: 0.62 was fitted under
-  // the era-1 search, and pruning compounds with depth, so era 2's d1:d6 transfer is a different
-  // shape. Re-fit from the in-loop pairs (`npm run screen:report`) before reading the shadow
-  // prediction as anything. 0.62 is the measured d1/d6 ratio over this
-  // engine's champion sequence (see the flag doc). Only affects the LOGGED prediction — the
-  // paired (screen, gate) observations recorded per cycle let screen:report re-fit it.
-  screenRatio: num(args['screen-ratio'], 0.62),
-  // Keep the screen's games in loop/screen-games.jsonl (a separate dataset — never the
-  // trainer's). On by default when --screen is on: the games are already paid for, and the
-  // ledger can rate from them. --no-screen-save discards them instead (see the flag doc for
-  // the disk cost, which is the only reason you'd want to).
-  screenSave: flag(args['screen-save'], true) && !args['no-screen-save'],
   lam: num(args.lambda, 1), // TD target mix passed to train.py (1 = pure result)
   // Drop tactically loud positions (in check / winning capture available) at featurize time
   // so the static net trains on the quiet-position distribution it's actually queried on at
@@ -1340,10 +1251,9 @@ function foldConfirmHarvest(promoted, res, confirmRes = null) {
   return foldCandidateHarvest(confirmHarvest, promoted, res, confirmRes);
 }
 
-// The body shared by the gate harvest and the screen harvest (--screen-save). `champElo` is
-// null when nothing needs relabeling (a promoted candidate is archived, hence rankable, so its
-// lines pass through as-is); otherwise every line tagged with the candidate's content hash is
-// rewritten to the ephemeral "nn<d>@elo<E>" form.
+// The harvest body. `champElo` is null when nothing needs relabeling (a promoted candidate is
+// archived, hence rankable, so its lines pass through as-is); otherwise every line tagged with
+// the candidate's content hash is rewritten to the ephemeral "nn<d>@elo<E>" form.
 //
 // E = the champion's ledger Elo AT THAT RECORD'S OWN DEPTH (read per line from the `vs` tag, so a
 // mixed-depth harvest stays correct) plus `edgeLo`. The base is therefore always depth-matched;
@@ -1352,8 +1262,8 @@ function foldConfirmHarvest(promoted, res, confirmRes = null) {
 // rating does, so the error is the per-candidate depth-transfer residual — small enough to accept
 // against the selection-bias protection the min buys, and the exact quantity the paired
 // (gate, confirm) rows now accumulate. Revisit once ~10 of them exist. What would genuinely
-// misrate a harvest is pairing it with an edge from a WILDLY different depth: the screen's d1
-// games must never be folded with a gate-depth edge.
+// misrate a harvest is pairing it with an edge from a WILDLY different depth, so never fold a
+// harvest against an edge measured several plies away from the depth its games were played at.
 function foldHarvest(src, dest, champElo, edgeLo, what) {
   if (!existsSync(src)) return;
   const candHash = weightsHash(candidate);
@@ -1475,11 +1385,11 @@ function failCycle(cycleNo, what, { rotate = false } = {}) {
   return true;
 }
 
-// --- Low-depth screen (shadow mode) -------------------------------------------------------
+// --- Match Elo confidence interval ---------------------------------------------------------
 // The 95% CI around an Elo edge, from the standard error of the MEAN score mapped through
 // eloFromScore (above) — deliberately the same convention as the match runner's own eloWithCI
-// (engine/src/main_match.zig), so a screen's numbers are directly comparable to a gate's.
-// Reconstructed from the W/D/L counts, which is exact: every game scores 1, 0.5 or 0.
+// (engine/src/main_match.zig), so the gate's and the confirmation's numbers are directly
+// comparable. Reconstructed from the W/D/L counts, which is exact: every game scores 1, .5 or 0.
 function eloWithCI(wins, draws, losses) {
   const n = wins + draws + losses;
   if (!n) return null;
@@ -1487,58 +1397,6 @@ function eloWithCI(wins, draws, losses) {
   const varSum = wins * (1 - p) ** 2 + draws * (0.5 - p) ** 2 + losses * p ** 2;
   const se = Math.sqrt(varSum / n / n); // standard error of the mean score
   return { score: p, elo: eloFromScore(p), lo: eloFromScore(p - 1.96 * se), hi: eloFromScore(p + 1.96 * se) };
-}
-
-// Play the candidate vs the champion at a CHEAP depth and predict the gate-depth edge.
-// Shadow mode: the return value is recorded and logged, and nothing else reads it — the gate
-// below still makes the promotion decision on its own evidence. Three deliberate choices:
-//   - fixed --games, NO --sprt: the screen ESTIMATES an edge (we want the CI, and a decision
-//     rule can be simulated offline from it afterwards); an SPRT would stop early and throw
-//     away exactly the precision that makes the screen worth anything.
-//   - the games NEVER reach selfplay.jsonl. This is the trap in the whole idea: the gate
-//     harvests ~97k positions per 2000 games, so 20k screen games would add ~970k positions
-//     per cycle — 10x the dataset's normal growth, at the worst label quality in the pool (a
-//     depth-1 `v`), landing straight in the cohort --filter-weak and refresh-v exist to drain.
-//     With --screen-save they go to a SEPARATE dataset (screenArchive) instead, which the
-//     ledger can rate from and a future experiment can mine, with no path to the trainer.
-//   - failure is non-fatal. It's instrumentation; a broken screen must never cost a cycle.
-// Returns the record for the track history, or null.
-function runScreen() {
-  if (!cfg.screen) return null;
-  if (existsSync(screenFile)) rmSync(screenFile);
-  if (existsSync(screenHarvest)) rmSync(screenHarvest); // no stale harvest from a prior cycle
-  const t0 = Date.now();
-  if (!run(`Screen (shadow): candidate vs champion @ depth ${cfg.screenDepth}`, matchBin,
-    ['--eval-a=nn', `--weights-a=${candidate}`, '--eval-b=nn', `--weights-b=${champion}`,
-      `--depth=${cfg.screenDepth}`, `--games=${cfg.screenGames}`,
-      `--result-file=${screenFile}`, `--seed=${Date.now()}`,
-      ...(cfg.screenSave ? [`--save-games=${screenHarvest}`] : []), ...jobArg])) return null;
-  let r;
-  try { r = JSON.parse(readFileSync(screenFile, 'utf8')); }
-  catch { log('  Screen produced no readable result; continuing to the gate.'); return null; }
-  const ci = eloWithCI(r.wins, r.draws, r.losses);
-  if (!ci) { log('  Screen played no games; continuing to the gate.'); return null; }
-  // Rescale to a gate-depth-equivalent edge. The ratio compresses low-depth Elo, so dividing
-  // by it also widens the CI proportionally — the screen's precision at the gate's scale is
-  // what matters, not its precision at depth 1.
-  const k = 1 / cfg.screenRatio;
-  const pred = { elo: ci.elo * k, lo: ci.lo * k, hi: ci.hi * k };
-  // The rule a real cascade would use: escalate unless the promotion bound is outside the
-  // prediction's CI. Rejecting on the UPPER bound (not the point estimate) is what keeps a
-  // screen conservative — it only kills a candidate it can rule out.
-  const wouldReject = pred.hi < cfg.elo1;
-  const secs = (Date.now() - t0) / 1000;
-  log(`  Screen: ${(ci.score * 100).toFixed(1)}% / ${ci.elo >= 0 ? '+' : ''}${ci.elo.toFixed(0)} Elo @ depth `
-    + `${cfg.screenDepth} over ${r.games} games in ${fmtDur(secs)} → predicts `
-    + `${pred.elo >= 0 ? '+' : ''}${pred.elo.toFixed(0)} Elo [${pred.lo.toFixed(0)}, ${pred.hi.toFixed(0)}] `
-    + `at depth ${cfg.gateDepth} (ratio ${cfg.screenRatio}). `
-    + `A screen WOULD ${wouldReject ? `REJECT (upper bound < +${cfg.elo1}, skipping the gate)` : 'ESCALATE'}. `
-    + 'Shadow mode — running the real gate anyway.');
-  return {
-    depth: cfg.screenDepth, games: r.games, seconds: Math.round(secs), ratio: cfg.screenRatio,
-    score: ci.score, elo: ci.elo, eloLo: ci.lo, eloHi: ci.hi,
-    predElo: pred.elo, predLo: pred.lo, predHi: pred.hi, wouldReject,
-  };
 }
 
 // --- Confirmation match (the promotion's second opinion) ----------------------------------
@@ -1672,10 +1530,7 @@ function runConfirm(cycleNo, candHash, champHash) {
 // --corpus-extra. Kept out of the dataset on purpose (see each one's flag doc), but a game's
 // players+result rates its pair wherever the file lives.
 function corpusExtraFiles() {
-  return [
-    ...(cfg.screen && cfg.screenSave ? [screenArchive] : []),
-    linkArchive,
-  ].filter((f) => existsSync(f));
+  return [linkArchive].filter((f) => existsSync(f));
 }
 
 // Is a pool refit due this cycle? A PROMOTION always forces one (a fresh champion sits at the
@@ -1802,11 +1657,11 @@ function runRankPool(label, opts = {}) {
       ...(calib ? ['--onboard=1'] : []), // fill the champion's under-played depths before the ordering objective
       `--games=${cfg.rankGames}`, ...(cfg.rankLink === null ? [] : [`--link=${cfg.rankLink}`]),
       `--data=${rawFile}`, `--ledger=${ledgerFile}`,
-      // Rate from the rating-only game files as well. Neither is in --data, because neither is
-      // meant for the trainer: the screen's games are depth-1 labels, and the link pass plays
-      // whatever pairs the adjacency graph is missing (weak nodes included, which is exactly
-      // what --play-strong exists to keep out of the training set). Both are still perfectly
-      // good EVIDENCE, and --save-games still points at --data, so nothing new is written here.
+      // Rate from the rating-only game files as well. The link pass is not in --data because it
+      // is not meant for the trainer: it plays whatever pairs the adjacency graph is missing,
+      // weak nodes included, which is exactly what --play-strong exists to keep out of the
+      // training set. Those games are still perfectly good EVIDENCE, and --save-games still
+      // points at --data, so nothing new is written here.
       ...(corpusExtraFiles().length ? [`--corpus-extra=${corpusExtraFiles().join(',')}`] : []),
       ...(cfg.harvest ? [] : ['--no-save-games']),
       '--no-scan', `--seed=${Date.now()}`, ...jobArg]);
@@ -2168,10 +2023,6 @@ log(`train:loop start — ${cfg.batch === 0
     ? `confirm ${cfg.confirmGames}g @ depth ${cfg.confirmDepth} on a fresh seed, no SPRT — promote only `
       + `above +${cfg.confirmElo} Elo | `
     : 'confirm OFF — promoting on the gate alone (--no-confirm) | ')
-  + (cfg.screen
-    ? `screen ${cfg.screenGames}g @ depth ${cfg.screenDepth} ratio ${cfg.screenRatio} (SHADOW — logged, never acted on`
-      + `${cfg.screenSave ? `; games kept in ${screenArchive}` : '; games discarded'}) | `
-    : '')
   + `candidate hidden=[${hidden}] λ=${cfg.lam} ${cfg.cold ? 'cold first cycle, warm after' : 'warm'} start`
   + `${existsSync(lineage) ? ' (resuming lineage)' : ''} | `
   + `refresh/cycle ${cfg.refreshCycle > 0 ? `${(cfg.refreshCycle * 100).toFixed(1)}% @ depth ${cfg.refreshCycleDepth}` : 'off'} | `
@@ -2332,12 +2183,6 @@ for (let i = 1; i <= cfg.cycles && !stopRequested(); i++) {
     log(`  Candidate speed: ${candNs.toFixed(0)} ns/node (~${Math.round(nps / 1000)}k nps) — arch [${archOf(candidate) ?? '?'}].`);
   }
 
-  // 3b. Shadow screen (--screen, off by default): a cheap low-depth read on the candidate,
-  //     logged and recorded but never acted on. Runs BEFORE the gate so the pairs it records
-  //     are (screen prediction, gate truth) on the same candidate, which is the only
-  //     population a real cascade would ever face. See runScreen.
-  const screen = runScreen();
-
   // 4. Gate: candidate (A) vs champion (B), SPRT(0, elo1). Unless --no-harvest,
   //    the gate's games are appended to the dataset (they're already paid for;
   //    every position gets the value from the engine that searched it — the mover's
@@ -2363,13 +2208,6 @@ for (let i = 1; i <= cfg.cycles && !stopRequested(); i++) {
       // never ran — so the candidate is relabeled as unpromoted even if a complete H1 verdict
       // happens to be readable. (With --no-confirm this stays exactly the old behaviour.)
       foldGateHarvest(cfg.confirmGames > 0 ? false : (r ? r.sprt === 'H1' : false), r);
-    }
-    // The screen's games were played before the gate started, so they survive the interrupt
-    // too. No verdict reached, so treat the candidate as unpromoted (the ephemeral tag is the
-    // conservative read — it rates the candidate rather than claiming it's a pool node).
-    if (cfg.screen && cfg.screenSave && existsSync(screenHarvest)) {
-      foldHarvest(screenHarvest, screenArchive, championLedgerElo(),
-        screen ? screen.eloLo : 0, `depth-${cfg.screenDepth} screen edge`);
     }
     if (!failCycle(c, 'The gate')) break;
     continue;
@@ -2453,26 +2291,6 @@ for (let i = 1; i <= cfg.cycles && !stopRequested(); i++) {
   // they are the DEEPEST labels any cycle produces. No reason to throw away 600 deep games
   // because the candidate they judged didn't promote.
   if (cfg.harvest) foldConfirmHarvest(promote, res, confirm);
-  // Same treatment for the screen's games, into their own dataset. A PROMOTED candidate is
-  // archived by hash, so its screen games become directly rateable evidence for the ledger —
-  // and 20k direct games on one pair is worth far more to the fit than the ~28 the pool's
-  // whole per-cycle budget buys (on the era-2 ladder, 186 of 191 rank-adjacent pairs have never
-  // met, 33 of them worth ordering). Non-promoted candidates get the ephemeral tag, keyed off
-  // the SCREEN's own edge at the SCREEN's depth — screen.eloLo, not the rescaled prediction.
-  if (cfg.screen && cfg.screenSave && existsSync(screenHarvest)) {
-    const promoted = promote; // the FINAL decision — a confirmation-rejected candidate isn't archived
-    const fold = foldHarvest(screenHarvest, screenArchive,
-      promoted ? null : championLedgerElo(),
-      screen ? screen.eloLo : 0, `depth-${cfg.screenDepth} screen edge`);
-    // The promoted case relabels nothing (the candidate is archived, so its own hash is a real
-    // ledger node) and would otherwise archive 20k games silently — say so, since that's the
-    // case where the games are worth the most to the pool.
-    if (fold && fold.folded) {
-      log(`  Archived ${fold.folded} depth-${cfg.screenDepth} screen game(s) to ${screenArchive}`
-        + `${promoted ? ' — rateable directly (candidate promoted, hash archived)' : ''}. `
-        + 'Separate dataset: rated by rank:pool, never featurized.');
-    }
-  }
   let promotedChampHash = null; // set on promotion, so the end-of-cycle rank calibrates all its depths
   if (promote) {
     const arch = JSON.parse(readFileSync(candidate, 'utf8')).arch;
@@ -2559,9 +2377,9 @@ for (let i = 1; i <= cfg.cycles && !stopRequested(); i++) {
       score: res.score, edgeElo: res.elo, absElo: candAbsElo,
       // The gate's OWN 95% CI. `edgeElo` alone hides how much of it is noise, and the spread
       // is huge on a futility-stopped gate (a 134-game stop carries several times the error
-      // bar of a full 2000-game one). screen:report needs it to separate real screen-vs-gate
-      // disagreement from the gate's own sampling error — without it a screen looks worse
-      // than it is, because the "truth" it's scored against is itself noisy.
+      // bar of a full 2000-game one). Anything comparing this edge against another measurement
+      // of the same candidate needs it, or the gate's own sampling error gets charged to
+      // whatever it is being compared with.
       ...(gateCI ? { edgeLo: gateCI.lo, edgeHi: gateCI.hi } : {}),
       // `sprt` stays the GATE's verdict; `promoted` is the final decision, so an H1 whose
       // confirmation failed records as `sprt: "H1", promoted: false` with the `confirm` block
@@ -2580,10 +2398,6 @@ for (let i = 1; i <= cfg.cycles && !stopRequested(); i++) {
       graftParent: grafting ? gatedVsChampHash : null,
       datasetBytes: existsSync(rawFile) ? statSync(rawFile).size : 0,
       hash: candHashForTrack,
-      // Shadow-screen observation, omitted entirely unless --screen ran. Paired with this
-      // same line's `edgeElo`/`score`, which are the gate's truth for the very same
-      // candidate — that pairing is the point, and `npm run screen:report` reads it back out.
-      ...(screen ? { screen } : {}),
       // Confirmation match, omitted entirely unless one ran (so a cycle from before this existed,
       // a --no-confirm cycle, and a non-H1 cycle all record exactly what they always did). Paired
       // with this line's `edgeElo`/`edgeLo`/`edgeHi`, these are two independent measurements of

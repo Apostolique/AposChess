@@ -45,7 +45,7 @@ pub const Net = struct {
     ilayers: []LayerI = &.{}, // quantized net (is_int = true)
     scale: f64,
     is_int: bool = false,
-    qa: i64 = 0, // activation scale (clipped ReLU upper bound)
+    qa: i64 = 0, // activation fixed-point scale (plain ReLU, not clamped)
     qw: i64 = 0, // dense-weight scale
 };
 
@@ -192,7 +192,7 @@ pub fn h0(net: *const Net) usize {
 }
 
 /// Add (or subtract) one piece's layer-0 columns to BOTH perspective accumulators,
-/// in raw (pre-clip) form. `accw` is white-perspective (us = white), `accb` is
+/// in raw (pre-ReLU) form. `accw` is white-perspective (us = white), `accb` is
 /// black-perspective (us = black, squares vertically flipped) — the standard NNUE dual
 /// accumulator. The single source for the feature layout, alongside featureIndices.
 pub fn accAddPiece(net: *const Net, accw: []i64, accb: []i64, role: Role, color: Color, sq: usize, add: bool) void {
@@ -222,7 +222,7 @@ pub fn accAddPiece(net: *const Net, accw: []i64, accb: []i64, role: Role, color:
     }
 }
 
-/// Recompute both perspective accumulators (raw, pre-clip) from scratch for `b`.
+/// Recompute both perspective accumulators (raw, pre-ReLU) from scratch for `b`.
 pub fn accRefresh(net: *const Net, accw: []i64, accb: []i64, b: *const [64]?Piece) void {
     const L0 = net.ilayers[0];
     const H0 = L0.out;

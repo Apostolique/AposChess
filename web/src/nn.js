@@ -18,10 +18,11 @@
 // flip needed.
 //
 // Two weight encodings share this forward pass: the classic FLOAT net, and a
-// QUANTIZED INTEGER net ({int:true, quant:{qa,qw}}, trained by train.py --quant with
-// clipped ReLU). The integer path (compileInt) does exact integer arithmetic —
-// layer-0 weights/bias at scale QA, dense weights at QW (biases QW·QA), activations
-// clipped to [0,QA], dequantized only before tanh — so it's bit-identical to nn.zig
+// QUANTIZED INTEGER net ({int:true, quant:{qa,qw}}, exported by train.py --quant —
+// training is unchanged, the net uses plain ReLU either way). The integer path
+// (compileInt) does exact integer arithmetic — layer-0 weights/bias at scale QA, dense
+// weights at QW (biases QW·QA), plain-ReLU activations at scale QA (NOT clamped to
+// [0,QA]; clamping cost −230 Elo here), dequantized only before tanh — bit-identical to nn.zig
 // and lets the Zig search maintain the first layer with an incrementally-updated
 // accumulator (the "U" in NNUE). See nn.zig / web/engine/README.md.
 
@@ -218,9 +219,9 @@ function compileInt(W) {
   const layers = W.layers.map((L) => ({ w: Float64Array.from(L.w), b: Float64Array.from(L.b) }));
   const w0 = layers[0].w, b0 = layers[0].b;
   const H0 = b0.length;
-  const acc = new Float64Array(H0); // raw accumulator (pre-clip), integer-valued
+  const acc = new Float64Array(H0); // raw accumulator (pre-ReLU), integer-valued
 
-  // Layer 0: bias + active feature columns (integers), then clipped ReLU into [0,QA].
+  // Layer 0: bias + active feature columns (integers), then plain ReLU at scale QA.
   function inputLayer(board, turn) {
     acc.set(b0);
     const flip = turn === 'black';
@@ -244,7 +245,7 @@ function compileInt(W) {
     return acc;
   }
 
-  // Final scalar head from a clipped activation buffer: integer dot product, then
+  // Final scalar head from the activation buffer: integer dot product, then
   // dequantize (÷ QW·QA) and squash. Shared by both shapes.
   function head(act, dim) {
     const Lf = layers[layers.length - 1];
@@ -258,7 +259,7 @@ function compileInt(W) {
     return (board, turn) => head(inputLayer(board, turn), H0);
   }
 
-  // Deeper nets: dense layers with requantization (÷ QW) + clipped ReLU between them.
+  // Deeper nets: dense layers with requantization (÷ QW) + plain ReLU between them.
   let widest = H0;
   for (const L of layers) widest = Math.max(widest, L.b.length);
   const bufA = new Float64Array(widest);

@@ -300,7 +300,7 @@ pub const Searcher = struct {
     // engine tries to lose as fast as possible. A move-selection mode layered on the nn eval
     // (set by the host after init); the search itself is unchanged. See chooseMoveExcl.
     minimize: bool = false,
-    // Incremental NNUE accumulators (raw, pre-clip), maintained through make/unmake when
+    // Incremental NNUE accumulators (raw, pre-ReLU), maintained through make/unmake when
     // the selected net is quantized — one per fixed perspective (us = white / us = black).
     // The leaf eval reads the side-to-move one (see evalNn). Float nets recompute instead.
     acc_white: [1024]i64 = undefined,

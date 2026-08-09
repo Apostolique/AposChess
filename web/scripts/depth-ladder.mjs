@@ -271,11 +271,10 @@ const cfg = {
   era: args.era === 'all' ? 'all' : num(args.era, SEARCH_ERA),
   data: typeof args.data === 'string' ? resolve(process.cwd(), args.data) : join(dataDir, 'selfplay.jsonl'),
   // --corpus-extra=A,B: additional game files to rate from, on top of --data. For games that are
-  // legitimate RATING evidence but deliberately not training data — the loop's low-depth screen
-  // games (train:loop --screen --screen-save) are the motivating case: 20k direct candidate-vs-
-  // champion games per cycle, which is orders of magnitude more direct evidence on that pair than
-  // the pool's own per-cycle play budget buys, but at depth-1 label quality that must never reach
-  // the trainer. Read exactly like --data; a missing file is skipped with a warning.
+  // legitimate RATING evidence but deliberately not training data — the loop's unrestricted link
+  // pass (loop/ladder-link-games.jsonl) is the motivating case: it plays whatever rank-adjacent
+  // pairs have never met, weak nodes included, which is exactly what --play-strong keeps out of
+  // the training set. Read exactly like --data; a missing file is skipped with a warning.
   corpusExtra: typeof args['corpus-extra'] === 'string'
     ? args['corpus-extra'].split(',').map((s) => s.trim()).filter(Boolean).map((s) => resolve(process.cwd(), s))
     : [],
