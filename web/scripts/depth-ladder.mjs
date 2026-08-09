@@ -86,6 +86,14 @@
 //                   the ladder is worth ~0 VOI, so the two strongest engines can sit next to each
 //                   other having never met, their order inferred entirely through third parties.
 //                   Convergence requires it too. 0 disables.
+//   --link-cost=C   which adjacent pairs the floor above APPLIES to: only those risking at least
+//                   C Elo of mis-order (default 5 = RESOLVED_COST, the same bar convergence uses).
+//                   A pair the ladder already prices at ~0 — two nodes 4 Elo apart with a ±210
+//                   pairwise margin — cannot have its order resolved by any affordable number of
+//                   games, and playing it re-sorts the neighbourhood and mints a fresh unlinked
+//                   adjacency elsewhere. So the floor covers the pairs whose order is worth
+//                   something and the ordering objective keeps the rest. 0 = every adjacent pair
+//                   (the pre-2026-08-09 rule, unreachable on a wide pool).
 //   --prior=P       virtual draws vs an even phantom, per node (regularizer). Default 1.
 //   --jobs=N        parallel game workers (default: CPU cores).
 //   --openings=K    random opening plies per game (default 6).
@@ -198,6 +206,12 @@ function parseDepths(spec, dflt) {
 // net's depth sweep — lands on the same stable scale. Pick the engines with --engines (default
 // 'all') or --net=X (one net); --depths sets the depths. The ledger is the single artifact: a
 // "depth curve" is just the ledger filtered to one net, so there's no separate mode to maintain.
+
+// Elo of expected mis-order cost beneath which a pair's ORDER is not worth buying: mis-placing two
+// engines this close changes no downstream decision, and the pairwise margins on a wide pool are an
+// order of magnitude bigger than the gaps anyway. Both the convergence verdict and the direct-link
+// floor are measured against it, so they agree on which pairs matter.
+const RESOLVED_COST = 5;
 const cfg = {
   // 'all' = hc + current champion + every archived champion [+ material]; or a comma list of
   // specs (a content hash/prefix, an archived filename/path, 'champion', 'hc', 'material').
@@ -233,6 +247,9 @@ const cfg = {
   // objective gets the budget. Resolved below to half a matchup when not given, so a single
   // matchup clears a pair. 0 disables.
   link: args.link !== undefined ? Math.max(0, Number(args.link)) : null,
+  // ...but only for pairs whose order is worth buying (see --link-cost above and the treadmill
+  // note in pickMatchup). 0 restores "every adjacent pair needs a direct link".
+  linkCost: Math.max(0, num(args['link-cost'], RESOLVED_COST)),
   prior: num(args.prior, 1),
   jobs: args.jobs !== undefined ? Number(args.jobs) : cpus().length,
   openings: num(args.openings, 6),
@@ -763,18 +780,33 @@ function pickMatchup(elo, varDiff, iter, gamesOf) {
   const sorted = [...schedulable].sort((a, b) => elo.get(a.id) - elo.get(b.id));
   // Direct-link floor. A rank-adjacent pair that has never met has its order inferred through
   // third parties, and the gap-weighted objective below will never fix that: a ~8 Elo gap scores
-  // ~0 VOI no matter how unmeasured it is. Least-linked pair first, widest pairwise contrast
-  // breaking ties, so the games land where the ladder is both unmeasured and unresolved.
+  // ~0 VOI no matter how unmeasured it is.
+  //
+  // "Every adjacent pair", though, is a TREADMILL once the pool is wide. Measured 2026-08-09 on
+  // the 192-node era-2 ladder: 107 of the 191 adjacent gaps are under 5 Elo while the median
+  // PAIRWISE margin is ±210, so those orders are noise — a matchup on one of them re-sorts its
+  // neighbourhood and mints a fresh unlinked adjacency somewhere else, and the ledger sat at
+  // "186 never met" no matter how many hours went in. Worse, the branch fires before the ordering
+  // objective, so while any pair is under the floor it takes 100% of the budget — and the old
+  // widest-variance tie-break spent it on whichever retired net happened to be thinnest, never on
+  // the pairs a reader acts on.
+  //
+  // So the floor applies where MIS-ORDERING WOULD COST SOMETHING (--link-cost, defaulting to the
+  // same RESOLVED_COST bar convergence uses), and inside that set the costliest pair goes first,
+  // fewest direct games breaking ties. Near-ties fall through to the ordering objective below,
+  // which prices them correctly at ~0. --link-cost=0 restores the old rule.
   if (cfg.link > 0) {
-    let pair = null, fewest = Infinity, widest = -1;
+    let pair = null, dearest = -1, fewest = Infinity;
     for (let k = 0; k < sorted.length - 1; k++) {
       const a = sorted[k], b = sorted[k + 1];
       const n = linked(a.id, b.id);
       if (n >= cfg.link) continue;
-      const v = varDiff(a.id, b.id);
-      if (n < fewest || (n === fewest && v > widest)) { pair = [a, b]; fewest = n; widest = v; }
+      const gap = elo.get(b.id) - elo.get(a.id);
+      const cost = gap * ncdf(-gap / Math.sqrt(Math.max(varDiff(a.id, b.id), 1e-9)));
+      if (cost < cfg.linkCost) continue;
+      if (cost > dearest || (cost === dearest && n < fewest)) { pair = [a, b]; dearest = cost; fewest = n; }
     }
-    if (pair) return { pair, reason: 'link', metric: fewest, floor: cfg.link };
+    if (pair) return { pair, reason: 'link', metric: fewest, floor: cfg.link, cost: dearest };
   }
   let best = null, bestVoi = 0, bestGap = 0, bestAmb = 0;
   for (let k = 0; k < sorted.length - 1; k++) {
@@ -955,7 +987,6 @@ const median = (xs) => { if (!xs.length) return null; const s = [...xs].sort((a,
 //     a free ground truth. Strict inversions (a deeper node estimated weaker) are the visible
 //     non-monotonicity; a "confident" inversion (drop exceeding the pair's contrast ±95) is a
 //     real transitivity/bug alarm that should never survive convergence.
-const RESOLVED_COST = 5; // Elo; mis-order risk below this is beneath the ledger's decision granularity
 function convergenceReport(elo, varDiff) {
   const links = directLinks();
   // Signal 0a, ahead of the link floor: is each node even ON the scale? An unanchored node has no
@@ -981,12 +1012,19 @@ function convergenceReport(elo, varDiff) {
   // reader is most likely to act on, and the one a top-of-ladder near-tie hides in.
   const underLinked = pairs.filter((p) => p.direct < cfg.link);
   const unlinked = pairs.filter((p) => p.direct === 0);
-  const worstLinkPair = underLinked.length ? underLinked[underLinked.length - 1] : null;
+  // The DEFICIT the scheduler will actually act on: under-linked pairs whose order is worth
+  // buying (--link-cost). The raw counts above stay in the report because they say how much of the
+  // ladder rests on transitivity, but they are not a target — on a 192-node pool most adjacent
+  // gaps are far under the pairwise noise floor, so "every pair has met" is a treadmill nothing
+  // can finish (see pickMatchup). The verdict and every consumer steer by these.
+  const relevant = underLinked.filter((p) => p.cost >= cfg.linkCost);
+  const worstLinkPair = relevant.length ? relevant[relevant.length - 1]
+    : underLinked.length ? underLinked[underLinked.length - 1] : null;
   // The ladder is wider than the schedule (--play / --depths / --no-pin-play), so an adjacency can
   // be unmeasured and also unplayable by this run. Say how many the run can actually close, else
   // "keep running" points at games it will never schedule.
   const schedIds = new Set(schedulable.map((c) => c.id));
-  const fixableLinks = underLinked.filter((p) => schedIds.has(p.a) && schedIds.has(p.b)).length;
+  const fixableLinks = relevant.filter((p) => schedIds.has(p.a) && schedIds.has(p.b)).length;
 
   // Per-version depth curves (need ≥2 depths to say anything about monotonicity).
   const byVersion = new Map();
@@ -1011,23 +1049,27 @@ function convergenceReport(elo, varDiff) {
   const nonMono = curves.filter((c) => c.inv > 0).sort((a, b) => b.worst - a.worst);
 
   const anchored = unanchored.length === 0;
-  const linkedOk = cfg.link === 0 || underLinked.length === 0;
+  const linkedOk = cfg.link === 0 || relevant.length === 0;
   const resolved = worstPair == null || worstPair.cost < RESOLVED_COST;
   const ordered = confInvTotal === 0;
   let verdict;
   if (!anchored) verdict = `NOT converged — ${unanchored.length} of ${competitors.length} node(s) have no chain of games to ${pinId}, `
     + `so their Elo is the prior rather than a measurement (nearest unanchored: ${unanchored[0].id}). The scheduler anchors them first.`;
-  else if (!linkedOk) verdict = `NOT converged — ${underLinked.length} adjacent pair(s) under the ${cfg.link}-game direct-link floor (${unlinked.length} have never met), so their order rests on transitivity. `
+  else if (!linkedOk) verdict = `NOT converged — ${relevant.length} adjacent pair(s) worth ≥ ${cfg.linkCost} Elo of mis-order are under the ${cfg.link}-game direct-link floor, so their order rests on transitivity `
+    + `(${underLinked.length} of ${pairs.length} pairs are under the floor in all, ${unlinked.length} have never met — the rest are near-ties the ordering objective prices at ~0). `
     + `${fixableLinks ? `Keep running (${fixableLinks} schedulable here).` : 'None are schedulable by this run — widen --depths/--play.'}`;
   else if (!resolved) verdict = `NOT converged — worst adjacent pair risks ${worstPair.cost.toFixed(1)} Elo of mis-order (want < ${RESOLVED_COST}). Keep running.`;
   else if (!ordered) verdict = `RESOLVED but ${confInvTotal} confident depth inversion(s) — possible non-transitivity/bug, inspect.`;
-  else verdict = `converged ✓ — every adjacent pair has met directly, none risks ≥ ${RESOLVED_COST} Elo of mis-order, and every depth curve is monotonic.`;
+  else verdict = `converged ✓ — every adjacent pair worth ordering has met directly, none risks ≥ ${RESOLVED_COST} Elo of mis-order, and every depth curve is monotonic.`;
 
   return {
     summary: {
       pairs: pairs.length, medPairMargin, medGap, misorderCost, worstPair,
       unanchored: unanchored.length, anchored,
       linkFloor: cfg.link, adjacentUnderLinked: underLinked.length, adjacentUnlinked: unlinked.length,
+      // The actionable slice of adjacentUnderLinked (cost ≥ linkCost) and how much of it THIS
+      // run's --play restriction can reach. train:loop's link pass keys off exactly these two.
+      linkCost: cfg.linkCost, adjacentUnderLinkedRelevant: relevant.length,
       adjacentUnderLinkedSchedulable: fixableLinks, worstLinkPair,
       versionsMonotonic: monotonic, versionsWithDepthCurve: curves.length, confidentInversions: confInvTotal,
       linked: linkedOk, resolved, ordered, converged: anchored && linkedOk && resolved && ordered, verdict,
@@ -1044,8 +1086,9 @@ function printConvergence(rep) {
   console.log(`\n===== Convergence check =====`);
   console.log(`  on the scale: ${s.pairs + 1 - s.unanchored}/${s.pairs + 1} node(s) have a chain of games to the pin`
     + `${s.unanchored ? `  |  ${s.unanchored} still rated at the prior, not measured` : ''}`);
-  console.log(`  direct links: ${s.adjacentUnderLinked} of ${s.pairs} adjacent pair(s) below the ${s.linkFloor}-game floor, ${s.adjacentUnlinked} never met`
-    + `${s.adjacentUnderLinked === s.adjacentUnderLinkedSchedulable ? '' : ` (${s.adjacentUnderLinkedSchedulable} schedulable this run)`}`
+  console.log(`  direct links: ${s.adjacentUnderLinkedRelevant} adjacent pair(s) worth ≥ ${s.linkCost} Elo are below the ${s.linkFloor}-game floor`
+    + `${s.adjacentUnderLinkedRelevant === s.adjacentUnderLinkedSchedulable ? '' : ` (${s.adjacentUnderLinkedSchedulable} schedulable this run)`}`
+    + `  |  ${s.adjacentUnderLinked} of ${s.pairs} under the floor in all, ${s.adjacentUnlinked} never met`
     + `${wl == null ? '' : `  |  highest-ranked: ${pairLbl(wl.a)} vs ${pairLbl(wl.b)} (${wl.direct} direct, gap ${wl.gap.toFixed(0)})`}`);
   console.log(`  mis-order risk: ${s.misorderCost == null ? 'n/a' : s.misorderCost.toFixed(0)} Elo total over ${s.pairs} adjacent pair(s)  |  worst ${wp == null ? 'n/a' : `${wp.cost.toFixed(1)} Elo — ${pairLbl(wp.a)} vs ${pairLbl(wp.b)} (gap ${wp.gap.toFixed(0)}, ±${wp.margin.toFixed(0)} pairwise)`}  (want worst < ${RESOLVED_COST})`);
   console.log(`  resolution:  median adjacent ±95 = ${s.medPairMargin == null ? 'n/a' : s.medPairMargin.toFixed(0)} (pairwise contrast, not vs-pin)  |  median neighbor gap = ${s.medGap == null ? 'n/a' : s.medGap.toFixed(0)}`);
@@ -1148,7 +1191,7 @@ function writeRankLedger(verbose) {
 
 console.log(`Engine ranking pool (active scheduler)`);
 console.log(`  ${competitors.length} node(s): ${competitors.map((c) => `${c.id.split('@')[0]}@${c.version.slice(0, 6)}${niceName(c.version) ? ` (${niceName(c.version)})` : ''}`).join(', ')}`);
-console.log(`  pin ${pinId} := ${PIN_ELO} | search era ${cfg.era}${cfg.era === 'all' ? ' (MIXED — forensic only)' : ''} | ${cfg.games} games/matchup | onboard ${cfg.onboard ? `${cfg.onboard}×avg` : 'off'} | link floor ${cfg.link || 'off'} | ${cfg.jobs} parallel job(s)`);
+console.log(`  pin ${pinId} := ${PIN_ELO} | search era ${cfg.era}${cfg.era === 'all' ? ' (MIXED — forensic only)' : ''} | ${cfg.games} games/matchup | onboard ${cfg.onboard ? `${cfg.onboard}×avg` : 'off'} | link floor ${cfg.link || 'off'}${cfg.link && cfg.linkCost ? ` on pairs worth ≥ ${cfg.linkCost} Elo` : ''} | ${cfg.jobs} parallel job(s)`);
 if (priorEraElo.note) console.log(`  scheduling prior: ${priorEraElo.note} (picks opponents for unrated nodes, never a rating)`);
 if (playMatch) console.log(`  --play: new games only among ${schedulable.map(nodeLabel).join(', ')} (rest rated from existing data)`);
 if (!cfg.pinPlay) console.log(`  --no-pin-play: ${pinId} is rated but plays nothing new (${schedulable.length} schedulable node(s))`);
@@ -1224,13 +1267,13 @@ if (cfg.rounds === 0) {
   };
   while (!stopped && Date.now() < deadline && played < cfg.matchups) {
     const { elo, ci, varDiff, gamesOf } = fit();
-    const { pair, reason, metric, floor, gap, amb, direct } = pickMatchup(elo, varDiff, played, gamesOf);
+    const { pair, reason, metric, floor, gap, amb, direct, cost } = pickMatchup(elo, varDiff, played, gamesOf);
     if (!pair) break;
     const [a, b] = pair;
     const tag = `[${played + 1}${Number.isFinite(cfg.matchups) ? `/${cfg.matchups}` : ''}]`;
     const why = reason === 'ordering' ? `ordering: gap ${gap.toFixed(0)} Elo at P(mis-order) ${(amb * 100).toFixed(0)}% — matchup buys ${metric.toFixed(2)} Elo`
       : reason === 'onboard' ? `onboard: ${metric} game(s), below floor ${floor.toFixed(0)} (${cfg.onboard}×pool avg), ${direct} direct game(s) with this opponent`
-      : reason === 'link' ? `link: rank-adjacent on ${metric} direct game(s), below the ${floor}-game floor`
+      : reason === 'link' ? `link: rank-adjacent on ${metric} direct game(s), below the ${floor}-game floor — ${cost.toFixed(1)} Elo of mis-order at stake`
       : reason === 'connect' ? `connect: ${metric} node(s) still have no chain of games to the pin, so their Elo is the prior — anchoring the closest one`
       : `rigidity: ±${metric.toFixed(0)} Elo`;
     // Announce with each node's CURRENT fitted Elo ±95 (the ledger's real estimate), so the
