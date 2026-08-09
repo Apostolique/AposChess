@@ -89,11 +89,15 @@ ranked pool's strong-engine play at depth 8 are the generators; set `--batch=N` 
 a dedicated champion self-play batch at `--depth`, default 8) → featurize (incremental
 — only the new games) → train a **candidate** (**warm-started** from its track's
 lineage/best or the champion so it fine-tunes in a few epochs; `--cold` restores
-from-scratch training) → play **candidate vs champion** as an SPRT → **promote the
-candidate only if it wins** (accepts H1). Otherwise the champion is kept. So the
-champion only ever moves uphill. It can also refresh the weakest value labels every
-cycle (`--refresh-cycle`, below — off by default), and run a bigger refresh on
-promotion (`--refresh-frac`, below).
+from-scratch training) → play **candidate vs champion** as an SPRT → on an H1, play a
+second, independent **confirmation match** at depth 8 → **promote only if both agree**.
+Otherwise the champion is kept. So the champion only ever moves uphill. The
+confirmation exists because an SPRT at `alpha=0.05` promotes a true-zero candidate 5%
+of the time and the loop runs that same test every cycle (see "The confirmation match"
+in `docs/nn-training.md`); `--no-confirm` restores the old promote-on-H1
+behaviour. It can also refresh the weakest value labels every cycle
+(`--refresh-cycle`, below — off by default), and run a bigger refresh on promotion
+(`--refresh-frac`, below).
 
 **Candidate lineage (sub-threshold gains accumulate).** A mature champion's real
 per-cycle gains are often +10-ish Elo — genuinely positive but below what the SPRT can
@@ -103,10 +107,12 @@ that grew only ~2%. Instead, when the gate is **inconclusive but the candidate s
 ≥ 50%**, the candidate is kept as the recipe's **lineage** (per experiment track —
 see "Experiment tracks" below) and the next cycle's candidate warm-starts **from it**
 rather than from the champion — so those small gains compound across cycles until the
-lineage clears the gate in one decided match. The champion stays protected (only an
-H1 promotes); a candidate that scores < 50% (or a decided H0) resets the lineage. The
-lineage survives a `Ctrl-C` restart, and switching `--hidden` just switches to that
-shape's own track (the previous shape's lineage is preserved and resumes later).
+lineage clears the gate in one decided match. The champion stays protected (a promotion
+needs an H1 **and** a confirmation); a gate winner the confirmation rejects lands in
+this same place, so it re-gates next cycle rather than being lost. A candidate that
+scores < 50% (or a decided H0) resets the lineage. The lineage survives a restart, and
+switching `--hidden` just switches to that shape's own track (the previous shape's
+lineage is preserved and resumes later).
 
 The gate's games are themselves **harvested into the dataset** (`--no-harvest` to
 disable): up to `--gate-games` per cycle — comparable volume to generation, already
@@ -121,8 +127,17 @@ strong-engine play at depth 8 (plus `--batch` generation when enabled).
   the catalog under its **own human name** (Ada, Boris, …) and flagged the current
   champion, so you can play it in the app under a real name from the moment it's
   promoted (rebuild for the production bundle; `npm run dev` serves it live).
-- Runs forever until `Ctrl-C` (or pass `--cycles=N`). Per-cycle decisions are printed
-  and appended to `training/data/loop/loop.log`.
+- Runs forever unless you pass `--cycles=N`. Stop it with **`npm run train:stop`** from
+  another terminal, not `Ctrl-C` — the loop sits inside `spawnSync` for nearly all of a
+  cycle and cannot run its own signal handler there, so it only ever *infers* an
+  interrupt from how the child died. `train:stop` drops a marker the loop checks between
+  steps, which always lands (`--now` kills the tree instead, losing the in-flight step).
+  `npm run train:pause` / `train:resume` freeze and thaw the whole process tree to hand
+  the machine back without losing anything. Per-cycle decisions are printed and appended
+  to `training/data/loop/loop.log`.
+- A **failed** step is not a stop: generation, featurize, training and the gate retry
+  once, and a cycle that still can't finish is abandoned (`cycle N: abandoned`) so the
+  run continues. Three abandoned cycles in a row is systemic and stops the loop.
 - **`--fresh` deletes the dataset** before the first cycle (irreversible — the raw
   `selfplay.jsonl` is git-ignored, so there's no recovery). On a small post-`--fresh`
   set a candidate has too little signal to beat a champion trained on millions of
