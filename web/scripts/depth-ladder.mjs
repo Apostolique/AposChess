@@ -53,7 +53,9 @@
 //                   depths you leave out keep their rating and their ledger row from the games
 //                   already in the dataset, they just don't get new ones. The ledger always holds
 //                   every node the dataset knows, so narrowing the schedule never narrows the ladder.
-//   --anchor-depth=D  the hc depth that is the pin / Elo 1500 (default 6). Always present as a node.
+//   --anchor-depth=D  the hc depth that is the pin (default 6). Always present as a node. Its Elo
+//                   is the era's entry in PIN_ELO_BY_ERA (era 1 = 1500, era 2 = 1360), not a
+//                   fresh 1500 per era — that bridge is what keeps absolute Elo comparable.
 //   --play=SPEC     restrict NEW scheduled games to matchups among these specs only (comma list).
 //                   Each is EITHER a bare engine spec (same forms as --engines) — every --depths
 //                   of it is schedulable — OR a depth-qualified NODE id `<eng><depth>@<spec>` (the
@@ -63,8 +65,8 @@
 //                   The pin and the rest of the pool are STILL rated from the games already in the
 //                   dataset; they just don't play any new games. Use this to pile games
 //                   onto a specific head-to-head while keeping everyone on the stable hc6 scale.
-//   --no-pin-play   keep the pin OUT of new games. hc<anchor-depth> stays a rated node at Elo 1500
-//                   (the scale), it just never plays. Its depth is fixed at --anchor-depth, so in a
+//   --no-pin-play   keep the pin OUT of new games. hc<anchor-depth> stays a rated node at the
+//                   era's pin Elo (the scale), it just never plays. Its depth is fixed at --anchor-depth, so in a
 //                   single-depth run (--depths=4) it's the one node off that depth and every game it
 //                   plays is a cross-depth game. The pool stays tied to the scale through the games
 //                   the pin has ALREADY played (in the dataset). Use this instead of moving
@@ -202,8 +204,8 @@ function parseDepths(spec, dflt) {
 }
 
 // ONE rating pool — no modes. Nodes are (engine, depth) pairs; hc<anchor-depth> (hc6 by
-// default) is ALWAYS a node and is the pin (Elo := 1500), so every pool — all engines, or one
-// net's depth sweep — lands on the same stable scale. Pick the engines with --engines (default
+// default) is ALWAYS a node and is the pin (Elo := PIN_ELO_BY_ERA[era]), so every pool — all
+// engines, or one net's depth sweep — lands on the same stable scale. Pick the engines with --engines (default
 // 'all') or --net=X (one net); --depths sets the depths. The ledger is the single artifact: a
 // "depth curve" is just the ledger filtered to one net, so there's no separate mode to maintain.
 
@@ -427,7 +429,7 @@ const byId = new Map(competitors.map((c) => [c.id, c]));
 const playMatch = playSpecs
   ? (c) => playSpecs.some(({ engine, depth }) => c.eng === engine.eng && c.version === engine.version && (depth == null || c.depth === depth))
   : null;
-// --no-pin-play drops the pin on top of that, even if --play named it: it keeps its Elo 1500 from
+// --no-pin-play drops the pin on top of that, even if --play named it: it keeps its pin Elo from
 // the games already on disk, so new games all stay inside --depths instead of going to the one
 // node whose depth is fixed at --anchor-depth.
 const schedulable = (playMatch ? competitors.filter(playMatch) : competitors).filter((c) => cfg.pinPlay || c.id !== pinId);

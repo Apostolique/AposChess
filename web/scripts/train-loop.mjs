@@ -786,7 +786,8 @@ const cfg = {
   // back into that same dataset, to tighten ratings. The refreshes below read the resulting parallel
   // ledger (engine-elo.ladder.json) to relabel the WEAKEST engine's `v` first. --no-rank reverts.
   rank: !args['no-rank'],
-  // hc pin depth for the pool (Elo 1500) — every rating lands on this stable scale.
+  // hc pin depth for the pool — every rating lands on this stable scale. The pin's Elo is
+  // per search era (PIN_ELO_BY_ERA in depth-ladder.mjs: era 1 = 1500, era 2 = 1360), not 1500.
   rankDepth: num(args['rank-depth'], 6),
   // Unrestricted link-closing pass (runLinkPass). ON by default: without it the ladder can sit
   // permanently un-converged whenever --play-strong makes the deficient pairs unschedulable,
