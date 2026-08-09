@@ -340,13 +340,17 @@
 //                   2026-08-06, 62 rank-adjacent pairs had never met and `adjacentUnderLinked-
 //                   Schedulable` was 0, so not one of them could be scheduled. Closing them meant
 //                   stopping the loop and running rank:pool by hand (no --play restriction, which
-//                   is exactly why that worked). The link pass does it automatically: when the
-//                   ledger reports unlinked adjacent pairs AND none are schedulable, it runs a
-//                   short unrestricted rank:pool. Its games go to loop/ladder-link-games.jsonl,
-//                   NOT the dataset — it plays whatever pairs the graph is missing, weak nodes
-//                   included, which is precisely what --play-strong keeps out of training — and
-//                   come back as --corpus-extra so the evidence still accumulates across cycles.
-//   --link-minutes=M  play budget for that pass (default 10, capped at 30).
+//                   is exactly why that worked). The link pass does it automatically: whenever
+//                   the ledger's deficit is bigger than what the strong-play set can reach, it
+//                   runs a short unrestricted rank:pool. Its games go to
+//                   loop/ladder-link-games.jsonl, NOT the dataset — it plays whatever pairs the
+//                   graph is missing, weak nodes included, which is precisely what --play-strong
+//                   keeps out of training — and come back as --corpus-extra so the evidence still
+//                   accumulates across cycles.
+//   --link-minutes=M  BASE play budget for that pass (default 10). It scales with the unreachable
+//                   backlog (M × backlog/8) and is hard-capped at 30 minutes, so a one-off debt
+//                   like a search-era re-baseline drains over a few cycles without any single
+//                   cycle handing more than half an hour to instrumentation.
 //   --rank-cycle=auto|N  refit the Bradley-Terry pool every N cycles instead of EVERY cycle.
 //                   **`auto` is the default**: refit every cycle while the ladder is still short
 //                   of convergence (the ratings are genuinely moving then), dropping to every 3rd
@@ -1167,23 +1171,36 @@ function championLedgerConfidence() {
 // never met at all, how many of those THIS run's --play restriction can actually schedule, and
 // the total mis-order cost. Returns null when the ledger has no convergence block (an older file).
 //
-// `schedulable` is the load-bearing field. --play-strong pins --play to the ~8 strongest nn
-// engines at one depth, so the rank step can only ever play games inside that set — while the
-// link deficit lives across the whole 184-node pool (other depths, hc nodes, retired champions).
-// When `unlinked > 0` and `schedulable === 0`, the ladder is telling us plainly that no amount of
-// --rank-minutes can close the gap, because every deficient pair is outside the play set. That is
-// a REACHABILITY problem wearing a budget problem's clothes, and it's why a hand-run rank:pool
-// (which carries no --play restriction) fixes what a bigger --rank-minutes cannot.
+// `relevant` and `schedulable` are the load-bearing fields, and `relevant` is the one that took
+// two rewrites to get right. The raw counts (`underLinked`, `unlinked`) are over EVERY
+// rank-adjacent pair, and on a 192-node pool most adjacent gaps sit far under the pairwise noise
+// floor — 107 of 191 under 5 Elo against a median ±210 margin — so "every pair has met" is a
+// target nothing can reach: play one near-tie and the refit re-sorts its neighbourhood into a
+// fresh unlinked adjacency. depth-ladder now reports the actionable slice separately
+// (`adjacentUnderLinkedRelevant`: pairs whose mis-order actually costs something), and that is
+// what the loop steers by — the raw numbers stay available for the log line only.
+//
+// `schedulable` then answers the reachability half. --play-strong pins --play to the ~8 strongest
+// nn engines at one depth, so the rank step can only play games inside that set, while the deficit
+// lives across the whole pool (other depths, hc nodes, retired champions). Whatever `relevant`
+// exceeds `schedulable` by is debt no amount of --rank-minutes can pay — a REACHABILITY problem
+// wearing a budget problem's clothes, and why a hand-run rank:pool (no --play restriction) fixes
+// what a bigger --rank-minutes cannot. runLinkPass is the loop's own version of that hand run.
 function ledgerConvergence() {
   const ledger = readLedger();
   if (!ledger) return null;
   const c = ledger.convergence;
   if (!c) return null;
+  const underLinked = c.adjacentUnderLinked ?? 0;
   return {
     converged: !!c.converged,
     linked: !!c.linked,
-    underLinked: c.adjacentUnderLinked ?? 0,
+    underLinked,
     unlinked: c.adjacentUnlinked ?? 0,
+    // Ledgers written before the cost gate existed have no relevant count; their raw count was
+    // the criterion at the time, so fall back to it rather than reading a missing field as zero
+    // (which would silently switch the link pass off until the next refit).
+    relevant: c.adjacentUnderLinkedRelevant ?? underLinked,
     schedulable: c.adjacentUnderLinkedSchedulable ?? 0,
     misorderCost: c.misorderCost ?? null,
     pairs: c.pairs ?? 0,
@@ -1234,7 +1251,7 @@ function adaptiveMaintenance(cyclesSincePromo, rankDue = true) {
     else if (conv.schedulable > 0) {
       // Scale with how much of the adjacency graph this run can still fix, capped at 3x.
       factor = clamp(1 + conv.schedulable / 4, 1, 3);
-      why = `${conv.schedulable} schedulable under-linked pair(s)`;
+      why = `${conv.schedulable} schedulable pair(s) worth linking`;
     } else if (conv.misorderCost != null && conv.pairs > 0) {
       // No link debt to close: fall back to ordering sharpness, per adjacent pair.
       const perPair = conv.misorderCost / conv.pairs;
@@ -1400,7 +1417,53 @@ function run(label, cmd, argv, cwd = webDir) {
   // Windows delivers console Ctrl-C to the whole process group; the child then exits
   // with STATUS_CONTROL_C_EXIT (0xC000013A) instead of a signal — an interrupt, not a crash.
   if (r.status === 0xC000013A) { stopping = true; log(`${label} interrupted (Ctrl-C); stopping loop.`); return false; }
-  if (r.status !== 0) { log(`${label} FAILED (exit ${r.status}); stopping loop.`); return false; }
+  if (r.status !== 0) { log(`${label} FAILED (exit ${r.status}).`); return false; }
+  return true;
+}
+
+// --- Surviving a failed step ---------------------------------------------------------------
+// A step that fails for a reason that isn't a stop — a python OOM on an oversized arch, a locked
+// file, a half-written featurize, a flaky binary — used to end the whole run. On an unattended loop
+// that means the machine sits idle until someone notices, which is the opposite of self-healing.
+// So the essential steps retry once, and a cycle that still can't complete is ABANDONED rather than
+// fatal: the loop moves to the next cycle, rotating off the recipe when the failure was in TRAINING
+// (the one failure a different architecture plausibly fixes — an arch too big for memory fails every
+// time it's retried and never on a different shape).
+//
+// The counter is what keeps that from becoming a hot spin: consecutive failed cycles, reset by any
+// cycle that reaches a gate verdict. Three in a row is systemic — no python, no dataset, a broken
+// binary — and grinding on it is worse than stopping with the reason in the log.
+const MAX_CONSECUTIVE_FAILURES = 3;
+let consecutiveFailures = 0;
+
+// run() plus one retry, for the steps a cycle cannot continue without. A stop short-circuits
+// run() itself, so this never retries a Ctrl-C.
+function runOrRetry(label, cmd, argv, cwd = webDir) {
+  if (run(label, cmd, argv, cwd)) return true;
+  if (stopping || stopRequested()) return false;
+  log(`  ${label} failed — retrying once before giving up on this cycle.`);
+  return run(`${label} (retry)`, cmd, argv, cwd);
+}
+
+// Abandon the current cycle. Returns true if the loop should carry on with the next one, false if
+// it should end (a stop is in flight, or the failure has repeated too often to be transient).
+function failCycle(cycleNo, what, { rotate = false } = {}) {
+  if (stopping || stopRequested()) return false;
+  consecutiveFailures++;
+  if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+    log(`cycle ${cycleNo}: ${what} failed again — ${consecutiveFailures} consecutive cycle(s) lost to it, `
+      + 'so this is not transient. Stopping; fix the cause and relaunch (the loop resumes warm).');
+    return false;
+  }
+  log(`cycle ${cycleNo}: abandoned — ${what} failed twice `
+    + `(${consecutiveFailures}/${MAX_CONSECUTIVE_FAILURES} consecutive). Moving on to the next cycle.`);
+  // --rotate=off means the caller pinned this shape on purpose, so a failure is not a licence to
+  // switch away from it — the retry-and-carry-on above is all this cycle gets.
+  if (rotate && cfg.rotate !== 'off') {
+    const next = nextRotationRecipe();
+    if (next && adoptRecipe(next, `${what} failed on this shape`)) return true;
+    log('    (no untried recipe to rotate onto; retrying the same one next cycle.)');
+  }
   return true;
 }
 
@@ -1640,14 +1703,28 @@ function rankCadence(c, promoted) {
 // adjacency graph is missing, which includes the weak nodes --play-strong deliberately keeps
 // out of training. They come back as --corpus-extra, so the evidence persists and accumulates
 // across cycles (a --no-save-games pass would inform only the run that played it).
+//
+// 2026-08-09: the guard used to be `schedulable > 0` — "a schedulable deficit is already handled
+// by giving the routine pass more minutes". That only holds when `schedulable` is a meaningful
+// fraction of the deficit. It wasn't: the live ledger read 186 unlinked pairs of which 2 were
+// schedulable, so the pass silently never fired while the routine pass ground those same 2 pairs
+// forever. The guard is now the reachability question it was always meant to ask — is there debt
+// the strong-play set CANNOT touch — and the budget scales with how much.
 function runLinkPass(conv) {
   if (!cfg.rank || !cfg.linkPass || !conv) return;
-  // Only when the deficit is real AND the routine pass cannot reach it. A schedulable deficit
-  // is already handled by adaptiveMaintenance giving the routine pass more minutes.
-  if (conv.converged || conv.unlinked <= 0 || conv.schedulable > 0) return;
-  const minutes = Math.max(2, Math.min(cfg.linkMinutes, 30));
-  log(`  Ladder link deficit: ${conv.unlinked} adjacent pair(s) have never met and NONE are `
-    + `schedulable under the strong-play set — more --rank-minutes cannot close them. `
+  if (conv.converged) return;
+  // Debt the routine pass provably cannot reach: pairs worth linking, minus the ones both of
+  // whose nodes are inside the play set. Nothing unreachable ⇒ nothing this pass can do that
+  // adaptiveMaintenance's extra --rank-minutes won't.
+  const unreachable = Math.max(0, conv.relevant - conv.schedulable);
+  if (unreachable <= 0) return;
+  // Bounded scaling on the same principle as adaptiveMaintenance: baseline when the backlog is
+  // one matchup's worth, more as it grows, hard-capped at 30m so a big deficit can slow a cycle
+  // but never take it over. ~8 pairs per baseline pass is what the 2026-08-07 10m pass cleared.
+  const minutes = Math.max(2, Math.min(Math.round(cfg.linkMinutes * Math.max(1, unreachable / 8)), 30));
+  log(`  Ladder link deficit: ${conv.relevant} adjacent pair(s) worth ordering are under the direct-link `
+    + `floor and only ${conv.schedulable} of them are schedulable under the strong-play set — `
+    + `more --rank-minutes cannot close the other ${unreachable}. `
     + `Running a ${minutes}m unrestricted link pass (games to ${linkArchive}, rating evidence only).`);
   run('Rank pool: unrestricted link pass', process.execPath,
     [rankScript, '--corpus', `--minutes=${minutes}`, `--anchor-depth=${cfg.rankDepth}`,
@@ -2141,21 +2218,27 @@ for (let i = 1; i <= cfg.cycles && !stopRequested(); i++) {
     // gate harvest + strong-engine --play games below). Announced once, then silent per cycle.
     if (i === 1) log(`No dedicated generation (--batch=0): fresh data comes from the gate harvest`
       + (cfg.playStrong ? ` + strong-engine ladder --play (depth ${cfg.playDepth}).` : ' + ranked-pool play.'));
-  } else if (!run('Generate (champion self-play)', genBin,
+  } else if (!runOrRetry('Generate (champion self-play)', genBin,
     [`--games=${cfg.batch}`, `--depth=${cfg.depth}`, '--eval=nn',
       ...(cfg.openings !== null ? [`--openings=${cfg.openings}`] : []),
       ...(cfg.openingTopk > 0 ? [`--opening-topk=${cfg.openingTopk}`] : []),
       ...adjudicateArgs(cfg.genAdjudicate),
-      `--seed=${Date.now()}`, ...jobArg])) break;
+      `--seed=${Date.now()}`, ...jobArg])) {
+    if (!failCycle(c, 'Generation')) break;
+    continue;
+  }
 
   // 2. Featurize the raw positions for the current feature set, into THIS recipe's featurized
   //    file (each filter config keeps its own, so alternating recipes don't re-featurize each
   //    switch), applying the recipe's dataset filters (--quiet-only / --filter-weak /
   //    --drop-conflicts). (After a refresh this is a full pass — the in-place rewrite
   //    invalidates the prefix.)
-  if (!run('Featurize', process.execPath,
+  if (!runOrRetry('Featurize', process.execPath,
     [featurizeScript, `--out=${featFile}`, ...(cfg.quietOnly ? ['--quiet-only'] : []),
-      ...filterArgs()])) break;
+      ...filterArgs()])) {
+    if (!failCycle(c, 'Featurize')) break;
+    continue;
+  }
 
   // 3. Train a candidate to a side file. --lambda blends the champion's search value into
   //    the target (TD/bootstrap) when < 1. Warm-start source for this cycle's candidate:
@@ -2205,7 +2288,7 @@ for (let i = 1; i <= cfg.cycles && !stopRequested(); i++) {
   // the child still starts from the champion's centipawn function (measured: 0.16 cp mean
   // deviation inside +/-100 cp, growing only in the saturated tail, which is the point — see
   // train.py --rescale). Unset scale stays unset: no flag, no behaviour change.
-  if (!run(`Train candidate${initLabel}`, python,
+  if (!runOrRetry(`Train candidate${initLabel}`, python,
     [trainPy, `--hidden=${hidden}`, `--data=${featFile}`, `--out=${candidate}`, `--lambda=${cfg.lam}`,
       ...(cfg.quant ? ['--quant'] : []),
       ...(cfg.scale !== undefined ? [`--scale=${cfg.scale}`, '--rescale'] : []),
@@ -2213,7 +2296,12 @@ for (let i = 1; i <= cfg.cycles && !stopRequested(); i++) {
       ...(cfg.wd !== undefined ? [`--wd=${cfg.wd}`] : []),
       ...(cfg.epochs !== undefined ? [`--epochs=${cfg.epochs}`] : []),
       ...(cfg.patience !== undefined ? [`--patience=${cfg.patience}`] : []),
-      ...(warm ? [`--init=${initFile}`] : [])])) break;
+      ...(warm ? [`--init=${initFile}`] : [])])) {
+    // Rotate: a shape that won't train (too big for memory, a bad graft) fails identically on
+    // every retry and typically trains fine on the next architecture the registry suggests.
+    if (!failCycle(c, 'Training', { rotate: true })) break;
+    continue;
+  }
 
   // Candidate "frame time": its per-node search cost (an arch property, not a strength claim and
   // not part of the gate decision). Live browser play is fixed-TIME, so a shape whose ns/node
@@ -2247,7 +2335,9 @@ for (let i = 1; i <= cfg.cycles && !stopRequested(); i++) {
       ...(cfg.harvest ? [`--save-games=${gateHarvest}`, `--seed=${Date.now()}`] : []), ...jobArg])) {
     // Ctrl-C / failure mid-gate: the runner still drained its played games to the harvest
     // temp. Fold them in (relabeling if a partial result is readable, else unchanged) so the
-    // already-played games aren't lost, then end the loop.
+    // already-played games aren't lost, then end the loop — or, on a plain crash, abandon just
+    // this cycle. The gate is deliberately NOT retried: a fresh 2000-game SPRT costs more than
+    // the cycle is worth, and its already-played games have been folded in either way.
     if (cfg.harvest) {
       let r = null; try { r = JSON.parse(readFileSync(resultFile, 'utf8')); } catch { /* no usable result */ }
       // With confirmation on, an interrupted gate can NEVER have promoted — the confirmation
@@ -2262,7 +2352,8 @@ for (let i = 1; i <= cfg.cycles && !stopRequested(); i++) {
       foldHarvest(screenHarvest, screenArchive, championLedgerElo(),
         screen ? screen.eloLo : 0, `depth-${cfg.screenDepth} screen edge`);
     }
-    break;
+    if (!failCycle(c, 'The gate')) break;
+    continue;
   }
 
   // 5. Read the gate's verdict. Promotion needs a significant win (SPRT H1) that then survives
@@ -2272,8 +2363,12 @@ for (let i = 1; i <= cfg.cycles && !stopRequested(); i++) {
   catch {
     log('No match result; keeping champion.');
     if (cfg.harvest) foldGateHarvest(false, null); // fold the played games in unchanged (no edge to relabel with)
+    if (!failCycle(c, 'Reading the gate result')) break;
     continue;
   }
+  // Featurize, training and the gate all completed: whatever went wrong on earlier cycles has
+  // cleared, so the consecutive-failure count starts over.
+  consecutiveFailures = 0;
   const pct = (res.score * 100).toFixed(1);
   // Eval-divergence between candidate and champion (only present when both sides are nn,
   // which the gate always is): how differently the two nets judge midgame positions —
@@ -2505,7 +2600,16 @@ for (let i = 1; i <= cfg.cycles && !stopRequested(); i++) {
     // Re-read AFTER the refit: the pass just rewrote the convergence block, so this sees the
     // deficit as it stands now rather than last cycle's. The link pass no-ops unless the
     // remaining deficit is genuinely unreachable from the strong-play set.
-    if (!stopping) runLinkPass(ledgerConvergence());
+    const conv = ledgerConvergence();
+    // One health line per cycle, so "is the ladder keeping up?" is answerable from the log
+    // instead of by stopping the loop and reading the ledger. The link pass logs when it fires;
+    // this is the line that says something on the cycles it doesn't.
+    if (conv) {
+      log(`  Ladder: ${conv.converged ? 'converged ✓' : `${conv.relevant} adjacent pair(s) owed a direct link `
+        + `(${conv.schedulable} reachable from the strong-play set)`}`
+        + `${conv.misorderCost != null && conv.pairs ? `, ${(conv.misorderCost / conv.pairs).toFixed(1)} Elo mis-order risk per adjacent pair` : ''}.`);
+    }
+    if (!stopping) runLinkPass(conv);
   }
 
   // Per-cycle value refresh — the LAST step of the cycle. Re-label a small slice of the
