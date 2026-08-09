@@ -363,6 +363,7 @@ function renderLadder() {
     el('h3', {}, 'Convergence'),
     convBadge(conv),
     el('div', { class: 'kv mt' }, el('span', { class: 'k' }, 'Pairs'), el('span', { class: 'v' }, fmt(conv?.pairs))),
+    el('div', { class: 'kv' }, el('span', { class: 'k' }, 'Links owed'), el('span', { class: 'v' }, fmt(conv?.adjacentUnderLinkedRelevant ?? conv?.adjacentUnderLinked))),
     el('div', { class: 'kv' }, el('span', { class: 'k' }, 'Never met'), el('span', { class: 'v' }, fmt(conv?.adjacentUnlinked))),
     el('div', { class: 'kv' }, el('span', { class: 'k' }, 'Worst mis-order'), el('span', { class: 'v' }, `${fmt(conv?.misorderCost, 0)} Elo`)),
     el('div', { class: 'kv' }, el('span', { class: 'k' }, 'Depth inversions'), el('span', { class: 'v' }, fmt(conv?.confidentInversions))),
