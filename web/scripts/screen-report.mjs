@@ -26,6 +26,14 @@
 //   sigma_transfer large (~20 Elo)  -> the screen only duplicates futility: not worth wiring in.
 // The report prints sigma_transfer with the noise subtracted out, and simulates the rule.
 //
+// KNOWN LIMITATION: it pools every recorded pair regardless of SEARCH ERA. The transfer curve
+// is a property of the search — pruning compounds with depth, so era 2's d1:d6 shape is not
+// era 1's — and a fit over both is a blend of two curves. History entries carry `era` (see
+// experiment-registry.mjs), so filtering is a one-line change; it is not done yet because
+// era 2 has only a couple of pairs and dropping the era-1 ones would leave nothing to fit.
+// Revisit once ~10 era-2 cycles exist, which is also when --screen-ratio (still the era-1
+// 0.62) can be re-derived.
+//
 // Read-only: it never writes, spawns, or touches the loop's state, so it is safe against a
 // live loop.
 
