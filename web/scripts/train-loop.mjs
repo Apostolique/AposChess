@@ -98,10 +98,10 @@
 //   --gate-depth=D  search depth for the gating match (default 6). Deliberately CHEAPER than the
 //                   depth the engine is deployed at, because the gate runs every cycle while the
 //                   confirmation (--confirm-depth, default 8) runs only on H1. A 40-game matchup
-//                   costs d6 73 s / d7 285 s / d8 494 s (jobs=14, over 50 era-2 matchups), which
-//                   would turn the observed ~62 min cycle into ~108 if the gate moved to 8 —
-//                   1.7x fewer promotion attempts, every cycle, to sharpen a measurement whose
-//                   per-candidate error at d6 has never been shown to matter.
+//                   measures d6 106 s / d7 249 s / d8 495 s (jobs=14, direct on an idle machine,
+//                   2026-08-08), so a d8 gate costs ~3.7x the gate's own wall clock on top of
+//                   EVERY cycle to sharpen a measurement whose per-candidate error at d6 has
+//                   never been shown to matter. See the cfg entry for what that number replaced.
 //   --elo1=E        SPRT H1 promotion threshold in Elo (default 20; elo0 is 0). This
 //                   is the SMALLEST gain worth promoting; it must be wide enough that
 //                   the SPRT can actually decide within --gate-games. A too-small band
@@ -140,7 +140,8 @@
 //                   the candidate faces a question it cannot have been tuned toward.
 //   --confirm-depth=D  search depth for the confirmation match (default 8, vs the gate's 6).
 //                   Deep search is affordable here and not in the gate because this only runs on
-//                   the ~5% of cycles that reach H1 (~1% of the loop's wall clock). It puts the
+//                   the ~5% of cycles that reach H1: 600 games at d8 is ~2 h (measured 495 s per
+//                   40-game matchup), which amortizes to ~6 min per cycle. It puts the
 //                   irreversible decision at the depth the engine is deployed at, and it makes
 //                   every promotion attempt log a paired (gate d6, confirm d8) edge — the
 //                   per-candidate depth-transfer residual on near-clones, which is exactly the
@@ -158,8 +159,9 @@
 //                   spurious promotions. The price to a genuine +20
 //                   candidate is P(pass) ~= 0.81, i.e. a real gain promotes in ~1.2 attempts
 //                   instead of 1 — and the failed attempt isn't lost, it re-gates from the
-//                   lineage. Compute cost is ~1 h at the measured gate throughput (2000 games
-//                   is 3h30-3h55), on the ~5% of cycles that reach H1: ~1% of the loop's clock.
+//                   lineage. Compute cost is ~2 h (600 games at --confirm-depth 8), on the ~5%
+//                   of cycles that reach H1: ~6 min amortized per cycle, so ~8-10% of the
+//                   observed 62-76 min cycles rather than the ~1% claimed while it ran at d6.
 //   --no-confirm    alias for --confirm-games=0 — promote on the gate alone, as the loop did
 //                   before 2026-08-07. Use it to reproduce an older run, not to go faster.
 //   --no-screen     turn OFF the shadow-mode low-depth screen, which is ON by default.
@@ -202,8 +204,8 @@
 //                   passes the file to rank:pool as --corpus-extra, so a PROMOTED candidate's
 //                   20k direct games against the champion it dethroned become the densest
 //                   single-pair evidence the pool has (its own per-cycle play budget buys ~28
-//                   games, and 62 rank-adjacent pairs have never met at all). A non-promoted
-//                   candidate isn't archived, so its games get the same ephemeral
+//                   games, and 186 of the era-2 ladder's 191 adjacencies have never met).
+//                   A non-promoted candidate isn't archived, so its games get the same ephemeral
 //                   "nn<d>@elo<E>" tag the gate harvest uses — keyed off the SCREEN's edge at
 //                   the SCREEN's depth, since that tag is an absolute Elo at that depth.
 //                   (2) They're real games with real terminal results, so if a use for
@@ -688,12 +690,17 @@ const cfg = {
   // GATE DEPTH stays 6, and the CONFIRMATION goes deep instead (--confirm-depth, below). The
   // temptation on 2026-08-08 was to move the gate to 8, where the engine is actually played (the
   // app's default preset is d7, generation runs d6-8), since the era-2 search reaches a given
-  // depth on ~a quarter of the nodes. The cost says otherwise: a 40-game matchup measures d6 73 s
-  // / d7 285 s / d8 494 s (jobs=14, fitted over 50 era-2 matchups), and against the observed cycle
-  // shape — 48 min training, ~26 min gate, 6 min screen, the gate usually stopped early by SPRT —
-  // a d8 gate turns a ~62 min cycle into ~108. That is 1.7x fewer attempts at ~13.5 Elo per
-  // promotion, paid on EVERY cycle, to sharpen a measurement whose per-candidate error at d6 has
-  // never been shown to matter. Gate cheap and often, confirm deep and rarely.
+  // depth on ~a quarter of the nodes. The cost still says no, but by LESS than the comment here
+  // used to claim. Measured directly on an idle machine (one 40-game nn-vs-nn matchup per depth,
+  // jobs=14, 2026-08-08 night): d6 106 s / 199.8 M nodes, d7 249 s / 443.0 M, d8 495 s / 977.1 M.
+  // That is a branching factor of 2.21 per ply and d8:d6 = 4.7x wall clock (4.9x in nodes, the
+  // number to quote since it is immune to nps jitter). The earlier figure here was a
+  // least-squares fit over 50 ladder matchups that read d6 73 s / d7 285 s / d8 494 s — 31% low
+  // at d6, which is the denominator of every ratio built on it, so its d8:d6 = 6.8x and the
+  // "~62 min cycle becomes ~108" estimate that followed were both inflated. A d8 gate is
+  // materially cheaper than that: redo the cycle arithmetic at 4.7x before treating d6 as
+  // settled. Gate cheap and often, confirm deep and rarely — still the right shape, on a
+  // narrower margin than it was decided on.
   gateDepth: num(args['gate-depth'], 6),
   elo1: num(args.elo1, 20), // wide enough that SPRT can decide within --gate-games
   // Futility stop for the gate SPRT (0 = off). See the flag doc above; the measured trade
@@ -1567,15 +1574,24 @@ function confirmSeed(cycleNo, candHash, champHash) {
 // 0.05 x 0.4 x 497 ~= 10, against 23 actual promotions. There is no multiple-comparisons control
 // anywhere else in the loop — every cycle is a fresh test of a fresh candidate against one bar.
 //
-// The strength ledger corroborates it. On the Bradley-Terry pool (loop/engine-elo.ladder.json,
-// depth-8 nodes, read 2026-08-07) the recent champion sequence rates Mona 1997, Nash 1997, Olga
-// 2004, Pia 2037, Quinn 2052, Rosa 2050, Sven 2064, Tara 2068 — and the CURRENT champion Uma
-// (cace14) 2018 +/-111, BELOW its own predecessor. The gates that produced those promotions
-// credited them with about +174 Elo in total; the ledger separates the endpoints by ~+70. Two of
-// the links (Nash over Mona, Rosa over Quinn) show no separation at all. That is the signature of
-// the 5%: each spurious promotion is permanent, and because the champion is BOTH the gate
-// opponent AND the warm-start source, a bad one raises the bar and suppresses every later
-// candidate's measured score.
+// The strength ledger LOOKED like it corroborated that (era-1 depth-8 nodes, read 2026-08-07:
+// Mona 1997, Nash 1997, Olga 2004, Pia 2037, Quinn 2052, Rosa 2050, Sven 2064, Tara 2068, with
+// the then-current champion Uma (cace14) at 2018 +/-111, BELOW its own predecessor, against ~+174
+// Elo the gates had credited over that span).
+//
+// IT DIDN'T. A 2000-game fixed-length run the next day (Uma vs Olga, 6 promotions apart, depth 6)
+// measured the span at +81 +/- 15 Elo, against +143 from summing the gates and +16 from the
+// ledger — so the LEDGER was the worst of the three instruments here, not the corroborating one
+// (Uma had 42 depth-8 games at +/-111, which is why --calibrate-minutes went 10 -> 30). The
+// candidates being gated are mostly REAL BUT SUB-THRESHOLD gains, ~+13.5 true against a 20 bar,
+// not true-zero noise.
+//
+// Keep the confirmation anyway, for a different reason than it was built for: its value is honest
+// Elo accounting, not blocking fakes. absElo, --filter-weak's cutoff and --rotate=auto's trend are
+// all anchored to the champion's rating, so a 1.8x inflation propagates into every one of them.
+// At +8 over 600 games it still passes a true +13 candidate ~64% of the time, so it does not block
+// real progress. The alpha argument above stands as a fact about the test's design; the "~10 of 23
+// were spurious" inference does not.
 //
 // So a gate winner has to say it twice. This is a FIXED-LENGTH rematch whose independence is the
 // entire point:
@@ -1595,9 +1611,11 @@ function confirmSeed(cycleNo, candHash, champHash) {
 // at a 5% draw rate (0.85 at 30%), so a real gain needs ~1.2 attempts instead of
 // 1 — and a failed confirmation is NOT a lost gain: the candidate stays as this track's lineage
 // and re-gates next cycle from there, so the cost is a delayed promotion, never a forfeited one.
-// The compute cost is small because promotions are rare: 600 games at --gate-depth is ~1 h at the
-// measured gate throughput (2000 games = 3h30-3h55), and only on the ~5% of cycles that reach H1
-// — about 1% of the loop's wall clock.
+// The compute cost is affordable because promotions are rare, not because the match is cheap:
+// 600 games at --confirm-depth 8 is ~2 h (a 40-game d8 matchup measures 495 s, jobs=14), against
+// ~27 min for the same 600 at the gate's d6. Only the ~5% of cycles that reach H1 pay it, so it
+// amortizes to ~6 min per cycle — ~8-10% of the observed 62-76 min cycles, not the ~1% this
+// comment claimed while the confirmation still ran at the gate's depth.
 //
 // Returns null when confirmation is OFF (--confirm-games=0 / --no-confirm); the caller then
 // promotes on H1 exactly as it did before this existed. Otherwise a record for the log and the
@@ -2430,16 +2448,17 @@ for (let i = 1; i <= cfg.cycles && !stopRequested(); i++) {
   // is what decides: a candidate the confirmation rejected is never archived, so its labels need
   // the ephemeral tag exactly like any other non-promoted gate winner's.
   if (cfg.harvest) foldGateHarvest(promote, res, confirm);
-  // The confirmation's own games get harvested on identical terms: same two engines, same
-  // --gate-depth, real strong-play data already paid for, and the same provenance rewrite. There
-  // is no reason to throw away 600 deep games because the candidate they judged didn't promote.
+  // The confirmation's own games get harvested on identical terms: same two engines, the same
+  // provenance rewrite, real strong-play data already paid for — and at --confirm-depth (8), so
+  // they are the DEEPEST labels any cycle produces. No reason to throw away 600 deep games
+  // because the candidate they judged didn't promote.
   if (cfg.harvest) foldConfirmHarvest(promote, res, confirm);
   // Same treatment for the screen's games, into their own dataset. A PROMOTED candidate is
   // archived by hash, so its screen games become directly rateable evidence for the ledger —
   // and 20k direct games on one pair is worth far more to the fit than the ~28 the pool's
-  // whole per-cycle budget buys (the ladder currently reports 62 rank-adjacent pairs that have
-  // never met at all). Non-promoted candidates get the ephemeral tag, keyed off the SCREEN's
-  // own edge at the SCREEN's depth — screen.eloLo, not the rescaled gate-depth prediction.
+  // whole per-cycle budget buys (on the era-2 ladder, 186 of 191 rank-adjacent pairs have never
+  // met, 33 of them worth ordering). Non-promoted candidates get the ephemeral tag, keyed off
+  // the SCREEN's own edge at the SCREEN's depth — screen.eloLo, not the rescaled prediction.
   if (cfg.screen && cfg.screenSave && existsSync(screenHarvest)) {
     const promoted = promote; // the FINAL decision — a confirmation-rejected candidate isn't archived
     const fold = foldHarvest(screenHarvest, screenArchive,
