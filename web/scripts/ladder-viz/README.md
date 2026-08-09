@@ -51,6 +51,21 @@ dataset's size and mtime, so the toolbar shows `pool snapshot behind dataset` on
 dataset has moved on since. That is normal between cycles, when the gate has appended games
 the ratings have not seen yet.
 
+## The ratings are one search era, the games list is every era
+
+A game record carries `se`, the search era it was played under (absent means era 1, which is
+everything before 2026-08-08). `rank:pool` rates one era at a time, so the ledger, the pool
+matrix, and therefore the **Ladder**, **Generations**, **Depth × Elo**, **Matchups** and
+**Expected** views all describe a single era. The summary says which one, alongside the pin
+value that era is anchored to, since the two eras sit on scales that differ by 140 Elo at
+`hc6` and much more for the nets.
+
+The **Games** tab does not filter. It is a byte index over `selfplay.jsonl` and every game in
+there is listed, both eras mixed, so the game counters in the toolbar are corpus-wide and will
+read higher than the games behind any rating. That is deliberate, since a game is worth
+replaying whichever search played it, but it means you cannot read a matchup's game count off
+the Games tab and expect the ladder to agree.
+
 ## Depth is shared, and the URL remembers everything
 
 There is one depth for the whole dashboard. Pick depth 6 on the ladder and the
@@ -158,7 +173,11 @@ which is why `rank:pool` now writes `prior` into the ledger.
 
 - **Ladder** — leaderboard at the shared depth (or each engine's best depth, at
   `all depths`), convergence verdict, current-champion card, latest gate result. Click
-  a row to jump to its depth curve.
+  a row to jump to its depth curve. The convergence card's **Links owed** is
+  `adjacentUnderLinkedRelevant`, the adjacent pairs worth ordering that have not met
+  for `--link` games — the count the scheduler and `train:loop`'s link pass steer by.
+  **Never met** below it is the raw count, which stays high on a wide pool and is not
+  a target (see `--link-cost` in `docs/tools.md`).
 - **Generations** — champion Elo across `train:loop` generations, plus Elo gained
   per generation. The line carries a band, see below.
 - **Depth × Elo** — one line per engine of Elo vs search depth, over the depths
