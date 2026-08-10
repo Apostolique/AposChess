@@ -1,21 +1,6 @@
 {
-  "default": "Uma",
+  "default": "Victor",
   "nets": [
-    {
-      "name": "Ivy",
-      "file": "ivy.json",
-      "arch": [
-        768,
-        64,
-        32,
-        16,
-        1
-      ],
-      "loopChampion": true,
-      "hash": "3938a0",
-      "gen": 9,
-      "note": "Retired train:loop champion (3938a0, 2026-06-26)."
-    },
     {
       "name": "Jack",
       "file": "jack.json",
@@ -246,7 +231,30 @@
       "loopChampion": true,
       "hash": "cace14",
       "gen": 21,
-      "note": "train:loop champion Uma (gen 21, cace14, 2026-08-07).",
+      "note": "train:loop champion Uma (gen 21, cace14, 2026-08-07)."
+    },
+    {
+      "name": "Victor",
+      "file": "victor.json",
+      "arch": [
+        768,
+        192,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        1
+      ],
+      "loopChampion": true,
+      "hash": "209a7c",
+      "gen": 22,
+      "note": "train:loop champion Victor (gen 22, 209a7c, 2026-08-10).",
       "current": true
     }
   ]
