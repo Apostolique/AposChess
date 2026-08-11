@@ -2,6 +2,146 @@
   "default": "Wren",
   "nets": [
     {
+      "name": "Ada",
+      "file": "ada.json",
+      "arch": [
+        768,
+        64,
+        1
+      ],
+      "loopChampion": true,
+      "hash": "94c88e",
+      "gen": 1,
+      "note": "Retired train:loop champion (94c88e, 2026-06-12)."
+    },
+    {
+      "name": "Boris",
+      "file": "boris.json",
+      "arch": [
+        768,
+        64,
+        1
+      ],
+      "loopChampion": true,
+      "hash": "a14d52",
+      "gen": 2,
+      "note": "Retired train:loop champion (a14d52, 2026-06-14)."
+    },
+    {
+      "name": "Clara",
+      "file": "clara.json",
+      "arch": [
+        768,
+        64,
+        1
+      ],
+      "loopChampion": true,
+      "hash": "932b7c",
+      "gen": 3,
+      "note": "Retired train:loop champion (932b7c, 2026-06-15)."
+    },
+    {
+      "name": "Dexter",
+      "file": "dexter.json",
+      "arch": [
+        768,
+        64,
+        1
+      ],
+      "loopChampion": true,
+      "hash": "880f6d",
+      "gen": 4,
+      "note": "Retired train:loop champion (880f6d, 2026-06-15)."
+    },
+    {
+      "name": "Elena",
+      "file": "elena.json",
+      "arch": [
+        768,
+        64,
+        16,
+        1
+      ],
+      "loopChampion": true,
+      "hash": "f63cda",
+      "gen": 5,
+      "note": "Retired train:loop champion (f63cda, 2026-06-16)."
+    },
+    {
+      "name": "Felix",
+      "file": "felix.json",
+      "arch": [
+        768,
+        64,
+        16,
+        1
+      ],
+      "loopChampion": true,
+      "hash": "08df7b",
+      "gen": 6,
+      "note": "Retired train:loop champion (08df7b, 2026-06-17)."
+    },
+    {
+      "name": "Greta",
+      "file": "greta.json",
+      "arch": [
+        768,
+        64,
+        16,
+        8,
+        1
+      ],
+      "loopChampion": true,
+      "hash": "22577c",
+      "gen": 7,
+      "note": "Retired train:loop champion (22577c, 2026-06-18)."
+    },
+    {
+      "name": "Hugo",
+      "file": "hugo.json",
+      "arch": [
+        768,
+        64,
+        16,
+        8,
+        1
+      ],
+      "loopChampion": true,
+      "hash": "a6baa2",
+      "gen": 8,
+      "note": "Retired train:loop champion (a6baa2, 2026-06-23)."
+    },
+    {
+      "name": "Ivy",
+      "file": "ivy.json",
+      "arch": [
+        768,
+        64,
+        32,
+        16,
+        1
+      ],
+      "loopChampion": true,
+      "hash": "3938a0",
+      "gen": 9,
+      "note": "Retired train:loop champion (3938a0, 2026-06-26)."
+    },
+    {
+      "name": "Jack",
+      "file": "jack.json",
+      "arch": [
+        768,
+        64,
+        32,
+        16,
+        1
+      ],
+      "loopChampion": true,
+      "hash": "c76205",
+      "gen": 10,
+      "note": "train:loop champion Jack (gen 10, c76205, 2026-06-28)."
+    },
+    {
       "name": "Jacques",
       "file": "jacques.json",
       "arch": [
