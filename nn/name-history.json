@@ -107,6 +107,19 @@
         1
       ],
       "note": "Retired train:loop champion (3938a0, 2026-06-26); pruned from the catalog 2026-08-10."
+    },
+    {
+      "name": "Jack",
+      "hash": "c76205",
+      "gen": 10,
+      "arch": [
+        768,
+        64,
+        32,
+        16,
+        1
+      ],
+      "note": "train:loop champion Jack (gen 10, c76205, 2026-06-28); pruned from the catalog 2026-08-11."
     }
   ]
 }
