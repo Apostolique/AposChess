@@ -1,21 +1,6 @@
 {
-  "default": "Victor",
+  "default": "Wren",
   "nets": [
-    {
-      "name": "Jack",
-      "file": "jack.json",
-      "arch": [
-        768,
-        64,
-        32,
-        16,
-        1
-      ],
-      "loopChampion": true,
-      "hash": "c76205",
-      "gen": 10,
-      "note": "train:loop champion Jack (gen 10, c76205, 2026-06-28)."
-    },
     {
       "name": "Jacques",
       "file": "jacques.json",
@@ -254,7 +239,28 @@
       "loopChampion": true,
       "hash": "209a7c",
       "gen": 22,
-      "note": "train:loop champion Victor (gen 22, 209a7c, 2026-08-10).",
+      "note": "train:loop champion Victor (gen 22, 209a7c, 2026-08-10)."
+    },
+    {
+      "name": "Wren",
+      "file": "wren.json",
+      "arch": [
+        768,
+        256,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        1
+      ],
+      "loopChampion": true,
+      "hash": "3aff90",
+      "gen": 23,
+      "note": "train:loop champion Wren (gen 23, 3aff90, 2026-08-11).",
       "current": true
     }
   ]
