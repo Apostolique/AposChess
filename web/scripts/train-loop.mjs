@@ -770,12 +770,15 @@ const cfg = {
   rankLink: args['rank-link'] !== undefined ? Math.max(0, Number(args['rank-link'])) : null,
   // On each promotion the NEW champion is published into the playable net catalog
   // (web/public/nn) under the next free human name and flagged the current champion, so it's
-  // pickable in the app under a real name from the moment it's promoted (past champions stay
-  // too). Only the most recent --keep-champions retired nets are kept (the current champion is
-  // always kept); older ones are pruned (weights file + manifest entry) to bound the deployed
-  // bundle (~0.5 MB each), but their name+hash move to name-history.json so ledger labels
-  // survive and names are never reused. 0 = off.
-  keepChampions: num(args['keep-champions'], 12),
+  // pickable in the app under a real name from the moment it's promoted. EVERY past champion
+  // stays pickable: --keep-champions caps how many retired nets the catalog holds (the current
+  // one is always kept) and prunes the older ones (weights file + manifest entry), moving their
+  // name+hash to name-history.json so ledger labels survive and names are never reused.
+  // DEFAULT 0 = off, and the ten champions a 12-cap had already pruned were restored from git
+  // history on 2026-08-11: the whole lineage is ~10 MB of the deployed bundle, nets are fetched
+  // one at a time on demand, and the app never paid for the ones nobody picked — cheap enough
+  // that "play the gen-1 net against the gen-23 net" beats the saving.
+  keepChampions: num(args['keep-champions'], 0),
   // Strong-engine ladder play as the generator. With no dedicated generation (--batch=0), the
   // per-cycle rank step restricts --play to the strongest nn engines (current champion + recent
   // champions) at --play-depth, so its harvested games — written straight into the dataset —
@@ -1726,9 +1729,10 @@ const CHAMPION_NAMES = ['Ada', 'Boris', 'Clara', 'Dexter', 'Elena', 'Felix', 'Gr
 // name and flag it the current champion (named at PROMOTION, not when dethroned) — so it's
 // pickable in the app under a real name from the moment it's promoted, and the app default +
 // analysis eval bar resolve to it via its `current` flag. Clears the previous current flag,
-// then prunes to the most recent cfg.keepChampions retired champions (deleting their weights +
-// manifest entries; the current one is always kept). Idempotent by content hash, so re-running
-// a promotion is a no-op. Returns the assigned name. Loads + writes the manifest itself.
+// then — only if cfg.keepChampions is set, which it is not by default — prunes down to that
+// many retired champions (deleting their weights + manifest entries; the current one is always
+// kept). Idempotent by content hash, so re-running a promotion is a no-op. Returns the assigned
+// name. Loads + writes the manifest itself.
 function publishChampion(file, arch) {
   let man = { default: null, nets: [] };
   try { man = JSON.parse(readFileSync(manifestFile, 'utf8')); } catch { /* new manifest */ }
@@ -1752,9 +1756,10 @@ function publishChampion(file, arch) {
   for (const n of champs()) delete n.current;
   entry.current = true;
   man.default = entry.name;
-  // Keep only the most recent cfg.keepChampions retired champions; never prune the current one.
-  // A pruned champion's identity (name+hash) is appended to name-history.json so the ledger
-  // keeps labeling its hash and the name stays spent; only the deployed weights go away.
+  // Opt-in (--keep-champions=N): keep only the N most recent retired champions, never pruning
+  // the current one. A pruned champion's identity (name+hash) is appended to name-history.json
+  // so the ledger keeps labeling its hash and the name stays spent; only the deployed weights
+  // go away. Off by default — the catalog keeps the whole lineage playable.
   if (cfg.keepChampions > 0) {
     const byAge = champs().filter((n) => !n.current).sort((a, b) => (a.gen || 0) - (b.gen || 0));
     const pruned = byAge.slice(0, Math.max(0, byAge.length - cfg.keepChampions));
