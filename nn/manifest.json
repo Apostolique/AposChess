@@ -1,5 +1,5 @@
 {
-  "default": "Wren",
+  "default": "Xena",
   "nets": [
     {
       "name": "Ada",
@@ -400,7 +400,28 @@
       "loopChampion": true,
       "hash": "3aff90",
       "gen": 23,
-      "note": "train:loop champion Wren (gen 23, 3aff90, 2026-08-11).",
+      "note": "train:loop champion Wren (gen 23, 3aff90, 2026-08-11)."
+    },
+    {
+      "name": "Xena",
+      "file": "xena.json",
+      "arch": [
+        768,
+        256,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        1
+      ],
+      "loopChampion": true,
+      "hash": "419374",
+      "gen": 24,
+      "note": "train:loop champion Xena (gen 24, 419374, 2026-08-12).",
       "current": true
     }
   ]

@@ -1,4 +1,4 @@
 {
-  "note": "Champions pruned from manifest.json live on here: the ledger labels their hash by name forever, and these names are never reused for future champions. Empty since 2026-08-11, when pruning was turned off (train:loop --keep-champions defaults to 0) and the ten already-pruned champions were restored to the catalog from git history. Append-only while pruning is on; maintained by train:loop (publishChampion).",
+  "note": "Champions pruned from manifest.json live on here: the ledger labels their hash by name forever, and these names are never reused for future champions. Empty since 2026-08-11, when pruning was turned off (train:loop --keep-champions defaults to 0) and the already-pruned champions were restored to the catalog from git history. Append-only while pruning is on; maintained by train:loop (publishChampion).",
   "names": []
 }
