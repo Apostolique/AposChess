@@ -1717,16 +1717,31 @@ function refreshArgs(frac, depth) {
 // the cohorts by strengths the engine no longer has, so the fallback is the random fraction.
 const refreshMode = () => (cfg.rank && readLedger()) ? 'weakest-first' : 'random';
 
-// Human names for champions, handed out in order (the first eight — Ada..Hugo — were the
-// initial hand-published lineage). Names are permanent: a pruned champion's name moves to
-// name-history.json and is never handed out again (a hash is a hash, a name is a net). When
-// all 26 are spent the fallback is champ-<hash>.
-const CHAMPION_NAMES = ['Ada', 'Boris', 'Clara', 'Dexter', 'Elena', 'Felix', 'Greta', 'Hugo',
+// Champion names, handed out in order: the next one nobody has taken. Names are permanent, so a
+// name never comes back even if its net leaves the catalog (a hash is a hash, a name is a net),
+// and the list runs A..Z so the name alone says roughly where in the lineage a champion sits.
+// Each lap of the alphabet gets its own kind of name, which is what tells two champions on the
+// same letter apart. Append a lap when one runs low. The fallback, once every name is spent, is
+// champ-<hash>.
+const CHAMPION_NAMES = [
+  // Lap 1, human first names (gens 1-23 so far). The first eight, Ada..Hugo, were the initial
+  // hand-published lineage.
+  'Ada', 'Boris', 'Clara', 'Dexter', 'Elena', 'Felix', 'Greta', 'Hugo',
   'Ivy', 'Jack', 'Kara', 'Leo', 'Mona', 'Nash', 'Olga', 'Pia', 'Quinn', 'Rosa', 'Sven',
-  'Tara', 'Uma', 'Victor', 'Wren', 'Xena', 'Yuri', 'Zara'];
+  'Tara', 'Uma', 'Victor', 'Wren', 'Xena', 'Yuri', 'Zara',
+  // Lap 2, gems and minerals. Nothing here reads as a person, so `nn8@3aff90 (Sapphire)` can't
+  // be mistaken for a lap-1 champion, and Q and X land on real stones (Quartz, Xenotime) rather
+  // than on something invented to fill the letter. Y is the thin one: yttrialite is a real
+  // mineral but nobody has heard of it.
+  'Agate', 'Beryl', 'Citrine', 'Diamond', 'Emerald', 'Fluorite', 'Garnet', 'Howlite',
+  'Iolite', 'Jasper', 'Kunzite', 'Lapis', 'Malachite', 'Nephrite', 'Onyx', 'Peridot',
+  'Quartz', 'Ruby', 'Sapphire', 'Topaz', 'Ulexite', 'Verdite', 'Wulfenite', 'Xenotime',
+  'Yttrialite', 'Zircon',
+];
 
-// Publish the just-promoted champion `file` into the net catalog under the next free human
-// name and flag it the current champion (named at PROMOTION, not when dethroned) — so it's
+// Publish the just-promoted champion `file` into the net catalog under the next free
+// CHAMPION_NAMES entry and flag it the current champion (named at PROMOTION, not when
+// dethroned) — so it's
 // pickable in the app under a real name from the moment it's promoted, and the app default +
 // analysis eval bar resolve to it via its `current` flag. Clears the previous current flag,
 // then — only if cfg.keepChampions is set, which it is not by default — prunes down to that
