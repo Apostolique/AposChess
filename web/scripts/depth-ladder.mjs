@@ -128,6 +128,13 @@
 //                   with unknown players; ephemeral `elo<N>` candidates aren't rated nodes, so
 //                   their games drop out in the fit. Pair `--rounds=0` with the default for a
 //                   pure refit-from-dataset.
+//   --corpus-extra=A,B  more game files to rate from, on top of --data, read exactly like it (a
+//                   missing file is skipped with a warning). Defaults to loop/ladder-link-games.jsonl,
+//                   the loop's unrestricted link pass: games that are legitimate RATING evidence but
+//                   deliberately not training data, so a bare run fits the same numbers train:loop
+//                   does. They're what ties the strong cluster to the pin, and dropping them moved
+//                   every depth-8 champion 106 Elo (2026-08-12). `--corpus-extra=` rates from --data
+//                   alone. The dataset's own games are never in here, so the sources just sum.
 //   --csv=FILE      also write a flat engine,version,depth,elo,ci95,games CSV (for plotting a
 //                   depth curve — filter to one version). Off unless given.
 //   --save-games[=F]  harvest the played games into F (default ON -> the --data dataset): every
@@ -275,9 +282,14 @@ const cfg = {
   // pass (loop/ladder-link-games.jsonl) is the motivating case: it plays whatever rank-adjacent
   // pairs have never met, weak nodes included, which is exactly what --play-strong keeps out of
   // the training set. Read exactly like --data; a missing file is skipped with a warning.
+  // That link archive is the DEFAULT, the same way legacy-pairs.json below is loaded with no flag:
+  // both are additive evidence that exists nowhere else, and a rating input the loop passes but a
+  // hand run forgets is a fit that silently disagrees with the loop's (2026-08-12: the whole top of
+  // the ladder read 106 Elo low at ±105 instead of ±79, because those games are the strong
+  // cluster's chain to the pin). `--corpus-extra=` (empty) rates from --data alone.
   corpusExtra: typeof args['corpus-extra'] === 'string'
     ? args['corpus-extra'].split(',').map((s) => s.trim()).filter(Boolean).map((s) => resolve(process.cwd(), s))
-    : [],
+    : [join(loopDir, 'ladder-link-games.jsonl')],
   // Derived snapshot of the fitted pairwise matrix + seed cursor (an output; see the header).
   pool: typeof args.pool === 'string' ? resolve(process.cwd(), args.pool) : join(loopDir, 'ladder-pool.json'),
   ledger: typeof args.ledger === 'string' ? resolve(process.cwd(), args.ledger) : join(loopDir, 'engine-elo.ladder.json'),
